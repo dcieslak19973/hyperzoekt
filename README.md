@@ -7,7 +7,7 @@ A Rust project exploring fast code search and semantic indexing by combining ide
 
 Goals
 -----
-- Build a high-performance, trigram-backed code search engine inspired by Zoekt, implemented (in part) in Rust.
+- Build a high-performance, trigram-backed code search engine inspired by Zoekt, implemented entirely in Rust.
 - Extract and reuse Tree-sitter tooling to produce rich syntactic and semantic information for source code.
 - Store Tree-sitter results and repository metadata in a flexible hypergraph to enable advanced queries, permission-aware access, and cross-repo analysis.
 - Provide usable interfaces: a command-line client and a simple web UI for searching and browsing index results.
