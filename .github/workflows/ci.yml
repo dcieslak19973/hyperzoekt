@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         toolchain: [stable, nightly]
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +41,9 @@ jobs:
         run: cargo test --verbose
 
       - name: Check formatting
+        if: matrix.toolchain == 'stable'
         run: cargo fmt -- --check
 
       - name: Run clippy
+        if: matrix.toolchain == 'stable'
         run: cargo clippy -- -D warnings

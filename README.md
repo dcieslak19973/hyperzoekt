@@ -1,6 +1,7 @@
 # hyperzoekt
 
 [![CI](https://github.com/dcieslak19973/hyperzoekt/actions/workflows/ci.yml/badge.svg)](https://github.com/dcieslak19973/hyperzoekt/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 A Rust partial port of Sourcegraph's zoekt (https://github.com/sourcegraph/zoekt).
 
