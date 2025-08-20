@@ -1,5 +1,7 @@
 # hyperzoekt
 
+[![CI](https://github.com/dcieslak19973/hyperzoekt/actions/workflows/ci.yml/badge.svg)](https://github.com/dcieslak19973/hyperzoekt/actions)
+
 A Rust partial port of Sourcegraph's zoekt (https://github.com/sourcegraph/zoekt).
 
 This project includes code derived from Sourcegraph's zoekt, which is licensed under the Apache License 2.0. See `LICENSE` and `NOTICE` for details.
