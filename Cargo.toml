@@ -1,0 +1,10 @@
+[package]
+name = "hyperzoekt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A Rust partial port of Sourcegraph's zoekt (search engine)."
+license = "Apache-2.0"
+repository = "https://github.com/<your-username>/hyperzoekt"
+
+[dependencies]
