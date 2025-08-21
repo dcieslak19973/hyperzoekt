@@ -74,8 +74,8 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const { context, github } = require('@actions/github');
-            const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            // `github` and `context` are provided by actions/github-script — do not redeclare them.
+            const sha = context.payload && context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
             // Create a check run named 'CI' and mark it successful if we reached this step
             await github.rest.checks.create({
               owner: context.repo.owner,
