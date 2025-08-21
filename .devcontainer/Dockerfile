@@ -6,6 +6,7 @@ RUN apt-get update \
     build-essential \
     pkg-config \
     libssl-dev \
+  openssh-client \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
