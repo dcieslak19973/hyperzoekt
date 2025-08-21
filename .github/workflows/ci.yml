@@ -62,3 +62,30 @@ jobs:
       - name: Run clippy
         if: matrix.toolchain == 'stable'
         run: cargo clippy -- -D warnings
+
+  report-ci:
+    name: CI
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Create CI check-run
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { context, github } = require('@actions/github');
+            const sha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            // Create a check run named 'CI' and mark it successful if we reached this step
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'CI',
+              head_sha: sha,
+              status: 'completed',
+              conclusion: 'success',
+              output: {
+                title: 'CI aggregated',
+                summary: 'Aggregated CI status from workflow matrix jobs.'
+              }
+            });
