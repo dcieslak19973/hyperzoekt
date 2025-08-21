@@ -28,8 +28,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
         "python" => {
             for line in source.lines() {
                 let t = line.trim();
-                if t.starts_with("import ") {
-                    let rest = &t[7..];
+                if let Some(rest) = t.strip_prefix("import ") {
                     for part in rest.split(',') {
                         let mut token = part.trim();
                         if let Some(idx) = token.find(" as ") {
@@ -73,10 +72,9 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
         "java" => {
             for line in source.lines() {
                 let t = line.trim();
-                if t.starts_with("import ") {
-                    let mut rest = &t[7..];
-                    if rest.starts_with("static ") {
-                        rest = &rest[7..];
+                if let Some(mut rest) = t.strip_prefix("import ") {
+                    if let Some(r) = rest.strip_prefix("static ") {
+                        rest = r;
                     }
                     if let Some(semi) = rest.find(';') {
                         rest = &rest[..semi];
@@ -114,8 +112,16 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
             let mut in_block = false;
             for line in source.lines() {
                 let t = line.trim();
+                // start of a block import: import (
                 if t.starts_with("import (") {
                     in_block = true;
+                    continue;
+                }
+                // single-line import: import "fmt" or import alias "pkg"
+                if t.starts_with("import ") {
+                    if let Some(m) = extract_quoted(t) {
+                        set.insert(normalize_module_basename(&m));
+                    }
                     continue;
                 }
                 if in_block {
@@ -126,26 +132,21 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                     if let Some(m) = extract_quoted(t) {
                         set.insert(normalize_module_basename(&m));
                     }
-                } else if t.starts_with("import ") {
-                    if let Some(m) = extract_quoted(t) {
-                        set.insert(normalize_module_basename(&m));
-                    }
                 }
             }
         }
         "rust" => {
             for line in source.lines() {
                 let t = line.trim();
-                if t.starts_with("mod ") {
-                    let token = t[4..]
+                if let Some(rest) = t.strip_prefix("mod ") {
+                    let token = rest
                         .split(|c: char| c == ';' || c == '{' || c.is_whitespace())
                         .next()
                         .unwrap_or("");
                     if !token.is_empty() {
                         set.insert(token.to_string());
                     }
-                } else if t.starts_with("use ") {
-                    let after = &t[4..];
+                } else if let Some(after) = t.strip_prefix("use ") {
                     let mut first = after
                         .split(|c: char| c == ':' || c == ';' || c == '{' || c.is_whitespace())
                         .next()
@@ -169,8 +170,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
         "c_sharp" => {
             for line in source.lines() {
                 let t = line.trim();
-                if t.starts_with("using ") {
-                    let after = &t[6..];
+                if let Some(after) = t.strip_prefix("using ") {
                     let head = after.split('=').next().unwrap_or(after);
                     let first = head
                         .split(|c: char| c == '.' || c == ';' || c.is_whitespace())
@@ -205,7 +205,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
 
 fn extract_quoted(s: &str) -> Option<String> {
     let mut current = None;
-    for (i, ch) in s.chars().enumerate() {
+    for (i, ch) in s.char_indices() {
         if ch == '"' || ch == '\'' {
             if current.is_none() {
                 current = Some((ch, i));
@@ -273,7 +273,7 @@ impl EntityKind {
             EntityKind::Other => "other",
         }
     }
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Self {
         match s {
             "file" => EntityKind::File,
             "class" => EntityKind::Class,
@@ -281,6 +281,13 @@ impl EntityKind {
             "method" => EntityKind::Method,
             _ => EntityKind::Other,
         }
+    }
+}
+
+impl std::str::FromStr for EntityKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(EntityKind::parse_str(s))
     }
 }
 
@@ -361,22 +368,12 @@ pub enum RepoIndexOutput<'a> {
     Null, // discard (still counts entities via sink)
 }
 
+#[derive(Default)]
 pub struct RepoIndexOptionsBuilder<'a> {
     root: Option<&'a Path>,
     output: Option<RepoIndexOutput<'a>>,
     include_langs: Option<HashSet<&'a str>>,
     progress: Option<&'a ProgressCallback<'a>>,
-}
-
-impl<'a> Default for RepoIndexOptionsBuilder<'a> {
-    fn default() -> Self {
-        Self {
-            root: None,
-            output: None,
-            include_langs: None,
-            progress: None,
-        }
-    }
 }
 
 impl<'a> RepoIndexOptions<'a> {
@@ -804,7 +801,7 @@ fn extract_signature<'a>(node: &Node<'a>, src: &'a str) -> &'a str {
     let text = src.get(node.byte_range()).unwrap_or("");
     // Up to first '{' or newline (whichever shorter) for brace languages; else first line
     if let Some(idx) = text.find('{') {
-        &text[..idx].trim_end()
+        text[..idx].trim_end()
     } else {
         text.lines().next().unwrap_or("")
     }

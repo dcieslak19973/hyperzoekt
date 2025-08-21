@@ -32,6 +32,20 @@ Build locally with Rust and Cargo (install via https://rustup.rs/):
 
 	cargo build
 
+Repo indexer
+-------------
+This workspace includes a small Tree-sitter backed repository indexer in `crates/repo-index`.
+
+To build and run the indexer binary (may take time the first build because Tree-sitter grammars compile native code):
+
+```bash
+cd crates/repo-index
+cargo build --release
+cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl
+```
+
+There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/repo-index/src/bin/index_repo.rs` for options.
+
 License
 -------
 This repository is licensed under the Apache License, Version 2.0. See the `LICENSE` and `NOTICE` files for details.

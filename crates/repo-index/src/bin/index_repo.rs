@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "doc": ent.doc,
             "rank": ent.rank,
         });
-        writeln!(writer, "{}", obj.to_string())?;
+        writeln!(writer, "{}", obj)?;
     }
 
     writer.flush()?;

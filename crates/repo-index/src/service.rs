@@ -189,7 +189,7 @@ impl RepoIndexService {
                 entities_store.push(StoredEntity {
                     id,
                     file_id,
-                    kind: super::internal::EntityKind::from_str(ent.kind),
+                    kind: super::internal::EntityKind::parse_str(ent.kind),
                     name: ent.name,
                     parent: ent.parent,
                     signature: ent.signature,
@@ -494,7 +494,7 @@ impl RepoIndexService {
                 "doc": e.doc,
                 "rank": e.rank,
             });
-            writeln!(w, "{}", json.to_string())?;
+            writeln!(w, "{}", json)?;
         }
         Ok(())
     }
@@ -594,8 +594,8 @@ impl RepoIndexService {
             } else {
                 0.0
             };
-            for i in 0..n {
-                new_rank[i] += teleport + dangling_contrib;
+            for item in new_rank.iter_mut().take(n) {
+                *item += teleport + dangling_contrib;
             }
             std::mem::swap(&mut rank, &mut new_rank);
         }
