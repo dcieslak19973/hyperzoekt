@@ -20,10 +20,14 @@ jobs:
         run: |
           # search repository for deprecated commands that should be replaced with environment files
           set -euo pipefail
-          # exclude common build/output dirs to avoid scanning generated files
-          # exclude this workflow file from the search so the check doesn't match its own text
-          if grep -R --line-number --binary-files=without-match --exclude='.github/workflows/ci.yml' --exclude-dir=.git --exclude-dir=target -e 'set-output' -e 'set-env' .; then
+          # search, but filter out this workflow file so the check doesn't report its own text
+          grep -R --line-number --binary-files=without-match --exclude-dir=.git --exclude-dir=target -e 'set-output' -e 'set-env' . \
+            | grep -v '\.github/workflows/ci.yml' | tee /tmp/deprecated_matches || true
+
+          if [ -s /tmp/deprecated_matches ]; then
             echo "::error::Deprecated GitHub Actions command found (set-output or set-env). Replace with environment files: GITHUB_OUTPUT / GITHUB_ENV"
+            echo "Matches:" 
+            cat /tmp/deprecated_matches
             exit 1
           fi
 
