@@ -24,7 +24,7 @@ Get involved
 ------------
 - See `TODO.md` for the current task list and `doc/PLANS.md` for architecture notes.
 - Read `CONTRIBUTING.md` for how to run, test and submit changes.
-- Open issues or feature requests using the provided templates.
+- Open issues or enhancement requests using the provided templates.
 
 Quick start
 -----------
