@@ -24,13 +24,27 @@ Get involved
 ------------
 - See `TODO.md` for the current task list and `doc/PLANS.md` for architecture notes.
 - Read `CONTRIBUTING.md` for how to run, test and submit changes.
-- Open issues or feature requests using the provided templates.
+- Open issues or enhancement requests using the provided templates.
 
 Quick start
 -----------
 Build locally with Rust and Cargo (install via https://rustup.rs/):
 
 	cargo build
+
+Repo indexer
+-------------
+This workspace includes a small Tree-sitter backed repository indexer in `crates/repo-index`.
+
+To build and run the indexer binary (may take time the first build because Tree-sitter grammars compile native code):
+
+```bash
+cd crates/repo-index
+cargo build --release
+cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl
+```
+
+There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/repo-index/src/bin/index_repo.rs` for options.
 
 License
 -------
