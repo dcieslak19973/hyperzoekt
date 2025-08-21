@@ -1,0 +1,23 @@
+{
+  "name": "hyperzoekt - Rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-vscode.cpptools",
+        "serayuzgur.crates"
+      ]
+      ,
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "postCreateCommand": "rustup component add rustfmt clippy || true && cargo build",
+  "remoteUser": "root"
+}
