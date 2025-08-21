@@ -1,0 +1,38 @@
+{
+  "name": "hyperzoekt - Rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-vscode.cpptools"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  // Note: ssh-agent feature removed to avoid GHCR authentication failures.
+  // Mount WSL ~/.ssh from the host into the container. To avoid committing
+  // your username into this file, set an environment variable on your host
+  // named `WSL_SSH_PATH` with the Windows UNC path to your WSL .ssh directory
+  // (example PowerShell command shown below). The devcontainer will expand
+  // ${localEnv:WSL_SSH_PATH} on the host when creating the container.
+  // Example (PowerShell, run once):
+  // setx WSL_SSH_PATH "\\\\wsl.localhost\\Ubuntu-24.04\\home\\YOUR_USER_NAME_HERE\\.ssh"
+  // Then restart VS Code so the env var is visible to the Remote - Containers process.
+  "mounts": [
+    "source=${localEnv:WSL_SSH_PATH},target=/root/.ssh,type=bind,consistency=cached"
+  ],
+  "postCreateCommand": "rustup component add rustfmt clippy || true && cargo build",
+  // If you want SSH agent forwarding, configure it in your environment or use the
+  // "ssh-agent" devcontainer feature instead of binding SSH_AUTH_SOCK directly.
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "/ssh-agent/socket"
+  },
+  "remoteUser": "root"
+}
