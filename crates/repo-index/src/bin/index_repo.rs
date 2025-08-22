@@ -83,6 +83,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // decide whether to emit start/end lines. For file pseudo-entities we only
+        // emit numeric 1-based start/end if there are import lines or unresolved
+        // imports recorded; otherwise emit null to avoid misleading 1/1 values.
+        let (start_field, end_field) = if matches!(ent.kind, repo_index::internal::EntityKind::File)
+        {
+            let has_imports = !imports.is_empty();
+            let has_unresolved = !unresolved_imports.is_empty();
+            if has_imports || has_unresolved {
+                (
+                    serde_json::Value::from(ent.start_line.saturating_add(1)),
+                    serde_json::Value::from(ent.end_line.saturating_add(1)),
+                )
+            } else {
+                (serde_json::Value::Null, serde_json::Value::Null)
+            }
+        } else {
+            (
+                serde_json::Value::from(ent.start_line.saturating_add(1)),
+                serde_json::Value::from(ent.end_line.saturating_add(1)),
+            )
+        };
+
         let obj = json!({
             "file": file.path,
             "language": file.language,
@@ -90,9 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "name": ent.name,
             "parent": ent.parent,
             "signature": ent.signature,
-            // emit 1-based lines to match IDEs
-            "start_line": ent.start_line.saturating_add(1),
-            "end_line": ent.end_line.saturating_add(1),
+            "start_line": start_field,
+            "end_line": end_field,
             "calls": ent.calls,
             "doc": ent.doc,
             "rank": ent.rank,

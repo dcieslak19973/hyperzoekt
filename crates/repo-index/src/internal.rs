@@ -21,6 +21,14 @@ use tree_sitter_typescript as ts_typescript;
 
 // --- Enhanced import extraction helper (multi-language heuristics) ---
 
+/// Extract import module basenames and their source line numbers from a file's source text.
+///
+/// Returns a Vec of (module_basename, line_number) pairs. IMPORTANT: line numbers
+/// returned here are 0-based (they directly reflect Tree-sitter's `start_position().row`).
+/// The indexer keeps internal AST/entity coordinates 0-based. Do NOT convert to 1-based
+/// here — conversion to IDE-friendly 1-based line numbers happens only at the outer
+/// exporter boundary (for example `export_jsonl` or the CLI), so that internal logic
+/// and comparisons remain consistent and avoid double-conversion bugs.
 pub fn extract_import_modules(lang: &str, source: &str) -> Vec<(String, usize)> {
     // return a list of (module_basename, line_number) pairs. Line numbers are 0-based
     // to match Tree-sitter's start_line convention used elsewhere.
@@ -570,6 +578,7 @@ pub(crate) fn extract_entities<'a>(
         "swift" => generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec),
         _ => {
             // fallback: whole file summary as one entity
+            // Use 0-based line numbers internally (start at 0, end at last row = lines-1).
             out.push(Entity {
                 file: path.display().to_string(),
                 language: lang,
@@ -581,8 +590,8 @@ pub(crate) fn extract_entities<'a>(
                     .to_string(),
                 parent: None,
                 signature: src.lines().next().unwrap_or("").to_string(),
-                start_line: 1,
-                end_line: src.lines().count(),
+                start_line: 0,
+                end_line: src.lines().count().saturating_sub(1),
                 calls: None,
                 doc: None,
             });
@@ -761,8 +770,9 @@ fn generic_class_function_walk<'a>(
                 name: name.to_string(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
+                // store 0-based Tree-sitter rows internally; exporters convert to 1-based
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
                 calls: None,
                 doc: extract_doc_comments(&node, src),
             };
@@ -783,8 +793,9 @@ fn generic_class_function_walk<'a>(
                 name: name.to_string(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
+                // store 0-based Tree-sitter rows internally; exporters convert to 1-based
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
                 calls: if calls.is_empty() { None } else { Some(calls) },
                 doc: extract_doc_comments(&node, src),
             });

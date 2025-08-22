@@ -147,6 +147,20 @@ Purpose
 Format
 - The snapshot interchange format used by the project is JSON-based, one-object-per-line (commonly stored as .jsonl files for portability). Consumers can also use other newline-safe encodings; the schema below describes the JSON shape.
 
+Line number conventions
+----------------------
+
+- Internal representation: all Tree-sitter-derived coordinates (for example, entity
+  `start_line`/`end_line`) are stored 0-based matching Tree-sitter's `row` value.
+- Export boundary: when emitting JSONL or writing to external systems (CLI output,
+  SurrealDB exports for UI consumption), the exporter MUST convert these to 1-based
+  line numbers to match IDE/editor conventions. This avoids surprising off-by-one
+  behavior for consumers while keeping internal computations consistent.
+
+Be explicit about conversion responsibilities when adding new export paths or
+APIs: prefer a single conversion site at the top-level exporter rather than
+scattering +1 adjustments across the codebase.
+
 Top-level fields (recommended)
 - file_path: string
 - repo: repository id or short name

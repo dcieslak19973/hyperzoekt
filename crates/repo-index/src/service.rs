@@ -356,6 +356,11 @@ impl RepoIndexService {
         Ok((svc, stats))
     }
 
+    /// NOTE: internal entity `start_line` and `end_line` values are stored 0-based
+    /// (Tree-sitter rows). Export helpers such as `export_jsonl` and the CLI convert
+    /// these to 1-based line numbers for IDE-friendly output. Keep internal logic
+    /// working with 0-based values to avoid double-conversion.
+
     /// Backwards-compatible convenience constructor used by tests/callers.
     pub fn build<P: AsRef<std::path::Path>>(root: P) -> Result<(Self, RepoIndexStats)> {
         let opts = crate::internal::RepoIndexOptions::builder()
@@ -514,9 +519,33 @@ impl RepoIndexService {
                 "name": e.name,
                 "parent": e.parent,
                 "signature": e.signature,
-                // export 1-based line numbers
-                "start_line": e.start_line.saturating_add(1),
-                "end_line": e.end_line.saturating_add(1),
+                // export 1-based line numbers; if this is a file pseudo-entity with no
+                // imports and no unresolved imports, emit `null` to avoid misleading 1/1
+                // values. Consumers should handle nulls as "not-applicable".
+                "start_line": (if e.kind.as_str() == "file" {
+                    let file_idx = self.files[e.file_id as usize].id as usize;
+                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    if has_imports || has_unres {
+                        serde_json::Value::from(e.start_line.saturating_add(1))
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else {
+                    serde_json::Value::from(e.start_line.saturating_add(1))
+                }),
+                "end_line": (if e.kind.as_str() == "file" {
+                    let file_idx = self.files[e.file_id as usize].id as usize;
+                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    if has_imports || has_unres {
+                        serde_json::Value::from(e.end_line.saturating_add(1))
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else {
+                    serde_json::Value::from(e.end_line.saturating_add(1))
+                }),
                 "calls": e.calls,
                 "doc": e.doc,
                 "rank": e.rank,
