@@ -66,3 +66,25 @@ If you encounter mysterious parse or compilation errors after making large autom
 ---
 
 Doc generated/edited by the repo maintainer tooling.
+
+## Embedded SurrealDB default behavior
+
+When running the indexer without a remote SurrealDB configured, the indexer will start an embedded, file-backed SurrealDB instance by default and persist its data to `.data/surreal.db`.
+
+Configuration summary:
+
+- Environment variables:
+	- `SURREAL_URL` — if set, the indexer will connect to this remote SurrealDB instance instead of embedding.
+	- `SURREAL_EMBED_MODE` — `file` (default) or `memory` (ephemeral).
+	- `SURREAL_EMBED_PATH` — path for embedded DB files (default: `.data/surreal.db`).
+
+- CLI flags (override env vars):
+	- `--surreal-url <url>`
+	- `--embed-mode <file|memory>`
+	- `--embed-path <path>`
+
+Notes:
+
+- The launcher will create the `.data/` directory automatically if it does not exist.
+- Use `SURREAL_EMBED_MODE=memory` for ephemeral runs (tests, CI) to avoid creating persistent files.
+- The repository's `.gitignore` should include `.data/` so DB files are not accidentally committed.

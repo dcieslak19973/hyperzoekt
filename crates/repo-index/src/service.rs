@@ -66,10 +66,14 @@ pub struct RepoIndexService {
     pub containment_parent: Vec<Option<u32>>, // entity id -> optional parent entity id
     pub call_edges: Vec<Vec<u32>>,           // entity id -> outgoing calls (resolved entity ids)
     pub reverse_call_edges: Vec<Vec<u32>>,   // entity id -> incoming calls (callers)
-    pub import_edges: Vec<Vec<u32>>, // placeholder until Step 4 (file-level imports -> file entity ids)
-    pub file_entities: Vec<u32>,     // mapping file index -> file entity id
-    pub unresolved_imports: Vec<Vec<String>>, // per file index unresolved module basenames
-    pub rank_weights: super::internal::RankWeights, // configured (possibly env overridden) weights
+    // import_edges: entity id -> list of target file-entity ids
+    pub import_edges: Vec<Vec<u32>>,
+    // import_lines: entity id -> parallel list of source line numbers for each import edge
+    pub import_lines: Vec<Vec<u32>>,
+    pub file_entities: Vec<u32>, // mapping file index -> file entity id
+    // per-file unresolved imports as (module_basename, line)
+    pub unresolved_imports: Vec<Vec<(String, u32)>>, // per file index unresolved module basenames with line numbers
+    pub rank_weights: super::internal::RankWeights,  // configured (possibly env overridden) weights
 }
 
 /// Service that holds the repository index built from Tree-sitter parsed files.
@@ -102,8 +106,8 @@ impl RepoIndexService {
         let mut name_index: HashMap<String, Vec<u32>> = HashMap::new();
         let mut file_count = 0usize;
         let mut parser = Parser::new();
-        // Temporary store of raw import module names per file index (not entity id yet)
-        let mut file_import_modules: HashMap<u32, HashSet<String>> = HashMap::new();
+        // Temporary store of raw import module names with line numbers per file index (not entity id yet)
+        let mut file_import_modules: HashMap<u32, Vec<(String, usize)>> = HashMap::new();
         for dent in walker {
             let dent = match dent {
                 Ok(d) => d,
@@ -207,6 +211,23 @@ impl RepoIndexService {
         for f in &files {
             let id = entities_store.len() as u32;
             file_entities.push(id);
+            // derive file-level start/end from any recorded import line numbers for the file
+            let (start_line_u32, end_line_u32) = if let Some(mods) = file_import_modules.get(&f.id)
+            {
+                if !mods.is_empty() {
+                    let mut min_ln = usize::MAX;
+                    let mut max_ln = 0usize;
+                    for (_m, ln) in mods.iter() {
+                        min_ln = std::cmp::min(min_ln, *ln);
+                        max_ln = std::cmp::max(max_ln, *ln);
+                    }
+                    (min_ln as u32, max_ln as u32)
+                } else {
+                    (0u32, 0u32)
+                }
+            } else {
+                (0u32, 0u32)
+            };
             entities_store.push(StoredEntity {
                 id,
                 file_id: f.id,
@@ -218,8 +239,8 @@ impl RepoIndexService {
                     .to_string(),
                 parent: None,
                 signature: String::new(),
-                start_line: 0,
-                end_line: 0,
+                start_line: start_line_u32,
+                end_line: end_line_u32,
                 calls: Vec::new(),
                 doc: None,
                 rank: 0.0,
@@ -231,7 +252,9 @@ impl RepoIndexService {
         let mut call_edges: Vec<Vec<u32>> = vec![Vec::new(); entity_len];
         let mut reverse_call_edges: Vec<Vec<u32>> = vec![Vec::new(); entity_len];
         let mut import_edges: Vec<Vec<u32>> = vec![Vec::new(); entity_len];
-        let mut unresolved_imports_per_file: Vec<Vec<String>> = vec![Vec::new(); files.len()];
+        let mut import_lines: Vec<Vec<u32>> = vec![Vec::new(); entity_len];
+        let mut unresolved_imports_per_file: Vec<Vec<(String, u32)>> =
+            vec![Vec::new(); files.len()];
         let mut scope_map: HashMap<(u32, String), u32> = HashMap::new();
         for e in &entities_store {
             scope_map.insert((e.file_id, e.name.to_lowercase()), e.id);
@@ -291,20 +314,21 @@ impl RepoIndexService {
         for (fid, mods) in file_import_modules.into_iter() {
             let file_entity_id = file_entities[fid as usize];
             let mut added: StdHashSet<u32> = StdHashSet::new();
-            for m in mods {
+            for (m, lineno) in mods {
                 let key = m.to_lowercase();
                 if let Some(count) = basename_counts.get(&key) {
                     if *count == 1 {
                         if let Some(target_file_entity) = basename_map.get(&key) {
                             if added.insert(*target_file_entity) {
                                 import_edges[file_entity_id as usize].push(*target_file_entity);
+                                import_lines[file_entity_id as usize].push(lineno as u32);
                             }
                             continue;
                         }
                     }
-                    unresolved_imports_per_file[fid as usize].push(m.clone());
+                    unresolved_imports_per_file[fid as usize].push((m.clone(), lineno as u32));
                 } else {
-                    unresolved_imports_per_file[fid as usize].push(m.clone());
+                    unresolved_imports_per_file[fid as usize].push((m.clone(), lineno as u32));
                 }
             }
         }
@@ -323,6 +347,7 @@ impl RepoIndexService {
             call_edges,
             reverse_call_edges,
             import_edges,
+            import_lines,
             file_entities,
             unresolved_imports: unresolved_imports_per_file,
             rank_weights,
@@ -330,6 +355,11 @@ impl RepoIndexService {
         svc.compute_pagerank();
         Ok((svc, stats))
     }
+
+    /// NOTE: internal entity `start_line` and `end_line` values are stored 0-based
+    /// (Tree-sitter rows). Export helpers such as `export_jsonl` and the CLI convert
+    /// these to 1-based line numbers for IDE-friendly output. Keep internal logic
+    /// working with 0-based values to avoid double-conversion.
 
     /// Backwards-compatible convenience constructor used by tests/callers.
     pub fn build<P: AsRef<std::path::Path>>(root: P) -> Result<(Self, RepoIndexStats)> {
@@ -471,11 +501,12 @@ impl RepoIndexService {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
-    pub fn unresolved_imports_for_file_index(&self, file_index: usize) -> &[String] {
+    pub fn unresolved_imports_for_file_index(&self, file_index: usize) -> &[(String, u32)] {
+        static EMPTY_PAIR_SLICE: &[(String, u32)] = &[];
         self.unresolved_imports
             .get(file_index)
             .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .unwrap_or(EMPTY_PAIR_SLICE)
     }
 
     // (Removed duplicate legacy import heuristic block; enhanced version defined above)
@@ -488,11 +519,54 @@ impl RepoIndexService {
                 "name": e.name,
                 "parent": e.parent,
                 "signature": e.signature,
-                "start_line": e.start_line,
-                "end_line": e.end_line,
+                // export 1-based line numbers; if this is a file pseudo-entity with no
+                // imports and no unresolved imports, emit `null` to avoid misleading 1/1
+                // values. Consumers should handle nulls as "not-applicable".
+                "start_line": (if e.kind.as_str() == "file" {
+                    let file_idx = self.files[e.file_id as usize].id as usize;
+                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    if has_imports || has_unres {
+                        serde_json::Value::from(e.start_line.saturating_add(1))
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else {
+                    serde_json::Value::from(e.start_line.saturating_add(1))
+                }),
+                "end_line": (if e.kind.as_str() == "file" {
+                    let file_idx = self.files[e.file_id as usize].id as usize;
+                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    if has_imports || has_unres {
+                        serde_json::Value::from(e.end_line.saturating_add(1))
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else {
+                    serde_json::Value::from(e.end_line.saturating_add(1))
+                }),
                 "calls": e.calls,
                 "doc": e.doc,
                 "rank": e.rank,
+                // provide imports/unresolved_imports with 1-based lines
+                "imports": self.import_edges.get(e.id as usize).map(|edges| {
+                    let lines = self.import_lines.get(e.id as usize);
+                    edges
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &eid)| {
+                            self.entities.get(eid as usize).and_then(|te| {
+                                self.files.get(te.file_id as usize).map(|tf| {
+                                    serde_json::json!({"path": tf.path, "line": lines.and_then(|l| l.get(i)).cloned().unwrap_or(0).saturating_add(1)})
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                }).unwrap_or(Vec::new()),
+                "unresolved_imports": self.unresolved_imports.get(self.files[e.file_id as usize].id as usize).map(|v| {
+                    v.iter().map(|(m, ln)| serde_json::json!({"module": m, "line": ln.saturating_add(1)})).collect::<Vec<_>>()
+                }).unwrap_or(Vec::new()),
             });
             writeln!(w, "{}", json)?;
         }

@@ -1,0 +1,57 @@
+graph LR
+  File[File<br/>id · path<br/> · language<br/> · repo]
+  AstEntity[AstEntity<br/>id · kind<br/> · name<br/> · signature? · start_line..end_line<br/> · snapshot->file_snapshot:id]
+  FileSnapshot[FileSnapshot<br/>id · content_hash<br/> · indexed_at<br/> · authored_at?<br/> · ts_ast/json<br/> · compressed_blob?]
+  Branch[Branch<br/>id · name<br/> · repo<br/> · protected?<br/> · default?]
+  Repository[Repository<br/>id · name<br/> · visibility?]
+  Project[Project<br/>id · name]
+  User[User<br/>id<br/> · username<br/> · email?]
+  Group[Group<br/>id<br/> · name<br/> · members]
+  Commit[Commit<br/>id sha<br/> · author -> user:id<br/>· message<br/> · authored_at]
+  PullRequest[PullRequest<br/> id<br/> · author -> user:id<br/> · base -> commit:id<br/> · head -> commit:id]
+  FileDiff[FileDiff<br/>file -> file:id<br/> · change_type]
+  Permission[Permission<br/>principal -> user/group<br/> · resource -> repository: · role ]
+
+  CallEdge[CallEdge]
+  ImportEdge[ImportEdge]
+  ContainEdge[ContainEdge]
+
+  AstEntity --> File
+  AstEntity --> FileSnapshot
+  AstEntity --> AstEntity
+  AstEntity --> File
+
+  File --> Repository
+  Repository --> Project
+
+  Commit --> Repository
+  Commit --> Commit
+  Commit --> User
+  Commit --> FileDiff
+
+  PullRequest --> Repository
+  PullRequest --> User
+  PullRequest --> Commit
+
+  FileDiff --> Repository
+  FileDiff --> Commit
+  FileDiff --> File
+
+  FileSnapshot --> File
+  FileSnapshot --> Branch
+
+  Group --> User
+
+  Permission --> User
+  Permission --> Repository
+
+  CallEdge --> AstEntity
+  ImportEdge --> File
+  ContainEdge --> AstEntity
+
+  subgraph Legend
+    L1["References stored as REFERENCE (e.g. file -> file:id)"]
+    L2["calls/imports may be arrays on entity/file or explicit edge tables"]
+    L3["Permissions: only read access enforced at query/search time"]
+    L4["file_snapshot stores per-version Tree-sitter AST (ts_ast) and content_hash"]
+  end

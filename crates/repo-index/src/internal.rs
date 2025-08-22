@@ -21,12 +21,22 @@ use tree_sitter_typescript as ts_typescript;
 
 // --- Enhanced import extraction helper (multi-language heuristics) ---
 
-pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
+/// Extract import module basenames and their source line numbers from a file's source text.
+///
+/// Returns a Vec of (module_basename, line_number) pairs. IMPORTANT: line numbers
+/// returned here are 0-based (they directly reflect Tree-sitter's `start_position().row`).
+/// The indexer keeps internal AST/entity coordinates 0-based. Do NOT convert to 1-based
+/// here — conversion to IDE-friendly 1-based line numbers happens only at the outer
+/// exporter boundary (for example `export_jsonl` or the CLI), so that internal logic
+/// and comparisons remain consistent and avoid double-conversion bugs.
+pub fn extract_import_modules(lang: &str, source: &str) -> Vec<(String, usize)> {
+    // return a list of (module_basename, line_number) pairs. Line numbers are 0-based
+    // to match Tree-sitter's start_line convention used elsewhere.
+    let mut vec: Vec<(String, usize)> = Vec::new();
     match lang {
         // Python: handle aliases, relative, multi-import
         "python" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if let Some(rest) = t.strip_prefix("import ") {
                     for part in rest.split(',') {
@@ -36,7 +46,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                         }
                         token = token.split_whitespace().next().unwrap_or("");
                         if !token.is_empty() {
-                            set.insert(token.to_string());
+                            vec.push((token.to_string(), lineno));
                         }
                     }
                 } else if t.starts_with("from ") {
@@ -46,7 +56,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                             mod_token = mod_token.trim_start_matches('.'); // collapse relative dots
                             mod_token = mod_token.split('.').next().unwrap_or("");
                             if !mod_token.is_empty() {
-                                set.insert(mod_token.to_string());
+                                vec.push((mod_token.to_string(), lineno));
                             }
                         }
                     }
@@ -55,14 +65,14 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
         }
         // Local quoted includes only
         "cpp" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if t.starts_with("#include \"") {
                     if let Some(start) = t.find('"') {
                         if let Some(end_rel) = t[start + 1..].find('"') {
                             let name = &t[start + 1..start + 1 + end_rel];
                             if !name.is_empty() {
-                                set.insert(normalize_module_basename(name));
+                                vec.push((normalize_module_basename(name), lineno));
                             }
                         }
                     }
@@ -70,7 +80,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
             }
         }
         "java" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if let Some(mut rest) = t.strip_prefix("import ") {
                     if let Some(r) = rest.strip_prefix("static ") {
@@ -81,36 +91,36 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                     }
                     let last = rest.rsplit('.').next().unwrap_or(rest).trim();
                     if !last.is_empty() && last != "*" {
-                        set.insert(last.to_string());
+                        vec.push((last.to_string(), lineno));
                     }
                 }
             }
         }
         "javascript" | "typescript" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if t.starts_with("import ") {
                     if let Some(idx) = t.find(" from ") {
                         let rest = &t[idx + 6..];
                         if let Some(m) = extract_quoted(rest) {
-                            set.insert(normalize_module_basename(&m));
+                            vec.push((normalize_module_basename(&m), lineno));
                         }
                     } else if t.starts_with("import ") && (t.contains('"') || t.contains('\'')) {
                         if let Some(m) = extract_quoted(t) {
-                            set.insert(normalize_module_basename(&m));
+                            vec.push((normalize_module_basename(&m), lineno));
                         }
                     }
                 } else if t.contains("require(") {
                     if let Some(m) = between(t, "require(", ")") {
                         let m2 = m.trim_matches(&['"', '\''] as &[_]);
-                        set.insert(normalize_module_basename(m2));
+                        vec.push((normalize_module_basename(m2), lineno));
                     }
                 }
             }
         }
         "go" => {
             let mut in_block = false;
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 // start of a block import: import (
                 if t.starts_with("import (") {
@@ -120,7 +130,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                 // single-line import: import "fmt" or import alias "pkg"
                 if t.starts_with("import ") {
                     if let Some(m) = extract_quoted(t) {
-                        set.insert(normalize_module_basename(&m));
+                        vec.push((normalize_module_basename(&m), lineno));
                     }
                     continue;
                 }
@@ -130,13 +140,13 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                         continue;
                     }
                     if let Some(m) = extract_quoted(t) {
-                        set.insert(normalize_module_basename(&m));
+                        vec.push((normalize_module_basename(&m), lineno));
                     }
                 }
             }
         }
         "rust" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if let Some(rest) = t.strip_prefix("mod ") {
                     let token = rest
@@ -144,7 +154,7 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                         .next()
                         .unwrap_or("");
                     if !token.is_empty() {
-                        set.insert(token.to_string());
+                        vec.push((token.to_string(), lineno));
                     }
                 } else if let Some(after) = t.strip_prefix("use ") {
                     let mut first = after
@@ -162,13 +172,13 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                             .unwrap_or("");
                     }
                     if !first.is_empty() && first != "*" {
-                        set.insert(first.to_string());
+                        vec.push((first.to_string(), lineno));
                     }
                 }
             }
         }
         "c_sharp" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if let Some(after) = t.strip_prefix("using ") {
                     let head = after.split('=').next().unwrap_or(after);
@@ -177,30 +187,30 @@ pub fn extract_import_modules(lang: &str, source: &str) -> HashSet<String> {
                         .next()
                         .unwrap_or("");
                     if !first.is_empty() {
-                        set.insert(first.to_string());
+                        vec.push((first.to_string(), lineno));
                     }
                 }
             }
         }
         "swift" => {
-            for line in source.lines() {
+            for (lineno, line) in source.lines().enumerate() {
                 let t = line.trim();
                 if let Some(rest) = t.strip_prefix("@testable import ") {
                     let tok = rest.split_whitespace().next().unwrap_or("");
                     if !tok.is_empty() {
-                        set.insert(tok.to_string());
+                        vec.push((tok.to_string(), lineno));
                     }
                 } else if let Some(rest) = t.strip_prefix("import ") {
                     let tok = rest.split_whitespace().next().unwrap_or("");
                     if !tok.is_empty() {
-                        set.insert(tok.to_string());
+                        vec.push((tok.to_string(), lineno));
                     }
                 }
             }
         }
         _ => {}
     }
-    set
+    vec
 }
 
 fn extract_quoted(s: &str) -> Option<String> {
@@ -568,6 +578,7 @@ pub(crate) fn extract_entities<'a>(
         "swift" => generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec),
         _ => {
             // fallback: whole file summary as one entity
+            // Use 0-based line numbers internally (start at 0, end at last row = lines-1).
             out.push(Entity {
                 file: path.display().to_string(),
                 language: lang,
@@ -579,8 +590,8 @@ pub(crate) fn extract_entities<'a>(
                     .to_string(),
                 parent: None,
                 signature: src.lines().next().unwrap_or("").to_string(),
-                start_line: 1,
-                end_line: src.lines().count(),
+                start_line: 0,
+                end_line: src.lines().count().saturating_sub(1),
                 calls: None,
                 doc: None,
             });
@@ -759,8 +770,9 @@ fn generic_class_function_walk<'a>(
                 name: name.to_string(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
+                // store 0-based Tree-sitter rows internally; exporters convert to 1-based
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
                 calls: None,
                 doc: extract_doc_comments(&node, src),
             };
@@ -781,8 +793,9 @@ fn generic_class_function_walk<'a>(
                 name: name.to_string(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
+                // store 0-based Tree-sitter rows internally; exporters convert to 1-based
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
                 calls: if calls.is_empty() { None } else { Some(calls) },
                 doc: extract_doc_comments(&node, src),
             });

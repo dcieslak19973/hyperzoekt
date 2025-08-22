@@ -25,3 +25,13 @@ This document records the evolving plans and architectural decisions for the hyp
 ---
 
 This document will be updated as the project progresses.
+
+## SurrealDB pivot (short summary)
+
+Decision: pivot from an in-repo hypergraph representation toward persisting entities and edges in SurrealDB.
+
+Rationale: SurrealDB offers a flexible document+graph model, indexes, and query power that simplify cross-repo graph queries and make operationalizing the index easier (single store for entities, files, and edges).
+
+Planned approach: have the repo-indexer write directly to SurrealDB, upserting records as they are produced by the Tree-sitter indexer; provide an option to run an embedded SurrealDB instance for local dev and an option to connect to remote SurrealDB for production. JSONL export will be supported only for debugging and offline inspection.
+
+See `doc/SURREALDB-INTEGRATION.md` for the full design and migration steps.
