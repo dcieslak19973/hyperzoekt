@@ -360,7 +360,6 @@ impl RepoIndexService {
     /// (Tree-sitter rows). Export helpers such as `export_jsonl` and the CLI convert
     /// these to 1-based line numbers for IDE-friendly output. Keep internal logic
     /// working with 0-based values to avoid double-conversion.
-
     /// Backwards-compatible convenience constructor used by tests/callers.
     pub fn build<P: AsRef<std::path::Path>>(root: P) -> Result<(Self, RepoIndexStats)> {
         let opts = crate::internal::RepoIndexOptions::builder()
@@ -524,8 +523,8 @@ impl RepoIndexService {
                 // values. Consumers should handle nulls as "not-applicable".
                 "start_line": (if e.kind.as_str() == "file" {
                     let file_idx = self.files[e.file_id as usize].id as usize;
-                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
-                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_imports = self.import_edges.get(e.id as usize).map(|v| !v.is_empty()).unwrap_or(false);
+                    let has_unres = self.unresolved_imports.get(file_idx).map(|v| !v.is_empty()).unwrap_or(false);
                     if has_imports || has_unres {
                         serde_json::Value::from(e.start_line.saturating_add(1))
                     } else {
@@ -536,8 +535,8 @@ impl RepoIndexService {
                 }),
                 "end_line": (if e.kind.as_str() == "file" {
                     let file_idx = self.files[e.file_id as usize].id as usize;
-                    let has_imports = !self.import_edges.get(e.id as usize).map(|v| v.is_empty()).unwrap_or(true) == false;
-                    let has_unres = !self.unresolved_imports.get(file_idx).map(|v| v.is_empty()).unwrap_or(true) == false;
+                    let has_imports = self.import_edges.get(e.id as usize).map(|v| !v.is_empty()).unwrap_or(false);
+                    let has_unres = self.unresolved_imports.get(file_idx).map(|v| !v.is_empty()).unwrap_or(false);
                     if has_imports || has_unres {
                         serde_json::Value::from(e.end_line.saturating_add(1))
                     } else {
@@ -563,10 +562,10 @@ impl RepoIndexService {
                             })
                         })
                         .collect::<Vec<_>>()
-                }).unwrap_or(Vec::new()),
+                }).unwrap_or_default(),
                 "unresolved_imports": self.unresolved_imports.get(self.files[e.file_id as usize].id as usize).map(|v| {
                     v.iter().map(|(m, ln)| serde_json::json!({"module": m, "line": ln.saturating_add(1)})).collect::<Vec<_>>()
-                }).unwrap_or(Vec::new()),
+                }).unwrap_or_default(),
             });
             writeln!(w, "{}", json)?;
         }

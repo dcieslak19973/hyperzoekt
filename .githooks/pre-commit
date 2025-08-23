@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run rustfmt (check) and clippy (deny warnings) across workspace.
+set -euo pipefail
+
+echo "Running pre-commit checks: cargo fmt --all -- --check"
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found in PATH; skipping pre-commit checks." >&2
+  exit 0
+fi
+
+# Check formatting
+if ! cargo fmt --all -- --check; then
+  echo "cargo fmt failed. Please run 'cargo fmt --all' to format your code." >&2
+  exit 1
+fi
+
+echo "Running cargo clippy --workspace -- -D warnings"
+# Run clippy for the workspace; fail commit if clippy reports warnings/errors
+if ! cargo clippy --workspace -- -D warnings; then
+  echo "cargo clippy failed. Fix clippy warnings or run 'cargo clippy' locally." >&2
+  exit 1
+fi
+
+echo "pre-commit checks passed."
+exit 0
