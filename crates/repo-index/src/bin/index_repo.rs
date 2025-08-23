@@ -12,7 +12,7 @@ struct Args {
     root: PathBuf,
 
     /// Output JSONL file
-    out: PathBuf,
+    out: Option<PathBuf>,
 
     /// Write output incrementally as files are processed
     #[arg(long)]
@@ -21,12 +21,17 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let out_dir = PathBuf::from(".data");
+    let _ = std::fs::create_dir_all(&out_dir);
+    // canonical output filename when the user doesn't provide one
+    let default_out = out_dir.join("bin_integration_out.jsonl");
 
     // Index all detected languages by default
 
     if args.incremental {
         // Stream results by passing a writer to options
-        let mut file_writer = BufWriter::new(File::create(&args.out)?);
+        let out_path = args.out.as_deref().unwrap_or(default_out.as_path());
+        let mut file_writer = BufWriter::new(File::create(out_path)?);
         let mut opts_builder = repo_index::internal::RepoIndexOptions::builder();
         opts_builder = opts_builder.root(&args.root);
         let opts = opts_builder.output_writer(&mut file_writer).build();
@@ -49,8 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .output_null()
         .build();
     let (svc, stats) = RepoIndexService::build_with_options(opts)?;
-
-    let mut writer = BufWriter::new(File::create(&args.out)?);
+    let out_path = args.out.as_deref().unwrap_or(default_out.as_path());
+    let mut writer = BufWriter::new(File::create(out_path)?);
 
     for ent in &svc.entities {
         let file = &svc.files[ent.file_id as usize];
@@ -124,10 +129,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     writer.flush()?;
+    let out_display = args.out.as_ref().unwrap_or(&default_out);
     println!(
         "Wrote {} entities to {}",
         svc.entities.len(),
-        args.out.display()
+        out_display.display()
     );
     println!(
         "Indexed {} files, {} entities in {:.3}s",

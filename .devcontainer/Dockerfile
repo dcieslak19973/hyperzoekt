@@ -3,14 +3,16 @@ FROM rust:1.89
 # Install common build deps
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    openssh-client \
-    ca-certificates \
-    curl \
-    gnupg \
-    apt-transport-https \
+  build-essential \
+  pkg-config \
+  libssl-dev \
+  openssh-client \
+  ca-certificates \
+  curl \
+  gnupg \
+  apt-transport-https \
+  jq \
+  ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) using the official GitHub CLI apt repository

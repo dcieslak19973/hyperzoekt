@@ -7,13 +7,47 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  checks:
+    name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable) with components
+        run: |
+          set -eux
+          # install rustup and the requested toolchain
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          # make cargo available to following steps
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # install components
+          rustup component add rustfmt clippy
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  build:
+    name: matrix build & test
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "-D warnings"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
         toolchain: [stable, nightly]
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - uses: actions/checkout@v4
 
       - name: Fail on deprecated GitHub Actions commands
@@ -43,11 +77,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-          components: rustfmt, clippy
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.toolchain }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # add components when available (some toolchains may not have them)
+          rustup component add rustfmt clippy || true
 
       - name: Build
         run: cargo build --verbose
@@ -55,37 +90,58 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Check formatting
+      - name: Check formatting (stable only)
         if: matrix.toolchain == 'stable'
         run: cargo fmt -- --check
 
-      - name: Run clippy
+      - name: Run clippy (stable only)
         if: matrix.toolchain == 'stable'
         run: cargo clippy -- -D warnings
 
   report-ci:
     name: CI
-    needs: build
+    needs: [checks, build]
     runs-on: ubuntu-latest
     permissions:
       checks: write
     steps:
-      - name: Create CI check-run
+      - name: Create CI aggregated check-run
         uses: actions/github-script@v6
         with:
           script: |
-            // `github` and `context` are provided by actions/github-script — do not redeclare them.
+            // Compute aggregated conclusion by listing jobs for this workflow run.
+            const runId = parseInt(process.env.GITHUB_RUN_ID || context.runId, 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             const sha = context.payload && context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
-            // Create a check run named 'CI' and mark it successful if we reached this step
+
+            const jobsResp = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: runId });
+            const jobs = (jobsResp.data && jobsResp.data.jobs) || [];
+
+            // Determine if any job (other than this aggregator) failed.
+            const failedJobs = jobs.filter(j => j.name && !j.name.toLowerCase().includes('report-ci') && j.status === 'completed' && j.conclusion !== 'success');
+            const conclusion = failedJobs.length > 0 ? 'failure' : 'success';
+
+            const summaryLines = [];
+            summaryLines.push(`Checked ${jobs.length} job(s).`);
+            if (failedJobs.length > 0) {
+              summaryLines.push(`Failed jobs (${failedJobs.length}):`);
+              for (const f of failedJobs) {
+                summaryLines.push(`- ${f.name} (${f.conclusion})`);
+              }
+            } else {
+              summaryLines.push('All upstream jobs succeeded.');
+            }
+
             await github.rest.checks.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               name: 'CI',
               head_sha: sha,
               status: 'completed',
-              conclusion: 'success',
+              conclusion,
               output: {
                 title: 'CI aggregated',
-                summary: 'Aggregated CI status from workflow matrix jobs.'
+                summary: summaryLines.join('\n')
               }
             });

@@ -68,6 +68,15 @@ Operational considerations
 - Indexes: create indexes on `file.path`, `entity.name`, and any frequently queried fields.
 - PageRank: compute offline or in-app and store `entity.rank` in SurrealDB; SurrealDB does not provide PageRank out-of-the-box.
 
+Access control (commercial)
+---------------------------
+This document describes the data and ingestion model for the open-source project. Access
+control, authentication provider integration, and enterprise permission syncing are planned
+as commercial, closed-source extensions exposed under a subscription model. The importer
+and direct streaming modes will include hooks so the commercial access-control layer can
+enforce query-time permissions and manage role-based access when deployed in multi-tenant
+or enterprise environments.
+
 Migration and roll-forward
 - Start with the importer and run it over historical JSONL to seed SurrealDB.
 - Add read/write tooling and dashboards that query SurrealDB rather than local hypergraph.
