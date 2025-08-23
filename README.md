@@ -26,6 +26,13 @@ Get involved
 - Read `CONTRIBUTING.md` for how to run, test and submit changes.
 - Open issues or enhancement requests using the provided templates.
 
+Access control
+--------------
+Access control and enterprise-grade permission features will be provided as a closed-source
+option available under a subscription model. The open-source core focuses on indexing,
+search, and the data model; commercial extensions will integrate permission syncing,
+authentication providers, and fine-grained enforcement at query time.
+
 Quick start
 -----------
 Build locally with Rust and Cargo (install via https://rustup.rs/):

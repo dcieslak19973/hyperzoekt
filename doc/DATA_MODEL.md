@@ -123,6 +123,80 @@ Performance notes
 - Files changed by a PR (join `pull_request` -> head commit -> commit.changed_files -> file_diff -> file).
 - Which repositories a user can search (use the permission resolution logic above).
 
+## Call graph: entity -> entity relationships
+
+Representing the call graph as explicit entity->entity relationships is recommended. This
+makes callers/callees queries, impact analysis, and graph algorithms (PageRank,
+reachability) efficient and straightforward.
+
+Key ideas
+- Direction: edges point from caller -> callee. Store the source location (line) on the
+  edge so callers can be mapped back to code.
+- Keep both resolved and unresolved edges. Resolved edges reference `entity` records; unresolved
+  edges store the callee text (name/module) and line so they can be resolved later.
+- Resolution should be best-effort and conservative: prefer not to invent a resolution when
+  multiple candidates exist — mark `ambiguous` or keep multiple candidate links with confidence.
+
+Edge metadata (suggested fields)
+- `from` -> entity:id
+- `to` -> entity:id (nullable for unresolved)
+- `kind` : string (e.g. `call`, `import`, `override`)
+- `line`: int (0-based internally; convert to 1-based at export)
+- `col`: int (optional)
+- `resolution`: string enum (`resolved`, `unresolved`, `ambiguous`)
+- `meta`: map (optional heuristic info, confidence score, original callee text)
+
+Storage options
+- In-memory adjacency lists — keep for fast local algorithms (you already maintain `call_edges`).
+- Persist as a typed edge table in SurrealDB (recommended for durability and cross-process queries).
+  For example a `call` table with `from -> entity:id` and `to -> entity:id` plus the fields above.
+
+SurrealDB example (pseudo-DDL)
+
+```sql
+CREATE TABLE call;
+-- Call record example
+CREATE call CONTENT {
+  from: entity:123,
+  to: entity:456,   -- null when unresolved
+  kind: "call",
+  line: 42,
+  resolution: "resolved",
+  meta: { callee_text: "foo::bar", confidence: 0.95 }
+};
+```
+
+Resolution strategy and ambiguity
+- Resolve same-file and local-scope symbols first. Use imports and basename maps for
+  cross-file resolution when there is a single unambiguous target.
+- If multiple candidates match, either mark the edge `ambiguous` or record multiple
+  low-confidence candidate edges — do not silently pick one.
+- For dynamic languages prefer keeping calls unresolved unless heuristics are strong.
+
+Indexing & update strategy
+- When re-indexing a file, recompute outgoing call edges for entities in that file and
+  upsert them in a single transaction: remove old outgoing edges, insert new ones.
+- Keep reverse indices (incoming edges) up-to-date for fast callers queries or derive them
+  from the `call` table with an index on `to`.
+
+Queries you will want
+- Outgoing calls for an entity (callees):
+  - SELECT * FROM call WHERE from = entity:123;
+- Incoming callers for an entity:
+  - SELECT * FROM call WHERE to = entity:456;
+- Depth-limited traversal (BFS) can be implemented in-app or via repeated DB queries.
+
+Graph algorithms
+- PageRank and other analytics should consume the persisted call graph. Either compute
+  PageRank periodically and store `entity.rank`, or run on demand for ad-hoc analysis.
+
+Notes
+- Store the original callee text and source location to allow re-resolution after code
+  changes (rename/move refactors) and to support developer tooling that shows unresolved
+  references in the UI.
+- Keep edge metadata compact to control DB size. If necessary, summarize high-volume
+  edges for very large repositories.
+
 ## Diagram
 
 See `doc/diagram.mmd`
