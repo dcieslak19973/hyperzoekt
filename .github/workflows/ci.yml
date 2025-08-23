@@ -10,6 +10,8 @@ jobs:
   checks:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,6 +35,8 @@ jobs:
   build:
     name: matrix build & test
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "-D warnings"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -41,6 +45,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - uses: actions/checkout@v4
+
+      - name: Fail on deprecated GitHub Actions commands
+        run: |
+          # search repository for deprecated commands that should be replaced with environment files
+          set -euo pipefail
+          # search, but filter out this workflow file so the check doesn't report its own text
+          grep -R --line-number --binary-files=without-match --exclude-dir=.git --exclude-dir=target -e 'set-output' -e 'set-env' . \
+            | grep -v '\.github/workflows/ci.yml' | tee /tmp/deprecated_matches || true
+
+          if [ -s /tmp/deprecated_matches ]; then
+            echo "::error::Deprecated GitHub Actions command found (set-output or set-env). Replace with environment files: GITHUB_OUTPUT / GITHUB_ENV"
+            echo "Matches:" 
+            cat /tmp/deprecated_matches
+            exit 1
+          fi
+          
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
