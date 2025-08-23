@@ -17,11 +17,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (stable) with components
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-          profile: minimal
+        run: |
+          set -eux
+          # install rustup and the requested toolchain
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          # make cargo available to following steps
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # install components
+          rustup component add rustfmt clippy
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
@@ -61,7 +64,7 @@ jobs:
             cat /tmp/deprecated_matches
             exit 1
           fi
-          
+
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
@@ -74,11 +77,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-          components: rustfmt, clippy
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.toolchain }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # add components when available (some toolchains may not have them)
+          rustup component add rustfmt clippy || true
 
       - name: Build
         run: cargo build --verbose
