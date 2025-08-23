@@ -1,0 +1,14 @@
+{
+    "total_entities_min": 10,
+    "languages": {
+        "rust": {
+            "min_entities": 1
+        },
+        "python": {
+            "min_entities": 1
+        },
+        "verilog": {
+            "min_entities": 1
+        }
+    }
+}

@@ -18,6 +18,7 @@ use tree_sitter_python as ts_python;
 use tree_sitter_rust as ts_rust;
 use tree_sitter_swift as ts_swift;
 use tree_sitter_typescript as ts_typescript;
+use tree_sitter_verilog as ts_verilog;
 
 // --- Enhanced import extraction helper (multi-language heuristics) ---
 
@@ -457,6 +458,7 @@ pub(crate) fn detect_language(path: &Path) -> Option<&'static str> {
         Some("js") => Some("javascript"),
         Some("ts") | Some("tsx") => Some("typescript"),
         Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("h") => Some("cpp"),
+        Some("v") | Some("sv") | Some("svh") => Some("verilog"),
         Some("java") => Some("java"),
         Some("cs") => Some("c_sharp"),
         Some("swift") => Some("swift"),
@@ -471,6 +473,7 @@ pub(crate) fn lang_to_ts(lang: &str) -> Option<Language> {
         "javascript" => ts_javascript::LANGUAGE.into(),
         "typescript" => ts_typescript::LANGUAGE_TYPESCRIPT.into(),
         "cpp" => ts_cpp::LANGUAGE.into(),
+        "verilog" => ts_verilog::LANGUAGE.into(),
         "java" => ts_java::LANGUAGE.into(),
         "c_sharp" => ts_c_sharp::LANGUAGE.into(),
         "swift" => ts_swift::LANGUAGE.into(),
@@ -576,6 +579,7 @@ pub(crate) fn extract_entities<'a>(
         "cpp" => generic_class_function_walk(lang, tree, src, path, out, &CppLangSpec),
         "c_sharp" => generic_class_function_walk(lang, tree, src, path, out, &CSharpLangSpec),
         "swift" => generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec),
+        "verilog" => generic_class_function_walk(lang, tree, src, path, out, &VerilogLangSpec),
         _ => {
             // fallback: whole file summary as one entity
             // Use 0-based line numbers internally (start at 0, end at last row = lines-1).
@@ -742,9 +746,127 @@ impl LangSpec for SwiftLangSpec {
         "name"
     }
 }
+struct VerilogLangSpec;
+impl LangSpec for VerilogLangSpec {
+    // Tree-sitter verilog uses `module_declaration` and various function/task nodes.
+    // These names are chosen to match common tree-sitter-verilog grammars; if your
+    // grammar differs adjust accordingly.
+    fn class_kind(&self) -> &'static str {
+        "module_declaration"
+    }
+    fn class_name_field(&self) -> &'static str {
+        "name"
+    }
+    fn function_kind(&self) -> &'static str {
+        "function_declaration"
+    }
+    fn function_name_field(&self) -> &'static str {
+        "name"
+    }
+}
 
 fn node_text<'a>(node: Node<'a>, src: &'a str) -> &'a str {
     node.utf8_text(src.as_bytes()).unwrap_or("")
+}
+
+fn extract_node_name<'a>(node: Node<'a>, src: &'a str, preferred_field: &str) -> String {
+    // try preferred field name
+    let mut found: Option<&str> = None;
+    if let Some(n) = node.child_by_field_name(preferred_field) {
+        let s = node_text(n, src);
+        if !s.is_empty() {
+            found = Some(s);
+        }
+    }
+    // common fallbacks
+    if found.is_none() {
+        for alt in ["name", "identifier", "module_identifier", "declarator"].iter() {
+            if let Some(n) = node.child_by_field_name(alt) {
+                let s = node_text(n, src);
+                if !s.is_empty() {
+                    found = Some(s);
+                    break;
+                }
+            }
+        }
+    }
+    // scan children for an identifier-like node
+    if found.is_none() {
+        let mut w = node.walk();
+        for child in node.children(&mut w) {
+            let k = child.kind();
+            if k.contains("ident") || k.contains("name") || k.contains("module") {
+                let s = node_text(child, src);
+                if !s.is_empty() {
+                    found = Some(s);
+                    break;
+                }
+            }
+        }
+    }
+
+    // If we didn't find a clear identifier from fields/children, fall back to
+    // tokenizing the node signature (useful for grammars that embed the name
+    // inside the full declaration text, e.g. Verilog's "function automatic int add(...);").
+    let mut candidate = if let Some(s) = found {
+        s.to_string()
+    } else {
+        // extract the node's signature text and use that as a candidate
+        extract_signature(&node, src).to_string()
+    };
+
+    // If the candidate derived from a child/field is suspiciously short
+    // (e.g., single-letter parameter names produced by some grammars),
+    // prefer the signature-derived identifier which is likely the real name.
+    if candidate.trim().len() <= 2 {
+        let sig = extract_signature(&node, src).to_string();
+        if !sig.is_empty() {
+            candidate = sig;
+        }
+    }
+
+    // Normalize to a bare identifier: if the candidate looks like a
+    // declaration/signature (contains '('), prefer the token immediately
+    // before the '('; otherwise prefer the last identifier-like token.
+    if let Some(pidx) = candidate.find('(') {
+        // slice up to '(' and extract tokens
+        let before = &candidate[..pidx];
+        let mut tokens: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for ch in before.chars() {
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                cur.push(ch);
+            } else if !cur.is_empty() {
+                tokens.push(cur.clone());
+                cur.clear();
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+        if let Some(last) = tokens.last() {
+            return last.clone();
+        }
+    }
+
+    // Fallback: last identifier-like token in whole candidate
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in candidate.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            tokens.push(cur.clone());
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    if let Some(last) = tokens.last() {
+        return last.clone();
+    }
+    candidate.trim().to_string()
 }
 
 fn generic_class_function_walk<'a>(
@@ -759,15 +881,12 @@ fn generic_class_function_walk<'a>(
     while let Some((node, parent)) = stack.pop() {
         let kind = node.kind();
         if kind == spec.class_kind() {
-            let name = node
-                .child_by_field_name(spec.class_name_field())
-                .map(|n| node_text(n, src))
-                .unwrap_or("");
+            let name = extract_node_name(node, src, spec.class_name_field());
             let entity = Entity {
                 file: path.display().to_string(),
                 language: lang,
                 kind: "class",
-                name: name.to_string(),
+                name: name.clone(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
                 // store 0-based Tree-sitter rows internally; exporters convert to 1-based
@@ -781,16 +900,13 @@ fn generic_class_function_walk<'a>(
                 stack.push((child, Some(name.to_string())));
             }
         } else if kind == spec.function_kind() {
-            let name = node
-                .child_by_field_name(spec.function_name_field())
-                .map(|n| node_text(n, src))
-                .unwrap_or("");
+            let name = extract_node_name(node, src, spec.function_name_field());
             let calls = collect_call_idents(node, src);
             out.push(Entity {
                 file: path.display().to_string(),
                 language: lang,
                 kind: "function",
-                name: name.to_string(),
+                name: name.clone(),
                 parent: parent.clone(),
                 signature: extract_signature(&node, src).to_string(),
                 // store 0-based Tree-sitter rows internally; exporters convert to 1-based
