@@ -109,19 +109,39 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            // Determine overall conclusion: if any required job failed, mark failure.
-            const needs = context.payload && context.payload.pull_request ? process.env.GITHUB_JOB_NEEDS : null;
-            // Simpler approach: mark success when this job runs (previous jobs completed). If any needed job failed, this job may still run only if configured; for now mark success.
+            // Compute aggregated conclusion by listing jobs for this workflow run.
+            const runId = parseInt(process.env.GITHUB_RUN_ID || context.runId, 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             const sha = context.payload && context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+
+            const jobsResp = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: runId });
+            const jobs = (jobsResp.data && jobsResp.data.jobs) || [];
+
+            // Determine if any job (other than this aggregator) failed.
+            const failedJobs = jobs.filter(j => j.name && !j.name.toLowerCase().includes('report-ci') && j.status === 'completed' && j.conclusion !== 'success');
+            const conclusion = failedJobs.length > 0 ? 'failure' : 'success';
+
+            const summaryLines = [];
+            summaryLines.push(`Checked ${jobs.length} job(s).`);
+            if (failedJobs.length > 0) {
+              summaryLines.push(`Failed jobs (${failedJobs.length}):`);
+              for (const f of failedJobs) {
+                summaryLines.push(`- ${f.name} (${f.conclusion})`);
+              }
+            } else {
+              summaryLines.push('All upstream jobs succeeded.');
+            }
+
             await github.rest.checks.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               name: 'CI',
               head_sha: sha,
               status: 'completed',
-              conclusion: 'success',
+              conclusion,
               output: {
                 title: 'CI aggregated',
-                summary: 'Aggregated CI status from workflow jobs.'
+                summary: summaryLines.join('\n')
               }
             });
