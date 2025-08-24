@@ -136,12 +136,14 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
         .query("SELECT * FROM entity WHERE file = $file")
         .bind(("file", file_path.to_string_lossy().to_string()))
         .await?;
-    // `res` is a Vec<QueryResponse> — check approximate presence by converting to string
-    let s = format!("{:?}", res);
+    // Extract entities from the query result and check that at least one is present
+    let entities: Vec<EntityPayload> = res
+        .take(0)
+        .unwrap_or_default();
     assert!(
-        s.contains("entity") || s.len() > 0,
-        "expected entities in DB result: {}",
-        s
+        !entities.is_empty(),
+        "expected entities in DB result: {:?}",
+        entities
     );
 
     Ok(())
