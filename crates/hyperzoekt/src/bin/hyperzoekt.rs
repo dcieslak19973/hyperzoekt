@@ -88,7 +88,7 @@ struct AppConfig {
 impl AppConfig {
     fn load(path: Option<&PathBuf>) -> Result<(Self, PathBuf), anyhow::Error> {
         let cfg_path = path
-            .map(|p| p.clone())
+            .cloned()
             .unwrap_or_else(|| PathBuf::from("crates/hyperzoekt/hyperzoekt.toml"));
         if cfg_path.exists() {
             let s = std::fs::read_to_string(&cfg_path)?;
@@ -277,8 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .and_then(|l| l.get(i))
                                     .cloned()
                                     .unwrap_or(0)
-                                    .saturating_add(1)
-                                    as u32;
+                                    .saturating_add(1);
                                 imports.push(ImportItem {
                                     path: target_file.path.clone(),
                                     line: line_no,
@@ -291,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (m, lineno) in unres {
                         unresolved_imports.push(UnresolvedImport {
                             module: m.clone(),
-                            line: lineno.saturating_add(1) as u32,
+                            line: lineno.saturating_add(1),
                         });
                     }
                 }
@@ -302,16 +301,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let has_unresolved = !unresolved_imports.is_empty();
                     if has_imports || has_unresolved {
                         (
-                            Some((ent.start_line.saturating_add(1)) as u32),
-                            Some((ent.end_line.saturating_add(1)) as u32),
+                            Some(ent.start_line.saturating_add(1)),
+                            Some(ent.end_line.saturating_add(1)),
                         )
                     } else {
                         (None, None)
                     }
                 } else {
                     (
-                        Some((ent.start_line.saturating_add(1)) as u32),
-                        Some((ent.end_line.saturating_add(1)) as u32),
+                        Some(ent.start_line.saturating_add(1)),
+                        Some(ent.end_line.saturating_add(1)),
                     )
                 };
 
@@ -366,8 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("failed to build runtime");
         rt.block_on(async move {
             let db = {
-                if surreal_url.is_some() {
-                    let url = surreal_url.as_ref().unwrap();
+                if let Some(url) = &surreal_url {
                     warn!("SURREAL_URL is set ({}), but remote connections are not yet supported in this build; falling back to embedded Mem", url);
                 }
                 info!("Starting embedded SurrealDB (Mem) namespace={} db={}", surreal_ns, surreal_db);
@@ -467,11 +465,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         // Channel closed: drain remaining messages via try_recv
-                        loop {
-                            match rx.try_recv() {
-                                Ok(next) => acc.extend(next),
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                            }
+                        while let Ok(next) = rx.try_recv() {
+                            acc.extend(next);
                         }
                         if acc.is_empty() {
                             break; // nothing left to do
@@ -504,7 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Prepare idempotent entity upsert: update by file+name, create if none
-                        match serde_json::to_value(&p) {
+                                match serde_json::to_value(p) {
                             Ok(v) => {
                                 // Fast path: attempt CREATE and on duplicate-key error
                                 // fall back to UPDATE by stable_id. This avoids the
@@ -656,7 +651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => error!("DB thread panicked: {:?}", e),
     }
 
-    return Ok(());
+    Ok(())
 }
 
 // Index a single file and return typed payloads representing its entities.
@@ -685,7 +680,7 @@ fn index_single_file(
                                 .and_then(|l| l.get(i))
                                 .cloned()
                                 .unwrap_or(0)
-                                .saturating_add(1) as u32;
+                                .saturating_add(1);
                             imports.push(ImportItem {
                                 path: target_file.path.clone(),
                                 line: line_no,
@@ -698,7 +693,7 @@ fn index_single_file(
                 for (m, lineno) in unres {
                     unresolved_imports.push(UnresolvedImport {
                         module: m.clone(),
-                        line: lineno.saturating_add(1) as u32,
+                        line: lineno.saturating_add(1),
                     });
                 }
             }
@@ -709,16 +704,16 @@ fn index_single_file(
             let has_unresolved = !unresolved_imports.is_empty();
             if has_imports || has_unresolved {
                 (
-                    Some((ent.start_line.saturating_add(1)) as u32),
-                    Some((ent.end_line.saturating_add(1)) as u32),
+                    Some(ent.start_line.saturating_add(1)),
+                    Some(ent.end_line.saturating_add(1)),
                 )
             } else {
                 (None, None)
             }
         } else {
             (
-                Some((ent.start_line.saturating_add(1)) as u32),
-                Some((ent.end_line.saturating_add(1)) as u32),
+                Some(ent.start_line.saturating_add(1)),
+                Some(ent.end_line.saturating_add(1)),
             )
         };
         // compute stable id
