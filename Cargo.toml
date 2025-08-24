@@ -5,3 +5,9 @@ members = [
 
 # Use the edition-2021 dependency resolver semantics for workspace members.
 resolver = "2"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 16

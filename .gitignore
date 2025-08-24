@@ -6,3 +6,6 @@ Cargo.lock
 *.log
 
 .data/
+
+# workspace-local sccache directory persisted across devcontainer rebuilds
+.sccache/

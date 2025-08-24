@@ -75,6 +75,9 @@ struct Args {
     /// Run in debug mode (one-shot send to DB or used by tests)
     #[arg(long)]
     debug: bool,
+    /// Start DB thread, send all payloads once, and exit (uses DB batching)
+    #[arg(long)]
+    stream_once: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -740,7 +743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let p_lit = serde_json::to_string(path).unwrap_or_else(|_| format!("\"{}\"", path));
                         let l_lit = serde_json::to_string(lang).unwrap_or_else(|_| format!("\"{}\"", lang));
                         q_parts.push(format!(
-                            "UPDATE file SET path = {p}, language = {l} WHERE path = {p}; CREATE file CONTENT {{ path: {p}, language: {l} }} IF NONE;",
+                            "UPDATE file SET path = {p}, language = {l} WHERE path = {p}; CREATE file CONTENT {{ path: {p}, language: {l} }};",
                             p = p_lit,
                             l = l_lit
                         ));
@@ -753,7 +756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let e_json = v.to_string();
                                 let s_lit = serde_json::to_string(&p.stable_id).unwrap_or_else(|_| format!("\"{}\"", p.stable_id));
                                 q_parts.push(format!(
-                                    "UPDATE entity CONTENT {e} WHERE stable_id = {s}; CREATE entity CONTENT {e} IF NONE;",
+                                    "UPDATE entity CONTENT {e} WHERE stable_id = {s}; CREATE entity CONTENT {e};",
                                     e = e_json,
                                     s = s_lit
                                 ));
@@ -868,6 +871,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(tx); // close channel
         match db_join.join() {
             Ok(Ok(())) => println!("Streaming import finished"),
+            Ok(Err(e)) => error!("DB task failed: {}", e),
+            Err(e) => error!("DB thread panicked: {:?}", e),
+        }
+        return Ok(());
+    }
+
+    // If CLI requests a single streaming run (send all payloads to DB batching and exit)
+    if args.stream_once {
+        if let Err(e) = tx.send(payloads) {
+            error!("Failed to send streaming payloads to DB thread: {}", e);
+        }
+        drop(tx);
+        match db_join.join() {
+            Ok(Ok(())) => println!("Streaming import finished (stream-once)"),
             Ok(Err(e)) => error!("DB task failed: {}", e),
             Err(e) => error!("DB thread panicked: {:?}", e),
         }
