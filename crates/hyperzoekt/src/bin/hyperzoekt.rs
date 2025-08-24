@@ -199,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = BufWriter::new(File::create(out_path)?);
         for ent in &svc.entities {
             let file = &svc.files[ent.file_id as usize];
-            // Attach file-level imports for File pseudo-entities
+            // Do not clone payloads for the DB thread; main will send payloads when needed
             let mut imports: Vec<serde_json::Value> = Vec::new();
             let mut unresolved_imports: Vec<serde_json::Value> = Vec::new();
             if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
@@ -388,6 +388,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    // If initial_batch is requested, perform per-record parameterized inserts
+    // from the main thread using a small tokio runtime. This avoids the
+    // SurrealQL $items parameter parsing issues and ensures the process exits
+    // after completing the initial load.
+    if initial_batch {
+        info!(
+            "Initial batch mode (main): inserting {} entities",
+            payloads.len()
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime");
+        let surreal_ns = surreal_ns.clone();
+        let surreal_db = surreal_db.clone();
+        let metrics_path = std::env::var("SURREAL_METRICS_FILE")
+            .unwrap_or_else(|_| ".data/db_metrics.json".to_string());
+        let entities_count = payloads.len();
+        let start = std::time::Instant::now();
+        let res: Result<(), anyhow::Error> = rt.block_on(async move {
+            let db = match Surreal::new::<Mem>(()).await {
+                Ok(s) => s,
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            };
+            db.use_ns(&surreal_ns)
+                .use_db(&surreal_db)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            for p in payloads.into_iter() {
+                if let Ok(v) = serde_json::to_value(p) {
+                    let q = "CREATE entity CONTENT $e";
+                    db.query(q)
+                        .bind(("e", v))
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+            Ok(())
+        });
+        let dur = start.elapsed();
+        let dur_ms = dur.as_millis();
+        let metrics = if res.is_ok() {
+            serde_json::json!({
+                "mode": "initial_batch",
+                "method": "per_record_parameterized",
+                "entities_sent": entities_count,
+                "batches_sent": 1,
+                "avg_batch_ms": dur_ms,
+                "min_batch_ms": dur_ms,
+                "max_batch_ms": dur_ms,
+                "note": "success",
+            })
+        } else {
+            serde_json::json!({
+                "mode": "initial_batch",
+                "method": "per_record_parameterized",
+                "entities_sent": entities_count,
+                "error": format!("{:?}", res.err()),
+            })
+        };
+        if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &metrics_path,
+            serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()),
+        );
+        info!("Wrote initial-batch metrics to {}", metrics_path);
+        return Ok(());
+    }
+
     // We'll run a DB task on a background thread and send payloads to it via
     // a bounded MPSC channel. This keeps the watcher and indexer synchronous
     // while preventing unbounded memory usage under load.
@@ -395,6 +466,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = sync_channel::<Vec<EntityPayload>>(channel_capacity);
     // Clone payloads for the DB thread so the main thread can still use the original
     let payloads_clone = payloads.clone();
+    // Setup a channel for metrics-dump signals (SIGUSR1). This allows dumping
+    // metrics on demand without shutting down the process.
+    let (metrics_signal_tx, metrics_signal_rx) = std::sync::mpsc::channel::<()>();
+    // Register SIGUSR1 handler (best-effort); spawn a thread to forward the
+    // signal into our metrics channel so the DB thread can react.
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGUSR1]) {
+        let tx_clone2 = metrics_signal_tx.clone();
+        thread::spawn(move || {
+            for _sig in signals.forever() {
+                // best-effort: ignore send errors
+                let _ = tx_clone2.send(());
+            }
+        });
+    }
+
     let db_join = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -422,23 +508,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // If initial_batch env var is set, perform a single batch insert of all payloads
             if initial_batch {
                 info!("Initial batch mode: inserting {} entities", payloads_clone.len());
-                // Prepare a single CREATE query with array of entities
+                // Prepare a single CREATE query with array of entities (parameterized)
                 let mut vals: Vec<serde_json::Value> = Vec::new();
                 for p in payloads_clone.iter() {
                     if let Ok(v) = serde_json::to_value(p) {
                         vals.push(v);
                     }
                 }
-                // We will insert as multiple CREATE statements in a single query
-                // by building a script that loops over the JSON array.
-                let q = format!(
-                    "BEGIN; \nCREATE entity CONTENTS {}; \nCOMMIT;",
-                    serde_json::to_string(&vals).unwrap_or_else(|_| "[]".to_string())
-                );
-                match db.query(&q).await {
-                    Ok(_) => info!("Initial batch insert succeeded"),
-                    Err(e) => warn!("Initial batch insert failed: {}", e),
+
+                // Try preferred: single-transaction parameterized batch
+                let items = serde_json::Value::Array(vals.clone());
+                let q_param = "BEGIN; CREATE entity CONTENTS $items; COMMIT;";
+                let ib_start = std::time::Instant::now();
+                match db.query(q_param).bind(("items", items.clone())).await {
+                    Ok(_) => {
+                        let dur = ib_start.elapsed();
+                        let dur_ms = dur.as_millis();
+                        info!("Initial batch insert succeeded (parameterized) duration_ms={}", dur_ms);
+                        // write a concise metrics snapshot for initial batch success
+                        let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
+                        if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let metrics = serde_json::json!({
+                            "mode": "initial_batch",
+                            "method": "parameterized_single_transaction",
+                            "entities_sent": vals.len(),
+                            "batches_sent": 1,
+                            "avg_batch_ms": dur_ms,
+                            "min_batch_ms": dur_ms,
+                            "max_batch_ms": dur_ms,
+                            "note": "success",
+                        });
+                        if let Ok(s) = serde_json::to_string_pretty(&metrics) {
+                            let _ = std::fs::write(&metrics_path, s);
+                            info!("Wrote initial-batch metrics to {}", metrics_path);
+                        }
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    Err(e) => {
+                        warn!("Parameterized initial batch failed: {}. Falling back to chunked inserts", e);
+                        // Fall through to chunked per-record parameterized INSERTs below
+                    }
                 }
+
+                // Fallback: chunk into smaller batches and insert parameterized per-chunk
+                let chunk_size = app_cfg.batch_capacity.unwrap_or(500usize).clamp(1, 1000);
+                for chunk in vals.chunks(chunk_size) {
+                    let chunk_items = serde_json::Value::Array(chunk.to_vec());
+                    let q_chunk = "BEGIN; CREATE entity CONTENTS $items; COMMIT;";
+                    match db.query(q_chunk).bind(("items", chunk_items)).await {
+                        Ok(_) => info!("Chunk insert succeeded: size={}", chunk.len()),
+                        Err(e) => warn!("Chunk insert failed (size={}): {}", chunk.len(), e),
+                    }
+                }
+
+                // Ensure we write metrics file even when the initial_batch path returns early
+                let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
+                let _ = std::fs::create_dir_all(std::path::Path::new(&metrics_path).parent().unwrap_or(std::path::Path::new(".")));
+                let metrics = serde_json::json!({
+                    "batches_sent": 0,
+                    "entities_sent": vals.len(),
+                    "note": "initial_batch completed",
+                });
+                let _ = std::fs::write(&metrics_path, serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()));
                 return Ok::<(), anyhow::Error>(());
             }
 
@@ -500,8 +633,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut batches_sent: usize = 0;
             let mut entities_sent: usize = 0;
             let mut total_retries: usize = 0;
+            // Detailed timing metrics for tuning
+            let mut batch_durations_sum_ms: u128 = 0;
+            let mut batch_durations_min_ms: Option<u128> = None;
+            let mut batch_durations_max_ms: Option<u128> = None;
+            let mut batch_failures: usize = 0;
+            let mut attempt_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
             loop {
+                // Check for metrics-dump signal without blocking the async runtime
+                if metrics_signal_rx.try_recv().is_ok() {
+                    // Compose current metrics snapshot and write to file
+                    let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
+                    if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let metrics = serde_json::json!({
+                        "batches_sent": batches_sent,
+                        "entities_sent": entities_sent,
+                        "total_retries": total_retries,
+                        "avg_batch_ms": if batches_sent>0 { (batch_durations_sum_ms as f64)/(batches_sent as f64) } else { 0.0 },
+                        "min_batch_ms": batch_durations_min_ms,
+                        "max_batch_ms": batch_durations_max_ms,
+                        "batch_failures": batch_failures,
+                        "attempt_counts": attempt_counts,
+                    });
+                    let _ = std::fs::write(&metrics_path, serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()));
+                    info!("Metrics dumped to {} due to signal", std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string()));
+                }
                 // Accumulate a batch, waiting up to `batch_timeout` for first item
                 let mut acc: Vec<EntityPayload> = Vec::new();
                 match rx.recv_timeout(batch_timeout) {
@@ -598,14 +757,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let q_all = q_parts.join(" ");
 
+                    let batch_start = std::time::Instant::now();
                     match db.query(&q_all).await {
                         Ok(_) => {
+                            let dur = batch_start.elapsed();
+                            let dur_ms = dur.as_millis();
                             batches_sent += 1;
                             entities_sent += acc.len();
+                            batch_durations_sum_ms += dur_ms;
+                            batch_durations_min_ms = Some(batch_durations_min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                            batch_durations_max_ms = Some(batch_durations_max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                            *attempt_counts.entry(attempt).or_insert(0) += 1;
+                            info!("Batch sent: size={} duration_ms={} attempt={}", acc.len(), dur_ms, attempt);
                             break;
                         }
                         Err(e) => {
-                            warn!("Batched DB write failed: {}", e);
+                            let dur = batch_start.elapsed();
+                            let dur_ms = dur.as_millis();
+                            batch_failures += 1;
+                            warn!("Batched DB write failed (size={} duration_ms={}): {}", acc.len(), dur_ms, e);
                             // will retry below
                         }
                     }
@@ -614,6 +784,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if attempt >= max_retries {
                         error!("Batch failed after {} attempts, dropping {} entities", attempt, acc.len());
                         total_retries += attempt - 1;
+                        *attempt_counts.entry(attempt).or_insert(0) += 1;
                         break;
                     }
                     total_retries += 1;
@@ -623,7 +794,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if batches_sent % 10 == 0 && batches_sent > 0 {
-                    info!("DB metrics: batches_sent={} entities_sent={} total_retries={}", batches_sent, entities_sent, total_retries);
+                    let avg = if batches_sent > 0 {
+                        (batch_durations_sum_ms as f64) / (batches_sent as f64)
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        "DB metrics: batches_sent={} entities_sent={} total_retries={} avg_batch_ms={:.2} min_ms={:?} max_ms={:?} failures={} attempts={:?}",
+                        batches_sent,
+                        entities_sent,
+                        total_retries,
+                        avg,
+                        batch_durations_min_ms,
+                        batch_durations_max_ms,
+                        batch_failures,
+                        attempt_counts
+                    );
+                }
+            }
+            // Write metrics file on shutdown for offline analysis
+            let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
+            let metrics = serde_json::json!({
+                "batches_sent": batches_sent,
+                "entities_sent": entities_sent,
+                "total_retries": total_retries,
+                "avg_batch_ms": if batches_sent>0 { (batch_durations_sum_ms as f64)/(batches_sent as f64) } else { 0.0 },
+                "min_batch_ms": batch_durations_min_ms,
+                "max_batch_ms": batch_durations_max_ms,
+                "batch_failures": batch_failures,
+                "attempt_counts": attempt_counts,
+            });
+            if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(s) = serde_json::to_string_pretty(&metrics) {
+                if let Err(e) = std::fs::write(&metrics_path, s) {
+                    warn!("Failed to write DB metrics file {}: {}", metrics_path, e);
+                } else {
+                    info!("Wrote DB metrics to {}", metrics_path);
                 }
             }
             Ok::<(), anyhow::Error>(())
