@@ -44,7 +44,7 @@ fn index_fixture_repo_writes_jsonl() {
     let expects: Value = serde_json::from_str(&expect_str).expect("parse expectations json");
 
     // helper to find an entity by (name, language)
-    let find = |name: &str, lang: &str| -> Option<&Value> {
+    let _find = |name: &str, lang: &str| -> Option<&Value> {
         objs.iter().find(|v| {
             v.get("name").and_then(|n| n.as_str()) == Some(name)
                 && v.get("language").and_then(|l| l.as_str()) == Some(lang)
@@ -57,14 +57,22 @@ fn index_fixture_repo_writes_jsonl() {
         .and_then(|l| l.get("verilog"))
         .is_some()
     {
-        // If a canonical Verilog module `foo` exists in the fixtures, run
-        // strict checks; otherwise skip these name-specific assertions so
-        // the test remains robust to fixture edits.
-        if let Some(foo) = find("foo", "verilog") {
+        // Target the canonical example file (`example.v`) for strict checks so
+        // generated/verilog files do not change which `foo` module is asserted.
+        let example_path = "tests/fixtures/example-treesitter-repo/src/verilog/example.v";
+        if let Some(foo) = objs.iter().find(|v| {
+            v.get("name").and_then(|n| n.as_str()) == Some("foo")
+                && v.get("language").and_then(|l| l.as_str()) == Some("verilog")
+                && v.get("file").and_then(|f| f.as_str()) == Some(example_path)
+        }) {
             assert_eq!(foo.get("start_line").and_then(|v| v.as_i64()), Some(1));
             assert_eq!(foo.get("end_line").and_then(|v| v.as_i64()), Some(6));
 
-            if let Some(add) = find("add", "verilog") {
+            if let Some(add) = objs.iter().find(|v| {
+                v.get("name").and_then(|n| n.as_str()) == Some("add")
+                    && v.get("language").and_then(|l| l.as_str()) == Some("verilog")
+                    && v.get("file").and_then(|f| f.as_str()) == Some(example_path)
+            }) {
                 assert_eq!(add.get("start_line").and_then(|v| v.as_i64()), Some(3));
                 assert_eq!(add.get("end_line").and_then(|v| v.as_i64()), Some(5));
                 assert_eq!(add.get("parent").and_then(|p| p.as_str()), Some("foo"));
