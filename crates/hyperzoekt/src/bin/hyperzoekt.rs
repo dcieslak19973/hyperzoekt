@@ -64,6 +64,17 @@ struct Args {
 
     /// Optional root path to override config
     root: Option<PathBuf>,
+    /// Optional output path to override config (JSONL debug output)
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+    /// Positional legacy output path (kept for backward compatibility with older tests)
+    out_pos: Option<PathBuf>,
+    /// Run incremental JSONL writer path (write JSONL and exit)
+    #[arg(long)]
+    incremental: bool,
+    /// Run in debug mode (one-shot send to DB or used by tests)
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +126,9 @@ impl AppConfig {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // Initialize logging (default to info if RUST_LOG is not set)
+    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
+    env_logger::Builder::from_env(env).init();
     let (app_cfg, cfg_path) = AppConfig::load(args.config.as_ref())?;
     info!("Loaded config from {}", cfg_path.display());
 
@@ -130,11 +144,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // canonical output filename when the user doesn't provide one
     let default_out = out_dir.join("bin_integration_out.jsonl");
 
+    // Determine effective output path: CLI flag overrides config, otherwise config overrides default
+    let effective_out: PathBuf = args
+        .out_pos
+        .as_ref()
+        .cloned()
+        .or_else(|| args.out.as_ref().cloned())
+        .or_else(|| app_cfg.out.clone())
+        .unwrap_or(default_out.clone());
+
     // Index all detected languages by default
 
-    if app_cfg.incremental.unwrap_or(false) {
+    // CLI flags take precedence over config
+    if args.incremental || app_cfg.incremental.unwrap_or(false) {
         // Stream results by passing a writer to options
-        let out_path = app_cfg.out.as_deref().unwrap_or(default_out.as_path());
+        let out_path = effective_out.as_path();
         let mut file_writer = BufWriter::new(File::create(out_path)?);
         let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
         opts_builder = opts_builder.root(&effective_root);
@@ -159,11 +183,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .root(&effective_root)
         .output_null()
         .build();
+    info!("Starting index build for {}", effective_root.display());
+    let build_start = std::time::Instant::now();
     let (svc, stats) = RepoIndexService::build_with_options(opts)?;
-    let out_path = app_cfg.out.as_deref().unwrap_or(default_out.as_path());
+    info!(
+        "Index build finished in {:.2}s (files_indexed={}, entities_indexed={})",
+        build_start.elapsed().as_secs_f64(),
+        stats.files_indexed,
+        stats.entities_indexed
+    );
+    let out_path = effective_out.as_path();
 
-    // If debug is set, dump JSONL to disk and exit. Otherwise stream to DB.
-    if app_cfg.debug.unwrap_or(false) {
+    // If debug is set (CLI or config), dump JSONL to disk and exit. Otherwise stream to DB.
+    if args.debug || app_cfg.debug.unwrap_or(false) {
         let mut writer = BufWriter::new(File::create(out_path)?);
         for ent in &svc.entities {
             let file = &svc.files[ent.file_id as usize];
@@ -250,6 +282,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+
+    // If SURREAL_INITIAL_BATCH=1, perform a single batch insert into the DB
+    let initial_batch = std::env::var("SURREAL_INITIAL_BATCH").ok().as_deref() == Some("1");
 
     // Streaming path: start an embedded SurrealDB (Mem) unless SURREAL_URL is set.
     // We'll spawn a tokio runtime on a new thread to run async upserts so the
@@ -358,6 +393,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // while preventing unbounded memory usage under load.
     let channel_capacity = app_cfg.channel_capacity.unwrap_or(100usize);
     let (tx, rx) = sync_channel::<Vec<EntityPayload>>(channel_capacity);
+    // Clone payloads for the DB thread so the main thread can still use the original
+    let payloads_clone = payloads.clone();
     let db_join = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -380,6 +417,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = db.use_ns(&surreal_ns).use_db(&surreal_db).await {
                 error!("use_ns/use_db failed: {}", e);
                 return Err::<(), anyhow::Error>(anyhow::anyhow!(e));
+            }
+
+            // If initial_batch env var is set, perform a single batch insert of all payloads
+            if initial_batch {
+                info!("Initial batch mode: inserting {} entities", payloads_clone.len());
+                // Prepare a single CREATE query with array of entities
+                let mut vals: Vec<serde_json::Value> = Vec::new();
+                for p in payloads_clone.iter() {
+                    if let Ok(v) = serde_json::to_value(p) {
+                        vals.push(v);
+                    }
+                }
+                // We will insert as multiple CREATE statements in a single query
+                // by building a script that loops over the JSON array.
+                let q = format!(
+                    "BEGIN; \nCREATE entity CONTENTS {}; \nCOMMIT;",
+                    serde_json::to_string(&vals).unwrap_or_else(|_| "[]".to_string())
+                );
+                match db.query(&q).await {
+                    Ok(_) => info!("Initial batch insert succeeded"),
+                    Err(e) => warn!("Initial batch insert failed: {}", e),
+                }
+                return Ok::<(), anyhow::Error>(());
             }
 
             // Schema initialization (best-effort, try several DDL variants to
@@ -483,63 +543,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut attempt: usize = 0;
                 loop {
                     attempt += 1;
-                    let mut failed = false;
-                    for p in acc.iter() {
-                        // Upsert file by path
-                        let q_file = "UPDATE file SET path = $path, language = $language WHERE path = $path; CREATE file CONTENT { path: $path, language: $language } IF NONE;";
-                        if let Err(e) = db
-                            .query(q_file)
-                            .bind(("path", p.file.clone()))
-                            .bind(("language", p.language.clone()))
-                            .await
-                        {
-                            warn!("DB write for file failed: {}", e);
-                            failed = true;
-                            break;
-                        }
 
-                        // Prepare idempotent entity upsert: update by file+name, create if none
-                                match serde_json::to_value(p) {
+                    // Build a single batched query for files and entities to reduce round trips.
+                    // For each unique file: UPDATE ...; CREATE ... IF NONE;
+                    // For each entity: UPDATE entity CONTENT $eN WHERE stable_id = $sN; CREATE entity CONTENT $eN IF NONE;
+                    let mut q_parts: Vec<String> = Vec::new();
+
+                    // Unique files
+                    let mut file_map: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                    let mut file_list: Vec<(&String, &String)> = Vec::new();
+                    for p in acc.iter() {
+                        if !file_map.contains_key(p.file.as_str()) {
+                            let idx = file_list.len();
+                            file_map.insert(p.file.as_str(), idx);
+                            file_list.push((&p.file, &p.language));
+                        }
+                    }
+                    for (path, lang) in file_list.iter() {
+                        let p_lit = serde_json::to_string(path).unwrap_or_else(|_| format!("\"{}\"", path));
+                        let l_lit = serde_json::to_string(lang).unwrap_or_else(|_| format!("\"{}\"", lang));
+                        q_parts.push(format!(
+                            "UPDATE file SET path = {p}, language = {l} WHERE path = {p}; CREATE file CONTENT {{ path: {p}, language: {l} }} IF NONE;",
+                            p = p_lit,
+                            l = l_lit
+                        ));
+                    }
+
+                    // Entities
+                    for p in acc.iter() {
+                        match serde_json::to_value(p) {
                             Ok(v) => {
-                                // Fast path: attempt CREATE and on duplicate-key error
-                                // fall back to UPDATE by stable_id. This avoids the
-                                // SELECT round-trip and relies on a unique index on
-                                // entity.stable_id which we attempted to create above.
-                                let q_create = "CREATE entity CONTENT $entity";
-                                match db.query(q_create).bind(("entity", v.clone())).await {
-                                    Ok(_) => {
-                                        // created successfully
-                                    }
-                                    Err(e) => {
-                                        let msg = format!("{}", e);
-                                        if msg.to_lowercase().contains("duplicate") || msg.to_lowercase().contains("unique") {
-                                            // Duplicate — update existing record by stable_id
-                                            let q_update = "UPDATE entity CONTENT $entity WHERE stable_id = $stable_id";
-                                            if let Err(e2) = db.query(q_update).bind(("entity", v.clone())).bind(("stable_id", p.stable_id.clone())).await {
-                                                warn!("DB update-after-duplicate failed: {}", e2);
-                                                failed = true;
-                                                break;
-                                            }
-                                        } else {
-                                            warn!("DB create for entity failed: {}", e);
-                                            failed = true;
-                                            break;
-                                        }
-                                    }
-                                }
+                                let e_json = v.to_string();
+                                let s_lit = serde_json::to_string(&p.stable_id).unwrap_or_else(|_| format!("\"{}\"", p.stable_id));
+                                q_parts.push(format!(
+                                    "UPDATE entity CONTENT {e} WHERE stable_id = {s}; CREATE entity CONTENT {e} IF NONE;",
+                                    e = e_json,
+                                    s = s_lit
+                                ));
                             }
                             Err(e) => {
                                 warn!("Failed to serialize entity payload for DB: {}", e);
-                                // Skip this entity but don't fail entire batch for serialization error
+                                // skip this entity's DB work but continue batching others
                                 continue;
                             }
                         }
                     }
 
-                    if !failed {
+                    if q_parts.is_empty() {
+                        // nothing to send
                         batches_sent += 1;
                         entities_sent += acc.len();
                         break;
+                    }
+
+                    let q_all = q_parts.join(" ");
+
+                    match db.query(&q_all).await {
+                        Ok(_) => {
+                            batches_sent += 1;
+                            entities_sent += acc.len();
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Batched DB write failed: {}", e);
+                            // will retry below
+                        }
                     }
 
                     // failed

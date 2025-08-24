@@ -19,16 +19,16 @@ Note: Tree-sitter grammar crates include native build steps and may take longer 
 
 ## Run the indexer binary
 
-The indexer binary `index_repo` is located in `crates/hyperzoekt/src/bin/index_repo.rs` and supports writing JSONL output.
+The indexer binary `hyperzoekt` is located in `crates/hyperzoekt/src/bin/hyperzoekt.rs` and supports writing JSONL output.
 
 ```bash
 
 cd crates/hyperzoekt
 # write full JSONL to file
-cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl
+cargo run --release --bin hyperzoekt -- --root /path/to/repo --output out.jsonl
 
 # streaming/incremental mode will output lines as entities are discovered
-cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl --incremental
+cargo run --release --bin hyperzoekt -- --root /path/to/repo --output out.jsonl --incremental
 ```
 
 ## Tests

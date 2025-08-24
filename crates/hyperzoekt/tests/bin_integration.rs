@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[test]
 fn index_fixture_repo_writes_jsonl() {
-    let mut cmd = Command::cargo_bin("index_repo").unwrap();
+    let mut cmd = Command::cargo_bin("hyperzoekt").unwrap();
     // use the canonical fixture that contains multiple language examples
     let fixture = PathBuf::from("tests/fixtures/example-treesitter-repo");
     let out_dir = PathBuf::from(".data");
@@ -17,7 +17,10 @@ fn index_fixture_repo_writes_jsonl() {
     }
     // request the preferred output path; the indexer may write another file name
     // but we will fall back to any .jsonl in .data/ when reading the results.
-    cmd.arg(fixture).arg(&preferred);
+    cmd.env("RUST_LOG", "info")
+        .arg("--incremental")
+        .arg(fixture)
+        .arg(&preferred);
     cmd.assert().success();
 
     // Read the single canonical output file written by the indexer
