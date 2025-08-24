@@ -1,5 +1,5 @@
 {
-    "total_entities_min": 10,
+    "total_entities_min": 30,
     "languages": {
         "rust": {
             "min_entities": 1
@@ -8,6 +8,12 @@
             "min_entities": 1
         },
         "verilog": {
+            "min_entities": 1
+        },
+        "tsx": {
+            "min_entities": 1
+        },
+        "swift": {
             "min_entities": 1
         }
     }

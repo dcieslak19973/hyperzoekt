@@ -140,7 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| app_cfg.root.clone())
         .unwrap_or_else(|| PathBuf::from("."));
     let out_dir = PathBuf::from(".data");
-    let _ = std::fs::create_dir_all(&out_dir);
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        warn!("Failed to create out dir {}: {}", out_dir.display(), e);
+    }
     // canonical output filename when the user doesn't provide one
     let default_out = out_dir.join("bin_integration_out.jsonl");
 
@@ -164,8 +166,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         opts_builder = opts_builder.root(&effective_root);
         // If incremental + debug, stream to file; otherwise stream to stdout (or to DB later)
         let opts = opts_builder.output_writer(&mut file_writer).build();
-        let (_svc, stats) = hyperzoekt::service::RepoIndexService::build_with_options(opts)?;
-        // flush just in case
+        let (svc, stats) = hyperzoekt::service::RepoIndexService::build_with_options(opts)?;
+        // write export to the provided writer (RepoIndexService doesn't write the
+        // output for us; callers must export) and flush.
+        svc.export_jsonl(&mut file_writer)?;
         file_writer.flush()?;
         println!(
             "Indexed {} files, {} entities in {:.3}s",
@@ -400,7 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to build runtime");
+            .map_err(Box::<dyn std::error::Error>::from)?;
         let surreal_ns = surreal_ns.clone();
         let surreal_db = surreal_db.clone();
         let metrics_path = std::env::var("SURREAL_METRICS_FILE")
@@ -449,13 +453,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         };
         if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(
+                    "Failed to create metrics parent dir {}: {}",
+                    parent.display(),
+                    e
+                );
+            }
         }
-        let _ = std::fs::write(
-            &metrics_path,
-            serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()),
-        );
-        info!("Wrote initial-batch metrics to {}", metrics_path);
+        match serde_json::to_string_pretty(&metrics) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&metrics_path, s) {
+                    warn!(
+                        "Failed to write initial-batch metrics {}: {}",
+                        metrics_path, e
+                    );
+                } else {
+                    info!("Wrote initial-batch metrics to {}", metrics_path);
+                }
+            }
+            Err(e) => warn!("Failed to serialize initial-batch metrics: {}", e),
+        }
         return Ok(());
     }
 
@@ -844,7 +862,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if app_cfg.debug.unwrap_or(false) {
         // One-shot: send existing payloads then exit
         // Send the full batch as a single message to the DB thread
-        tx.send(payloads).ok();
+        if let Err(e) = tx.send(payloads) {
+            error!("Failed to send initial payloads to DB thread: {}", e);
+        }
         drop(tx); // close channel
         match db_join.join() {
             Ok(Ok(())) => println!("Streaming import finished"),
@@ -862,7 +882,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut watcher: RecommendedWatcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| match res {
             Ok(ev) => {
-                let _ = watch_tx.send(ev);
+                if watch_tx.send(ev).is_err() {
+                    warn!("watch channel closed, dropping event");
+                }
             }
             Err(e) => warn!("watch error: {}", e),
         },
@@ -915,7 +937,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Re-index each unique file and send batches per file
         for path in changed.into_iter() {
             if let Ok((file_payloads, _stats)) = index_single_file(&path) {
-                tx_clone.send(file_payloads).ok();
+                if let Err(e) = tx_clone.send(file_payloads) {
+                    warn!("Failed to send file payloads to DB thread: {}", e);
+                }
             }
         }
     }
