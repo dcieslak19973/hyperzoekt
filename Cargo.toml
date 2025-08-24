@@ -1,6 +1,6 @@
 [workspace]
 members = [
-	"crates/repo-index",
+	"crates/hyperzoekt",
 ]
 
 # Use the edition-2021 dependency resolver semantics for workspace members.

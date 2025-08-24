@@ -4,14 +4,14 @@ This document provides quick instructions to build, run, and test the Tree-sitte
 
 ## Build
 
-Install Rust via rustup (https://rustup.rs/) and then build the workspace or just the `repo-index` crate:
+Install Rust via rustup (https://rustup.rs/) and then build the workspace or just the `hyperzoekt` crate:
 
 ```bash
 # build entire workspace
 cargo build
 
-# or build only the repo-index crate
-cd crates/repo-index
+# or build only the hyperzoekt crate
+cd crates/hyperzoekt
 cargo build --release
 ```
 
@@ -19,10 +19,11 @@ Note: Tree-sitter grammar crates include native build steps and may take longer 
 
 ## Run the indexer binary
 
-The indexer binary `index_repo` is located in `crates/repo-index/src/bin/index_repo.rs` and supports writing JSONL output.
+The indexer binary `index_repo` is located in `crates/hyperzoekt/src/bin/index_repo.rs` and supports writing JSONL output.
 
 ```bash
-cd crates/repo-index
+
+cd crates/hyperzoekt
 # write full JSONL to file
 cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl
 
@@ -32,10 +33,10 @@ cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl 
 
 ## Tests
 
-Run tests for the `repo-index` crate only:
+Run tests for the `hyperzoekt` crate only:
 
 ```bash
-cd crates/repo-index
+cd crates/hyperzoekt
 cargo test
 ```
 

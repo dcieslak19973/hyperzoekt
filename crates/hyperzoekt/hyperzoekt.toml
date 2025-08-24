@@ -1,0 +1,25 @@
+# hyperzoekt default configuration
+# Place this file in the crate directory or pass --config to the binary.
+
+# Repository root to index (optional). If omitted the CLI positional root or cwd is used.
+root = "."
+
+# When debug = true the binary writes JSONL to `out` and exits.
+debug = false
+
+# When incremental = true the binary streams results to `out` as files are processed.
+incremental = false
+
+# Debug output path (relative to working directory)
+out = ".data/bin_integration_out.jsonl"
+
+# Ingestion tuning
+channel_capacity = 100
+# debounce window in milliseconds
+debounce_ms = 200
+# maximum number of entities to accumulate in a batch before flushing
+batch_capacity = 500
+# batch timeout in milliseconds (flush if no new events arrive)
+batch_timeout_ms = 500
+# max retries for a failed batch
+max_retries = 3

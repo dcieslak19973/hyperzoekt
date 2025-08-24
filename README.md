@@ -41,17 +41,17 @@ Build locally with Rust and Cargo (install via https://rustup.rs/):
 
 Repo indexer
 -------------
-This workspace includes a small Tree-sitter backed repository indexer in `crates/repo-index`.
+This workspace includes a small Tree-sitter backed repository indexer in `crates/hyperzoekt`.
 
 To build and run the indexer binary (may take time the first build because Tree-sitter grammars compile native code):
 
 ```bash
-cd crates/repo-index
+cd crates/hyperzoekt
 cargo build --release
 cargo run --release --bin index_repo -- --root /path/to/repo --output out.jsonl
 ```
 
-There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/repo-index/src/bin/index_repo.rs` for options.
+There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/hyperzoekt/src/bin/index_repo.rs` for options.
 
 License
 -------
