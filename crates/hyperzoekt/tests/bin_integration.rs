@@ -223,22 +223,16 @@ fn index_fixture_repo_writes_jsonl() {
     // helper to find a file-kind entity by filename and language
     let find_file = |name: &str, lang: &str, path_suffix: Option<&str>| -> Option<&Value> {
         objs.iter().find(|v| {
-            if v.get("kind").and_then(|k| k.as_str()) != Some("file") {
-                return false;
-            }
-            if v.get("name").and_then(|n| n.as_str()) != Some(name) {
-                return false;
-            }
-            if v.get("language").and_then(|l| l.as_str()) != Some(lang) {
-                return false;
-            }
-            if let Some(suff) = path_suffix {
-                if let Some(fp) = v.get("file").and_then(|f| f.as_str()) {
-                    return fp.ends_with(suff);
+            v.get("kind").and_then(|k| k.as_str()) == Some("file")
+                && v.get("name").and_then(|n| n.as_str()) == Some(name)
+                && v.get("language").and_then(|l| l.as_str()) == Some(lang)
+                && match path_suffix {
+                    Some(suff) => v
+                        .get("file")
+                        .and_then(|f| f.as_str())
+                        .map_or(false, |fp| fp.ends_with(suff)),
+                    None => true,
                 }
-                return false;
-            }
-            true
         })
     };
 
