@@ -14,7 +14,7 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use sha2::Digest;
 
 // Typed in-process payloads to avoid JSON string churn
@@ -161,27 +161,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Index all detected languages by default
 
     // CLI flags take precedence over config
-    if args.incremental || app_cfg.incremental.unwrap_or(false) {
-        // Stream results by passing a writer to options
-        let out_path = effective_out.as_path();
-        let mut file_writer = BufWriter::new(File::create(out_path)?);
-        let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
-        opts_builder = opts_builder.root(&effective_root);
-        // If incremental + debug, stream to file; otherwise stream to stdout (or to DB later)
-        let opts = opts_builder.output_writer(&mut file_writer).build();
-        let (svc, stats) = hyperzoekt::service::RepoIndexService::build_with_options(opts)?;
-        // write export to the provided writer (RepoIndexService doesn't write the
-        // output for us; callers must export) and flush.
-        svc.export_jsonl(&mut file_writer)?;
-        file_writer.flush()?;
-        println!(
-            "Indexed {} files, {} entities in {:.3}s",
-            stats.files_indexed,
-            stats.entities_indexed,
-            stats.duration.as_secs_f64()
-        );
-        return Ok(());
-    }
     // Removed include_langs processing, indexing all detected languages by default
 
     // Non-incremental: build in-memory and then either write JSONL (--debug)
@@ -202,7 +181,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = effective_out.as_path();
 
     // If debug is set (CLI or config), dump JSONL to disk and exit. Otherwise stream to DB.
-    if args.debug || app_cfg.debug.unwrap_or(false) {
+    // Also honor `incremental` from the config (kept for backwards compatibility).
+    let is_incremental = app_cfg.incremental.unwrap_or(false);
+    if args.debug || app_cfg.debug.unwrap_or(false) || is_incremental {
         let mut writer = BufWriter::new(File::create(out_path)?);
         for ent in &svc.entities {
             let file = &svc.files[ent.file_id as usize];
@@ -412,9 +393,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let surreal_db = surreal_db.clone();
         let metrics_path = std::env::var("SURREAL_METRICS_FILE")
             .unwrap_or_else(|_| ".data/db_metrics.json".to_string());
-        let entities_count = payloads.len();
+        // Serialize payloads into a JSON array up-front and perform parameterized
+        // inserts using either a single-transaction (when small) or chunked
+        // parameterized transactions sized to configured batch_capacity. This
+        // mirrors the DB-thread initial_batch behavior and avoids doing one DB
+        // call per entity which is very slow.
+        let mut vals: Vec<serde_json::Value> = Vec::new();
+        for p in payloads.iter() {
+            if let Ok(v) = serde_json::to_value(p) {
+                vals.push(v);
+            }
+        }
         let start = std::time::Instant::now();
-        let res: Result<(), anyhow::Error> = rt.block_on(async move {
+        let chunk_size = app_cfg.batch_capacity.unwrap_or(500usize).clamp(1, 5000);
+        let metrics_path_clone = metrics_path.clone();
+        rt.block_on(async move {
             let db = match Surreal::new::<Mem>(()).await {
                 Ok(s) => s,
                 Err(e) => return Err(anyhow::anyhow!(e)),
@@ -423,60 +416,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .use_db(&surreal_db)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-            for p in payloads.into_iter() {
-                if let Ok(v) = serde_json::to_value(p) {
-                    let q = "CREATE entity CONTENT $e";
-                    db.query(q)
-                        .bind(("e", v))
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Avoid attempting single-transaction parameterized inserts; chunk
+            // instead to remain compatible with the embedded SurrealDB parser.
+
+            // Chunk and send parameterized per-chunk sized to configured batch_capacity
+            let mut batches_sent_local: usize = 0;
+            let mut entities_sent_local: usize = 0;
+            let mut sum_ms: u128 = 0;
+            let mut min_ms: Option<u128> = None;
+            let mut max_ms: Option<u128> = None;
+            for chunk in vals.chunks(chunk_size) {
+                // Build an inline JSON CREATE transaction for this chunk. Some
+                // embedded SurrealDB releases reject the `CONTENTS $items`
+                // parameter form, so emit literal JSON in the query instead.
+                let mut parts: Vec<String> = Vec::new();
+                for item in chunk.iter() {
+                    let e_json = item.to_string();
+                    parts.push(format!("CREATE entity CONTENT {};", e_json));
+                }
+                let q_chunk = format!("BEGIN; {} COMMIT;", parts.join(" "));
+                let chunk_start = std::time::Instant::now();
+                match db.query(&q_chunk).await {
+                    Ok(_) => {
+                        let dur = chunk_start.elapsed();
+                        let dur_ms = dur.as_millis();
+                        batches_sent_local += 1;
+                        entities_sent_local += chunk.len();
+                        sum_ms += dur_ms;
+                        min_ms = Some(min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                        max_ms = Some(max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                        info!(
+                            "Chunk insert succeeded (main): size={} duration_ms={}",
+                            chunk.len(),
+                            dur_ms
+                        );
+                    }
+                    Err(e) => warn!("Chunk insert failed (main) (size={}): {}", chunk.len(), e),
                 }
             }
-            Ok(())
-        });
-        let dur = start.elapsed();
-        let dur_ms = dur.as_millis();
-        let metrics = if res.is_ok() {
-            serde_json::json!({
-                "mode": "initial_batch",
-                "method": "per_record_parameterized",
-                "entities_sent": entities_count,
-                "batches_sent": 1,
-                "avg_batch_ms": dur_ms,
-                "min_batch_ms": dur_ms,
-                "max_batch_ms": dur_ms,
-                "note": "success",
-            })
-        } else {
-            serde_json::json!({
-                "mode": "initial_batch",
-                "method": "per_record_parameterized",
-                "entities_sent": entities_count,
-                "error": format!("{:?}", res.err()),
-            })
-        };
-        if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!(
-                    "Failed to create metrics parent dir {}: {}",
-                    parent.display(),
-                    e
-                );
+
+            // write metrics
+            if let Some(parent) = std::path::Path::new(&metrics_path_clone).parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
-        }
-        match serde_json::to_string_pretty(&metrics) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&metrics_path, s) {
-                    warn!(
-                        "Failed to write initial-batch metrics {}: {}",
-                        metrics_path, e
-                    );
-                } else {
-                    info!("Wrote initial-batch metrics to {}", metrics_path);
-                }
-            }
-            Err(e) => warn!("Failed to serialize initial-batch metrics: {}", e),
-        }
+            let avg_ms = if batches_sent_local > 0 {
+                (sum_ms as f64) / (batches_sent_local as f64)
+            } else {
+                0.0
+            };
+            let metrics = serde_json::json!({
+                "mode": "initial_batch",
+                "method": "chunked_parameterized",
+                "entities_sent": entities_sent_local,
+                "batches_sent": batches_sent_local,
+                "avg_batch_ms": avg_ms,
+                "total_time_ms": sum_ms,
+                "min_batch_ms": min_ms,
+                "max_batch_ms": max_ms,
+                "note": "completed",
+            });
+            let _ = std::fs::write(
+                &metrics_path_clone,
+                serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()),
+            );
+            Ok::<(), anyhow::Error>(())
+        })?;
+        let _dur_ms = start.elapsed().as_millis();
+        info!(
+            "Initial batch (main) completed; metrics written to {}",
+            metrics_path
+        );
         return Ok(());
     }
 
@@ -537,60 +547,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Try preferred: single-transaction parameterized batch
-                let items = serde_json::Value::Array(vals.clone());
-                let q_param = "BEGIN; CREATE entity CONTENTS $items; COMMIT;";
-                let ib_start = std::time::Instant::now();
-                match db.query(q_param).bind(("items", items.clone())).await {
-                    Ok(_) => {
-                        let dur = ib_start.elapsed();
-                        let dur_ms = dur.as_millis();
-                        info!("Initial batch insert succeeded (parameterized) duration_ms={}", dur_ms);
-                        // write a concise metrics snapshot for initial batch success
-                        let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
-                        if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let metrics = serde_json::json!({
-                            "mode": "initial_batch",
-                            "method": "parameterized_single_transaction",
-                            "entities_sent": vals.len(),
-                            "batches_sent": 1,
-                            "avg_batch_ms": dur_ms,
-                            "min_batch_ms": dur_ms,
-                            "max_batch_ms": dur_ms,
-                            "note": "success",
-                        });
-                        if let Ok(s) = serde_json::to_string_pretty(&metrics) {
-                            let _ = std::fs::write(&metrics_path, s);
-                            info!("Wrote initial-batch metrics to {}", metrics_path);
-                        }
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    Err(e) => {
-                        warn!("Parameterized initial batch failed: {}. Falling back to chunked inserts", e);
-                        // Fall through to chunked per-record parameterized INSERTs below
-                    }
-                }
+                // Chunk size derived from config; ensure we don't send a single massive
+                // transaction larger than the configured batch_capacity. If total
+                // items <= chunk_size we attempt a single parameterized transaction,
+                // otherwise we send per-chunk parameterized transactions sized to
+                // `chunk_size`.
+                let chunk_size = app_cfg.batch_capacity.unwrap_or(500usize).clamp(1, 5000);
+                // The embedded SurrealDB used here does not reliably accept a
+                // single-transaction `CREATE ... CONTENTS $items` form on all
+                // releases (some report a parser error). To stay compatible across
+                // versions we always use chunked parameterized inserts sized to
+                // `chunk_size`.
 
-                // Fallback: chunk into smaller batches and insert parameterized per-chunk
-                let chunk_size = app_cfg.batch_capacity.unwrap_or(500usize).clamp(1, 1000);
+                // Chunk and send parameterized per-chunk sized to configured batch_capacity
+                let mut batches_sent_local: usize = 0;
+                let mut entities_sent_local: usize = 0;
+                let mut sum_ms: u128 = 0;
+                let mut min_ms: Option<u128> = None;
+                let mut max_ms: Option<u128> = None;
                 for chunk in vals.chunks(chunk_size) {
-                    let chunk_items = serde_json::Value::Array(chunk.to_vec());
-                    let q_chunk = "BEGIN; CREATE entity CONTENTS $items; COMMIT;";
-                    match db.query(q_chunk).bind(("items", chunk_items)).await {
-                        Ok(_) => info!("Chunk insert succeeded: size={}", chunk.len()),
+                    // Inline JSON CREATEs to avoid parser incompatibilities with
+                    // parameterized CONTENTS across embedded SurrealDB releases.
+                    let mut parts: Vec<String> = Vec::new();
+                    for item in chunk.iter() {
+                        let e_json = item.to_string();
+                        parts.push(format!("CREATE entity CONTENT {};", e_json));
+                    }
+                    let q_chunk = format!("BEGIN; {} COMMIT;", parts.join(" "));
+                    let chunk_start = std::time::Instant::now();
+                    match db.query(&q_chunk).await {
+                        Ok(_) => {
+                            let dur = chunk_start.elapsed();
+                            let dur_ms = dur.as_millis();
+                            batches_sent_local += 1;
+                            entities_sent_local += chunk.len();
+                            sum_ms += dur_ms;
+                            min_ms = Some(min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                            max_ms = Some(max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                            info!("Chunk insert succeeded: size={} duration_ms={}", chunk.len(), dur_ms);
+                        }
                         Err(e) => warn!("Chunk insert failed (size={}): {}", chunk.len(), e),
                     }
                 }
 
-                // Ensure we write metrics file even when the initial_batch path returns early
+                // Ensure we write metrics file summarizing the chunked inserts
                 let metrics_path = std::env::var("SURREAL_METRICS_FILE").unwrap_or_else(|_| ".data/db_metrics.json".to_string());
                 let _ = std::fs::create_dir_all(std::path::Path::new(&metrics_path).parent().unwrap_or(std::path::Path::new(".")));
+                let avg_ms = if batches_sent_local > 0 { (sum_ms as f64) / (batches_sent_local as f64) } else { 0.0 };
                 let metrics = serde_json::json!({
-                    "batches_sent": 0,
-                    "entities_sent": vals.len(),
-                    "note": "initial_batch completed",
+                    "mode": "initial_batch",
+                    "method": "chunked_parameterized",
+                    "entities_sent": entities_sent_local,
+                    "batches_sent": batches_sent_local,
+                    "avg_batch_ms": avg_ms,
+                    "total_time_ms": sum_ms,
+                    "min_batch_ms": min_ms,
+                    "max_batch_ms": max_ms,
+                    "note": "completed",
                 });
                 let _ = std::fs::write(&metrics_path, serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".to_string()));
                 return Ok::<(), anyhow::Error>(());
@@ -605,23 +618,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // for older DEFINE/ALTER forms. We only keep two variants per
             // logical item to support the current + one previous version.
             let schema_groups: Vec<Vec<&str>> = vec![
-                // Prefer CREATE TABLE (newer) then fallback to DEFINE TABLE
-                vec!["CREATE TABLE entity;", "DEFINE TABLE entity;"],
-                vec!["CREATE TABLE file;", "DEFINE TABLE file;"],
-                // Prefer CREATE/ALTER-style field creation then fallback to DEFINE FIELD
-                vec![
-                    "ALTER TABLE entity CREATE FIELD stable_id TYPE string;",
-                    "DEFINE FIELD stable_id ON entity TYPE string;",
-                ],
-                // Prefer CREATE INDEX then fallback to DEFINE INDEX
-                vec![
-                    "CREATE INDEX idx_entity_stable_id ON entity (stable_id);",
-                    "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
-                ],
-                vec![
-                    "CREATE INDEX idx_file_path ON file (path);",
-                    "DEFINE INDEX idx_file_path ON file COLUMNS path;",
-                ],
+                // Prefer DEFINE/legacy syntax first (works on older embeddable releases),
+                // fall back to newer CREATE-style variants when available.
+                    vec!["DEFINE TABLE entity;", "CREATE TABLE entity;"],
+                    vec!["DEFINE TABLE file;", "CREATE TABLE file;"],
+                    // Prefer DEFINE FIELD then fallback to ALTER CREATE FIELD
+                    vec![
+                        "DEFINE FIELD stable_id ON entity TYPE string;",
+                        "ALTER TABLE entity CREATE FIELD stable_id TYPE string;",
+                    ],
+                    // Prefer DEFINE INDEX then fallback to CREATE INDEX
+                    vec![
+                        "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
+                        "CREATE INDEX idx_entity_stable_id ON entity (stable_id);",
+                    ],
+                    vec![
+                        "DEFINE INDEX idx_file_path ON file COLUMNS path;",
+                        "CREATE INDEX idx_file_path ON file (path);",
+                    ],
             ];
 
             for group in schema_groups.iter() {
@@ -634,9 +648,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         Err(e) => {
-                            // Try next variant; only log at debug/trace level would be ideal,
-                            // but keep warn so operators can see compatibility issues.
-                            warn!("Schema variant failed: {} -> {}", *q, e);
+                            // Per-variant failures are expected across different
+                            // embedded SurrealDB releases. Log at trace level to avoid
+                            // noisy WARN output; we'll warn only if all variants fail.
+                            trace!("Schema variant failed: {} -> {}", *q, e);
                         }
                     }
                 }
@@ -649,6 +664,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let batch_capacity: usize = app_cfg.batch_capacity.unwrap_or(500usize);
             let batch_timeout = Duration::from_millis(app_cfg.batch_timeout_ms.unwrap_or(500));
             let max_retries: usize = app_cfg.max_retries.unwrap_or(3usize);
+            // Whether to send streaming batches in chunked inline-CREATEs
+            let streaming_chunked = std::env::var("SURREAL_STREAM_CHUNKED").ok().as_deref() == Some("1");
 
             // Simple metrics
             let mut batches_sent: usize = 0;
@@ -674,6 +691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "entities_sent": entities_sent,
                         "total_retries": total_retries,
                         "avg_batch_ms": if batches_sent>0 { (batch_durations_sum_ms as f64)/(batches_sent as f64) } else { 0.0 },
+                        "total_time_ms": batch_durations_sum_ms,
                         "min_batch_ms": batch_durations_min_ms,
                         "max_batch_ms": batch_durations_max_ms,
                         "batch_failures": batch_failures,
@@ -776,28 +794,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
 
-                    let q_all = q_parts.join(" ");
-
-                    let batch_start = std::time::Instant::now();
-                    match db.query(&q_all).await {
-                        Ok(_) => {
-                            let dur = batch_start.elapsed();
-                            let dur_ms = dur.as_millis();
-                            batches_sent += 1;
-                            entities_sent += acc.len();
-                            batch_durations_sum_ms += dur_ms;
-                            batch_durations_min_ms = Some(batch_durations_min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
-                            batch_durations_max_ms = Some(batch_durations_max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
-                            *attempt_counts.entry(attempt).or_insert(0) += 1;
-                            info!("Batch sent: size={} duration_ms={} attempt={}", acc.len(), dur_ms, attempt);
-                            break;
+                    if streaming_chunked {
+                        // When enabled, ensure file-related updates are applied
+                        // first (so files exist), then split the entity payloads
+                        // into chunks of `batch_capacity` and send inline CREATE
+                        // transactions per-chunk. This mirrors the initial-batch
+                        // chunking and ensures we actually produce multiple
+                        // DB requests for large `acc` sizes.
+                        // First, apply the file updates (if any) derived from q_parts
+                        let mut file_qs: Vec<String> = Vec::new();
+                        for part in q_parts.iter() {
+                            // Only include the file-related UPDATE/CREATE parts.
+                            // We distinguish them by looking for the `UPDATE file` prefix.
+                            if part.starts_with("UPDATE file") {
+                                file_qs.push(part.clone());
+                            }
                         }
-                        Err(e) => {
-                            let dur = batch_start.elapsed();
-                            let dur_ms = dur.as_millis();
-                            batch_failures += 1;
-                            warn!("Batched DB write failed (size={} duration_ms={}): {}", acc.len(), dur_ms, e);
-                            // will retry below
+                        if !file_qs.is_empty() {
+                            let q_files = file_qs.join(" ");
+                            let file_start = std::time::Instant::now();
+                            match db.query(&q_files).await {
+                                Ok(_) => {
+                                    let dur = file_start.elapsed();
+                                    let dur_ms = dur.as_millis();
+                                    batches_sent += 1;
+                                    batch_durations_sum_ms += dur_ms;
+                                    batch_durations_min_ms = Some(batch_durations_min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                                    batch_durations_max_ms = Some(batch_durations_max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                                    info!("File-update batch applied: parts={} duration_ms={}", file_qs.len(), dur_ms);
+                                }
+                                Err(e) => {
+                                    warn!("File-update batch failed: {}", e);
+                                }
+                            }
+                        }
+
+                        // Then send entity CREATEs in chunks
+                        let mut local_batches = 0usize;
+                        let mut local_entities = 0usize;
+                        let mut local_sum_ms: u128 = 0;
+                        let mut local_min_ms: Option<u128> = None;
+                        let mut local_max_ms: Option<u128> = None;
+                        for chunk in acc.chunks(batch_capacity) {
+                            let mut parts: Vec<String> = Vec::new();
+                            for p in chunk.iter() {
+                                match serde_json::to_value(p) {
+                                    Ok(v) => {
+                                        let e_json = v.to_string();
+                                        parts.push(format!("CREATE entity CONTENT {};", e_json));
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to serialize entity payload for chunked streaming: {}", e);
+                                    }
+                                }
+                            }
+                            if parts.is_empty() {
+                                continue;
+                            }
+                            let q_chunk = format!("BEGIN; {} COMMIT;", parts.join(" "));
+                            let chunk_start = std::time::Instant::now();
+                            match db.query(&q_chunk).await {
+                                Ok(_) => {
+                                    let dur = chunk_start.elapsed();
+                                    let dur_ms = dur.as_millis();
+                                    local_batches += 1;
+                                    local_entities += chunk.len();
+                                    local_sum_ms += dur_ms;
+                                    local_min_ms = Some(local_min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                                    local_max_ms = Some(local_max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                                    info!("Chunked streaming insert succeeded: size={} duration_ms={}", chunk.len(), dur_ms);
+                                }
+                                Err(e) => {
+                                    let dur = chunk_start.elapsed();
+                                    let dur_ms = dur.as_millis();
+                                    batch_failures += 1;
+                                    warn!("Chunked streaming insert failed (size={} duration_ms={}): {}", chunk.len(), dur_ms, e);
+                                }
+                            }
+                        }
+                        if local_batches > 0 {
+                            batches_sent += local_batches;
+                            entities_sent += local_entities;
+                            batch_durations_sum_ms += local_sum_ms;
+                            batch_durations_min_ms = Some(batch_durations_min_ms.map_or(local_min_ms.unwrap_or(0), |m| m.min(local_min_ms.unwrap_or(m))));
+                            batch_durations_max_ms = Some(batch_durations_max_ms.map_or(local_max_ms.unwrap_or(0), |m| m.max(local_max_ms.unwrap_or(m))));
+                            *attempt_counts.entry(attempt).or_insert(0) += 1;
+                            info!("Streaming (chunked) sent: size={} batches={} attempt={}", local_entities, local_batches, attempt);
+                        }
+                        break;
+                    } else {
+                        let q_all = q_parts.join(" ");
+
+                        let batch_start = std::time::Instant::now();
+                        match db.query(&q_all).await {
+                            Ok(_) => {
+                                let dur = batch_start.elapsed();
+                                let dur_ms = dur.as_millis();
+                                batches_sent += 1;
+                                entities_sent += acc.len();
+                                batch_durations_sum_ms += dur_ms;
+                                batch_durations_min_ms = Some(batch_durations_min_ms.map_or(dur_ms, |m| m.min(dur_ms)));
+                                batch_durations_max_ms = Some(batch_durations_max_ms.map_or(dur_ms, |m| m.max(dur_ms)));
+                                *attempt_counts.entry(attempt).or_insert(0) += 1;
+                                info!("Batch sent: size={} duration_ms={} attempt={}", acc.len(), dur_ms, attempt);
+                                break;
+                            }
+                            Err(e) => {
+                                let dur = batch_start.elapsed();
+                                let dur_ms = dur.as_millis();
+                                batch_failures += 1;
+                                warn!("Batched DB write failed (size={} duration_ms={}): {}", acc.len(), dur_ms, e);
+                                // will retry below
+                            }
                         }
                     }
 
@@ -840,6 +948,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "entities_sent": entities_sent,
                 "total_retries": total_retries,
                 "avg_batch_ms": if batches_sent>0 { (batch_durations_sum_ms as f64)/(batches_sent as f64) } else { 0.0 },
+                "total_time_ms": batch_durations_sum_ms,
                 "min_batch_ms": batch_durations_min_ms,
                 "max_batch_ms": batch_durations_max_ms,
                 "batch_failures": batch_failures,

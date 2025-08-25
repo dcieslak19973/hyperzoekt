@@ -17,9 +17,25 @@ out = ".data/bin_integration_out.jsonl"
 channel_capacity = 100
 # debounce window in milliseconds
 debounce_ms = 200
+#
+# Recommended batch tuning
+# - batch_capacity: how many entities to accumulate before flushing. Larger
+#   values increase throughput but raise per-flush latency and risk creating
+#   very large DB transactions. A good default is 500 which gives a small
+#   number of medium-sized chunks for most repositories.
+# - batch_timeout_ms: how long to wait (ms) before flushing a partially-
+#   filled batch. Lower values improve responsiveness at the cost of more
+#   DB calls. 100ms is a sensible default for interactive/continuous
+#   streaming workloads.
+#
+# For one-time initial loads prefer `initial_batch` (chunked inline CREATEs)
+# since it produced the lowest total import time in our experiments. For
+# long-running streaming, either enable chunked streaming (so large flushes
+# are split) or tune `batch_timeout_ms` down to avoid monolithic transactions.
+#
 # maximum number of entities to accumulate in a batch before flushing
 batch_capacity = 500
 # batch timeout in milliseconds (flush if no new events arrive)
-batch_timeout_ms = 500
+batch_timeout_ms = 100
 # max retries for a failed batch
 max_retries = 3
