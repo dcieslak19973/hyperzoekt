@@ -181,8 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = effective_out.as_path();
 
     // If debug is set (CLI or config), dump JSONL to disk and exit. Otherwise stream to DB.
-    // Also honor `incremental` from the config (kept for backwards compatibility).
-    let is_incremental = app_cfg.incremental.unwrap_or(false);
+    // Honor `--incremental` CLI flag or `incremental` in the config (either enables JSONL dump and exit).
+    let is_incremental = args.incremental || app_cfg.incremental.unwrap_or(false);
     if args.debug || app_cfg.debug.unwrap_or(false) || is_incremental {
         let mut writer = BufWriter::new(File::create(out_path)?);
         for ent in &svc.entities {
