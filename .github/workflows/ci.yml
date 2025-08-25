@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-D warnings"
-      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +34,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        env:
+          RUSTC_WRAPPER: ""
         run: cargo clippy --workspace -- -D warnings
 
       - name: Run tests
@@ -45,7 +46,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: "-D warnings"
-      RUSTC_WRAPPER: sccache
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -107,6 +107,8 @@ jobs:
 
       - name: Run clippy (stable only)
         if: matrix.toolchain == 'stable'
+        env:
+          RUSTC_WRAPPER: ""
         run: cargo clippy -- -D warnings
 
   report-ci:
