@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-D warnings"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +27,12 @@ jobs:
           # install components
           rustup component add rustfmt clippy
 
+      - name: Setup sccache
+        uses: actions-rs/sccache@v1
+        with:
+          # install latest prebuilt sccache
+          version: latest
+
       - name: Verify formatting
         run: cargo fmt --all -- --check
 
@@ -39,7 +46,8 @@ jobs:
     name: matrix build & test
     runs-on: ${{ matrix.os }}
     env:
-      RUSTFLAGS: "-D warnings"
+  RUSTFLAGS: "-D warnings"
+  RUSTC_WRAPPER: sccache
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -83,6 +91,11 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           # add components when available (some toolchains may not have them)
           rustup component add rustfmt clippy || true
+
+      - name: Setup sccache
+        uses: actions-rs/sccache@v1
+        with:
+          version: latest
 
       - name: Build
         run: cargo build --verbose
