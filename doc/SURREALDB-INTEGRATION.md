@@ -68,6 +68,17 @@ Operational considerations
 - Indexes: create indexes on `file.path`, `entity.name`, and any frequently queried fields.
 - PageRank: compute offline or in-app and store `entity.rank` in SurrealDB; SurrealDB does not provide PageRank out-of-the-box.
 
+Practical batching notes (recent findings)
+
+- Defaults and recommendation: the repository includes a recommended starting configuration in `crates/hyperzoekt/hyperzoekt.toml` of `batch_capacity = 500` and `batch_timeout_ms = 100`. These values are a reasonable starting point for small-to-medium repositories and were chosen after running an empirical sweep across several capacities and timeouts.
+- Inline JSON CREATE: to improve robustness across embedded SurrealDB parser versions the importer now emits inline JSON `CREATE` statements per chunk rather than relying on a single parameterized `CONTENTS $items` transaction. This avoids Surreal parser incompatibilities observed in some versions.
+- Streaming chunking: the streaming write path historically produced a single very large transaction for some runs. A `streaming_chunked` mode was implemented (controlled by `SURREAL_STREAM_CHUNKED`) which causes the DB-thread to split accumulated entities into chunks sized by `batch_capacity` and send multiple inline-`CREATE` transactions. Enabling this mode reduces end-to-end streaming import latency to match the chunked initial-batch path.
+
+Metrics
+
+- The ingestion metrics written by the binary include per-batch latencies and now include a `total_time_ms` field (sum of per-chunk durations). Use `total_time_ms` to compare end-to-end import times across modes.
+
+
 Access control (commercial)
 ---------------------------
 This document describes the data and ingestion model for the open-source project. Access
