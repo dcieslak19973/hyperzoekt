@@ -1,0 +1,20 @@
+{
+    "total_entities_min": 30,
+    "languages": {
+        "rust": {
+            "min_entities": 1
+        },
+        "python": {
+            "min_entities": 1
+        },
+        "verilog": {
+            "min_entities": 1
+        },
+        "tsx": {
+            "min_entities": 1
+        },
+        "swift": {
+            "min_entities": 1
+        }
+    }
+}

@@ -1,0 +1,5 @@
+# experiment
+batch_capacity = 1000
+batch_timeout_ms = 500
+max_retries = 3
+channel_capacity = 200

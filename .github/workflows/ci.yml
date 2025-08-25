@@ -1,10 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  push: {}
+  pull_request: {}
 
 jobs:
   checks:
@@ -26,10 +24,18 @@ jobs:
           # install components
           rustup component add rustfmt clippy
 
+      - name: Install sccache
+        run: |
+          set -eux
+          # cargo should be on PATH from previous step
+          cargo install sccache --locked || true
+
       - name: Verify formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        env:
+          RUSTC_WRAPPER: ""
         run: cargo clippy --workspace -- -D warnings
 
       - name: Run tests
@@ -84,6 +90,11 @@ jobs:
           # add components when available (some toolchains may not have them)
           rustup component add rustfmt clippy || true
 
+      - name: Install sccache
+        run: |
+          set -eux
+          cargo install sccache --locked || true
+
       - name: Build
         run: cargo build --verbose
 
@@ -96,6 +107,8 @@ jobs:
 
       - name: Run clippy (stable only)
         if: matrix.toolchain == 'stable'
+        env:
+          RUSTC_WRAPPER: ""
         run: cargo clippy -- -D warnings
 
   report-ci:

@@ -1,23 +1,53 @@
 #!/usr/bin/env bash
-# Pre-commit hook: run rustfmt (check) and clippy (deny warnings) across workspace.
+# Pre-commit hook: attempt safe automatic fixes (cargo fix, cargo clippy --fix,
+# cargo fmt) then stage any modifications and finally run strict clippy checks
+# (deny warnings) to block commits that still contain issues.
 set -euo pipefail
 
-echo "Running pre-commit checks: cargo fmt --all -- --check"
+echo "Running pre-commit: attempt auto-fixes (cargo fix, clippy --fix), format, then strict clippy"
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found in PATH; skipping pre-commit checks." >&2
   exit 0
 fi
 
-# Check formatting
-if ! cargo fmt --all -- --check; then
-  echo "cargo fmt failed. Please run 'cargo fmt --all' to format your code." >&2
-  exit 1
+# Only run Rust auto-fix/format steps when staged Rust files exist to avoid
+# running heavy cargo commands on non-Rust commits.
+STAGED_RUST_FILES=$(git diff --name-only --staged | rg "\.rs$" || true)
+if [ -n "$STAGED_RUST_FILES" ]; then
+  # 1) Apply rustc auto-fixes
+  echo "Running: cargo fix --workspace --allow-dirty --allow-staged"
+  if cargo fix --workspace --allow-dirty --allow-staged; then
+    echo "cargo fix applied (if any fixable warnings existed)"
+  else
+    echo "cargo fix failed or had no fixes; continuing" >&2
+  fi
+
+  # 2) Apply clippy auto-fixes where supported. --fix implies --no-deps and --all-targets.
+  echo "Running: cargo clippy --fix --allow-dirty --allow-staged"
+  if cargo clippy --fix --allow-dirty --allow-staged; then
+    echo "cargo clippy --fix applied suggestions (if any)"
+  else
+    echo "cargo clippy --fix either failed or made no changes; continuing" >&2
+  fi
+
+  # 3) Ensure formatting is applied
+  echo "Running: cargo fmt --all"
+  cargo fmt --all
+
+  # 4) If fixes produced changes, add them to the commit
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "Staging autofix changes"
+    git add -A
+  fi
+else
+  echo "No staged Rust files; skipping auto-fix/format steps"
 fi
 
-echo "Running cargo clippy --workspace -- -D warnings"
-# Run clippy for the workspace; fail commit if clippy reports warnings/errors
+# 5) Final strict clippy pass to block commits with remaining warnings
+echo "Running strict clippy: cargo clippy --workspace -- -D warnings"
 if ! cargo clippy --workspace -- -D warnings; then
-  echo "cargo clippy failed. Fix clippy warnings or run 'cargo clippy' locally." >&2
+  echo "cargo clippy failed with warnings/errors. Please inspect and fix them locally." >&2
+  echo "If autofix modified files, they have been staged for you; amend the commit after review." >&2
   exit 1
 fi
 

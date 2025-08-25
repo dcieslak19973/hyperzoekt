@@ -5,12 +5,12 @@ This document describes a planned pivot from an in-repo hypergraph representatio
 Goals
 - Provide a durable, queryable, and indexable store for entities, files, and typed edges (calls, imports, containment).
 - Support both local embedded SurrealDB for development and a remote SurrealDB instance for production.
-- Keep the existing `crates/repo-index` code largely unchanged by introducing a small streaming bridge that ingests JSONL and writes to SurrealDB.
+ - Keep the existing `crates/hyperzoekt` code largely unchanged by introducing a small streaming bridge that ingests JSONL and writes to SurrealDB.
 
 Design overview
 
 Modes
-- Importer mode (recommended first step): a separate crate `crates/repo-index-importer` reads JSONL (produced by `repo-index`) and upserts into SurrealDB. Supports `--embed` for local embedded SurrealDB or `--surreal-url` to connect remotely.
+- Importer mode (recommended first step): a small importer binary under `crates/hyperzoekt/src/bin/importer.rs` reads JSONL (produced by the indexer) and upserts into SurrealDB. Supports `--embed` for local embedded SurrealDB or `--surreal-url` to connect remotely.
 - Direct streaming mode (future): the indexer itself uses an async writer that upserts records to SurrealDB while indexing. This requires converting the indexer to use an async runtime and adding a `ChannelWriter` bridge (sync -> async) if needed.
 
 Schema (starter)
@@ -83,7 +83,7 @@ Migration and roll-forward
 - Optionally remove the in-repo hypergraph or keep it for local-only fast queries.
 
 Next steps
-1. Implement `crates/repo-index-importer` with `--embed` and `--surreal-url` flags.
+1. Implement the importer binary under `crates/hyperzoekt/src/bin/importer.rs` with `--embed` and `--surreal-url` flags.
 2. Add schema creation scripts or queries to initialize indexes.
 3. Test importer on a small fixture repo and measure performance.
 4. Optionally implement direct streaming via embedding in the indexer once importer is stable.
