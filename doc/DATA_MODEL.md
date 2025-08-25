@@ -1,6 +1,6 @@
-# Data model: SurrealDB mapping for repo-index
+# Data model: SurrealDB mapping for hyperzoekt
 
-This document describes the planned SurrealDB data model for the Tree-sitter repo indexer and the related SCM lifecycle objects (users, groups, projects, repositories, commits, PRs, diffs). It focuses on using `REFERENCE` relations and on read-access permissions (the only permission type we currently need to enforce at query time).
+This document describes the planned SurrealDB data model for the Tree-sitter indexer in `hyperzoekt` and the related SCM lifecycle objects (users, groups, projects, repositories, commits, PRs, diffs). It focuses on using `REFERENCE` relations and on read-access permissions (the only permission type we currently need to enforce at query time).
 
 ## Goals
 - Represent Tree-sitter entities and code graph (calls/imports/containment) with REFERENCEs or edge tables.
@@ -215,7 +215,7 @@ npx -y @mermaid-js/mermaid-cli@10.9.1 --puppeteerConfigFile doc/puppeteer.json -
 This section describes the AST interchange schema used by the indexer for debug snapshots and offline inspection. The snapshot format is intended for fixtures, tests, and replay; the indexer will write directly to SurrealDB in normal operation.
 
 Purpose
-- The repo-indexer writes directly to SurrealDB in normal operation.
+- `hyperzoekt` writes directly to SurrealDB in normal operation.
 - The AST snapshot format is a convenient, portable snapshot format for debugging, offline inspection, test fixtures, and replay.
 
 Format
