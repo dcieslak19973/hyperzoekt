@@ -25,11 +25,11 @@ jobs:
           # install components
           rustup component add rustfmt clippy
 
-      - name: Setup sccache
-        uses: actions-rs/sccache@v1
-        with:
-          # install latest prebuilt sccache
-          version: latest
+      - name: Install sccache
+        run: |
+          set -eux
+          # cargo should be on PATH from previous step
+          cargo install sccache --locked || true
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
@@ -90,10 +90,10 @@ jobs:
           # add components when available (some toolchains may not have them)
           rustup component add rustfmt clippy || true
 
-      - name: Setup sccache
-        uses: actions-rs/sccache@v1
-        with:
-          version: latest
+      - name: Install sccache
+        run: |
+          set -eux
+          cargo install sccache --locked || true
 
       - name: Build
         run: cargo build --verbose
