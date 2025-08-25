@@ -9,3 +9,5 @@ Cargo.lock
 
 # workspace-local sccache directory persisted across devcontainer rebuilds
 .sccache/
+.tmp/
+.tmp_experiments/
