@@ -63,7 +63,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                                 .and_then(|l| l.get(i))
                                 .cloned()
                                 .unwrap_or(0)
-                                .saturating_add(1);
+                                .saturating_add(1) as u32;
                             imports.push(ImportItem {
                                 path: target_file.path.clone(),
                                 line: line_no,
@@ -76,7 +76,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                 for (m, lineno) in unres {
                     unresolved_imports.push(UnresolvedImport {
                         module: m.clone(),
-                        line: lineno.saturating_add(1),
+                        line: lineno.saturating_add(1) as u32,
                     });
                 }
             }
@@ -144,7 +144,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
     // `res` is a Vec<QueryResponse> — check approximate presence by converting to string
     let s = format!("{:?}", res);
     assert!(
-        s.contains("entity") || !s.is_empty(),
+        s.contains("entity"),
         "expected entities in DB result: {}",
         s
     );

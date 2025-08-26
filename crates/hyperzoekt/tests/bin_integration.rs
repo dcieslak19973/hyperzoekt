@@ -195,7 +195,7 @@ fn index_fixture_repo_writes_jsonl() {
         // validate its line numbers.
         let top_level = objs.iter().find(|v| {
             v.get("language").and_then(|l| l.as_str()) == Some(lang)
-                && (v.get("parent").is_none() || v.get("parent").is_none_or(|p| p.is_null()))
+                && v.get("parent").is_none_or(|p| p.is_null())
         });
         assert!(
             top_level.is_some(),
