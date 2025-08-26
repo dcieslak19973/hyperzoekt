@@ -11,7 +11,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&file_path, "fn hello() { println!(\"hi\"); }\n")?;
 
     // Build options to index this single file
-    let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
+    let mut opts_builder = hyperzoekt::repo_index::indexer::RepoIndexOptions::builder();
     opts_builder = opts_builder.root(&file_path);
     let opts = opts_builder.output_null().build();
     let (svc, _stats) = RepoIndexService::build_with_options(opts)?;
@@ -49,7 +49,10 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
         let file = &svc.files[ent.file_id as usize];
         let mut imports: Vec<ImportItem> = Vec::new();
         let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
-        if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
+        if matches!(
+            ent.kind,
+            hyperzoekt::repo_index::indexer::types::EntityKind::File
+        ) {
             if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                 let lines = svc.import_lines.get(ent.id as usize);
                 for (i, &target_eid) in edge_list.iter().enumerate() {
@@ -60,7 +63,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                                 .and_then(|l| l.get(i))
                                 .cloned()
                                 .unwrap_or(0)
-                                .saturating_add(1) as u32;
+                                .saturating_add(1);
                             imports.push(ImportItem {
                                 path: target_file.path.clone(),
                                 line: line_no,
@@ -73,27 +76,29 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                 for (m, lineno) in unres {
                     unresolved_imports.push(UnresolvedImport {
                         module: m.clone(),
-                        line: lineno.saturating_add(1) as u32,
+                        line: lineno.saturating_add(1),
                     });
                 }
             }
         }
-        let (start_field, end_field) = if matches!(ent.kind, hyperzoekt::internal::EntityKind::File)
-        {
+        let (start_field, end_field) = if matches!(
+            ent.kind,
+            hyperzoekt::repo_index::indexer::types::EntityKind::File
+        ) {
             let has_imports = !imports.is_empty();
             let has_unresolved = !unresolved_imports.is_empty();
             if has_imports || has_unresolved {
                 (
-                    Some((ent.start_line.saturating_add(1)) as u32),
-                    Some((ent.end_line.saturating_add(1)) as u32),
+                    Some(ent.start_line.saturating_add(1)),
+                    Some(ent.end_line.saturating_add(1)),
                 )
             } else {
                 (None, None)
             }
         } else {
             (
-                Some((ent.start_line.saturating_add(1)) as u32),
-                Some((ent.end_line.saturating_add(1)) as u32),
+                Some(ent.start_line.saturating_add(1)),
+                Some(ent.end_line.saturating_add(1)),
             )
         };
         payloads.push(EntityPayload {
@@ -139,7 +144,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
     // `res` is a Vec<QueryResponse> — check approximate presence by converting to string
     let s = format!("{:?}", res);
     assert!(
-        s.contains("entity") || s.len() > 0,
+        s.contains("entity") || !s.is_empty(),
         "expected entities in DB result: {}",
         s
     );

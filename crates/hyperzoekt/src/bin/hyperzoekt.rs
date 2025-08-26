@@ -1,6 +1,7 @@
 // ...existing code...
 
 use clap::Parser;
+use hyperzoekt::repo_index::indexer::{EntityKind, RepoIndexOptions, RepoIndexStats};
 use hyperzoekt::repo_index::RepoIndexService;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -172,7 +173,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     // Non-incremental: build in-memory and then either write JSONL (--debug)
     // or stream directly into SurrealDB.
-    let opts = hyperzoekt::internal::RepoIndexOptions::builder()
+    let opts = RepoIndexOptions::builder()
         .root(&effective_root)
         .output_null()
         .build();
@@ -203,7 +204,7 @@ fn main() -> Result<(), anyhow::Error> {
             // Do not clone payloads for the DB thread; main will send payloads when needed
             let mut imports: Vec<serde_json::Value> = Vec::new();
             let mut unresolved_imports: Vec<serde_json::Value> = Vec::new();
-            if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
+            if matches!(ent.kind, EntityKind::File) {
                 // import_edges stores target entity ids (file pseudo-entity ids)
                 if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                     let lines = svc.import_lines.get(ent.id as usize);
@@ -233,24 +234,23 @@ fn main() -> Result<(), anyhow::Error> {
             // decide whether to emit start/end lines. For file pseudo-entities we only
             // emit numeric 1-based start/end if there are import lines or unresolved
             // imports recorded; otherwise emit null to avoid misleading 1/1 values.
-            let (start_field, end_field) =
-                if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
-                    let has_imports = !imports.is_empty();
-                    let has_unresolved = !unresolved_imports.is_empty();
-                    if has_imports || has_unresolved {
-                        (
-                            serde_json::Value::from(ent.start_line.saturating_add(1)),
-                            serde_json::Value::from(ent.end_line.saturating_add(1)),
-                        )
-                    } else {
-                        (serde_json::Value::Null, serde_json::Value::Null)
-                    }
-                } else {
+            let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
+                let has_imports = !imports.is_empty();
+                let has_unresolved = !unresolved_imports.is_empty();
+                if has_imports || has_unresolved {
                     (
                         serde_json::Value::from(ent.start_line.saturating_add(1)),
                         serde_json::Value::from(ent.end_line.saturating_add(1)),
                     )
-                };
+                } else {
+                    (serde_json::Value::Null, serde_json::Value::Null)
+                }
+            } else {
+                (
+                    serde_json::Value::from(ent.start_line.saturating_add(1)),
+                    serde_json::Value::from(ent.end_line.saturating_add(1)),
+                )
+            };
 
             let obj = json!({
                 "file": file.path,
@@ -302,7 +302,7 @@ fn main() -> Result<(), anyhow::Error> {
             let file = &svc.files[ent.file_id as usize];
             let mut imports: Vec<ImportItem> = Vec::new();
             let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
-            if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
+            if matches!(ent.kind, EntityKind::File) {
                 if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                     let lines = svc.import_lines.get(ent.id as usize);
                     for (i, &target_eid) in edge_list.iter().enumerate() {
@@ -331,24 +331,23 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             }
-            let (start_field, end_field) =
-                if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
-                    let has_imports = !imports.is_empty();
-                    let has_unresolved = !unresolved_imports.is_empty();
-                    if has_imports || has_unresolved {
-                        (
-                            Some(ent.start_line.saturating_add(1)),
-                            Some(ent.end_line.saturating_add(1)),
-                        )
-                    } else {
-                        (None, None)
-                    }
-                } else {
+            let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
+                let has_imports = !imports.is_empty();
+                let has_unresolved = !unresolved_imports.is_empty();
+                if has_imports || has_unresolved {
                     (
                         Some(ent.start_line.saturating_add(1)),
                         Some(ent.end_line.saturating_add(1)),
                     )
-                };
+                } else {
+                    (None, None)
+                }
+            } else {
+                (
+                    Some(ent.start_line.saturating_add(1)),
+                    Some(ent.end_line.saturating_add(1)),
+                )
+            };
 
             // Compute stable id from environment and entity fields
             let project =
@@ -1094,11 +1093,9 @@ fn main() -> Result<(), anyhow::Error> {
 }
 
 // Index a single file and return typed payloads representing its entities.
-fn index_single_file(
-    path: &Path,
-) -> Result<(Vec<EntityPayload>, hyperzoekt::internal::RepoIndexStats), anyhow::Error> {
+fn index_single_file(path: &Path) -> Result<(Vec<EntityPayload>, RepoIndexStats), anyhow::Error> {
     // Build options that target the single file via root and incremental writer
-    let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
+    let mut opts_builder = RepoIndexOptions::builder();
     opts_builder = opts_builder.root(path);
     // Use output_null as we will collect entities via the returned service
     let opts = opts_builder.output_null().build();
@@ -1108,7 +1105,7 @@ fn index_single_file(
         let file = &svc.files[ent.file_id as usize];
         let mut imports: Vec<ImportItem> = Vec::new();
         let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
-        if matches!(ent.kind, hyperzoekt::internal::EntityKind::File) {
+        if matches!(ent.kind, EntityKind::File) {
             if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                 let lines = svc.import_lines.get(ent.id as usize);
                 for (i, &target_eid) in edge_list.iter().enumerate() {
@@ -1137,8 +1134,7 @@ fn index_single_file(
                 }
             }
         }
-        let (start_field, end_field) = if matches!(ent.kind, hyperzoekt::internal::EntityKind::File)
-        {
+        let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
             let has_imports = !imports.is_empty();
             let has_unresolved = !unresolved_imports.is_empty();
             if has_imports || has_unresolved {

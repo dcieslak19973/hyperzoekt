@@ -18,7 +18,7 @@ fn appconfig_load_from_file() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&cfg_path, toml)?;
     let s = std::fs::read_to_string(&cfg_path)?;
     let cfg: LocalAppConfig = toml::from_str(&s)?;
-    assert_eq!(cfg.debug.unwrap_or(false), true);
+    assert!(cfg.debug.unwrap_or(false));
     assert_eq!(cfg.channel_capacity.unwrap_or(0), 42);
     Ok(())
 }

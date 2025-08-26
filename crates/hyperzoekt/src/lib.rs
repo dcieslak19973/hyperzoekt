@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-pub mod internal;
 pub mod repo_index;
 pub use repo_index::RepoIndexService;
 pub mod mcp;
