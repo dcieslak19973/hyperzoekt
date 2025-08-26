@@ -16,5 +16,1422 @@
         "swift": {
             "min_entities": 1
         }
+    },
+    "file_line_expectations": {
+        "tests/fixtures/example-treesitter-repo/src/cpp/example.cpp": {
+            "start_line": 1,
+            "end_line": 2
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_01.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_02.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_03.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_04.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_05.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_06.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_07.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_08.cpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/point.hpp": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/cpp/pose.hpp": {
+            "start_line": 3,
+            "end_line": 3
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_01.cs": {
+            "start_line": 1,
+            "end_line": 1
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_02.cs": {
+            "start_line": 1,
+            "end_line": 1
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_03.cs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_04.cs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_05.cs": {
+            "start_line": 1,
+            "end_line": 1
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_06.cs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/csharp/geometry_examples.cs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/go/exceptions_01.go": {
+            "start_line": 2,
+            "end_line": 2
+        },
+        "tests/fixtures/example-treesitter-repo/src/go/exceptions_02.go": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/go/geometry.go": {
+            "start_line": 5,
+            "end_line": 5
+        },
+        "tests/fixtures/example-treesitter-repo/src/java/Ex01.java": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/java/Ex02.java": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/java/GeometryExample.java": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/js/example.js": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/js/exceptions_01.js": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/python/example.py": {
+            "start_line": 2,
+            "end_line": 2
+        },
+        "tests/fixtures/example-treesitter-repo/src/python/exceptions_01.py": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/python/exceptions_02.py": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/rust/errors_01.rs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/rust/errors_02.rs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/rust/geometry.rs": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/swift/example.swift": {
+            "start_line": 2,
+            "end_line": 2
+        },
+        "tests/fixtures/example-treesitter-repo/src/swift/exceptions_01.swift": {
+            "start_line": 1,
+            "end_line": 7
+        },
+        "tests/fixtures/example-treesitter-repo/src/tsx/PointComponent.tsx": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/tsx/exceptions_01.tsx": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/tsx/exceptions_component.tsx": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/typescript/example.ts": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/typescript/exceptions_01.ts": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/typescript/exceptions_a.ts": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/verilog/example.v": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/verilog/exceptions_01.v": {
+            "start_line": null,
+            "end_line": null
+        },
+        "tests/fixtures/example-treesitter-repo/src/verilog/foo.v": {
+            "start_line": null,
+            "end_line": null
+        }
+    },
+    "entity_expectations": {
+        "tests/fixtures/example-treesitter-repo/src/cpp/example.cpp": [
+            {
+                "kind": "class",
+                "name": "Cat",
+                "parent": null,
+                "start_line": 56,
+                "end_line": 61
+            },
+            {
+                "kind": "function",
+                "name": "getName",
+                "parent": "Cat",
+                "start_line": 60,
+                "end_line": 60
+            },
+            {
+                "kind": "function",
+                "name": "Cat",
+                "parent": "Cat",
+                "start_line": 59,
+                "end_line": 59
+            },
+            {
+                "kind": "class",
+                "name": "Named",
+                "parent": null,
+                "start_line": 50,
+                "end_line": 54
+            },
+            {
+                "kind": "class",
+                "name": "Box",
+                "parent": null,
+                "start_line": 42,
+                "end_line": 48
+            },
+            {
+                "kind": "function",
+                "name": "get",
+                "parent": "Box",
+                "start_line": 47,
+                "end_line": 47
+            },
+            {
+                "kind": "function",
+                "name": "Box",
+                "parent": "Box",
+                "start_line": 46,
+                "end_line": 46
+            },
+            {
+                "kind": "class",
+                "name": "Dog",
+                "parent": null,
+                "start_line": 35,
+                "end_line": 39
+            },
+            {
+                "kind": "function",
+                "name": "Dog",
+                "parent": "Dog",
+                "start_line": 38,
+                "end_line": 38
+            },
+            {
+                "kind": "class",
+                "name": "Animal",
+                "parent": null,
+                "start_line": 21,
+                "end_line": 33
+            },
+            {
+                "kind": "function",
+                "name": "distance_and_heading_to",
+                "parent": "Animal",
+                "start_line": 27,
+                "end_line": 32
+            },
+            {
+                "kind": "function",
+                "name": "Animal",
+                "parent": "Animal",
+                "start_line": 26,
+                "end_line": 26
+            },
+            {
+                "kind": "function",
+                "name": "add",
+                "parent": null,
+                "start_line": 16,
+                "end_line": 19
+            },
+            {
+                "kind": "file",
+                "name": "example.cpp",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 2
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_01.cpp": [
+            {
+                "kind": "function",
+                "name": "main01",
+                "parent": null,
+                "start_line": 7,
+                "end_line": 18
+            },
+            {
+                "kind": "function",
+                "name": "ex_func_01",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 5
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_02.cpp": [
+            {
+                "kind": "function",
+                "name": "ex_func_02",
+                "parent": null,
+                "start_line": 3,
+                "end_line": 13
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_02.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_03.cpp": [
+            {
+                "kind": "function",
+                "name": "ex_func_03",
+                "parent": null,
+                "start_line": 7,
+                "end_line": 10
+            },
+            {
+                "kind": "function",
+                "name": "what",
+                "parent": null,
+                "start_line": 4,
+                "end_line": 4
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_03.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_04.cpp": [
+            {
+                "kind": "function",
+                "name": "may_fail",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 6
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_04.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_05.cpp": [
+            {
+                "kind": "class",
+                "name": "CppEx",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 15
+            },
+            {
+                "kind": "function",
+                "name": "run",
+                "parent": "CppEx",
+                "start_line": 4,
+                "end_line": 14
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_05.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_06.cpp": [
+            {
+                "kind": "function",
+                "name": "wrapper6",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 9
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_06.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_07.cpp": [
+            {
+                "kind": "function",
+                "name": "thrower",
+                "parent": null,
+                "start_line": 3,
+                "end_line": 3
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_07.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/exceptions_08.cpp": [
+            {
+                "kind": "function",
+                "name": "ex8",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 11
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_08.cpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/point.hpp": [
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 5,
+                "end_line": 21
+            },
+            {
+                "kind": "function",
+                "name": "headingTo",
+                "parent": "Point",
+                "start_line": 17,
+                "end_line": 20
+            },
+            {
+                "kind": "function",
+                "name": "distanceTo",
+                "parent": "Point",
+                "start_line": 11,
+                "end_line": 16
+            },
+            {
+                "kind": "function",
+                "name": "Point",
+                "parent": "Point",
+                "start_line": 10,
+                "end_line": 10
+            },
+            {
+                "kind": "function",
+                "name": "Point",
+                "parent": "Point",
+                "start_line": 9,
+                "end_line": 9
+            },
+            {
+                "kind": "file",
+                "name": "point.hpp",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/cpp/pose.hpp": [
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 5,
+                "end_line": 14
+            },
+            {
+                "kind": "function",
+                "name": "headingTo",
+                "parent": "Pose",
+                "start_line": 10,
+                "end_line": 13
+            },
+            {
+                "kind": "function",
+                "name": "Pose",
+                "parent": "Pose",
+                "start_line": 9,
+                "end_line": 9
+            },
+            {
+                "kind": "file",
+                "name": "pose.hpp",
+                "parent": null,
+                "start_line": 3,
+                "end_line": 3
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_01.cs": [
+            {
+                "kind": "class",
+                "name": "Ex01",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 4
+            },
+            {
+                "kind": "function",
+                "name": "F",
+                "parent": "Ex01",
+                "start_line": 3,
+                "end_line": 3
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.cs",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_02.cs": [
+            {
+                "kind": "class",
+                "name": "Ex02",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 6
+            },
+            {
+                "kind": "function",
+                "name": "Run",
+                "parent": "Ex02",
+                "start_line": 3,
+                "end_line": 5
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_02.cs",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_03.cs": [
+            {
+                "kind": "class",
+                "name": "Ex03",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 5
+            },
+            {
+                "kind": "function",
+                "name": "M",
+                "parent": "Ex03",
+                "start_line": 2,
+                "end_line": 4
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_03.cs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_04.cs": [
+            {
+                "kind": "class",
+                "name": "Ex04",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "function",
+                "name": "Thrower",
+                "parent": "Ex04",
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_04.cs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_05.cs": [
+            {
+                "kind": "class",
+                "name": "Ex05",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 2
+            },
+            {
+                "kind": "function",
+                "name": "B",
+                "parent": "Ex05",
+                "start_line": 2,
+                "end_line": 2
+            },
+            {
+                "kind": "function",
+                "name": "A",
+                "parent": "Ex05",
+                "start_line": 2,
+                "end_line": 2
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_05.cs",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/exceptions_06.cs": [
+            {
+                "kind": "class",
+                "name": "Ex06",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "function",
+                "name": "Finally",
+                "parent": "Ex06",
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_06.cs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/csharp/geometry_examples.cs": [
+            {
+                "kind": "class",
+                "name": "Dog",
+                "parent": null,
+                "start_line": 37,
+                "end_line": 42
+            },
+            {
+                "kind": "class",
+                "name": "Animal",
+                "parent": null,
+                "start_line": 23,
+                "end_line": 35
+            },
+            {
+                "kind": "function",
+                "name": "DistanceAndHeadingTo",
+                "parent": "Animal",
+                "start_line": 30,
+                "end_line": 34
+            },
+            {
+                "kind": "class",
+                "name": "MainClass",
+                "parent": null,
+                "start_line": 10,
+                "end_line": 14
+            },
+            {
+                "kind": "function",
+                "name": "Add",
+                "parent": "MainClass",
+                "start_line": 11,
+                "end_line": 13
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 8
+            },
+            {
+                "kind": "file",
+                "name": "geometry_examples.cs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/go/exceptions_01.go": [
+            {
+                "kind": "function",
+                "name": "main",
+                "parent": null,
+                "start_line": 4,
+                "end_line": 7
+            },
+            {
+                "kind": "function",
+                "name": "mayPanic",
+                "parent": null,
+                "start_line": 3,
+                "end_line": 3
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.go",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 2
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/go/exceptions_02.go": [
+            {
+                "kind": "function",
+                "name": "f2",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 4
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_02.go",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/go/geometry.go": [
+            {
+                "kind": "function",
+                "name": "NewDog",
+                "parent": null,
+                "start_line": 68,
+                "end_line": 70
+            },
+            {
+                "kind": "class",
+                "name": "struct",
+                "parent": null,
+                "start_line": 64,
+                "end_line": 66
+            },
+            {
+                "kind": "function",
+                "name": "NewAnimal",
+                "parent": null,
+                "start_line": 54,
+                "end_line": 56
+            },
+            {
+                "kind": "class",
+                "name": "struct",
+                "parent": null,
+                "start_line": 49,
+                "end_line": 52
+            },
+            {
+                "kind": "class",
+                "name": "int",
+                "parent": null,
+                "start_line": 40,
+                "end_line": 40
+            },
+            {
+                "kind": "function",
+                "name": "NewPose",
+                "parent": null,
+                "start_line": 32,
+                "end_line": 34
+            },
+            {
+                "kind": "class",
+                "name": "struct",
+                "parent": null,
+                "start_line": 27,
+                "end_line": 30
+            },
+            {
+                "kind": "function",
+                "name": "NewPoint",
+                "parent": null,
+                "start_line": 13,
+                "end_line": 15
+            },
+            {
+                "kind": "class",
+                "name": "struct",
+                "parent": null,
+                "start_line": 8,
+                "end_line": 11
+            },
+            {
+                "kind": "file",
+                "name": "geometry.go",
+                "parent": null,
+                "start_line": 5,
+                "end_line": 5
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/java/Ex01.java": [
+            {
+                "kind": "class",
+                "name": "Ex01",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 4
+            },
+            {
+                "kind": "function",
+                "name": "main",
+                "parent": "Ex01",
+                "start_line": 3,
+                "end_line": 3
+            },
+            {
+                "kind": "function",
+                "name": "may",
+                "parent": "Ex01",
+                "start_line": 2,
+                "end_line": 2
+            },
+            {
+                "kind": "file",
+                "name": "Ex01.java",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/java/Ex02.java": [
+            {
+                "kind": "class",
+                "name": "Ex02",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 7
+            },
+            {
+                "kind": "function",
+                "name": "run",
+                "parent": "Ex02",
+                "start_line": 3,
+                "end_line": 6
+            },
+            {
+                "kind": "file",
+                "name": "Ex02.java",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/java/GeometryExample.java": [
+            {
+                "kind": "class",
+                "name": "GeometryExample",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 21
+            },
+            {
+                "kind": "function",
+                "name": "main",
+                "parent": "GeometryExample",
+                "start_line": 16,
+                "end_line": 20
+            },
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": "GeometryExample",
+                "start_line": 9,
+                "end_line": 14
+            },
+            {
+                "kind": "function",
+                "name": "headingTo",
+                "parent": "Pose",
+                "start_line": 13,
+                "end_line": 13
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": "GeometryExample",
+                "start_line": 3,
+                "end_line": 7
+            },
+            {
+                "kind": "function",
+                "name": "distanceTo",
+                "parent": "Point",
+                "start_line": 6,
+                "end_line": 6
+            },
+            {
+                "kind": "file",
+                "name": "GeometryExample.java",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/js/example.js": [
+            {
+                "kind": "function",
+                "name": "main",
+                "parent": null,
+                "start_line": 26,
+                "end_line": 30
+            },
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 15,
+                "end_line": 24
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 13
+            },
+            {
+                "kind": "file",
+                "name": "example.js",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/js/exceptions_01.js": [
+            {
+                "kind": "function",
+                "name": "mayThrow",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.js",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/python/example.py": [
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 14,
+                "end_line": 20
+            },
+            {
+                "kind": "function",
+                "name": "heading_to",
+                "parent": "Pose",
+                "start_line": 19,
+                "end_line": 20
+            },
+            {
+                "kind": "function",
+                "name": "__init__",
+                "parent": "Pose",
+                "start_line": 15,
+                "end_line": 17
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 4,
+                "end_line": 12
+            },
+            {
+                "kind": "function",
+                "name": "distance_to",
+                "parent": "Point",
+                "start_line": 9,
+                "end_line": 12
+            },
+            {
+                "kind": "function",
+                "name": "__init__",
+                "parent": "Point",
+                "start_line": 5,
+                "end_line": 7
+            },
+            {
+                "kind": "file",
+                "name": "example.py",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 2
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/python/exceptions_01.py": [
+            {
+                "kind": "function",
+                "name": "caller",
+                "parent": null,
+                "start_line": 12,
+                "end_line": 18
+            },
+            {
+                "kind": "function",
+                "name": "may_raise",
+                "parent": null,
+                "start_line": 5,
+                "end_line": 10
+            },
+            {
+                "kind": "class",
+                "name": "MyError",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 3
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.py",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/python/exceptions_02.py": [
+            {
+                "kind": "function",
+                "name": "resource_user",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 5
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_02.py",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/rust/errors_01.rs": [
+            {
+                "kind": "function",
+                "name": "caller",
+                "parent": null,
+                "start_line": 9,
+                "end_line": 14
+            },
+            {
+                "kind": "function",
+                "name": "may_fail",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 7
+            },
+            {
+                "kind": "file",
+                "name": "errors_01.rs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/rust/errors_02.rs": [
+            {
+                "kind": "function",
+                "name": "will_panic",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 3
+            },
+            {
+                "kind": "file",
+                "name": "errors_02.rs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/rust/geometry.rs": [
+            {
+                "kind": "function",
+                "name": "distance_and_heading_to",
+                "parent": null,
+                "start_line": 37,
+                "end_line": 42
+            },
+            {
+                "kind": "function",
+                "name": "new",
+                "parent": null,
+                "start_line": 31,
+                "end_line": 36
+            },
+            {
+                "kind": "class",
+                "name": "Animal",
+                "parent": null,
+                "start_line": 25,
+                "end_line": 28
+            },
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 20,
+                "end_line": 23
+            },
+            {
+                "kind": "function",
+                "name": "heading_to",
+                "parent": null,
+                "start_line": 15,
+                "end_line": 17
+            },
+            {
+                "kind": "function",
+                "name": "distance_to",
+                "parent": null,
+                "start_line": 10,
+                "end_line": 14
+            },
+            {
+                "kind": "function",
+                "name": "new",
+                "parent": null,
+                "start_line": 7,
+                "end_line": 9
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 4
+            },
+            {
+                "kind": "file",
+                "name": "geometry.rs",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/swift/example.swift": [
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 15,
+                "end_line": 22
+            },
+            {
+                "kind": "function",
+                "name": "headingTo",
+                "parent": "Pose",
+                "start_line": 19,
+                "end_line": 21
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 4,
+                "end_line": 13
+            },
+            {
+                "kind": "function",
+                "name": "distanceTo",
+                "parent": "Point",
+                "start_line": 8,
+                "end_line": 12
+            },
+            {
+                "kind": "file",
+                "name": "example.swift",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 2
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/swift/exceptions_01.swift": [
+            {
+                "kind": "function",
+                "name": "mayThrow",
+                "parent": null,
+                "start_line": 9,
+                "end_line": 11
+            },
+            {
+                "kind": "class",
+                "name": "ExampleError",
+                "parent": null,
+                "start_line": 8,
+                "end_line": 8
+            },
+            {
+                "kind": "function",
+                "name": "mayThrow",
+                "parent": null,
+                "start_line": 3,
+                "end_line": 5
+            },
+            {
+                "kind": "class",
+                "name": "MyErr",
+                "parent": null,
+                "start_line": 2,
+                "end_line": 2
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.swift",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 7
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/tsx/PointComponent.tsx": [
+            {
+                "kind": "file",
+                "name": "PointComponent.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            },
+            {
+                "kind": "file",
+                "name": "PointComponent.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/tsx/exceptions_01.tsx": [
+            {
+                "kind": "file",
+                "name": "exceptions_01.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/tsx/exceptions_component.tsx": [
+            {
+                "kind": "file",
+                "name": "exceptions_component.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_component.tsx",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/typescript/example.ts": [
+            {
+                "kind": "function",
+                "name": "main",
+                "parent": null,
+                "start_line": 34,
+                "end_line": 38
+            },
+            {
+                "kind": "class",
+                "name": "Pose",
+                "parent": null,
+                "start_line": 20,
+                "end_line": 32
+            },
+            {
+                "kind": "class",
+                "name": "Point",
+                "parent": null,
+                "start_line": 4,
+                "end_line": 18
+            },
+            {
+                "kind": "file",
+                "name": "example.ts",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/typescript/exceptions_01.ts": [
+            {
+                "kind": "function",
+                "name": "mayThrow",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.ts",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/typescript/exceptions_a.ts": [
+            {
+                "kind": "function",
+                "name": "mayThrowA",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 1
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_a.ts",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/verilog/example.v": [
+            {
+                "kind": "class",
+                "name": "top",
+                "parent": null,
+                "start_line": 8,
+                "end_line": 11
+            },
+            {
+                "kind": "class",
+                "name": "foo",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 6
+            },
+            {
+                "kind": "function",
+                "name": "add",
+                "parent": "foo",
+                "start_line": 3,
+                "end_line": 5
+            },
+            {
+                "kind": "file",
+                "name": "example.v",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/verilog/exceptions_01.v": [
+            {
+                "kind": "class",
+                "name": "ex_fatal",
+                "parent": null,
+                "start_line": 7,
+                "end_line": 12
+            },
+            {
+                "kind": "class",
+                "name": "ex1",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 6
+            },
+            {
+                "kind": "file",
+                "name": "exceptions_01.v",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ],
+        "tests/fixtures/example-treesitter-repo/src/verilog/foo.v": [
+            {
+                "kind": "class",
+                "name": "foo",
+                "parent": null,
+                "start_line": 1,
+                "end_line": 10
+            },
+            {
+                "kind": "function",
+                "name": "add",
+                "parent": "foo",
+                "start_line": 4,
+                "end_line": 8
+            },
+            {
+                "kind": "file",
+                "name": "foo.v",
+                "parent": null,
+                "start_line": null,
+                "end_line": null
+            }
+        ]
     }
 }
