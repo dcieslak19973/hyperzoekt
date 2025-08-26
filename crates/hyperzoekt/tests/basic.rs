@@ -1,4 +1,4 @@
-use hyperzoekt::service::RepoIndexService;
+use hyperzoekt::repo_index::RepoIndexService;
 use std::fs;
 use tempfile::tempdir;
 
