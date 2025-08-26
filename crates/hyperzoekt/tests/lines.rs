@@ -1,4 +1,4 @@
-use hyperzoekt::service::RepoIndexService;
+use hyperzoekt::repo_index::RepoIndexService;
 
 #[test]
 fn exported_lines_are_one_based() {

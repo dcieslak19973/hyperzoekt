@@ -40,7 +40,7 @@ Build locally with Rust and Cargo (install via https://rustup.rs/):
 	cargo build
 
 Repo indexer
--------------
+------------
 This workspace includes a small Tree-sitter backed repository indexer in `crates/hyperzoekt`.
 
 To build and run the indexer binary (may take time the first build because Tree-sitter grammars compile native code):
@@ -48,10 +48,25 @@ To build and run the indexer binary (may take time the first build because Tree-
 ```bash
 cd crates/hyperzoekt
 cargo build --release
-cargo run --release --bin hyperzoekt -- --root /path/to/repo --output out.jsonl
+cargo run --release --bin hyperzoekt -- --root /path/to/repo --out ./.data/out.jsonl --debug
 ```
 
-There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/hyperzoekt/src/bin/hyperzoekt.rs` for options.
+There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/hyperzoekt/src/bin/hyperzoekt` for code.
+
+CLI flags (summary)
+-------------------
+- `--config <file>`: Optional config TOML (defaults to `crates/hyperzoekt/hyperzoekt.toml`).
+- `--root <path>`: Repository root (directory) or single file to index. Required for most modes.
+- `--out <file>` / `-o <file>`: Output JSONL path (used by `--debug` and `--incremental`).
+- `--debug`: Index and write a single JSONL snapshot, then exit.
+- `--incremental`: Stream JSONL as files are processed (continues running unless combined with flags below).
+- `--stream-once`: Perform a one-off streaming run and exit (use with `--root <file or dir>`).
+- `--mcp-stdio`: Run the MCP server over stdio (used by the MCP E2E test).
+- `--mcp-http`: Run the MCP server over HTTP (dev/testing).
+
+Notes
+- Positional arguments for root/output have been removed. Always pass `--root` and `--out`.
+- Example incremental run: `cargo run --bin hyperzoekt -- --root ./some/repo --out ./.data/out.jsonl --incremental`
 
 License
 -------
