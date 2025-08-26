@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 mod db_writer;
 mod index;
-mod payload;
 mod watcher;
 
 use hyperzoekt::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
