@@ -75,6 +75,12 @@ struct Args {
     /// Run in debug mode (one-shot send to DB or used by tests)
     #[arg(long)]
     debug: bool,
+    /// Run as an MCP stdio server (uses rust-mcp-sdk StdioTransport)
+    #[arg(long)]
+    mcp_stdio: bool,
+    /// Run as an MCP streaming HTTP server (uses rust-mcp-sdk hyper_server)
+    #[arg(long)]
+    mcp_http: bool,
     /// Start DB thread, send all payloads once, and exit (uses DB batching)
     #[arg(long)]
     stream_once: bool,
@@ -179,6 +185,149 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.entities_indexed
     );
     let out_path = effective_out.as_path();
+
+    // If MCP stdio/server flags are set, start the appropriate MCP server and exit.
+    if args.mcp_stdio || args.mcp_http {
+        // Build basic InitializeResult and handler using rust-mcp-sdk
+        use async_trait::async_trait;
+        use rust_mcp_sdk::mcp_server::{hyper_server, server_runtime, HyperServerOptions};
+        use rust_mcp_sdk::schema::{
+            Implementation, InitializeResult, ServerCapabilities, ServerCapabilitiesTools,
+            LATEST_PROTOCOL_VERSION,
+        };
+        use rust_mcp_sdk::{mcp_server::ServerHandler, McpServer};
+
+        let server_details = InitializeResult {
+            server_info: Implementation {
+                name: "hyperzoekt-mcp".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+            },
+            capabilities: ServerCapabilities {
+                tools: Some(ServerCapabilitiesTools { list_changed: None }),
+                ..Default::default()
+            },
+            meta: None,
+            instructions: Some("hyperzoekt MCP server".to_string()),
+            protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
+        };
+
+        struct Handler {
+            svc: RepoIndexService,
+        }
+        #[async_trait]
+        impl ServerHandler for Handler {
+            async fn handle_list_tools_request(
+                &self,
+                _req: rust_mcp_sdk::schema::ListToolsRequest,
+                _runtime: &dyn McpServer,
+            ) -> std::result::Result<
+                rust_mcp_sdk::schema::ListToolsResult,
+                rust_mcp_sdk::schema::RpcError,
+            > {
+                Ok(rust_mcp_sdk::schema::ListToolsResult {
+                    meta: None,
+                    next_cursor: None,
+                    tools: vec![],
+                })
+            }
+
+            async fn handle_call_tool_request(
+                &self,
+                request: rust_mcp_sdk::schema::CallToolRequest,
+                _runtime: &dyn McpServer,
+            ) -> std::result::Result<
+                rust_mcp_sdk::schema::CallToolResult,
+                rust_mcp_sdk::schema::schema_utils::CallToolError,
+            > {
+                // Support a simple `search` tool that accepts { q: string }
+                // The SDK provides typed params: request.params.name and request.params.arguments
+                let tool_name = request.params.name.as_str();
+                if tool_name != "search" {
+                    return Err(
+                        rust_mcp_sdk::schema::schema_utils::CallToolError::unknown_tool(
+                            tool_name.to_string(),
+                        ),
+                    );
+                }
+
+                // arguments: Option<Map<String, serde_json::Value>>
+                if let Some(args) = &request.params.arguments {
+                    if let Some(qv) = args.get("q").and_then(|v| v.as_str()) {
+                        let results = self.svc.search(qv, 50);
+                        let mut map = serde_json::Map::new();
+                        // RepoEntity is Serialize so this should succeed
+                        map.insert(
+                            "results".to_string(),
+                            serde_json::to_value(&results).unwrap_or(serde_json::Value::Null),
+                        );
+                        let res = rust_mcp_sdk::schema::CallToolResult {
+                            content: Vec::new(),
+                            is_error: None,
+                            meta: None,
+                            structured_content: Some(map),
+                        };
+                        return Ok(res);
+                    }
+                }
+
+                // Build a CallToolError using anyhow so the error implements std::error::Error
+                // CallToolError::new expects a type that implements std::error::Error + 'static
+                #[derive(Debug)]
+                struct SimpleErr(String);
+                impl std::fmt::Display for SimpleErr {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "{}", self.0)
+                    }
+                }
+                impl std::error::Error for SimpleErr {}
+                Err(rust_mcp_sdk::schema::schema_utils::CallToolError::new(
+                    SimpleErr("invalid params for search".to_string()),
+                ))
+            }
+        }
+
+        if args.mcp_stdio {
+            // Start stdio transport server runtime
+            let transport =
+                rust_mcp_sdk::StdioTransport::new(rust_mcp_sdk::TransportOptions::default())?;
+            let handler = Handler { svc };
+            let server = server_runtime::create_server(server_details, transport, handler);
+            // start async runtime
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                if let Err(e) = server.start().await {
+                    eprintln!("MCP stdio server failed: {}", e);
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            return Ok(());
+        }
+
+        if args.mcp_http {
+            let handler = Handler { svc };
+            let server = hyper_server::create_server(
+                server_details,
+                handler,
+                HyperServerOptions {
+                    host: "127.0.0.1".to_string(),
+                    ..Default::default()
+                },
+            );
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                if let Err(e) = server.start().await {
+                    eprintln!("MCP http server failed: {}", e);
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            return Ok(());
+        }
+    }
 
     // If debug is set (CLI or config), dump JSONL to disk and exit. Otherwise stream to DB.
     // Honor `--incremental` CLI flag or `incremental` in the config (either enables JSONL dump and exit).

@@ -3,11 +3,12 @@ use crate::internal::{
 };
 use anyhow::Result;
 use ignore::WalkBuilder;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use tree_sitter::{Language, Parser};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RepoEntity {
     pub name: String,
     pub path: String,
