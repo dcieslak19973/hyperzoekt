@@ -5,3 +5,4 @@
 pub mod internal;
 pub mod service;
 pub use service::RepoIndexService;
+pub mod mcp;

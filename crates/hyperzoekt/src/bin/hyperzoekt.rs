@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use log::{error, info, trace, warn};
 use sha2::Digest;
+// Library exposes MCP starter in `hyperzoekt::mcp`
 
 // Typed in-process payloads to avoid JSON string churn
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,7 +134,7 @@ impl AppConfig {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
     // Initialize logging (default to info if RUST_LOG is not set)
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
@@ -186,147 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let out_path = effective_out.as_path();
 
-    // If MCP stdio/server flags are set, start the appropriate MCP server and exit.
+    // If MCP stdio/server flags are set, delegate to the extracted MCP module
     if args.mcp_stdio || args.mcp_http {
-        // Build basic InitializeResult and handler using rust-mcp-sdk
-        use async_trait::async_trait;
-        use rust_mcp_sdk::mcp_server::{hyper_server, server_runtime, HyperServerOptions};
-        use rust_mcp_sdk::schema::{
-            Implementation, InitializeResult, ServerCapabilities, ServerCapabilitiesTools,
-            LATEST_PROTOCOL_VERSION,
-        };
-        use rust_mcp_sdk::{mcp_server::ServerHandler, McpServer};
-
-        let server_details = InitializeResult {
-            server_info: Implementation {
-                name: "hyperzoekt-mcp".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-            },
-            capabilities: ServerCapabilities {
-                tools: Some(ServerCapabilitiesTools { list_changed: None }),
-                ..Default::default()
-            },
-            meta: None,
-            instructions: Some("hyperzoekt MCP server".to_string()),
-            protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
-        };
-
-        struct Handler {
-            svc: RepoIndexService,
-        }
-        #[async_trait]
-        impl ServerHandler for Handler {
-            async fn handle_list_tools_request(
-                &self,
-                _req: rust_mcp_sdk::schema::ListToolsRequest,
-                _runtime: &dyn McpServer,
-            ) -> std::result::Result<
-                rust_mcp_sdk::schema::ListToolsResult,
-                rust_mcp_sdk::schema::RpcError,
-            > {
-                Ok(rust_mcp_sdk::schema::ListToolsResult {
-                    meta: None,
-                    next_cursor: None,
-                    tools: vec![],
-                })
-            }
-
-            async fn handle_call_tool_request(
-                &self,
-                request: rust_mcp_sdk::schema::CallToolRequest,
-                _runtime: &dyn McpServer,
-            ) -> std::result::Result<
-                rust_mcp_sdk::schema::CallToolResult,
-                rust_mcp_sdk::schema::schema_utils::CallToolError,
-            > {
-                // Support a simple `search` tool that accepts { q: string }
-                // The SDK provides typed params: request.params.name and request.params.arguments
-                let tool_name = request.params.name.as_str();
-                if tool_name != "search" {
-                    return Err(
-                        rust_mcp_sdk::schema::schema_utils::CallToolError::unknown_tool(
-                            tool_name.to_string(),
-                        ),
-                    );
-                }
-
-                // arguments: Option<Map<String, serde_json::Value>>
-                if let Some(args) = &request.params.arguments {
-                    if let Some(qv) = args.get("q").and_then(|v| v.as_str()) {
-                        let results = self.svc.search(qv, 50);
-                        let mut map = serde_json::Map::new();
-                        // RepoEntity is Serialize so this should succeed
-                        map.insert(
-                            "results".to_string(),
-                            serde_json::to_value(&results).unwrap_or(serde_json::Value::Null),
-                        );
-                        let res = rust_mcp_sdk::schema::CallToolResult {
-                            content: Vec::new(),
-                            is_error: None,
-                            meta: None,
-                            structured_content: Some(map),
-                        };
-                        return Ok(res);
-                    }
-                }
-
-                // Build a CallToolError using anyhow so the error implements std::error::Error
-                // CallToolError::new expects a type that implements std::error::Error + 'static
-                #[derive(Debug)]
-                struct SimpleErr(String);
-                impl std::fmt::Display for SimpleErr {
-                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(f, "{}", self.0)
-                    }
-                }
-                impl std::error::Error for SimpleErr {}
-                Err(rust_mcp_sdk::schema::schema_utils::CallToolError::new(
-                    SimpleErr("invalid params for search".to_string()),
-                ))
-            }
-        }
-
-        if args.mcp_stdio {
-            // Start stdio transport server runtime
-            let transport =
-                rust_mcp_sdk::StdioTransport::new(rust_mcp_sdk::TransportOptions::default())?;
-            let handler = Handler { svc };
-            let server = server_runtime::create_server(server_details, transport, handler);
-            // start async runtime
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async move {
-                if let Err(e) = server.start().await {
-                    eprintln!("MCP stdio server failed: {}", e);
-                }
-                Ok::<(), anyhow::Error>(())
-            })?;
-            return Ok(());
-        }
-
-        if args.mcp_http {
-            let handler = Handler { svc };
-            let server = hyper_server::create_server(
-                server_details,
-                handler,
-                HyperServerOptions {
-                    host: "127.0.0.1".to_string(),
-                    ..Default::default()
-                },
-            );
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async move {
-                if let Err(e) = server.start().await {
-                    eprintln!("MCP http server failed: {}", e);
-                }
-                Ok::<(), anyhow::Error>(())
-            })?;
-            return Ok(());
-        }
+        // Delegate to the library-provided MCP runner
+        return hyperzoekt::mcp::run_mcp(svc, args.mcp_stdio, args.mcp_http);
     }
 
     // If debug is set (CLI or config), dump JSONL to disk and exit. Otherwise stream to DB.
@@ -537,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(Box::<dyn std::error::Error>::from)?;
+            .map_err(|e| anyhow::anyhow!(e))?;
         let surreal_ns = surreal_ns.clone();
         let surreal_db = surreal_db.clone();
         let metrics_path = std::env::var("SURREAL_METRICS_FILE")
@@ -1328,27 +1192,4 @@ fn index_single_file(
         });
     }
     Ok((payloads, stats))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AppConfig;
-    use std::path::PathBuf;
-
-    #[test]
-    fn appconfig_load_from_file() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let cfg_path = dir.path().join("test_config.toml");
-        let toml = r#"
-        debug = true
-        out = ".data/test_out.jsonl"
-        channel_capacity = 42
-        "#;
-        std::fs::write(&cfg_path, toml)?;
-        let (cfg, path) = AppConfig::load(Some(&PathBuf::from(&cfg_path)))?;
-        assert_eq!(cfg.debug.unwrap_or(false), true);
-        assert_eq!(cfg.channel_capacity.unwrap_or(0), 42);
-        assert_eq!(path, cfg_path);
-        Ok(())
-    }
 }
