@@ -6,7 +6,7 @@ fn test_handle_call_tool_sync_search() {
     // build a service for the current repo (uses test fixtures/helpers already
     // present in the crate tests). We will reuse the existing RepoIndexService
     // constructor to build an in-memory index.
-    let svc = RepoIndexService::build(std::path::Path::new("./")).expect("build index");
+    let (svc, _stats) = RepoIndexService::build(std::path::Path::new("./")).expect("build index");
 
     // simple search query that should return results for common symbols like `main`.
     let params = Some({

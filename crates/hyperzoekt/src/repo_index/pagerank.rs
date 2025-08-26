@@ -11,7 +11,7 @@ pub fn compute_pagerank(svc: &mut RepoIndexService) {
     }
 
     // Extract weights & params
-    let crate::internal::RankWeights {
+    let crate::repo_index::indexer::types::RankWeights {
         call: w_call,
         import: w_import,
         containment: w_contain,
@@ -91,7 +91,7 @@ pub fn compute_pagerank(svc: &mut RepoIndexService) {
 #[cfg(test)]
 mod tests {
     use super::compute_pagerank;
-    use crate::internal::{EntityKind, RankWeights};
+    use crate::repo_index::indexer::types::{EntityKind, RankWeights};
     use crate::repo_index::types::{FileRecord, RepoIndexService, StoredEntity};
 
     #[test]

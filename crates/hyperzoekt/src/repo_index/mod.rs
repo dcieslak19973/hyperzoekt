@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod graph;
+pub mod indexer;
 pub mod pagerank;
 pub mod search;
 pub mod types;

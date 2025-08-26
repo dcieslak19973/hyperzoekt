@@ -1,6 +1,6 @@
 // content moved from service/builder.rs
 
-use crate::internal::{
+use crate::repo_index::indexer::{
     detect_language, extract_entities, lang_to_ts, RepoIndexOptions, RepoIndexStats,
 };
 use anyhow::Result;
@@ -59,7 +59,8 @@ pub fn build_with_options(
         };
         if parser.set_language(&language).is_err() {
             if matches!(lang, "c_sharp" | "swift") {
-                let imports = crate::internal::extract_import_modules(lang, &src);
+                let imports =
+                    crate::repo_index::indexer::helpers::extract_import_modules(lang, &src);
                 let file_path_str = path.display().to_string();
                 let file_id = *files_map.entry(file_path_str.clone()).or_insert_with(|| {
                     let id = files.len() as u32;
@@ -86,7 +87,7 @@ pub fn build_with_options(
         };
         let mut entities_local = Vec::new();
         extract_entities(lang, &tree, &src, path, &mut entities_local);
-        let imports = crate::internal::extract_import_modules(lang, &src);
+        let imports = crate::repo_index::indexer::helpers::extract_import_modules(lang, &src);
         let file_path_str = path.display().to_string();
         let file_id = *files_map.entry(file_path_str.clone()).or_insert_with(|| {
             let id = files.len() as u32;
@@ -116,7 +117,7 @@ pub fn build_with_options(
             entities_store.push(StoredEntity {
                 id,
                 file_id,
-                kind: crate::internal::EntityKind::parse_str(ent.kind),
+                kind: crate::repo_index::indexer::types::EntityKind::parse_str(ent.kind),
                 name: ent.name,
                 parent: ent.parent,
                 signature: ent.signature,
@@ -153,7 +154,7 @@ pub fn build_with_options(
         entities_store.push(StoredEntity {
             id,
             file_id: f.id,
-            kind: crate::internal::EntityKind::File,
+            kind: crate::repo_index::indexer::types::EntityKind::File,
             name: std::path::Path::new(&f.path)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -190,7 +191,7 @@ pub fn build_with_options(
         }
     }
     for e in &entities_store {
-        if matches!(e.kind, crate::internal::EntityKind::File) {
+        if matches!(e.kind, crate::repo_index::indexer::types::EntityKind::File) {
             continue;
         }
         let mut resolved_local: StdHashSet<u32> = StdHashSet::new();
@@ -203,7 +204,7 @@ pub fn build_with_options(
         }
     }
     for e in &entities_store {
-        if matches!(e.kind, crate::internal::EntityKind::File) {
+        if matches!(e.kind, crate::repo_index::indexer::types::EntityKind::File) {
             continue;
         }
         let already: StdHashSet<u32> = call_edges[e.id as usize].iter().cloned().collect();
@@ -258,7 +259,7 @@ pub fn build_with_options(
         entities_indexed: entities_store.len(),
         duration: start.elapsed(),
     };
-    let rank_weights = crate::internal::RankWeights::from_env();
+    let rank_weights = crate::repo_index::indexer::types::RankWeights::from_env();
     let mut svc = RepoIndexService {
         files,
         entities: entities_store,
@@ -278,7 +279,7 @@ pub fn build_with_options(
 }
 
 pub fn build<P: AsRef<std::path::Path>>(root: P) -> Result<(RepoIndexService, RepoIndexStats)> {
-    let opts = crate::internal::RepoIndexOptions::builder()
+    let opts = crate::repo_index::indexer::types::RepoIndexOptions::builder()
         .root(root.as_ref())
         .output_null()
         .build();

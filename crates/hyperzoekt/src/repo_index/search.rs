@@ -120,7 +120,7 @@ mod tests {
         let e0 = StoredEntity {
             id: 0,
             file_id: 0,
-            kind: crate::internal::EntityKind::Function,
+            kind: crate::repo_index::indexer::types::EntityKind::Function,
             name: "foo".into(),
             parent: None,
             signature: "".into(),
@@ -133,7 +133,7 @@ mod tests {
         let e1 = StoredEntity {
             id: 1,
             file_id: 0,
-            kind: crate::internal::EntityKind::Function,
+            kind: crate::repo_index::indexer::types::EntityKind::Function,
             name: "bar".into(),
             parent: None,
             signature: "".into(),
@@ -158,7 +158,7 @@ mod tests {
             import_lines: vec![Vec::new(); 2],
             file_entities: vec![0],
             unresolved_imports: vec![Vec::new()],
-            rank_weights: crate::internal::RankWeights::default(),
+            rank_weights: crate::repo_index::indexer::types::RankWeights::default(),
         }
     }
 

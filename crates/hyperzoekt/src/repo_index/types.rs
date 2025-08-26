@@ -1,6 +1,6 @@
 // content moved from service/types.rs
 
-use crate::internal::{RepoIndexOptions, RepoIndexStats};
+use crate::repo_index::indexer::types::{RepoIndexOptions, RepoIndexStats};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -25,7 +25,7 @@ pub struct FileRecord {
 pub struct StoredEntity {
     pub id: u32,
     pub file_id: u32,
-    pub kind: crate::internal::EntityKind,
+    pub kind: crate::repo_index::indexer::types::EntityKind,
     pub name: String,
     pub parent: Option<String>,
     pub signature: String,
@@ -72,7 +72,7 @@ pub struct RepoIndexService {
     pub file_entities: Vec<u32>, // mapping file index -> file entity id
     // per-file unresolved imports as (module_basename, line)
     pub unresolved_imports: Vec<Vec<(String, u32)>>, // per file index unresolved module basenames with line numbers
-    pub rank_weights: crate::internal::RankWeights,  // configured (possibly env overridden) weights
+    pub rank_weights: crate::repo_index::indexer::types::RankWeights, // configured (possibly env overridden) weights
 }
 
 impl RepoIndexService {
