@@ -19,7 +19,9 @@ fn index_fixture_repo_writes_jsonl() {
     // but we will fall back to any .jsonl in .data/ when reading the results.
     cmd.env("RUST_LOG", "info")
         .arg("--incremental")
-        .arg(fixture)
+        .arg("--root")
+        .arg(&fixture)
+        .arg("--out")
         .arg(&preferred);
     cmd.assert().success();
 
@@ -193,7 +195,7 @@ fn index_fixture_repo_writes_jsonl() {
         // validate its line numbers.
         let top_level = objs.iter().find(|v| {
             v.get("language").and_then(|l| l.as_str()) == Some(lang)
-                && (v.get("parent").is_none() || v.get("parent").map_or(false, |p| p.is_null()))
+                && v.get("parent").is_none_or(|p| p.is_null())
         });
         assert!(
             top_level.is_some(),
@@ -230,7 +232,7 @@ fn index_fixture_repo_writes_jsonl() {
                     Some(suff) => v
                         .get("file")
                         .and_then(|f| f.as_str())
-                        .map_or(false, |fp| fp.ends_with(suff)),
+                        .is_some_and(|fp| fp.ends_with(suff)),
                     None => true,
                 }
         })
@@ -418,9 +420,9 @@ fn index_fixture_repo_writes_jsonl() {
         {
             if let Some(fe) = fmap.get(path) {
                 // start_line expectation (may be null)
-                if fe.get("start_line").map_or(true, |v| v.is_null()) {
+                if fe.get("start_line").is_none_or(|v| v.is_null()) {
                     assert!(
-                        file_ent.get("start_line").map_or(true, |v| v.is_null()),
+                        file_ent.get("start_line").is_none_or(|v| v.is_null()),
                         "expected start_line null for {} ({})",
                         lang,
                         path
@@ -437,9 +439,9 @@ fn index_fixture_repo_writes_jsonl() {
                     assert_eq!(fs, es, "start_line for {} ({})", lang, path);
                 }
 
-                if fe.get("end_line").map_or(true, |v| v.is_null()) {
+                if fe.get("end_line").is_none_or(|v| v.is_null()) {
                     assert!(
-                        file_ent.get("end_line").map_or(true, |v| v.is_null()),
+                        file_ent.get("end_line").is_none_or(|v| v.is_null()),
                         "expected end_line null for {} ({})",
                         lang,
                         path
@@ -501,10 +503,8 @@ fn index_fixture_repo_writes_jsonl() {
                     // helper to check parent equality (handles null)
                     let parent_matches = |o: &Value| -> bool {
                         match parent_val {
-                            Some(p) if p.is_null() => {
-                                o.get("parent").map_or(true, |pp| pp.is_null())
-                            }
-                            Some(p) => p.as_str().map_or(false, |ps| {
+                            Some(p) if p.is_null() => o.get("parent").is_none_or(|pp| pp.is_null()),
+                            Some(p) => p.as_str().is_some_and(|ps| {
                                 o.get("parent").and_then(|pp| pp.as_str()) == Some(ps)
                             }),
                             None => true,
@@ -560,9 +560,9 @@ fn index_fixture_repo_writes_jsonl() {
                     let fobj = found.unwrap();
 
                     // compare start_line (handle null expectation)
-                    if expected_start.map_or(true, |v| v.is_null()) {
+                    if expected_start.is_none_or(|v| v.is_null()) {
                         assert!(
-                            fobj.get("start_line").map_or(true, |v| v.is_null()),
+                            fobj.get("start_line").is_none_or(|v| v.is_null()),
                             "expected start_line null for {} in {}",
                             name,
                             file
@@ -579,9 +579,9 @@ fn index_fixture_repo_writes_jsonl() {
                     }
 
                     // compare end_line (handle null expectation)
-                    if expected_end.map_or(true, |v| v.is_null()) {
+                    if expected_end.is_none_or(|v| v.is_null()) {
                         assert!(
-                            fobj.get("end_line").map_or(true, |v| v.is_null()),
+                            fobj.get("end_line").is_none_or(|v| v.is_null()),
                             "expected end_line null for {} in {}",
                             name,
                             file

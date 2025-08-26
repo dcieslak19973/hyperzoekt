@@ -10,10 +10,10 @@ async fn surreal_initial_batch_inserts_entities() -> Result<(), Box<dyn std::err
 
     // Build index service using library API, target the example fixture
     let root = std::path::PathBuf::from("tests/fixtures/example-treesitter-repo");
-    let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
+    let mut opts_builder = hyperzoekt::repo_index::indexer::RepoIndexOptions::builder();
     opts_builder = opts_builder.root(&root).output_null();
     let (svc, _stats) =
-        hyperzoekt::service::RepoIndexService::build_with_options(opts_builder.build())?;
+        hyperzoekt::repo_index::RepoIndexService::build_with_options(opts_builder.build())?;
 
     // Build payloads similar to binary
     let mut payloads = Vec::new();
