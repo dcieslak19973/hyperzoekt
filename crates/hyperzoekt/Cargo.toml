@@ -18,7 +18,7 @@ tree-sitter-typescript = { version = "0.23", package = "tree-sitter-typescript" 
 tree-sitter-cpp = "0.23"
 tree-sitter-java = { version = "0.23", package = "tree-sitter-java" }
 tree-sitter-c-sharp = { version = "0.23", package = "tree-sitter-c-sharp" }
-tree-sitter-swift = { version = "0.6", package = "tree-sitter-swift" }
+tree-sitter-swift = { version = "0.7", package = "tree-sitter-swift" }
 tree-sitter-go = { version = "0.23", package = "tree-sitter-go" }
 tree-sitter-verilog = "1.0"
 
