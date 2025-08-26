@@ -9,6 +9,7 @@ RUN apt-get update \
   openssh-client \
   ca-certificates \
   curl \
+  strace \
   gnupg \
   apt-transport-https \
   jq \

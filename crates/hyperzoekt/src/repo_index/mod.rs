@@ -8,3 +8,5 @@ pub mod search;
 pub mod types;
 
 pub use types::{FileRecord, RepoEntity, RepoIndexService, StoredEntity};
+// Re-export indexer payload types at crate::repo_index::payload for convenience
+// payload types are available under `repo_index::indexer::payload`.

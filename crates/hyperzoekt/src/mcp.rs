@@ -44,15 +44,21 @@ pub fn run_mcp(
             rust_mcp_sdk::schema::ListToolsResult,
             rust_mcp_sdk::schema::RpcError,
         > {
+            log::info!("MCP handler: handle_list_tools_request invoked");
             // Advertise tools via a compatibility shim; keep SDK-native tools Vec empty to be safe.
             let mut _tools_arr: Vec<serde_json::Value> = Vec::new();
             _tools_arr.push(json!({"name":"search","title":"Search symbols by exact name","description":"Returns matching symbol definitions"}));
             _tools_arr.push(json!({"name":"usages","title":"Find usages of a symbol","description":"Returns definitions and nearby callers/callees for a symbol"}));
-            Ok(rust_mcp_sdk::schema::ListToolsResult {
+            let res = rust_mcp_sdk::schema::ListToolsResult {
                 meta: None,
                 next_cursor: None,
                 tools: Vec::new(),
-            })
+            };
+            log::info!(
+                "MCP handler: handle_list_tools_request responding (tools_count={})",
+                _tools_arr.len()
+            );
+            Ok(res)
         }
 
         async fn handle_call_tool_request(
@@ -64,6 +70,11 @@ pub fn run_mcp(
             rust_mcp_sdk::schema::schema_utils::CallToolError,
         > {
             let tool_name = request.params.name.as_str();
+            log::info!(
+                "MCP handler: handle_call_tool_request invoked for tool={} args={:?}",
+                tool_name,
+                request.params.arguments
+            );
 
             #[derive(Debug)]
             struct SimpleErr(String);
@@ -89,6 +100,10 @@ pub fn run_mcp(
                             meta: None,
                             structured_content: Some(map),
                         };
+                        log::info!(
+                            "MCP handler: search response prepared (count={})",
+                            results.len()
+                        );
                         return Ok(res);
                     }
                 }
@@ -147,6 +162,17 @@ pub fn run_mcp(
                             meta: None,
                             structured_content: Some(map),
                         };
+                        log::info!(
+                            "MCP handler: usages response prepared (usages_count={})",
+                            res.structured_content
+                                .as_ref()
+                                .map(|m| m
+                                    .get("usages")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0))
+                                .unwrap_or(0)
+                        );
                         return Ok(res);
                     }
                 }
@@ -166,17 +192,22 @@ pub fn run_mcp(
     if use_stdio {
         // Map transport errors into an anyhow::Error string to avoid moving
         // non-Sync error types into the anyhow::Error internals.
+        log::info!("MCP: creating stdio transport");
         let transport =
             rust_mcp_sdk::StdioTransport::new(rust_mcp_sdk::TransportOptions::default())
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        log::info!("MCP: stdio transport created");
         let handler = Handler { svc };
         let server = server_runtime::create_server(server_details, transport, handler);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        log::info!("MCP: starting stdio server runtime");
         rt.block_on(async move {
             if let Err(e) = server.start().await {
                 eprintln!("MCP stdio server failed: {}", e);
+            } else {
+                log::info!("MCP: server.start() returned Ok");
             }
             Ok::<(), anyhow::Error>(())
         })?;

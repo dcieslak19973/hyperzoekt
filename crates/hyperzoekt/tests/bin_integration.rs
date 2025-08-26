@@ -19,7 +19,9 @@ fn index_fixture_repo_writes_jsonl() {
     // but we will fall back to any .jsonl in .data/ when reading the results.
     cmd.env("RUST_LOG", "info")
         .arg("--incremental")
-        .arg(fixture)
+        .arg("--root")
+        .arg(&fixture)
+        .arg("--out")
         .arg(&preferred);
     cmd.assert().success();
 

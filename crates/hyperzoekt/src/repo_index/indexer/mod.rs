@@ -2,6 +2,7 @@ pub mod extract;
 pub mod helpers;
 pub mod index;
 pub mod langspec;
+pub mod payload;
 pub mod types;
 
 pub use extract::extract_entities;

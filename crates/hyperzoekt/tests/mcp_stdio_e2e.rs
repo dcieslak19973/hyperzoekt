@@ -1,127 +1,164 @@
-use assert_cmd::prelude::*;
-use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use rust_mcp_sdk::mcp_client::client_runtime as sdk_client_runtime;
+use rust_mcp_sdk::mcp_client::ClientHandler;
+use rust_mcp_sdk::schema::{
+    CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams,
+    LATEST_PROTOCOL_VERSION,
+};
+use rust_mcp_sdk::McpClient; // bring trait methods into scope
+use rust_mcp_sdk::{StdioTransport as SdkStdioTransport, TransportOptions};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
-// This test launches the hyperzoekt binary in MCP stdio mode and sends a
-// minimal CallToolRequest for the `search` tool, then verifies a valid
-// CallToolResult comes back.
-// This end-to-end stdio test is flaky in CI (MCP framing/transport timing). Mark as
-// ignored for now; we'll re-enable once the initialize/connect logic is hardened.
-#[test]
-#[ignore]
-fn mcp_stdio_search_e2e() -> Result<(), Box<dyn std::error::Error>> {
-    // Start the binary with --mcp_stdio; ensure dev build path
-    let mut cmd = Command::cargo_bin("hyperzoekt")?;
-    cmd.arg("--mcp-stdio")
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped());
+// This test launches the hyperzoekt binary in MCP stdio mode using the official
+// rust-mcp-sdk client runtime, then calls the `search` tool and validates a result.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_stdio_search_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    // 1) Create a client-side stdio transport that launches our server binary.
+    // Resolve server binary path: prefer Cargo-provided env var; else derive from current_exe
+    let server_cmd_path = std::env::var("CARGO_BIN_EXE_hyperzoekt")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let mut path = std::env::current_exe().expect("current_exe");
+            // target/debug/deps/<test> -> target/debug
+            if path.pop() { /* deps */ }
+            if path.pop() { /* debug */ }
+            path.push("hyperzoekt");
+            path
+        });
+    let server_cmd_path = server_cmd_path.canonicalize().unwrap_or(server_cmd_path);
+    println!("Launching MCP server: {}", server_cmd_path.display());
+    let server_cmd_str: String = server_cmd_path.to_string_lossy().into_owned();
+    let transport = SdkStdioTransport::create_with_server_launch(
+        &server_cmd_str,
+        vec!["--mcp-stdio".to_string()],
+        None,
+        TransportOptions::default(),
+    )?;
 
-    let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("child stdin");
-    let stdout = child.stdout.take().expect("child stdout");
+    // 2) Minimal client handler (use defaults).
+    struct TestClientHandler;
+    impl ClientHandler for TestClientHandler {}
 
-    // Spawn a thread to copy stderr for diagnostics
-    let child_stderr = child.stderr.take().expect("child stderr");
-    let err_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(child_stderr);
-        while let Ok(n) = r.read_line(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            eprint!("[child stderr] {}", buf);
-            buf.clear();
-        }
-    });
+    // 3) Initialize the MCP client runtime.
+    let client_info = InitializeRequestParams {
+        client_info: Implementation {
+            name: "hyperzoekt-e2e-client".to_string(),
+            version: "0.1.0".to_string(),
+            title: None,
+        },
+        capabilities: ClientCapabilities::default(),
+        protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
+    };
+    let client = sdk_client_runtime::create_client(client_info, transport, TestClientHandler);
 
-    // Reader thread to collect framed responses (Content-Length)
-    let mut reader = BufReader::new(stdout);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let _handle = thread::spawn(move || {
-        let res = (|| -> Result<serde_json::Value, String> {
-            // helper to read a single framed message
-            fn read_message<R: Read>(r: &mut BufReader<R>) -> Result<String, String> {
-                let mut header = String::new();
-                // Read header lines until we find a blank line
-                loop {
-                    let mut line = String::new();
-                    let n = r.read_line(&mut line).map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        return Err("EOF while reading header".to_string());
-                    }
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                    header.push_str(&line);
-                }
-                // parse Content-Length
-                for ln in header.lines() {
-                    if let Some(rest) = ln.strip_prefix("Content-Length:") {
-                        if let Ok(len) = rest.trim().parse::<usize>() {
-                            let mut buf = vec![0u8; len];
-                            r.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                            return String::from_utf8(buf).map_err(|e| e.to_string());
-                        }
-                    }
-                }
-                Err("no Content-Length header found".to_string())
-            }
+    // 4) Start the client (connects, performs initialize handshake).
+    let client_arc = client.clone();
+    // start() takes self: Arc<Self>, so use a clone to keep client_arc usable
+    client_arc.clone().start().await?;
 
-            // First message should be initialize/result or server's init response
-            let s = read_message(&mut reader)?;
-            let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-            Ok(v)
-        })();
-        // send the result back (ignore send errors)
-        let _ = tx.send(res);
-    });
+    // Sanity check initialize
+    let server_ver = client_arc.server_version();
+    assert!(
+        server_ver.is_some(),
+        "server did not report version after init"
+    );
+    assert_eq!(
+        client_arc.server_has_tools(),
+        Some(true),
+        "server missing tools"
+    );
 
-    // send a fake framed initialize request (we keep this minimal and hope the server
-    // responds quickly; building a full MCP client is more code than this test)
-    let init = json!({
-        "jsonrpc": "2.0",
-        "id": "init",
-        "method": "mcp/initialize",
-        "params": { "name": "test-client" }
-    })
-    .to_string();
-    // Write Content-Length header per MCP stdio (simple)
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", init.len(), init)?;
-    stdin.flush()?;
+    // 5) Call the `search` tool via the SDK.
+    let mut args: JsonMap<String, JsonValue> = JsonMap::new();
+    args.insert(
+        "q".to_string(),
+        JsonValue::String("nonexistent-symbol-xyz".to_string()),
+    );
+    let params = CallToolRequestParams {
+        name: "search".to_string(),
+        arguments: Some(args),
+    };
+    let res = client_arc
+        .call_tool(params)
+        .await
+        .expect("call_tool(search) failed");
 
-    // wait briefly for server to initialize
-    thread::sleep(Duration::from_millis(200));
-
-    // Now send a CallToolRequest for search
-    let call = json!({
-        "jsonrpc": "2.0",
-        "id": "1",
-        "method": "mcp/callTool",
-        "params": { "name": "search", "arguments": { "q": "nonexistent-symbol-xyz" } }
-    })
-    .to_string();
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", call.len(), call)?;
-    stdin.flush()?;
-
-    // Give the server some time to respond
-    thread::sleep(Duration::from_millis(300));
-
-    // Read initialize response (with a timeout)
-    let init_val = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("timeout waiting for init");
-    match init_val {
-        Ok(v) => assert!(v.get("server_info").is_some()),
-        Err(e) => panic!("reader error: {}", e),
+    // Validate structured_content shape: { "results": [ { name, path, line }, ... ] }
+    let sc = res
+        .structured_content
+        .expect("missing structured_content from search result");
+    let results = sc
+        .get("results")
+        .unwrap_or_else(|| panic!("structured_content missing 'results': {:?}", sc));
+    assert!(
+        results.is_array(),
+        "'results' must be an array, got: {}",
+        results
+    );
+    let arr = results.as_array().unwrap();
+    // For the nonexistent query we expect zero results, but if there are any, validate shape.
+    if let Some(first) = arr.first() {
+        assert!(
+            first.is_object(),
+            "result item should be an object: {}",
+            first
+        );
+        let obj = first.as_object().unwrap();
+        assert!(
+            obj.get("name").and_then(|v| v.as_str()).is_some(),
+            "missing string 'name' field"
+        );
+        assert!(
+            obj.get("path").and_then(|v| v.as_str()).is_some(),
+            "missing string 'path' field"
+        );
+        assert!(
+            obj.get("line").and_then(|v| v.as_u64()).is_some(),
+            "missing numeric 'line' field"
+        );
     }
 
-    // Tear down child
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = err_handle.join();
+    // Positive-case query: known symbol "search" should exist in this repository.
+    let mut args2: JsonMap<String, JsonValue> = JsonMap::new();
+    args2.insert("q".to_string(), JsonValue::String("search".to_string()));
+    let params2 = CallToolRequestParams {
+        name: "search".to_string(),
+        arguments: Some(args2),
+    };
+    let res2 = client_arc
+        .call_tool(params2)
+        .await
+        .expect("call_tool(search q=search) failed");
+    let sc2 = res2
+        .structured_content
+        .expect("missing structured_content from search result (positive)");
+    let results2 = sc2
+        .get("results")
+        .unwrap_or_else(|| panic!("structured_content missing 'results': {:?}", sc2));
+    assert!(results2.is_array(), "'results' must be an array");
+    let arr2 = results2.as_array().unwrap();
+    assert!(
+        !arr2.is_empty(),
+        "expected at least one result for query 'search'"
+    );
+    let first2 = arr2[0]
+        .as_object()
+        .expect("first result should be an object");
+    let name2 = first2
+        .get("name")
+        .and_then(|v| v.as_str())
+        .expect("result missing string 'name'");
+    let path2 = first2
+        .get("path")
+        .and_then(|v| v.as_str())
+        .expect("result missing string 'path'");
+    assert_eq!(name2, "search", "first result name should be 'search'");
+    assert!(
+        path2.contains("repo_index/search.rs"),
+        "path should contain repo_index/search.rs, got: {}",
+        path2
+    );
+
+    // 6) Shutdown cleanly to avoid flaky hangs in CI.
+    client_arc.shut_down().await?;
     Ok(())
 }
