@@ -1,4 +1,4 @@
-// Service module facade — re-export smaller modules for clarity.
+// Service (renamed to repo_index) module facade — re-export smaller modules for clarity.
 
 pub mod builder;
 pub mod graph;

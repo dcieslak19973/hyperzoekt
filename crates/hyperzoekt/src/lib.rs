@@ -3,6 +3,6 @@
 #![allow(dead_code)]
 
 pub mod internal;
-pub mod service;
-pub use service::RepoIndexService;
+pub mod repo_index;
+pub use repo_index::RepoIndexService;
 pub mod mcp;

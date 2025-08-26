@@ -13,7 +13,7 @@ async fn surreal_initial_batch_inserts_entities() -> Result<(), Box<dyn std::err
     let mut opts_builder = hyperzoekt::internal::RepoIndexOptions::builder();
     opts_builder = opts_builder.root(&root).output_null();
     let (svc, _stats) =
-        hyperzoekt::service::RepoIndexService::build_with_options(opts_builder.build())?;
+        hyperzoekt::repo_index::RepoIndexService::build_with_options(opts_builder.build())?;
 
     // Build payloads similar to binary
     let mut payloads = Vec::new();

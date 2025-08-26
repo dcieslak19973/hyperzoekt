@@ -1,7 +1,7 @@
 // ...existing code...
 
 use clap::Parser;
-use hyperzoekt::service::RepoIndexService;
+use hyperzoekt::repo_index::RepoIndexService;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::File;

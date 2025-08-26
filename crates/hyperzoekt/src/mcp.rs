@@ -1,4 +1,4 @@
-use crate::service::RepoIndexService;
+use crate::repo_index::RepoIndexService;
 use async_trait::async_trait;
 use rust_mcp_sdk::mcp_server::{hyper_server, server_runtime, HyperServerOptions};
 use rust_mcp_sdk::schema::{

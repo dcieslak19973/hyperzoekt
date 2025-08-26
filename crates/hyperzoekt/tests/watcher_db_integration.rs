@@ -1,4 +1,4 @@
-use hyperzoekt::service::RepoIndexService;
+use hyperzoekt::repo_index::RepoIndexService;
 use surrealdb::engine::local::Mem;
 use surrealdb::Surreal;
 use tempfile::tempdir;

@@ -1,4 +1,4 @@
-use hyperzoekt::service::RepoIndexService;
+use hyperzoekt::repo_index::RepoIndexService;
 
 #[test]
 fn debug_find_may_fail_and_caller() {
