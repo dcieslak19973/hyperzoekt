@@ -1,4 +1,4 @@
-ZOOKT Benchmarking
+ZOEKT Benchmarking
 ===================
 
 This document explains the benchmarking tools included in the `zoekt` crates and the JSON output format produced by the bench tools (`zr-query-bench`, `zr-bench`) and how `zr-compare-bench` consumes that output.

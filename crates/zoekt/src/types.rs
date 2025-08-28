@@ -9,6 +9,16 @@ pub struct RepoMeta {
     pub branches: Vec<String>,
 }
 
+/// A discovered symbol inside a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Symbol {
+    pub name: String,
+    /// byte offset where the symbol name starts in the file (if available)
+    pub start: Option<u32>,
+    /// 1-based line number containing the symbol (if available)
+    pub line: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMeta {
     pub path: PathBuf,
@@ -16,8 +26,8 @@ pub struct DocumentMeta {
     pub size: u64,
     /// Branches this document is present in. For in-memory index builder we default to ["HEAD"].
     pub branches: Vec<String>,
-    /// Extracted top-level symbol names (naive) for select=symbol
-    pub symbols: Vec<String>,
+    /// Extracted top-level symbols (name + offset) for select=symbol
+    pub symbols: Vec<Symbol>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

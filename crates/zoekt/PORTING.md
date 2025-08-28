@@ -83,6 +83,65 @@ CLI naming:
 - Observability: metrics, tracing spans, debug flags/endpoints, index stats dumps.
 - CLI parity: indexer flags, merge/compactor, shard inspector, compatibility aides.
 
+Status annotations (current implementation highlights)
+
+- Query language/filters: [Done/Partial]
+   - repo/file/lang parsing and filtering are implemented in `QueryPlan::parse` and `Searcher::search_plan` (supports exact, glob, regex and case handling).
+   - `branch:` parsing and early rejection logic exist, but the in-memory `IndexBuilder` currently sets per-document `branches = ["HEAD"]` only. Multi-branch indexing input is not yet plumbed.
+   - `path-only` is implemented; `content-only` flag exists but is not enforced consistently everywhere. Action: add explicit `content_only` semantics and tests.
+
+- select=repo|file|symbol: [Partial]
+   - `select=repo` and `select=file` are implemented.
+   - `select=symbol` emits `DocumentMeta.symbols` for matched docs, but symbols are populated by a naive regex extractor and are not indexed (no symbol postings/trigram), and symbol results are not filtered by the query pattern. Action: small PR to filter symbols by pattern and respect case-sensitivity; medium PR to add symbol postings/trigram prefilter.
+
+- Symbol extraction: [Partial]
+   - A simple regex-based extractor exists for Rust/Go/Python (`extract_symbols` in `index.rs`). The repo contains typesitter/tree-sitter ASTs and a recommended plan for a typesitter-backed extractor (higher fidelity). Action: add an opt-in typesitter extractor module and tests for Go/Rust/Python.
+
+- Regex prefiltering: [Partial]
+   - Basic trigram prefilter support exists in `ShardSearcher` and the `regex_analyze` helper, but parity with Go's robust prefiltering (edge cases and small trigram sets) needs more tests and hardening. Action: add Go-derived regex testcases and tighten `prefilter_from_regex` handling.
+
+- Match fidelity and context: [Partial]
+   - `ShardSearcher` supports line-index-based context extraction and `SearchMatch` ranges; in-memory `Searcher` fallbacks read files directly. Action: add tests for byte/rune offsets, multi-byte characters, and deduplication semantics.
+
+- Shard format / versioning: [Implemented]
+   - `ShardWriter`/`ShardReader` implement a binary format (current `VERSION = 4`) with metadata (repo name/root/hash/branches) and line index. Reader returns contextual errors on corruption. Action: add `zr-inspect` and clearer version-mismatch error messages; consider a migration path for older formats.
+
+- Shard-writer performance: [Todo / Recommendations present]
+   - Current writer is correct but not optimized (reads files per-doc, writes with backpatching). `PORTING.md` contains prioritized optimizations (single-read-per-file, buffered writes, remove per-doc backpatching, parallelize). Action: implement low-risk writer optimizations behind a flag and add microbenchmarks.
+
+- Incremental/multi-branch indexing & lifecycle: [Todo]
+   - Watch-based updates, merges/compaction, and multi-branch/document branch metadata are not implemented. Action: add `--branch`/manifest support to `zr-index`, populate per-doc `branches`, and add simple merge/compact tooling.
+
+- Tests & parity: [Partial]
+   - There are shard roundtrip and corruption tests; broader parity tests versus Go Zoekt (queries, tricky regexes, symbol accuracy, branch selection) are missing. Action: add Go-derived golden fixtures and per-query expected outputs in `crates/zoekt/tests/fixtures` and a small CI job.
+
+Actionable next steps (small PRs, rank-ordered)
+
+1) Symbol-filtering small PR (low risk)
+    - Filter `DocumentMeta.symbols` by pattern (literal/regex) when `select=symbol` is requested, honor `case_sensitive`, and add unit tests.
+
+2) Content-only semantics (low risk)
+    - Make `content_only` an explicit gate that disables path-matching and add tests that assert path vs content behavior.
+
+3) Shard-writer quick perf pass (low risk)
+    - Read each file once, buffer section writes via `BufWriter` (or in-memory section buffers), and remove per-doc backpatching; add microbench timings.
+
+4) Typesitter-backed symbol extractor (stageable)
+    - Add an opt-in extractor module, wire into `IndexBuilder` via a feature flag or runtime selection, and add per-language fixtures/tests.
+
+5) Regex prefilter hardening & parity tests
+    - Add Go-derived regex edge-case tests, iterate `regex_analyze::prefilter_from_regex`, and ensure `ShardSearcher`/`InMemoryIndex` use prefilter results before full scans.
+
+6) Multi-branch and lifecycle plumbing
+    - Add `--branch/manifest` support to `zr-index`, populate per-doc `branches`, and add query-time branch tests.
+
+7) Observability & CLI parity
+    - Add `zr-inspect` to dump shard headers, include basic timing metrics in `zr-search`, and add a `zr-merge`/compact proof-of-concept.
+
+Notes
+- The current codebase already implements a useful core: query parsing, trigrams, shard read/write, and simple symbol extraction. The prioritized small PRs above are designed to be low-risk and test-covered to incrementally reach parity with upstream Zoekt (excluding WebUI).
+
+
 ## Prioritized roadmap
 
 1) Query correctness and filters (High value, low risk)
@@ -150,3 +209,31 @@ CLI naming:
    - Run `cargo bench`/`zr-query-bench` on a small corpus to measure indexing cost and iterate on parallelism and parser instance reuse.
 
 Implementing typesitter-based extraction first for high-value languages (Go, Rust, Python, JavaScript/TypeScript) and falling back to regex elsewhere will give the best balance of accuracy and engineering cost.
+
+### Shard writer performance (practical optimizations)
+
+The current `ShardWriter::write_from_index` is straightforward and correct, but it can be significantly faster with a few pragmatic changes. Prioritized list (highest impact first):
+
+- Read each file only once and reuse the bytes for trigram extraction, line-start computation and hash accumulation. Avoid re-reading the same file multiple times.
+- Batch writes: replace many small `write_all` calls with buffered or chunked writes (use `std::io::BufWriter` or assemble per-section `Vec<u8>` buffers and write them once). This reduces syscall overhead dramatically.
+- Eliminate per-doc seek/backpatch cycles. Either compute section sizes up-front (walk in-memory structures to get lengths) or build sections into in-memory buffers and write the line-index block in a single pass (record offsets in-memory while building data).
+- Parallelize per-file CPU work (trigram extraction, line table building, hashing) with a thread pool (rayon) and then merge results into global postings. This uses multicore hardware to reduce wall-clock time.
+- Use more efficient in-memory postings builders: accumulate per-file postings and append to per-trigram vectors, use smallvec-like storage for short lists, and avoid heavy nested maps during the hot loop.
+- Serialize postings compactly (delta + varint) and optionally compress large sections (zstd/snappy) if IO-bound. Consider deterministic ordering to simplify merging.
+- For very large shards, consider pre-sizing the output file and writing via `mmap` or writing large contiguous chunks to minimize kernel copy overhead.
+
+Quick, low-risk first steps to implement (recommended order):
+
+1. Stop rereading files: read file bytes once and reuse them for all per-file work.
+2. Wrap the writer in `BufWriter` and batch per-section writes into moderate-sized buffers (a few MB) before flushing.
+3. Replace seek/backpatch per-doc with either a precomputed offset pass or by writing the line index after the data sections in a single write.
+4. Add simple per-file parallelism around trigram/line/hash extraction (configurable worker count).
+
+Measure and validate: add microtimers around (a) file reading/parsing, (b) posting assembly, (c) serialization/writes. Use `zr-query-bench` or a small harness and flamegraphs to confirm where to invest further.
+
+Notes and trade-offs:
+- Buffering increases peak memory; use chunking for very large repos.
+- Compression trades CPU for IO; useful when disks or network are the bottleneck.
+- Keep the on-disk format versioned so you can adopt compact encodings later behind a version flag.
+
+Implement these changes incrementally (feature-flagged or behind a config) and add benchmarks to avoid regressions.

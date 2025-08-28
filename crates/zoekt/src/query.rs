@@ -19,7 +19,10 @@ pub enum Query {
 pub struct QueryResult {
     pub doc: RepoDocId,
     pub path: String,
+    /// symbol name (if this result is a symbol-select)
     pub symbol: Option<String>,
+    /// optional symbol location with offsets/line when available
+    pub symbol_loc: Option<crate::types::Symbol>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,6 +157,7 @@ impl<'a> Searcher<'a> {
                     doc: d,
                     path: meta.path.display().to_string(),
                     symbol: None,
+                    symbol_loc: None,
                 })
             })
             .collect()
@@ -348,23 +352,178 @@ impl<'a> Searcher<'a> {
                         doc: 0,
                         path: inner.repo.name.clone(),
                         symbol: None,
+                        symbol_loc: None,
                     }]
                 }
             }
             SelectKind::Symbol => {
-                // emit one result per symbol in filtered docs
-                let mut out = Vec::new();
+                let mut out: Vec<QueryResult> = Vec::new();
+
+                if let Some(pat) = &plan.pattern {
+                    // prefilter candidate docs using symbol trigrams when possible
+                    let mut cand_docs: Option<Vec<RepoDocId>> = None;
+                    if plan.regex {
+                        // heuristic: extract alnum substrings >=3 from regex
+                        let mut subs: Vec<String> = Vec::new();
+                        let mut cur = String::new();
+                        for ch in pat.chars() {
+                            if ch.is_alphanumeric() {
+                                cur.push(ch);
+                            } else {
+                                if cur.len() >= 3 {
+                                    subs.push(cur.clone());
+                                }
+                                cur.clear();
+                            }
+                        }
+                        if cur.len() >= 3 {
+                            subs.push(cur);
+                        }
+                        if let Some(sub) = subs.first() {
+                            let tris: Vec<[u8; 3]> = crate::trigram::trigrams(sub).collect();
+                            if !tris.is_empty() {
+                                for t in tris {
+                                    if let Some(list) = inner.symbol_trigrams.get(&t) {
+                                        let mut docs: Vec<RepoDocId> = list.clone();
+                                        docs.sort_unstable();
+                                        docs.dedup();
+                                        cand_docs = Some(match cand_docs {
+                                            None => docs,
+                                            Some(prev) => intersect_sorted(&prev, &docs),
+                                        });
+                                    } else {
+                                        cand_docs = Some(Vec::new());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let tris: Vec<[u8; 3]> = crate::trigram::trigrams(pat).collect();
+                        if !tris.is_empty() {
+                            for t in tris {
+                                if let Some(list) = inner.symbol_trigrams.get(&t) {
+                                    let mut docs: Vec<RepoDocId> = list.clone();
+                                    docs.sort_unstable();
+                                    docs.dedup();
+                                    cand_docs = Some(match cand_docs {
+                                        None => docs,
+                                        Some(prev) => intersect_sorted(&prev, &docs),
+                                    });
+                                } else {
+                                    cand_docs = Some(Vec::new());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(cdocs) = cand_docs {
+                        let filtered_set: std::collections::HashSet<RepoDocId> =
+                            filtered.iter().copied().collect();
+                        for d in cdocs.into_iter().filter(|d| filtered_set.contains(d)) {
+                            if let Some(meta) = inner.docs.get(d as usize) {
+                                if plan.regex {
+                                    let mut pat_s = pat.clone();
+                                    if !plan.case_sensitive && !pat_s.starts_with("(?i)") {
+                                        pat_s = format!("(?i){}", pat_s);
+                                    }
+                                    if let Ok(re) = Regex::new(&pat_s) {
+                                        for sym in &meta.symbols {
+                                            if re.is_match(&sym.name) {
+                                                out.push(QueryResult {
+                                                    doc: d,
+                                                    path: meta.path.display().to_string(),
+                                                    symbol: Some(sym.name.clone()),
+                                                    symbol_loc: Some(sym.clone()),
+                                                });
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let nee = if plan.case_sensitive {
+                                        pat.clone()
+                                    } else {
+                                        pat.to_lowercase()
+                                    };
+                                    for sym in &meta.symbols {
+                                        let hay = if plan.case_sensitive {
+                                            sym.name.clone()
+                                        } else {
+                                            sym.name.to_lowercase()
+                                        };
+                                        if hay.contains(&nee) {
+                                            out.push(QueryResult {
+                                                doc: d,
+                                                path: meta.path.display().to_string(),
+                                                symbol: Some(sym.name.clone()),
+                                                symbol_loc: Some(sym.clone()),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    // fallthrough to full scan if cand_docs was None or empty
+                }
+
                 for d in filtered {
                     if let Some(meta) = inner.docs.get(d as usize) {
-                        for sym in &meta.symbols {
-                            out.push(QueryResult {
-                                doc: d,
-                                path: meta.path.display().to_string(),
-                                symbol: Some(sym.clone()),
-                            });
+                        if let Some(pat) = &plan.pattern {
+                            if plan.regex {
+                                let mut pat_s = pat.clone();
+                                if !plan.case_sensitive && !pat_s.starts_with("(?i)") {
+                                    pat_s = format!("(?i){}", pat_s);
+                                }
+                                if let Ok(re) = Regex::new(&pat_s) {
+                                    for sym in &meta.symbols {
+                                        if re.is_match(&sym.name) {
+                                            out.push(QueryResult {
+                                                doc: d,
+                                                path: meta.path.display().to_string(),
+                                                symbol: Some(sym.name.clone()),
+                                                symbol_loc: Some(sym.clone()),
+                                            });
+                                        }
+                                    }
+                                }
+                            } else {
+                                let nee = if plan.case_sensitive {
+                                    pat.clone()
+                                } else {
+                                    pat.to_lowercase()
+                                };
+                                for sym in &meta.symbols {
+                                    let hay = if plan.case_sensitive {
+                                        sym.name.clone()
+                                    } else {
+                                        sym.name.to_lowercase()
+                                    };
+                                    if hay.contains(&nee) {
+                                        out.push(QueryResult {
+                                            doc: d,
+                                            path: meta.path.display().to_string(),
+                                            symbol: Some(sym.name.clone()),
+                                            symbol_loc: Some(sym.clone()),
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            for sym in &meta.symbols {
+                                out.push(QueryResult {
+                                    doc: d,
+                                    path: meta.path.display().to_string(),
+                                    symbol: Some(sym.name.clone()),
+                                    symbol_loc: Some(sym.clone()),
+                                });
+                            }
                         }
                     }
                 }
+
                 out
             }
             SelectKind::File => filtered
@@ -374,6 +533,7 @@ impl<'a> Searcher<'a> {
                         doc: d,
                         path: meta.path.display().to_string(),
                         symbol: None,
+                        symbol_loc: None,
                     })
                 })
                 .collect(),

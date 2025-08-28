@@ -155,6 +155,17 @@ fn run_query_on_shard(rdr: &ShardReader, q: &Query) -> Vec<u32> {
     }
 }
 
+fn run_symbol_select_on_shard(
+    rdr: &ShardReader,
+    pattern: &str,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Vec<u32> {
+    let s = ShardSearcher::new(rdr);
+    let res = s.search_symbols_prefiltered(Some(pattern), is_regex, case_sensitive);
+    res.into_iter().map(|r| r.doc).collect()
+}
+
 #[derive(Parser)]
 struct Opts {
     /// Path to index root (will be built if path doesn't contain an index)
@@ -183,6 +194,12 @@ struct Opts {
     /// How many iterations between verbose heartbeat messages
     #[clap(long, default_value = "10")]
     verbose_every: usize,
+    /// Optional description to include in output JSON
+    #[clap(long)]
+    description: Option<String>,
+    /// When set, write two shards (with and without symbol postings) and compare symbol-select timings
+    #[clap(long)]
+    compare_symbol_postings: bool,
 }
 
 // result structs are emitted via serde_json::json!
@@ -352,6 +369,137 @@ fn main() -> anyhow::Result<()> {
                 "rss_kb_after": rss_after,
             }));
         }
+
+        // Additionally, run a small symbol-select benchmark suite when in shard mode.
+        let symbol_patterns = [
+            ("DoThing", false, true),
+            ("dothing", false, false),
+            ("Foo", false, false),
+            ("^DoThing$", true, true),
+        ];
+        let mut symbol_results = Vec::new();
+        for (pat, is_re, cs) in symbol_patterns.iter() {
+            let mut times = Vec::new();
+            // warmups
+            for _ in 0..opts.warmup {
+                if total_start.elapsed() >= budget {
+                    break;
+                }
+                let _ = run_symbol_select_on_shard(&rdr, pat, *is_re, *cs);
+            }
+            for _ in 0..opts.iters {
+                if total_start.elapsed() >= budget {
+                    break;
+                }
+                let start = Instant::now();
+                let _ = run_symbol_select_on_shard(&rdr, pat, *is_re, *cs);
+                times.push(start.elapsed().as_micros());
+            }
+            let mut times_copy = times.clone();
+            let mean = mean_ms(&times_copy);
+            let median = pctile_ms(&mut times_copy, 0.5);
+            let p95 = pctile_ms(&mut times_copy, 0.95);
+            symbol_results.push(json!({
+                "pattern": pat,
+                "is_regex": is_re,
+                "case_sensitive": cs,
+                "iters": opts.iters,
+                "completed_iters": times.len(),
+                "times_us": times,
+                "mean_ms": mean,
+                "median_ms": median,
+                "p95_ms": p95,
+            }));
+        }
+        // attach symbol results to overall results
+        results.push(json!({ "symbol_select_results": symbol_results }));
+
+        // If compare_symbol_postings requested, write a second shard without symbol postings
+        if opts.compare_symbol_postings {
+            println!("compare_symbol_postings: generating no-symbols shard...");
+            let dir = opts.path.join(".data");
+            std::fs::create_dir_all(&dir)?;
+            let shard_with = dir.join("index-with-symbols.shard");
+            let shard_without = dir.join("index-no-symbols.shard");
+            // write both shards synchronously here to avoid thread complexity in the benchmark flow
+            ShardWriter::new(&shard_with).write_from_index_with_options(&idx, true)?;
+            ShardWriter::new(&shard_without).write_from_index_with_options(&idx, false)?;
+
+            let rdr_with = ShardReader::open(&shard_with)?;
+            let rdr_without = ShardReader::open(&shard_without)?;
+
+            // run the same symbol patterns on both and collect results
+            let symbol_patterns = [
+                ("DoThing", false, true),
+                ("dothing", false, false),
+                ("Foo", false, false),
+                ("^DoThing$", true, true),
+            ];
+            let mut with_results = Vec::new();
+            let mut without_results = Vec::new();
+            for (pat, is_re, cs) in symbol_patterns.iter() {
+                // with postings
+                let mut times = Vec::new();
+                for _ in 0..opts.warmup {
+                    if total_start.elapsed() >= budget {
+                        break;
+                    }
+                    let _ = run_symbol_select_on_shard(&rdr_with, pat, *is_re, *cs);
+                }
+                for _ in 0..opts.iters {
+                    if total_start.elapsed() >= budget {
+                        break;
+                    }
+                    let start = Instant::now();
+                    let _ = run_symbol_select_on_shard(&rdr_with, pat, *is_re, *cs);
+                    times.push(start.elapsed().as_micros());
+                }
+                let mut tcopy = times.clone();
+                with_results.push(json!({
+                    "pattern": pat,
+                    "is_regex": is_re,
+                    "case_sensitive": cs,
+                    "times_us": times,
+                    "mean_ms": mean_ms(&tcopy),
+                    "median_ms": pctile_ms(&mut tcopy, 0.5),
+                    "p95_ms": pctile_ms(&mut tcopy, 0.95),
+                }));
+
+                // without postings
+                let mut times2 = Vec::new();
+                for _ in 0..opts.warmup {
+                    if total_start.elapsed() >= budget {
+                        break;
+                    }
+                    let _ = run_symbol_select_on_shard(&rdr_without, pat, *is_re, *cs);
+                }
+                for _ in 0..opts.iters {
+                    if total_start.elapsed() >= budget {
+                        break;
+                    }
+                    let start = Instant::now();
+                    let _ = run_symbol_select_on_shard(&rdr_without, pat, *is_re, *cs);
+                    times2.push(start.elapsed().as_micros());
+                }
+                let mut tcopy2 = times2.clone();
+                without_results.push(json!({
+                    "pattern": pat,
+                    "is_regex": is_re,
+                    "case_sensitive": cs,
+                    "times_us": times2,
+                    "mean_ms": mean_ms(&tcopy2),
+                    "median_ms": pctile_ms(&mut tcopy2, 0.5),
+                    "p95_ms": pctile_ms(&mut tcopy2, 0.95),
+                }));
+            }
+            // attach compare results
+            results.push(json!({
+                "symbol_compare": {
+                    "with_postings": with_results,
+                    "without_postings": without_results,
+                }
+            }));
+        }
     } else {
         // use in-memory index for searching
         index_elapsed_ms = Some(ib_dur.as_millis());
@@ -447,7 +595,8 @@ fn main() -> anyhow::Result<()> {
 
     let out = json!({
         "timestamp_ms": now,
-        "path": opts.path.display().to_string(),
+    "path": opts.path.display().to_string(),
+    "description": opts.description,
     "results": results,
     // index metadata
     "index_path": index_path,

@@ -11,6 +11,10 @@ pub struct InMemoryIndexInner {
     pub repo: RepoMeta,
     pub docs: Vec<DocumentMeta>,
     pub terms: HashMap<String, Vec<RepoDocId>>, // unsorted, no positions (yet)
+    /// symbol term map (lowercased symbol -> doc ids)
+    pub symbol_terms: HashMap<String, Vec<RepoDocId>>,
+    /// trigram -> doc ids for symbols (used as a prefilter)
+    pub symbol_trigrams: HashMap<[u8; 3], Vec<RepoDocId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +191,8 @@ impl IndexBuilder {
 
         // Very naive tokenization: split on non-word, build term->docids map
         let mut acc: HashMap<String, Vec<RepoDocId>> = HashMap::new();
+        let mut symbol_terms: HashMap<String, Vec<RepoDocId>> = HashMap::new();
+        let mut symbol_trigrams: HashMap<[u8; 3], Vec<RepoDocId>> = HashMap::new();
         // Tokenize only text-like files. Use a small heuristic to skip binary files.
         for (i, meta) in docs.iter().enumerate() {
             let path = self.root.join(&meta.path);
@@ -224,6 +230,21 @@ impl IndexBuilder {
             }
         }
 
+        // After symbols are populated in `docs`, build symbol term/trigram maps
+        for (i, meta) in docs.iter().enumerate() {
+            for sym in &meta.symbols {
+                let key = sym.name.to_lowercase();
+                symbol_terms
+                    .entry(key.clone())
+                    .or_default()
+                    .push(i as RepoDocId);
+                // trigram prefilter on symbol name
+                for tri in crate::trigram::trigrams(&sym.name) {
+                    symbol_trigrams.entry(tri).or_default().push(i as RepoDocId);
+                }
+            }
+        }
+
         fn is_text(buf: &[u8]) -> bool {
             // Reject if NUL present
             if buf.contains(&0) {
@@ -246,6 +267,8 @@ impl IndexBuilder {
             repo,
             docs,
             terms: acc,
+            symbol_terms,
+            symbol_trigrams,
         };
         Ok(InMemoryIndex {
             inner: std::sync::Arc::new(RwLock::new(inner)),
@@ -253,39 +276,72 @@ impl IndexBuilder {
     }
 }
 
-fn extract_symbols(content: &str, ext: &str) -> Vec<String> {
+fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
     let mut out = Vec::new();
     if ext == "rs" {
-        let re_fn = Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-        let re_struct = Regex::new(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        // allow Unicode identifier characters using XID properties
+        let re_fn = Regex::new(r"\bfn\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
+        let re_struct = Regex::new(r"\bstruct\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
         for cap in re_fn.captures_iter(content) {
             if let Some(m) = cap.get(1) {
-                out.push(m.as_str().to_string());
+                out.push(crate::types::Symbol {
+                    name: m.as_str().to_string(),
+                    start: Some(m.start() as u32),
+                    line: Some(line_for_offset(content, m.start() as u32) as u32 + 1),
+                });
             }
         }
         for cap in re_struct.captures_iter(content) {
             if let Some(m) = cap.get(1) {
-                out.push(m.as_str().to_string());
+                out.push(crate::types::Symbol {
+                    name: m.as_str().to_string(),
+                    start: Some(m.start() as u32),
+                    line: Some(line_for_offset(content, m.start() as u32) as u32 + 1),
+                });
             }
         }
     } else if ext == "py" {
-        let re = Regex::new(r"^(?:\s*)(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        let re = Regex::new(r"^(?:\s*)(?:def|class)\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
+        let mut offset = 0usize;
         for line in content.lines() {
             if let Some(cap) = re.captures(line) {
                 if let Some(m) = cap.get(1) {
-                    out.push(m.as_str().to_string());
+                    out.push(crate::types::Symbol {
+                        name: m.as_str().to_string(),
+                        start: Some((offset + m.start()) as u32),
+                        line: Some((out.len() as u32) + 1),
+                    });
                 }
             }
+            offset += line.len() + 1; // approximate line length + newline
         }
     } else if ext == "go" {
-        let re = Regex::new(r"\bfunc(?:\s*\(.*?\))?\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        let re = Regex::new(r"\bfunc(?:\s*\(.*?\))?\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
         for cap in re.captures_iter(content) {
             if let Some(m) = cap.get(1) {
-                out.push(m.as_str().to_string());
+                out.push(crate::types::Symbol {
+                    name: m.as_str().to_string(),
+                    start: Some(m.start() as u32),
+                    line: Some(line_for_offset(content, m.start() as u32) as u32 + 1),
+                });
             }
         }
     }
     out
+}
+
+// Helper to compute line index (0-based) for a byte offset within content
+fn line_for_offset(content: &str, pos: u32) -> usize {
+    let bytes = content.as_bytes();
+    let mut idx = 0usize;
+    let mut line = 0usize;
+    while idx < bytes.len() && (idx as u32) < pos {
+        if bytes[idx] == b'\n' {
+            line += 1;
+        }
+        idx += 1;
+    }
+    line
 }
 
 fn detect_lang_from_ext(path: &std::path::Path) -> Option<String> {

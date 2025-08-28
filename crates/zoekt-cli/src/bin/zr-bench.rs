@@ -29,6 +29,9 @@ struct Opts {
     /// Write a shard file after indexing to <path>/.data/index.shard
     #[clap(long)]
     write_shard: bool,
+    /// Optional description to include in output JSON
+    #[clap(long)]
+    description: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
     let out = json!({
         "timestamp_ms": now,
         "path": repo.display().to_string(),
+    "description": opts.description,
         "docs": idx.doc_count(),
         "scanned_bytes": scanned_bytes,
         "elapsed_ms": dur.as_millis(),

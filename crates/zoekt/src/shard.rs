@@ -26,8 +26,14 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+// Type aliases to reduce clippy::type_complexity warnings.
+type SymbolTuple = (String, Option<u32>, Option<u32>);
+type SymbolsTable = Vec<Vec<SymbolTuple>>;
+type PostingsMap = HashMap<[u8; 3], BTreeMap<u32, Vec<u32>>>;
+type SymbolPostingsMap = HashMap<[u8; 3], Vec<u32>>;
+
 const MAGIC: u32 = 0x5a4f_454b; // 'ZOEK'
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 pub struct ShardWriter {
     path: PathBuf,
@@ -41,6 +47,15 @@ impl ShardWriter {
     }
 
     pub fn write_from_index(&self, idx: &InMemoryIndex) -> Result<()> {
+        self.write_from_index_with_options(idx, true)
+    }
+
+    /// Write shard with option to include symbol trigram postings.
+    pub fn write_from_index_with_options(
+        &self,
+        idx: &InMemoryIndex,
+        include_symbol_postings: bool,
+    ) -> Result<()> {
         let mut f = File::create(&self.path).context("create shard file")?;
         let inner = idx.read_inner();
         // Header placeholders; we'll fill offsets after writing sections.
@@ -68,7 +83,7 @@ impl ShardWriter {
         }
 
         // Build postings: trigram -> BTreeMap<doc, Vec<u32 /*pos*/>>
-        let mut term_map: HashMap<[u8; 3], BTreeMap<RepoDocId, Vec<u32>>> = HashMap::new();
+        let mut term_map: PostingsMap = HashMap::new();
         // Build line starts per doc (byte offsets)
         let mut lines_per_doc: Vec<Vec<u32>> = Vec::with_capacity(inner.docs.len());
         for (i, meta) in inner.docs.iter().enumerate() {
@@ -96,8 +111,9 @@ impl ShardWriter {
             lines_per_doc.push(starts);
         }
 
-        // Write postings section
+        // Write postings section: first content trigrams, then symbol trigrams (optional).
         let postings_off = f.stream_position()?;
+        // content trigrams
         f.write_all(&(term_map.len() as u32).to_le_bytes())?;
         for (tri, postings) in term_map.iter() {
             f.write_all(tri)?; // 3 bytes
@@ -109,6 +125,25 @@ impl ShardWriter {
                     f.write_all(&p.to_le_bytes())?;
                 }
             }
+        }
+        if include_symbol_postings {
+            // symbol trigrams: write a second map with doc lists (npos may be zero)
+            let sym_map = &inner.symbol_trigrams;
+            f.write_all(&(sym_map.len() as u32).to_le_bytes())?;
+            for (tri, docs) in sym_map.iter() {
+                f.write_all(tri)?;
+                // docs is Vec<RepoDocId>
+                f.write_all(&(docs.len() as u32).to_le_bytes())?;
+                for d in docs.iter() {
+                    let doc = *d;
+                    f.write_all(&doc.to_le_bytes())?;
+                    // write zero positions to keep the same per-doc format
+                    f.write_all(&0u32.to_le_bytes())?;
+                }
+            }
+        } else {
+            // write zero symbol map
+            f.write_all(&0u32.to_le_bytes())?;
         }
 
         // Write metadata section (repo name/root/hash/branches)
@@ -136,6 +171,24 @@ impl ShardWriter {
             let bb = b.as_bytes();
             f.write_all(&(bb.len() as u16).to_le_bytes())?;
             f.write_all(bb)?;
+        }
+        // Write per-doc symbols: for each doc, [count:u16] followed by entries of
+        // [name_len:u16][name_bytes][start:u32 (0xFFFF_FFFF for none)][line:u32 (0xFFFF_FFFF for none)]
+        for d in &inner.docs {
+            let syms = &d.symbols;
+            f.write_all(&(syms.len() as u16).to_le_bytes())?;
+            for s in syms {
+                let nb = s.name.as_bytes();
+                if nb.len() > u16::MAX as usize {
+                    bail!("symbol name too long");
+                }
+                f.write_all(&(nb.len() as u16).to_le_bytes())?;
+                f.write_all(nb)?;
+                let start = s.start.unwrap_or(u32::MAX);
+                let line = s.line.unwrap_or(u32::MAX);
+                f.write_all(&start.to_le_bytes())?;
+                f.write_all(&line.to_le_bytes())?;
+            }
         }
 
         // Write line index section: for each doc, store (data_off, count); then write line data blocks
@@ -189,6 +242,8 @@ pub struct ShardReader {
     repo_root: String,
     _repo_hash: [u8; 32],
     branches: Vec<String>,
+    // parsed per-doc symbols stored as Vec<Vec<(name,start,line)>>
+    symbols: SymbolsTable,
 }
 
 impl ShardReader {
@@ -199,29 +254,73 @@ impl ShardReader {
         if mmap.len() < 12 + 8 * 5 {
             bail!("file too small")
         }
-        let magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
-        let ver = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let magic = u32::from_le_bytes(mmap[0..4].try_into().with_context(|| {
+            format!(
+                "shard truncated or malformed while reading magic (len={})",
+                mmap.len()
+            )
+        })?);
+        let ver = u32::from_le_bytes(mmap[4..8].try_into().with_context(|| {
+            format!(
+                "shard truncated or malformed while reading version (len={})",
+                mmap.len()
+            )
+        })?);
         if magic != MAGIC || ver != VERSION {
             bail!("bad header")
         }
-        let doc_count = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let docs_off = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
-        let postings_off = u64::from_le_bytes(mmap[20..28].try_into().unwrap());
-        let meta_off = u64::from_le_bytes(mmap[28..36].try_into().unwrap());
-        let line_index_off = u64::from_le_bytes(mmap[36..44].try_into().unwrap());
-        let _line_data_off = u64::from_le_bytes(mmap[44..52].try_into().unwrap());
+        let doc_count = u32::from_le_bytes(
+            mmap[8..12]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading doc_count")?,
+        );
+        let docs_off = u64::from_le_bytes(
+            mmap[12..20]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading docs_off")?,
+        );
+        let postings_off = u64::from_le_bytes(
+            mmap[20..28]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading postings_off")?,
+        );
+        let meta_off = u64::from_le_bytes(
+            mmap[28..36]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading meta_off")?,
+        );
+        let line_index_off = u64::from_le_bytes(
+            mmap[36..44]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading line_index_off")?,
+        );
+        let _line_data_off = u64::from_le_bytes(
+            mmap[44..52]
+                .try_into()
+                .with_context(|| "shard truncated or malformed while reading line_data_off")?,
+        );
         // parse metadata
         let mut moff = meta_off as usize;
         let n1 = u16::from_le_bytes(mmap[moff..moff + 2].try_into().unwrap()) as usize;
         moff += 2;
         let _repo_name = std::str::from_utf8(&mmap[moff..moff + n1])
-            .unwrap()
+            .with_context(|| {
+                format!(
+                    "shard metadata corrupted: repo_name not valid UTF-8 (meta_off={}, moff={})",
+                    meta_off, moff
+                )
+            })?
             .to_string();
         moff += n1;
         let n2 = u16::from_le_bytes(mmap[moff..moff + 2].try_into().unwrap()) as usize;
         moff += 2;
         let repo_root = std::str::from_utf8(&mmap[moff..moff + n2])
-            .unwrap()
+            .with_context(|| {
+                format!(
+                    "shard metadata corrupted: repo_root not valid UTF-8 (meta_off={}, moff={})",
+                    meta_off, moff
+                )
+            })?
             .to_string();
         moff += n2;
         let mut _repo_hash = [0u8; 32];
@@ -235,10 +334,55 @@ impl ShardReader {
             let bl = u16::from_le_bytes(mmap[moff..moff + 2].try_into().unwrap()) as usize;
             moff += 2;
             let b = std::str::from_utf8(&mmap[moff..moff + bl])
-                .unwrap()
+                .with_context(|| format!("shard metadata corrupted: branch name not valid UTF-8 (meta_off={}, moff={})", meta_off, moff))?
                 .to_string();
             moff += bl;
             branches.push(b);
+        }
+        // per-doc symbols: for each doc, [count:u16] then entries of [name_len:u16][name][start:u32][line:u32]
+        let mut symbols: SymbolsTable = Vec::with_capacity(doc_count as usize);
+        for d in 0..(doc_count as usize) {
+            let cnt = u16::from_le_bytes(mmap[moff..moff + 2].try_into().with_context(|| {
+                format!(
+                    "shard truncated while reading symbol count (meta_off={}, moff={}, doc={})",
+                    meta_off, moff, d
+                )
+            })?) as usize;
+            moff += 2;
+            let mut syms = Vec::with_capacity(cnt);
+            for _ in 0..cnt {
+                let nl = u16::from_le_bytes(mmap[moff..moff + 2].try_into().with_context(|| {
+                    format!(
+                        "shard truncated while reading symbol name len (meta_off={}, moff={})",
+                        meta_off, moff
+                    )
+                })?) as usize;
+                moff += 2;
+                let name = std::str::from_utf8(&mmap[moff..moff + nl])
+                    .with_context(|| format!("shard metadata corrupted: symbol name not valid UTF-8 (meta_off={}, moff={})", meta_off, moff))?
+                    .to_string();
+                moff += nl;
+                let start =
+                    u32::from_le_bytes(mmap[moff..moff + 4].try_into().with_context(|| {
+                        format!(
+                            "shard truncated while reading symbol start (meta_off={}, moff={})",
+                            meta_off, moff
+                        )
+                    })?);
+                moff += 4;
+                let line =
+                    u32::from_le_bytes(mmap[moff..moff + 4].try_into().with_context(|| {
+                        format!(
+                            "shard truncated while reading symbol line (meta_off={}, moff={})",
+                            meta_off, moff
+                        )
+                    })?);
+                moff += 4;
+                let start_opt = if start == u32::MAX { None } else { Some(start) };
+                let line_opt = if line == u32::MAX { None } else { Some(line) };
+                syms.push((name, start_opt, line_opt));
+            }
+            symbols.push(syms);
         }
         Ok(Self {
             mmap,
@@ -250,6 +394,7 @@ impl ShardReader {
             repo_root,
             _repo_hash,
             branches,
+            symbols,
         })
     }
 
@@ -269,38 +414,73 @@ impl ShardReader {
         &self.branches
     }
 
-    fn iter_docs(&self) -> impl Iterator<Item = String> + '_ {
-        let mut off = self.docs_off as usize;
-        (0..self.doc_count).map(move |_| {
-            let len = u16::from_le_bytes(self.mmap[off..off + 2].try_into().unwrap()) as usize;
-            off += 2;
-            let s = std::str::from_utf8(&self.mmap[off..off + len])
-                .unwrap()
-                .to_string();
-            off += len;
-            s
-        })
+    /// Return per-doc symbols parsed from the shard metadata, if any.
+    pub fn symbols_for_doc(&self, doc: u32) -> Option<&[SymbolTuple]> {
+        if (doc as usize) < self.symbols.len() {
+            Some(&self.symbols[doc as usize])
+        } else {
+            None
+        }
     }
 
-    fn postings_map(&self) -> HashMap<[u8; 3], BTreeMap<u32, Vec<u32>>> {
+    fn iter_docs(&self) -> Result<Vec<String>> {
+        let mut off = self.docs_off as usize;
+        let mut out = Vec::with_capacity(self.doc_count as usize);
+        for _ in 0..self.doc_count {
+            let len =
+                u16::from_le_bytes(self.mmap[off..off + 2].try_into().with_context(|| {
+                    format!("shard truncated while reading doc len (off={})", off)
+                })?) as usize;
+            off += 2;
+            let s = std::str::from_utf8(&self.mmap[off..off + len])
+                .with_context(|| {
+                    format!(
+                        "shard metadata corrupted: doc path not valid UTF-8 (off={})",
+                        off
+                    )
+                })?
+                .to_string();
+            off += len;
+            out.push(s);
+        }
+        Ok(out)
+    }
+
+    fn postings_map(&self) -> Result<PostingsMap> {
         let mut off = self.postings_off as usize;
         let mut map = HashMap::new();
-        let term_count = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()) as usize;
+        let term_count =
+            u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                format!("shard truncated while reading term_count (off={})", off)
+            })?) as usize;
         off += 4;
         for _ in 0..term_count {
-            let tri: [u8; 3] = self.mmap[off..off + 3].try_into().unwrap();
+            let tri: [u8; 3] = self.mmap[off..off + 3]
+                .try_into()
+                .with_context(|| format!("shard truncated while reading trigram (off={})", off))?;
             off += 3;
-            let n_docs = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()) as usize;
+            let n_docs =
+                u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                    format!("shard truncated while reading n_docs (off={})", off)
+                })?) as usize;
             off += 4;
             let mut postings = BTreeMap::new();
             for _ in 0..n_docs {
-                let d = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap());
+                let d =
+                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                        format!("shard truncated while reading doc id (off={})", off)
+                    })?);
                 off += 4;
-                let npos = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()) as usize;
+                let npos =
+                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                        format!("shard truncated while reading npos (off={})", off)
+                    })?) as usize;
                 off += 4;
                 let mut pos = Vec::with_capacity(npos);
                 for _ in 0..npos {
-                    let p = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap());
+                    let p = u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(
+                        || format!("shard truncated while reading position (off={})", off),
+                    )?);
                     off += 4;
                     pos.push(p);
                 }
@@ -308,7 +488,79 @@ impl ShardReader {
             }
             map.insert(tri, postings);
         }
-        map
+        Ok(map)
+    }
+
+    fn symbol_postings_map(&self) -> Result<SymbolPostingsMap> {
+        // The postings section contains first the content trigram map, then the symbol trigram map.
+        let mut off = self.postings_off as usize;
+        // skip content map
+        let content_term_count =
+            u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                format!(
+                    "shard truncated while reading content term_count (off={})",
+                    off
+                )
+            })?) as usize;
+        off += 4;
+        for _ in 0..content_term_count {
+            off += 3; // tri
+            let n_docs =
+                u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                    format!("shard truncated while reading content n_docs (off={})", off)
+                })?) as usize;
+            off += 4;
+            for _ in 0..n_docs {
+                // doc id
+                off += 4;
+                // npos
+                let npos =
+                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                        format!("shard truncated while reading content npos (off={})", off)
+                    })?);
+                off += 4;
+                // skip positions
+                off += (npos as usize) * 4;
+            }
+        }
+        // now read symbol map
+        let mut sym_map: SymbolPostingsMap = HashMap::new();
+        let sym_count =
+            u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                format!(
+                    "shard truncated while reading symbol term_count (off={})",
+                    off
+                )
+            })?) as usize;
+        off += 4;
+        for _ in 0..sym_count {
+            let tri: [u8; 3] = self.mmap[off..off + 3].try_into().with_context(|| {
+                format!("shard truncated while reading symbol trigram (off={})", off)
+            })?;
+            off += 3;
+            let n_docs =
+                u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                    format!("shard truncated while reading symbol n_docs (off={})", off)
+                })?) as usize;
+            off += 4;
+            let mut docs = Vec::with_capacity(n_docs);
+            for _ in 0..n_docs {
+                let d =
+                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                        format!("shard truncated while reading symbol doc id (off={})", off)
+                    })?);
+                off += 4;
+                // read npos (may be zero)
+                let _npos =
+                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
+                        format!("shard truncated while reading symbol npos (off={})", off)
+                    })?);
+                off += 4;
+                docs.push(d);
+            }
+            sym_map.insert(tri, docs);
+        }
+        Ok(sym_map)
     }
 
     fn line_index_entry(&self, doc: u32) -> Option<(u64, u32)> {
@@ -342,20 +594,20 @@ impl ShardReader {
 pub struct ShardSearcher<'a> {
     rdr: &'a ShardReader,
 }
-
 impl<'a> ShardSearcher<'a> {
     pub fn new(rdr: &'a ShardReader) -> Self {
         Self { rdr }
     }
 
     pub fn search_literal(&self, needle: &str) -> Vec<(u32, String)> {
-        // Use postings prefilter then confirm by scanning files on disk relative to unknown root.
-        // For now, we only return doc ids/paths from the shard and do not open files.
         let tris: Vec<_> = trigrams(needle).collect();
         if tris.is_empty() {
             return vec![];
         }
-        let map = self.rdr.postings_map();
+        let map = match self.rdr.postings_map() {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
         let mut cand: Option<Vec<u32>> = None;
         for t in tris {
             if let Some(v) = map.get(&t) {
@@ -368,7 +620,10 @@ impl<'a> ShardSearcher<'a> {
                 return vec![];
             }
         }
-        let paths: Vec<_> = self.rdr.iter_docs().collect();
+        let paths: Vec<_> = match self.rdr.iter_docs() {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        };
         cand.unwrap_or_default()
             .into_iter()
             .map(|d| (d, paths[d as usize].clone()))
@@ -376,15 +631,20 @@ impl<'a> ShardSearcher<'a> {
     }
 
     pub fn search_regex_prefiltered(&self, pattern: &str) -> Vec<(u32, String)> {
-        // Use a simple prefilter to get candidate docs via trigrams, then confirm by regex.
         use regex::Regex;
         let _re = match Regex::new(pattern) {
             Ok(r) => r,
             Err(_) => return vec![],
         };
         let pf = prefilter_from_regex(pattern);
-        let paths: Vec<_> = self.rdr.iter_docs().collect();
-        let map = self.rdr.postings_map();
+        let map = match self.rdr.postings_map() {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
+        let paths: Vec<_> = match self.rdr.iter_docs() {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        };
         let mut cand: Option<Vec<u32>> = None;
         if let crate::regex_analyze::Prefilter::Conj(tris) = pf {
             for t in tris {
@@ -399,7 +659,6 @@ impl<'a> ShardSearcher<'a> {
                 }
             }
         } else {
-            // no prefilter: consider all docs
             cand = Some((0..paths.len() as u32).collect());
         }
         cand.unwrap_or_default()
@@ -418,7 +677,6 @@ impl<'a> ShardSearcher<'a> {
         needle: &str,
         opts: &SearchOpts,
     ) -> Vec<SearchMatch> {
-        // branch filter (repo-level). If set and not present, return empty.
         if let Some(b) = &opts.branch {
             if !self.rdr.branches().iter().any(|x| x == b) {
                 return vec![];
@@ -433,7 +691,10 @@ impl<'a> ShardSearcher<'a> {
             return vec![];
         }
         let first = tris[0];
-        let map = self.rdr.postings_map();
+        let map = match self.rdr.postings_map() {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
         let mut cand: Option<Vec<u32>> = None;
         for t in tris.iter() {
             if let Some(v) = map.get(t) {
@@ -446,11 +707,13 @@ impl<'a> ShardSearcher<'a> {
                 return vec![];
             }
         }
-        let paths: Vec<_> = self.rdr.iter_docs().collect();
+        let paths: Vec<_> = match self.rdr.iter_docs() {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        };
         let mut out = Vec::new();
         if let Some(cdocs) = cand {
             for d in cdocs {
-                // path filters
                 let path = &paths[d as usize];
                 if let Some(pref) = &opts.path_prefix {
                     if !path.starts_with(pref) {
@@ -526,9 +789,14 @@ impl<'a> ShardSearcher<'a> {
             Ok(r) => r,
             Err(_) => return vec![],
         };
-        let paths: Vec<_> = self.rdr.iter_docs().collect();
-        // candidate docs via prefilter
-        let map = self.rdr.postings_map();
+        let map = match self.rdr.postings_map() {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
+        let paths: Vec<_> = match self.rdr.iter_docs() {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        };
         let mut cand: Option<Vec<u32>> = None;
         if let crate::regex_analyze::Prefilter::Conj(tris) = prefilter_from_regex(pattern) {
             for t in tris.iter() {
@@ -599,6 +867,153 @@ impl<'a> ShardSearcher<'a> {
         }
         out
     }
+
+    /// Search symbols in the shard. If `pattern` is Some, filter symbol names by the pattern
+    /// (regex when `is_regex` is true). Returns `crate::query::QueryResult` with `symbol_loc` populated
+    /// from the shard metadata when available.
+    pub fn search_symbols_prefiltered(
+        &self,
+        pattern: Option<&str>,
+        is_regex: bool,
+        case_sensitive: bool,
+    ) -> Vec<crate::query::QueryResult> {
+        let paths = match self.rdr.iter_docs() {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        };
+        let mut out = Vec::new();
+
+        // If we have a pattern, try to prefilter candidate docs using symbol trigram postings.
+        if let Some(pat) = pattern {
+            // If regex, extract alnum substrings >=3 as heuristic; else use trigrams of the pattern.
+            let mut tris: Vec<[u8; 3]> = Vec::new();
+            if is_regex {
+                let mut subs: Vec<String> = Vec::new();
+                let mut cur = String::new();
+                for ch in pat.chars() {
+                    if ch.is_alphanumeric() {
+                        cur.push(ch);
+                    } else {
+                        if cur.len() >= 3 {
+                            subs.push(cur.clone());
+                        }
+                        cur.clear();
+                    }
+                }
+                if cur.len() >= 3 {
+                    subs.push(cur);
+                }
+                if let Some(sub) = subs.first() {
+                    tris = crate::trigram::trigrams(sub).collect();
+                }
+            } else {
+                tris = crate::trigram::trigrams(pat).collect();
+            }
+
+            if !tris.is_empty() {
+                if let Ok(sym_map) = self.rdr.symbol_postings_map() {
+                    let mut cand_docs: Option<Vec<u32>> = None;
+                    for t in tris {
+                        if let Some(list) = sym_map.get(&t) {
+                            let mut docs = list.clone();
+                            docs.sort_unstable();
+                            docs.dedup();
+                            cand_docs = Some(match cand_docs {
+                                None => docs,
+                                Some(prev) => intersect_sorted(&prev, &docs),
+                            });
+                        } else {
+                            cand_docs = Some(Vec::new());
+                            break;
+                        }
+                    }
+                    if let Some(cdocs) = cand_docs {
+                        let filtered_set: std::collections::HashSet<u32> =
+                            (0..paths.len() as u32).collect();
+                        for d in cdocs.into_iter().filter(|d| filtered_set.contains(d)) {
+                            if let Some(sym_list) = self.rdr.symbols_for_doc(d) {
+                                for sym_tuple in sym_list.iter() {
+                                    let name = &sym_tuple.0;
+                                    let matched = if is_regex {
+                                        let mut pat_s = pat.to_string();
+                                        if !case_sensitive && !pat_s.starts_with("(?i)") {
+                                            pat_s = format!("(?i){}", pat_s);
+                                        }
+                                        if let Ok(re) = regex::Regex::new(&pat_s) {
+                                            re.is_match(name)
+                                        } else {
+                                            false
+                                        }
+                                    } else if case_sensitive {
+                                        name.contains(pat)
+                                    } else {
+                                        name.to_lowercase().contains(&pat.to_lowercase())
+                                    };
+                                    if matched {
+                                        let sym = crate::types::Symbol {
+                                            name: name.clone(),
+                                            start: sym_tuple.1,
+                                            line: sym_tuple.2,
+                                        };
+                                        out.push(crate::query::QueryResult {
+                                            doc: d,
+                                            path: paths[d as usize].clone(),
+                                            symbol: Some(name.clone()),
+                                            symbol_loc: Some(sym),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+
+        // Fallback: scan all docs' symbols as before
+        for d in 0..(paths.len() as u32) {
+            if let Some(sym_list) = self.rdr.symbols_for_doc(d) {
+                for sym_tuple in sym_list.iter() {
+                    let name = &sym_tuple.0;
+                    let matched = if let Some(pat) = pattern {
+                        if is_regex {
+                            let mut pat_s = pat.to_string();
+                            if !case_sensitive && !pat_s.starts_with("(?i)") {
+                                pat_s = format!("(?i){}", pat_s);
+                            }
+                            if let Ok(re) = regex::Regex::new(&pat_s) {
+                                re.is_match(name)
+                            } else {
+                                false
+                            }
+                        } else if case_sensitive {
+                            name.contains(pat)
+                        } else {
+                            name.to_lowercase().contains(&pat.to_lowercase())
+                        }
+                    } else {
+                        true
+                    };
+                    if matched {
+                        let sym = crate::types::Symbol {
+                            name: name.clone(),
+                            start: sym_tuple.1,
+                            line: sym_tuple.2,
+                        };
+                        out.push(crate::query::QueryResult {
+                            doc: d,
+                            path: paths[d as usize].clone(),
+                            symbol: Some(name.clone()),
+                            symbol_loc: Some(sym),
+                        });
+                    }
+                }
+            }
+        }
+
+        out
+    }
 }
 
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -638,6 +1053,156 @@ mod tests {
         assert!(hits
             .iter()
             .any(|m| m.path.ends_with("a.txt") && m.line >= 1));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_shard_metadata_returns_error() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("a.txt"), b"hello zoekt shard")?;
+        let idx = build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        // Read shard bytes and corrupt the repo_name bytes to invalid UTF-8
+        let mut bytes = std::fs::read(&shard_path)?;
+        // Find meta_off at header offset 28..36
+        let meta_off = u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        // repo_name length is first u16 at meta_off
+        let n1 = u16::from_le_bytes(bytes[meta_off..meta_off + 2].try_into().unwrap()) as usize;
+        let name_start = meta_off + 2;
+        if n1 > 0 {
+            // Flip first byte to 0xFF to make invalid UTF-8
+            bytes[name_start] = 0xFF;
+        }
+        let corrupt_path = dir.path().join("index-corrupt.shard");
+        std::fs::write(&corrupt_path, &bytes)?;
+
+        let res = ShardReader::open(&corrupt_path);
+        assert!(res.is_err());
+        let msg = res.err().unwrap().to_string();
+        assert!(msg.contains("repo_name not valid UTF-8") || msg.contains("shard truncated"));
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_trigram_prefilter_roundtrip() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let content = r#"
+        // top-level functions
+        fn Foo_bar() {}
+        fn Other() {}
+        "#;
+        std::fs::write(dir.path().join("a.rs"), content)?;
+        let idx = crate::build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        let reader = ShardReader::open(&shard_path)?;
+        let searcher = ShardSearcher::new(&reader);
+        // search for symbol substring "Foo" (non-regex)
+        let res = searcher.search_symbols_prefiltered(Some("Foo"), false, false);
+        // should find Foo_bar symbol
+        assert!(res.iter().any(|r| r.symbol.as_deref() == Some("Foo_bar")));
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_regex_case_sensitive_and_insensitive() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let content = r#"
+        // top-level functions
+        fn DoThing() {}
+        fn dothing() {}
+        "#;
+        std::fs::write(dir.path().join("a.rs"), content)?;
+        let idx = crate::build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        let reader = ShardReader::open(&shard_path)?;
+        let searcher = ShardSearcher::new(&reader);
+
+        // Case-sensitive regex should only match DoThing
+        let res_cs = searcher.search_symbols_prefiltered(Some("^DoThing$"), true, true);
+        assert!(res_cs
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("DoThing")));
+        assert!(!res_cs
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("dothing")));
+
+        // Case-insensitive regex should match both
+        let res_ci = searcher.search_symbols_prefiltered(Some("^dothing$"), true, false);
+        // should find both variants (pattern applied case-insensitively)
+        assert!(res_ci
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("DoThing")));
+        assert!(res_ci
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("dothing")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_unicode_and_multibyte_names() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // include an accented e (U+00E9) and some other multibyte chars
+        let content = "fn caf\u{e9}() {}\nfn 漢字_func() {}\n";
+        std::fs::write(dir.path().join("a.rs"), content)?;
+        let idx = crate::build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        let reader = ShardReader::open(&shard_path)?;
+        let searcher = ShardSearcher::new(&reader);
+
+        // literal match for caf e9 (case-sensitive)
+        let res = searcher.search_symbols_prefiltered(Some("caf\u{e9}"), false, true);
+        assert!(res.iter().any(|r| r.symbol.as_deref() == Some("caf\u{e9}")));
+
+        // literal match for non-ascii name
+        let res2 = searcher.search_symbols_prefiltered(Some("漢字_func"), false, true);
+        assert!(res2
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("漢字_func")));
+
+        // regex unicode, case-insensitive should still find the accented name
+        let res3 = searcher.search_symbols_prefiltered(Some("caf."), true, false);
+        assert!(res3
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("caf\u{e9}")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn many_symbols_in_single_doc() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // generate many symbol names to ensure postings scale
+        let mut content = String::new();
+        let count = 200usize;
+        for i in 0..count {
+            content.push_str(&format!("fn sym_{:04}() {{}}\n", i));
+        }
+        std::fs::write(dir.path().join("big.rs"), content)?;
+        let idx = crate::build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        let reader = ShardReader::open(&shard_path)?;
+        let searcher = ShardSearcher::new(&reader);
+
+        // search for common prefix
+        let res = searcher.search_symbols_prefiltered(Some("sym_00"), false, false);
+        // expect at least several matches; exact count should be >= 11 (sym_0000..sym_0010 etc.)
+        assert!(res.len() >= 11, "expected many symbols, got {}", res.len());
+
+        // search for a specific one
+        let res2 = searcher.search_symbols_prefiltered(Some("sym_0199"), false, false);
+        assert!(res2.iter().any(|r| r.symbol.as_deref() == Some("sym_0199")));
+
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use zoekt_rs::{
     build_in_memory_index,
-    query::{QueryPlan, Searcher},
+    query::{QueryPlan, QueryResult, Searcher, SelectKind},
     SearchMatch, SearchOpts, ShardReader, ShardSearcher,
 };
 
@@ -45,7 +45,23 @@ fn main() -> Result<()> {
         let rdr = ShardReader::open(shard)?;
         let s = ShardSearcher::new(&rdr);
         let opts = build_opts(&args)?;
-        if args.regex {
+
+        // Build a QueryPlan similarly to in-memory path so we can honor select= filters.
+        let mut qstr = args.query.clone();
+        if args.regex && !qstr.contains("regex:") && !qstr.contains("re:") {
+            qstr = format!("{} regex:yes", qstr);
+        }
+        let plan = QueryPlan::parse(&qstr)?;
+
+        if plan.select == SelectKind::Symbol {
+            // Use shard-backed symbol search
+            let results = s.search_symbols_prefiltered(
+                plan.pattern.as_deref(),
+                plan.regex,
+                plan.case_sensitive,
+            );
+            print_symbol_results(results, args.json)?;
+        } else if plan.regex {
             let matches = s.search_regex_confirmed(&args.query, &opts);
             print_matches(matches, args.json)?;
         } else {
@@ -106,6 +122,37 @@ fn print_matches(matches: Vec<SearchMatch>, json: bool) -> Result<()> {
                 "{}:{}:{}-{}:\n{}{}{}",
                 m.path, m.line, m.start, m.end, m.before, m.line_text, m.after
             );
+        }
+    }
+    Ok(())
+}
+
+fn print_symbol_results(results: Vec<QueryResult>, json: bool) -> Result<()> {
+    if json {
+        for r in results {
+            let v = serde_json::json!({
+                "doc": r.doc,
+                "path": r.path,
+                "symbol": r.symbol,
+                "symbol_loc": r.symbol_loc.map(|s| serde_json::json!({"name": s.name, "start": s.start, "line": s.line})),
+            });
+            println!("{}", v);
+        }
+    } else {
+        for r in results {
+            if let Some(loc) = r.symbol_loc {
+                println!(
+                    "{}:symbol:{}:{} (line {:?})",
+                    r.path,
+                    loc.name,
+                    loc.start.unwrap_or(0),
+                    loc.line
+                );
+            } else if let Some(sym) = r.symbol {
+                println!("{}:symbol:{}", r.path, sym);
+            } else {
+                println!("{}:symbol:<unknown>", r.path);
+            }
         }
     }
     Ok(())
