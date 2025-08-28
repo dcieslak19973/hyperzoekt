@@ -7,6 +7,7 @@ pub mod regex_analyze;
 pub mod shard;
 pub mod trigram;
 pub mod types;
+pub mod typesitter;
 
 pub use crate::index::{InMemoryIndex, IndexBuilder, RepoDocId};
 pub use crate::query::{Query, QueryPlan, QueryResult, Searcher, SelectKind};

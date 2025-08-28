@@ -25,6 +25,7 @@ use crate::{
     trigram::{trigrams, trigrams_with_pos},
 };
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 // Type aliases to reduce clippy::type_complexity warnings.
 type SymbolTuple = (String, Option<u32>, Option<u32>);
@@ -56,6 +57,10 @@ impl ShardWriter {
         idx: &InMemoryIndex,
         include_symbol_postings: bool,
     ) -> Result<()> {
+        let global_start = Instant::now();
+        let mut stages: Vec<(&str, u128)> = Vec::new();
+        // capture total indexing + write time; we'll print stage durations at the end
+
         let mut f = File::create(&self.path).context("create shard file")?;
         let inner = idx.read_inner();
         // Header placeholders; we'll fill offsets after writing sections.
@@ -86,6 +91,7 @@ impl ShardWriter {
         let mut term_map: PostingsMap = HashMap::new();
         // Build line starts per doc (byte offsets)
         let mut lines_per_doc: Vec<Vec<u32>> = Vec::with_capacity(inner.docs.len());
+        let t_read_start = Instant::now();
         for (i, meta) in inner.docs.iter().enumerate() {
             let text =
                 std::fs::read_to_string(inner.repo.root.join(&meta.path)).unwrap_or_default();
@@ -110,10 +116,13 @@ impl ShardWriter {
             }
             lines_per_doc.push(starts);
         }
+        let t_read_end = Instant::now();
+        stages.push(("read_and_trigrams", (t_read_end - t_read_start).as_millis()));
 
         // Write postings section: first content trigrams, then symbol trigrams (optional).
         let postings_off = f.stream_position()?;
         // content trigrams
+        let t_ser_content_start = Instant::now();
         f.write_all(&(term_map.len() as u32).to_le_bytes())?;
         for (tri, postings) in term_map.iter() {
             f.write_all(tri)?; // 3 bytes
@@ -126,8 +135,14 @@ impl ShardWriter {
                 }
             }
         }
+        let t_ser_content_end = Instant::now();
+        stages.push((
+            "serialize_content_trigrams",
+            (t_ser_content_end - t_ser_content_start).as_millis(),
+        ));
         if include_symbol_postings {
             // symbol trigrams: write a second map with doc lists (npos may be zero)
+            let t_ser_sym_start = Instant::now();
             let sym_map = &inner.symbol_trigrams;
             f.write_all(&(sym_map.len() as u32).to_le_bytes())?;
             for (tri, docs) in sym_map.iter() {
@@ -141,13 +156,25 @@ impl ShardWriter {
                     f.write_all(&0u32.to_le_bytes())?;
                 }
             }
+            let t_ser_sym_end = Instant::now();
+            stages.push((
+                "serialize_symbol_trigrams",
+                (t_ser_sym_end - t_ser_sym_start).as_millis(),
+            ));
         } else {
             // write zero symbol map
+            let t_ser_sym_start = Instant::now();
             f.write_all(&0u32.to_le_bytes())?;
+            let t_ser_sym_end = Instant::now();
+            stages.push((
+                "serialize_symbol_trigrams",
+                (t_ser_sym_end - t_ser_sym_start).as_millis(),
+            ));
         }
 
         // Write metadata section (repo name/root/hash/branches)
         let meta_off = f.stream_position()?;
+        let t_meta_start = Instant::now();
         let repo_name = inner.repo.name.as_bytes();
         let repo_root = inner.repo.root.display().to_string();
         let repo_root_b = repo_root.as_bytes();
@@ -172,6 +199,11 @@ impl ShardWriter {
             f.write_all(&(bb.len() as u16).to_le_bytes())?;
             f.write_all(bb)?;
         }
+        let t_meta_end = Instant::now();
+        stages.push((
+            "metadata_hash_and_write",
+            (t_meta_end - t_meta_start).as_millis(),
+        ));
         // Write per-doc symbols: for each doc, [count:u16] followed by entries of
         // [name_len:u16][name_bytes][start:u32 (0xFFFF_FFFF for none)][line:u32 (0xFFFF_FFFF for none)]
         for d in &inner.docs {
@@ -190,6 +222,8 @@ impl ShardWriter {
                 f.write_all(&line.to_le_bytes())?;
             }
         }
+        // note: per-doc symbols write time is included in metadata timing above; if you need
+        // finer granularity, split it out similarly to other stages.
 
         // Write line index section: for each doc, store (data_off, count); then write line data blocks
         let line_index_off = f.stream_position()?;
@@ -198,6 +232,7 @@ impl ShardWriter {
             f.write_all(&0u32.to_le_bytes())?;
         }
         let line_data_off = f.stream_position()?;
+        let t_line_start = Instant::now();
         let mut idx_ptr = line_index_off;
         for starts in &lines_per_doc {
             let entry_off = f.stream_position()?;
@@ -213,8 +248,11 @@ impl ShardWriter {
             idx_ptr += 12; // 8 + 4
             f.seek(SeekFrom::Start(cur))?;
         }
+        let t_line_end = Instant::now();
+        stages.push(("line_index_write", (t_line_end - t_line_start).as_millis()));
 
         // Patch header with offsets
+        let t_flush_start = Instant::now();
         f.flush()?;
         f.seek(SeekFrom::Start(0))?;
         let mut header2 = Vec::new();
@@ -227,6 +265,17 @@ impl ShardWriter {
         header2.extend(&line_index_off.to_le_bytes());
         header2.extend(&line_data_off.to_le_bytes());
         f.write_all(&header2)?;
+        let t_flush_end = Instant::now();
+        stages.push((
+            "final_flush_and_header_patch",
+            (t_flush_end - t_flush_start).as_millis(),
+        ));
+
+        let total_ms = (Instant::now() - global_start).as_millis();
+        eprintln!("INDEXING_TIMINGS total_ms={}ms", total_ms);
+        for (name, ms) in stages.iter() {
+            eprintln!("  {}: {} ms", name, ms);
+        }
         Ok(())
     }
 }
@@ -646,20 +695,54 @@ impl<'a> ShardSearcher<'a> {
             Err(_) => return vec![],
         };
         let mut cand: Option<Vec<u32>> = None;
-        if let crate::regex_analyze::Prefilter::Conj(tris) = pf {
-            for t in tris {
-                if let Some(v) = map.get(&t) {
-                    let docs: Vec<u32> = v.keys().copied().collect();
-                    cand = Some(match cand {
-                        None => docs,
-                        Some(prev) => intersect_sorted(&prev, &docs),
-                    });
-                } else {
-                    return vec![];
+        match pf {
+            crate::regex_analyze::Prefilter::Conj(tris) => {
+                for t in tris {
+                    if let Some(v) = map.get(&t) {
+                        let docs: Vec<u32> = v.keys().copied().collect();
+                        cand = Some(match cand {
+                            None => docs,
+                            Some(prev) => intersect_sorted(&prev, &docs),
+                        });
+                    } else {
+                        return vec![];
+                    }
                 }
             }
-        } else {
-            cand = Some((0..paths.len() as u32).collect());
+            crate::regex_analyze::Prefilter::Disj(disj) => {
+                // For disjunction, union all per-branch candidate sets.
+                let mut union_docs: Vec<u32> = Vec::new();
+                use std::collections::BTreeSet;
+                let mut set: BTreeSet<u32> = BTreeSet::new();
+                for tris in disj {
+                    let mut branch_cand: Option<Vec<u32>> = None;
+                    let mut branch_ok = true;
+                    for t in tris {
+                        if let Some(v) = map.get(&t) {
+                            let docs: Vec<u32> = v.keys().copied().collect();
+                            branch_cand = Some(match branch_cand {
+                                None => docs,
+                                Some(prev) => intersect_sorted(&prev, &docs),
+                            });
+                        } else {
+                            branch_ok = false;
+                            break;
+                        }
+                    }
+                    if branch_ok {
+                        if let Some(bc) = branch_cand {
+                            for d in bc.into_iter() {
+                                set.insert(d);
+                            }
+                        }
+                    }
+                }
+                union_docs.extend(set);
+                cand = Some(union_docs);
+            }
+            _ => {
+                cand = Some((0..paths.len() as u32).collect());
+            }
         }
         cand.unwrap_or_default()
             .into_iter()

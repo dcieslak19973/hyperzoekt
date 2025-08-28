@@ -29,13 +29,20 @@ Status (high level):
 - [x] Minimal in-memory index/search scaffolding (IndexBuilder, Searcher)
 - [x] Query AST and simple evaluator (Literal, Regex, And/Or/Not)
 - [x] Trigram module (bootstrap)
-- [x] Persistent shard prototype (writer/reader) and mmap-backed searcher
+- [x] Persistent shard writer/reader and mmap-backed searcher
 - [x] CLI tools: zr-index, zr-search, zr-bench, zr-query-bench, zr-compare-bench
 - [x] Benchmark JSON schema and comparator with indexing summary table output
-- [ ] Regex analysis improvements (parity with Go’s regex prefiltering)
-- [ ] Full postings format and ranking, line/match context extraction
-- [ ] Repo/file scoping, symbol awareness
-- [ ] Broader test parity with Go Zoekt
+ - [~] Regex analysis improvements (basic prefilter exists; needs hardening to match Go)
+
+    Notes: a conservative trigram-extraction heuristic exists in `crates/zoekt/src/regex_analyze.rs`. It helps common cases but is not yet a full port of Go Zoekt's regex lowering. Recommended short-term actions:
+
+    1. Harden the extractor using a regex AST (for example `regex-syntax`) to safely extract literal substrings and compute conjunctive trigram sets.
+    2. Add Go-derived regex edge-case tests into `crates/zoekt/tests/` for parity verification.
+    3. Ensure the prefilter falls back to a safe default (no prefilter) when uncertain to avoid false negatives.
+
+- [~] Full postings format and ranking, line/match context extraction (core pieces present; more work required)
+- [~] Repo/file scoping, symbol awareness (symbol extraction + per-doc symbols persisted; symbol-trigram postings and shard-side prefilter implemented but needs tuning)
+- [~] Broader test parity with Go Zoekt (good unit coverage; need Go-derived fixtures and golden comparisons)
 
 Mapping (Go -> Rust modules):
 - zoekt/query -> crates/zoekt/src/query.rs (AST and execution, slice-based set ops)
@@ -88,11 +95,22 @@ Status annotations (current implementation highlights)
 - Query language/filters: [Done/Partial]
    - repo/file/lang parsing and filtering are implemented in `QueryPlan::parse` and `Searcher::search_plan` (supports exact, glob, regex and case handling).
    - `branch:` parsing and early rejection logic exist, but the in-memory `IndexBuilder` currently sets per-document `branches = ["HEAD"]` only. Multi-branch indexing input is not yet plumbed.
-   - `path-only` is implemented; `content-only` flag exists but is not enforced consistently everywhere. Action: add explicit `content_only` semantics and tests.
+   - `path-only` is implemented; `content-only` flag exists and is enforced in `Searcher::search_plan`. Unit tests validate path-vs-content behavior.
+ - Query language/filters: [Partial]
+      - repo/file/lang parsing and filtering: implemented and exercised by unit tests in `QueryPlan::parse` and `Searcher::search_plan` (supports exact, glob, regex and case handling). Status: mostly done.
+      - `branch:` parsing & early rejection: parsing and per-query branch checks exist, but indexing currently only records `branches = ["HEAD"]` for in-memory runs. Status: partial — multi-branch indexing input and end-to-end branch tests are outstanding.
+      - `path-only` / `content-only`: `path-only` behavior is implemented; a `content_only` flag exists but is not consistently enforced across search plan execution. Action: add an explicit `content_only` gate in `Searcher::search_plan` and unit/integration tests that assert path-vs-content behavior.
 
-- select=repo|file|symbol: [Partial]
+   Concrete next actions (short-term, low-risk):
+      1. Wire multi-branch input into `IndexBuilder` (support `--branch`/manifest) and add an end-to-end test exercising `branch:` selection at query time.
+      2. Implement `content_only` semantics explicitly in `Searcher::search_plan`, add unit tests for `path-only` vs `content-only`, and add a couple of integration tests asserting expected matches.
+      3. Add a small CI test that indexes a multi-branch fixture (2 branches) and verifies branch-scoped query results to prevent regressions.
+
+   With these items done the query/filters surface will be functionally complete for typical search workflows; remaining work is tuning (branch-aware ranking, multi-branch sharding) and broader parity tests with Go.
+
+-- select=repo|file|symbol: [Partial]
    - `select=repo` and `select=file` are implemented.
-   - `select=symbol` emits `DocumentMeta.symbols` for matched docs, but symbols are populated by a naive regex extractor and are not indexed (no symbol postings/trigram), and symbol results are not filtered by the query pattern. Action: small PR to filter symbols by pattern and respect case-sensitivity; medium PR to add symbol postings/trigram prefilter.
+   - `select=symbol`: progress made — per-doc symbols are persisted in shards and the indexer builds in-memory symbol trigrams/terms. The shard writer can optionally append an on-disk symbol-trigram postings map (writer exposes an option to omit postings for baseline shards), and the reader exposes `symbol_postings_map()` which the shard searcher uses to prefilter candidate docs. CLI and bench tooling are wired to exercise `select=symbol`. Remaining work: tune symbol-postings performance (prefilter vs full scan), add golden tests for symbol accuracy, and ensure case-sensitivity/regex filtering is applied consistently.
 
 - Symbol extraction: [Partial]
    - A simple regex-based extractor exists for Rust/Go/Python (`extract_symbols` in `index.rs`). The repo contains typesitter/tree-sitter ASTs and a recommended plan for a typesitter-backed extractor (higher fidelity). Action: add an opt-in typesitter extractor module and tests for Go/Rust/Python.
@@ -104,7 +122,7 @@ Status annotations (current implementation highlights)
    - `ShardSearcher` supports line-index-based context extraction and `SearchMatch` ranges; in-memory `Searcher` fallbacks read files directly. Action: add tests for byte/rune offsets, multi-byte characters, and deduplication semantics.
 
 - Shard format / versioning: [Implemented]
-   - `ShardWriter`/`ShardReader` implement a binary format (current `VERSION = 4`) with metadata (repo name/root/hash/branches) and line index. Reader returns contextual errors on corruption. Action: add `zr-inspect` and clearer version-mismatch error messages; consider a migration path for older formats.
+   - `ShardWriter`/`ShardReader` implement a binary format (current `VERSION = 5`) with metadata (repo name/root/hash/branches), per-doc symbol lists, and line index. Recent work added optional symbol-trigram postings (appended after the content trigram map) and reader-side parsing via `symbol_postings_map()` to enable shard-side symbol prefiltering. Reader returns contextual errors on corruption. Action: add `zr-inspect` and clearer version-mismatch error messages; consider a migration path for older formats.
 
 - Shard-writer performance: [Todo / Recommendations present]
    - Current writer is correct but not optimized (reads files per-doc, writes with backpatching). `PORTING.md` contains prioritized optimizations (single-read-per-file, buffered writes, remove per-doc backpatching, parallelize). Action: implement low-risk writer optimizations behind a flag and add microbenchmarks.

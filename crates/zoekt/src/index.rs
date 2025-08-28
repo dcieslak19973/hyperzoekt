@@ -277,6 +277,15 @@ impl IndexBuilder {
 }
 
 fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
+    // Prefer a Tree-sitter based extractor when available; fall back to
+    // the simpler regex-based extractor implemented below.
+    let out = crate::typesitter::extract_symbols_typesitter(content, ext);
+    if !out.is_empty() {
+        return out;
+    }
+
+    // Fallback to regex-based extraction for languages not supported by
+    // the Tree-sitter extractor or when parsing fails.
     let mut out = Vec::new();
     if ext == "rs" {
         // allow Unicode identifier characters using XID properties

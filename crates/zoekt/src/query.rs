@@ -243,8 +243,12 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        // Apply path-only/content-only: if path-only and pattern present, re-evaluate against path tokens
-        if plan.path_only {
+        // Apply path-only/content-only: when a pattern is present and the user did not
+        // request content-only semantics, also consider filename (path) matches. If
+        // `path_only` is set we replace the candidate set with path matches. Otherwise
+        // we union path matches with the existing content-based `base_docs` so the
+        // default behavior matches both path and content hits.
+        if !plan.content_only {
             if let Some(pat) = &plan.pattern {
                 let inner = self.idx.read_inner();
                 let needle = if plan.case_sensitive {
@@ -252,7 +256,7 @@ impl<'a> Searcher<'a> {
                 } else {
                     pat.to_lowercase()
                 };
-                let mut docs = Vec::new();
+                let mut path_docs = Vec::new();
                 for (i, meta) in inner.docs.iter().enumerate() {
                     let p = meta.path.display().to_string();
                     let hay = if plan.case_sensitive {
@@ -261,10 +265,14 @@ impl<'a> Searcher<'a> {
                         p.to_lowercase()
                     };
                     if hay.contains(&needle) {
-                        docs.push(i as RepoDocId);
+                        path_docs.push(i as RepoDocId);
                     }
                 }
-                base_docs = docs;
+                if plan.path_only {
+                    base_docs = path_docs;
+                } else {
+                    base_docs = union_sorted(&base_docs, &path_docs);
+                }
             }
         }
 
