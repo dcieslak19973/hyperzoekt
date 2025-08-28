@@ -11,3 +11,4 @@ Cargo.lock
 .sccache/
 .tmp/
 .tmp_experiments/
+.bench_results/

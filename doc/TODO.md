@@ -15,3 +15,8 @@
 		 * Add a small integration test or reproducible script that runs `--stream-once` with `SURREAL_STREAM_CHUNKED=1` and asserts `batches_sent` > 1 for large inputs (exercise acc > batch_capacity).
 		 * Consider making `streaming_chunked` the default (remove env guard) after the test/validation.
 		 * Re-run the batch sweep after any change and update `doc/BATCH_SIZE_TUNING.md` and `doc/SURREALDB-INTEGRATION.md` if behavior changes.
+
+Longer term, we want to be mindful that the MCP interface should be optimized for how
+an LLM would use it.  Since most LLMs explore codebases using tools like `grep` and
+`ripgrep`, we should assume that the LLM would want to interact with this search tool
+in the same way.
