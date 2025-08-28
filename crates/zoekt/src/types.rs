@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub struct RepoMeta {
     pub name: String,
     pub root: PathBuf,
+    // For future multi-branch support; for now, single-repo indexing will default to ["HEAD"].
+    pub branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +14,10 @@ pub struct DocumentMeta {
     pub path: PathBuf,
     pub lang: Option<String>,
     pub size: u64,
+    /// Branches this document is present in. For in-memory index builder we default to ["HEAD"].
+    pub branches: Vec<String>,
+    /// Extracted top-level symbol names (naive) for select=symbol
+    pub symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

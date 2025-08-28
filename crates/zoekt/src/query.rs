@@ -1,8 +1,9 @@
 use crate::index::{InMemoryIndex, RepoDocId};
+use globset::{GlobBuilder, GlobSetBuilder};
 use lru::LruCache;
 use regex::Regex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,113 @@ pub enum Query {
 pub struct QueryResult {
     pub doc: RepoDocId,
     pub path: String,
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SelectKind {
+    #[default]
+    File,
+    Repo,
+    Symbol,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryPlan {
+    // core query text (literal or regex). If regex=true, treat as regex.
+    pub pattern: Option<String>,
+    pub regex: bool,
+    // filters
+    pub repos: Vec<String>,
+    pub repo_globs: Vec<String>,
+    pub repo_regexes: Vec<Regex>,
+    pub file_globs: Vec<String>,
+    pub file_regexes: Vec<Regex>,
+    pub langs: Vec<String>,
+    pub branches: Vec<String>,
+    pub case_sensitive: bool,
+    pub content_only: bool,
+    pub path_only: bool,
+    pub select: SelectKind,
+}
+
+impl QueryPlan {
+    pub fn parse(input: &str) -> anyhow::Result<Self> {
+        // Extremely small subset of Zoekt syntax:
+        // tokens split by whitespace, filters of form key:value, select=..., case:yes|no
+        // If a token is not key:value or select=, it contributes to the pattern (joined by space).
+        let mut plan = QueryPlan::default();
+        let mut pats: Vec<String> = Vec::new();
+        let mut is_regex = false;
+        for tok in shell_split(input).into_iter() {
+            if let Some((k, v)) = tok.split_once(':') {
+                match k {
+                    "repo" => {
+                        if looks_like_regex(v) {
+                            if let Ok(re) = Regex::new(v) {
+                                plan.repo_regexes.push(re);
+                            } else {
+                                plan.repos.push(v.to_string());
+                            }
+                        } else if v.contains('*') || v.contains('?') || v.contains('[') {
+                            plan.repo_globs.push(v.to_string());
+                        } else {
+                            plan.repos.push(v.to_string());
+                        }
+                    }
+                    "file" => {
+                        // treat as a regex if it looks like one, otherwise glob-ish
+                        if looks_like_regex(v) {
+                            if let Ok(re) = Regex::new(v) {
+                                plan.file_regexes.push(re);
+                            }
+                        } else {
+                            plan.file_globs.push(v.to_string());
+                        }
+                    }
+                    "lang" => plan.langs.push(v.to_lowercase()),
+                    "branch" => plan.branches.push(v.to_string()),
+                    "case" => {
+                        plan.case_sensitive = matches!(v, "yes" | "true" | "sensitive");
+                    }
+                    "select" => {
+                        plan.select = match v {
+                            "repo" => SelectKind::Repo,
+                            "symbol" => SelectKind::Symbol,
+                            _ => SelectKind::File,
+                        }
+                    }
+                    "content" => {
+                        plan.content_only = matches!(v, "only" | "yes" | "true");
+                    }
+                    "path" => {
+                        plan.path_only = matches!(v, "only" | "yes" | "true");
+                    }
+                    "re" | "regex" => {
+                        is_regex = matches!(v, "1" | "yes" | "true");
+                    }
+                    _ => pats.push(tok),
+                }
+            } else if let Some((k, v)) = tok.split_once('=') {
+                if k == "select" {
+                    plan.select = match v {
+                        "repo" => SelectKind::Repo,
+                        "symbol" => SelectKind::Symbol,
+                        _ => SelectKind::File,
+                    };
+                } else {
+                    pats.push(tok);
+                }
+            } else {
+                pats.push(tok);
+            }
+        }
+        if !pats.is_empty() {
+            plan.pattern = Some(pats.join(" "));
+        }
+        plan.regex = is_regex;
+        Ok(plan)
+    }
 }
 
 pub struct Searcher<'a> {
@@ -45,9 +153,231 @@ impl<'a> Searcher<'a> {
                 inner.docs.get(d as usize).map(|meta| QueryResult {
                     doc: d,
                     path: meta.path.display().to_string(),
+                    symbol: None,
                 })
             })
             .collect()
+    }
+
+    pub fn search_plan(&self, plan: &QueryPlan) -> Vec<QueryResult> {
+        // repo filter
+        {
+            let inner = self.idx.read_inner();
+            if !plan.repos.is_empty() || !plan.repo_regexes.is_empty() {
+                let name = &inner.repo.name;
+                let hay = if plan.case_sensitive {
+                    name.clone()
+                } else {
+                    name.to_lowercase()
+                };
+                let ok_sub = plan
+                    .repos
+                    .iter()
+                    .map(|r| {
+                        if plan.case_sensitive {
+                            r.clone()
+                        } else {
+                            r.to_lowercase()
+                        }
+                    })
+                    .any(|r| hay.contains(&r));
+                let ok_re = plan.repo_regexes.iter().any(|re| {
+                    if plan.case_sensitive {
+                        re.is_match(name)
+                    } else {
+                        let pat = format!("(?i){}", re.as_str());
+                        Regex::new(&pat)
+                            .map(|rr| rr.is_match(name))
+                            .unwrap_or(false)
+                    }
+                });
+                // repo globs
+                let ok_glob = if !plan.repo_globs.is_empty() {
+                    let mut gb = GlobSetBuilder::new();
+                    for g in &plan.repo_globs {
+                        let mut bldr = GlobBuilder::new(g);
+                        bldr.case_insensitive(!plan.case_sensitive);
+                        if let Ok(gl) = bldr.build() {
+                            gb.add(gl);
+                        }
+                    }
+                    gb.build().map(|s| s.is_match(name)).unwrap_or(false)
+                } else {
+                    false
+                };
+                if !(ok_sub || ok_re || ok_glob) {
+                    return vec![];
+                }
+            }
+            if !plan.branches.is_empty() {
+                // Very early: InMemoryIndex only has HEAD
+                let branches: HashSet<_> = inner.repo.branches.iter().collect();
+                if !plan
+                    .branches
+                    .iter()
+                    .any(|b| branches.contains(&b.to_string()))
+                {
+                    return vec![];
+                }
+            }
+        }
+
+        // Build a base doc set either by content/path pattern or by filters only
+        let mut base_docs: Vec<RepoDocId> = (0..self.idx.doc_count() as RepoDocId).collect();
+        if let Some(mut pat) = plan.pattern.clone() {
+            if plan.regex {
+                // maintain case choice: default regex is case-sensitive; add (?i) when not sensitive
+                if !plan.case_sensitive && !pat.starts_with("(?i)") {
+                    pat = format!("(?i){}", pat);
+                }
+                base_docs = self.eval(&Query::Regex(pat));
+            } else if plan.case_sensitive {
+                // do a scan to respect case
+                base_docs = self.eval_literal_case_sensitive(&pat);
+            } else {
+                base_docs = self.eval(&Query::Literal(pat));
+            }
+        }
+
+        // Apply path-only/content-only: if path-only and pattern present, re-evaluate against path tokens
+        if plan.path_only {
+            if let Some(pat) = &plan.pattern {
+                let inner = self.idx.read_inner();
+                let needle = if plan.case_sensitive {
+                    pat.clone()
+                } else {
+                    pat.to_lowercase()
+                };
+                let mut docs = Vec::new();
+                for (i, meta) in inner.docs.iter().enumerate() {
+                    let p = meta.path.display().to_string();
+                    let hay = if plan.case_sensitive {
+                        p
+                    } else {
+                        p.to_lowercase()
+                    };
+                    if hay.contains(&needle) {
+                        docs.push(i as RepoDocId);
+                    }
+                }
+                base_docs = docs;
+            }
+        }
+
+        // Now apply file filters: prefix/regex (we only have regex list and globs here)
+        let inner = self.idx.read_inner();
+        // Build globset from file_globs with case handling
+        let globset = if !plan.file_globs.is_empty() {
+            let mut b = GlobSetBuilder::new();
+            for g in &plan.file_globs {
+                let mut gb = GlobBuilder::new(g);
+                gb.case_insensitive(!plan.case_sensitive);
+                if let Ok(gl) = gb.build() {
+                    b.add(gl);
+                }
+            }
+            b.build().ok()
+        } else {
+            None
+        };
+        let mut filtered: Vec<RepoDocId> = Vec::new();
+        'doc: for d in base_docs {
+            let meta = match inner.docs.get(d as usize) {
+                Some(m) => m,
+                None => continue,
+            };
+            let path_str = meta.path.display().to_string();
+            // lang filter
+            if !plan.langs.is_empty() {
+                let l = meta.lang.as_deref().unwrap_or("");
+                if !plan.langs.iter().any(|x| x == l) {
+                    continue 'doc;
+                }
+            }
+            // file globs via globset
+            if let Some(gs) = &globset {
+                if !gs.is_match(&path_str) {
+                    continue 'doc;
+                }
+            } else {
+                for g in &plan.file_globs {
+                    let hay = if plan.case_sensitive {
+                        path_str.clone()
+                    } else {
+                        path_str.to_lowercase()
+                    };
+                    let nee = if plan.case_sensitive {
+                        g.clone()
+                    } else {
+                        g.to_lowercase()
+                    };
+                    if !hay.contains(&nee) {
+                        continue 'doc;
+                    }
+                }
+            }
+            // file regex (honor case via (?i))
+            for re in &plan.file_regexes {
+                if plan.case_sensitive {
+                    if !re.is_match(&path_str) {
+                        continue 'doc;
+                    }
+                } else {
+                    let pat = format!("(?i){}", re.as_str());
+                    match Regex::new(&pat) {
+                        Ok(rr) => {
+                            if !rr.is_match(&path_str) {
+                                continue 'doc;
+                            }
+                        }
+                        Err(_) => continue 'doc,
+                    }
+                }
+            }
+            filtered.push(d);
+        }
+
+        // handle select modes
+        match plan.select {
+            SelectKind::Repo => {
+                if filtered.is_empty() {
+                    vec![]
+                } else {
+                    let inner = self.idx.read_inner();
+                    vec![QueryResult {
+                        doc: 0,
+                        path: inner.repo.name.clone(),
+                        symbol: None,
+                    }]
+                }
+            }
+            SelectKind::Symbol => {
+                // emit one result per symbol in filtered docs
+                let mut out = Vec::new();
+                for d in filtered {
+                    if let Some(meta) = inner.docs.get(d as usize) {
+                        for sym in &meta.symbols {
+                            out.push(QueryResult {
+                                doc: d,
+                                path: meta.path.display().to_string(),
+                                symbol: Some(sym.clone()),
+                            });
+                        }
+                    }
+                }
+                out
+            }
+            SelectKind::File => filtered
+                .into_iter()
+                .filter_map(|d| {
+                    inner.docs.get(d as usize).map(|meta| QueryResult {
+                        doc: d,
+                        path: meta.path.display().to_string(),
+                        symbol: None,
+                    })
+                })
+                .collect(),
+        }
     }
 
     fn eval(&self, q: &Query) -> Vec<RepoDocId> {
@@ -122,6 +452,7 @@ impl<'a> Searcher<'a> {
 
     fn eval_literal(&self, needle: &str) -> Vec<RepoDocId> {
         let inner = self.idx.read_inner();
+        // case-insensitive by default (we'll add case handling via QueryPlan)
         if let Some(list) = inner.terms.get(&needle.to_lowercase()) {
             let mut v: Vec<RepoDocId> = list.to_vec();
             v.sort_unstable();
@@ -136,7 +467,8 @@ impl<'a> Searcher<'a> {
             .filter_map(|(i, meta)| {
                 let path = inner.repo.root.join(&meta.path);
                 if let Ok(text) = std::fs::read_to_string(&path) {
-                    if text.contains(needle) {
+                    let hay = text.to_lowercase();
+                    if hay.contains(&needle.to_lowercase()) {
                         return Some(i as RepoDocId);
                     }
                 }
@@ -189,6 +521,26 @@ impl<'a> Searcher<'a> {
             }
             Query::Not(inner_q) => self.estimate_cost(inner_q),
         }
+    }
+
+    fn eval_literal_case_sensitive(&self, needle: &str) -> Vec<RepoDocId> {
+        let inner = self.idx.read_inner();
+        let mut v: Vec<RepoDocId> = inner
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, meta)| {
+                let path = inner.repo.root.join(&meta.path);
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if text.contains(needle) {
+                        return Some(i as RepoDocId);
+                    }
+                }
+                None
+            })
+            .collect();
+        v.sort_unstable();
+        v
     }
 }
 
@@ -277,4 +629,47 @@ fn difference_sorted(left: &[RepoDocId], right: &[RepoDocId]) -> Vec<RepoDocId> 
         i += 1;
     }
     out
+}
+
+// Very small helper: split on whitespace, honoring single/double quotes.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut in_s = false;
+    let mut in_d = false;
+    for ch in input.chars() {
+        match ch {
+            '\'' if !in_d => {
+                in_s = !in_s;
+            }
+            '"' if !in_s => {
+                in_d = !in_d;
+            }
+            c if c.is_whitespace() && !in_s && !in_d => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            c => buf.push(c),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+fn looks_like_regex(s: &str) -> bool {
+    // Heuristic: presence of typical regex metacharacters
+    s.contains('[')
+        || s.contains(']')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('|')
+        || s.contains('?')
+        || s.contains('+')
+        || s.contains('*')
+        || s.contains('^')
+        || s.contains('$')
+        || s.contains('\\')
 }

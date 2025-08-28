@@ -21,6 +21,7 @@ pathdiff = "0.2"
 sha2 = "0.10"
 ignore = "0.4"
 lru = "0.8"
+globset = "0.4"
 
 [dev-dependencies]
 proptest = "1"

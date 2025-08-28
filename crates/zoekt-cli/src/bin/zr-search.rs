@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use zoekt_rs::{
     build_in_memory_index,
-    query::{Query, Searcher},
+    query::{QueryPlan, Searcher},
     SearchMatch, SearchOpts, ShardReader, ShardSearcher,
 };
 
@@ -11,7 +11,7 @@ use zoekt_rs::{
 struct Args {
     /// Path to repository root
     repo: std::path::PathBuf,
-    /// Query (literal or regex if --regex)
+    /// Query (literal by default). You can also pass Zoekt-like filters: repo:, file:, lang:, branch:, case:, path:only, content:only, select=repo|file|symbol.
     query: String,
     /// Treat query as regex
     #[arg(long)]
@@ -34,6 +34,9 @@ struct Args {
     /// Filter by path regex
     #[arg(long)]
     path_regex: Option<String>,
+    /// Branch filter (shard search only for now; must match shard metadata)
+    #[arg(long)]
+    branch: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -52,12 +55,13 @@ fn main() -> Result<()> {
     } else {
         let idx = build_in_memory_index(&args.repo)?;
         let s = Searcher::new(&idx);
-        let q = if args.regex {
-            Query::Regex(args.query)
-        } else {
-            Query::Literal(args.query)
-        };
-        for r in s.search(&q) {
+        // If --regex given, we annotate plan with regex:yes
+        let mut qstr = args.query.clone();
+        if args.regex && !qstr.contains("regex:") && !qstr.contains("re:") {
+            qstr = format!("{} regex:yes", qstr);
+        }
+        let plan = QueryPlan::parse(&qstr)?;
+        for r in s.search_plan(&plan) {
             println!("{}", r.path);
         }
     }
@@ -77,6 +81,7 @@ fn build_opts(args: &Args) -> Result<SearchOpts> {
         path_regex,
         limit: args.limit,
         context: args.context,
+        branch: args.branch.clone(),
     })
 }
 

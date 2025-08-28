@@ -9,7 +9,7 @@ pub mod trigram;
 pub mod types;
 
 pub use crate::index::{InMemoryIndex, IndexBuilder, RepoDocId};
-pub use crate::query::{Query, QueryResult, Searcher};
+pub use crate::query::{Query, QueryPlan, QueryResult, Searcher, SelectKind};
 pub use crate::shard::{SearchMatch, SearchOpts, ShardReader, ShardSearcher, ShardWriter};
 
 /// Convenience re-export for callers who want a simple one-shot build and search

@@ -27,7 +27,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 
 const MAGIC: u32 = 0x5a4f_454b; // 'ZOEK'
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 pub struct ShardWriter {
     path: PathBuf,
@@ -111,7 +111,7 @@ impl ShardWriter {
             }
         }
 
-        // Write metadata section (repo name/root/hash)
+        // Write metadata section (repo name/root/hash/branches)
         let meta_off = f.stream_position()?;
         let repo_name = inner.repo.name.as_bytes();
         let repo_root = inner.repo.root.display().to_string();
@@ -129,6 +129,14 @@ impl ShardWriter {
         f.write_all(&(repo_root_b.len() as u16).to_le_bytes())?;
         f.write_all(repo_root_b)?;
         f.write_all(&hash[..])?; // 32 bytes
+                                 // branches: count + each [len:u16][bytes]
+        let branches = &inner.repo.branches;
+        f.write_all(&(branches.len() as u16).to_le_bytes())?;
+        for b in branches {
+            let bb = b.as_bytes();
+            f.write_all(&(bb.len() as u16).to_le_bytes())?;
+            f.write_all(bb)?;
+        }
 
         // Write line index section: for each doc, store (data_off, count); then write line data blocks
         let line_index_off = f.stream_position()?;
@@ -180,6 +188,7 @@ pub struct ShardReader {
     _repo_name: String,
     repo_root: String,
     _repo_hash: [u8; 32],
+    branches: Vec<String>,
 }
 
 impl ShardReader {
@@ -217,6 +226,20 @@ impl ShardReader {
         moff += n2;
         let mut _repo_hash = [0u8; 32];
         _repo_hash.copy_from_slice(&mmap[moff..moff + 32]);
+        moff += 32;
+        // branches
+        let mut branches = Vec::new();
+        let n_br = u16::from_le_bytes(mmap[moff..moff + 2].try_into().unwrap()) as usize;
+        moff += 2;
+        for _ in 0..n_br {
+            let bl = u16::from_le_bytes(mmap[moff..moff + 2].try_into().unwrap()) as usize;
+            moff += 2;
+            let b = std::str::from_utf8(&mmap[moff..moff + bl])
+                .unwrap()
+                .to_string();
+            moff += bl;
+            branches.push(b);
+        }
         Ok(Self {
             mmap,
             doc_count,
@@ -226,6 +249,7 @@ impl ShardReader {
             _repo_name,
             repo_root,
             _repo_hash,
+            branches,
         })
     }
 
@@ -240,6 +264,9 @@ impl ShardReader {
     }
     pub fn repo_hash(&self) -> [u8; 32] {
         self._repo_hash
+    }
+    pub fn branches(&self) -> &[String] {
+        &self.branches
     }
 
     fn iter_docs(&self) -> impl Iterator<Item = String> + '_ {
@@ -391,6 +418,12 @@ impl<'a> ShardSearcher<'a> {
         needle: &str,
         opts: &SearchOpts,
     ) -> Vec<SearchMatch> {
+        // branch filter (repo-level). If set and not present, return empty.
+        if let Some(b) = &opts.branch {
+            if !self.rdr.branches().iter().any(|x| x == b) {
+                return vec![];
+            }
+        }
         let needle_b = needle.as_bytes();
         if needle_b.len() < 3 {
             return vec![];
@@ -484,6 +517,11 @@ impl<'a> ShardSearcher<'a> {
     }
 
     pub fn search_regex_confirmed(&self, pattern: &str, opts: &SearchOpts) -> Vec<SearchMatch> {
+        if let Some(b) = &opts.branch {
+            if !self.rdr.branches().iter().any(|x| x == b) {
+                return vec![];
+            }
+        }
         let re = match regex::Regex::new(pattern) {
             Ok(r) => r,
             Err(_) => return vec![],
@@ -622,6 +660,7 @@ pub struct SearchOpts {
     pub path_regex: Option<regex::Regex>,
     pub limit: Option<usize>,
     pub context: usize,
+    pub branch: Option<String>,
 }
 
 fn line_for_offset(starts: &[u32], pos: u32) -> (usize, u32) {

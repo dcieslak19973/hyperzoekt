@@ -107,6 +107,7 @@ impl IndexBuilder {
                 .to_string_lossy()
                 .to_string(),
             root: self.root.clone(),
+            branches: vec!["HEAD".to_string()],
         };
         let mut docs = Vec::new();
 
@@ -174,10 +175,13 @@ impl IndexBuilder {
             if size > self.max_file_size {
                 continue;
             }
+            let lang = detect_lang_from_ext(&rel);
             docs.push(DocumentMeta {
                 path: rel,
-                lang: None,
+                lang,
                 size: size as u64,
+                branches: vec!["HEAD".to_string()],
+                symbols: Vec::new(),
             });
         }
 
@@ -202,6 +206,21 @@ impl IndexBuilder {
                 for tok in seen.into_iter() {
                     acc.entry(tok).or_default().push(i as RepoDocId);
                 }
+                // naive symbol extraction will be attached after the main loop
+            }
+        }
+
+        // Re-open files to populate per-doc branches (HEAD) and symbols properly
+        for meta in docs.iter_mut() {
+            meta.branches = vec!["HEAD".to_string()];
+            let path = self.root.join(&meta.path);
+            if let Ok(s) = fs::read_to_string(&path) {
+                meta.symbols = extract_symbols(
+                    &s,
+                    meta.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                );
+            } else {
+                meta.symbols = Vec::new();
             }
         }
 
@@ -232,4 +251,64 @@ impl IndexBuilder {
             inner: std::sync::Arc::new(RwLock::new(inner)),
         })
     }
+}
+
+fn extract_symbols(content: &str, ext: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if ext == "rs" {
+        let re_fn = Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        let re_struct = Regex::new(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        for cap in re_fn.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+        for cap in re_struct.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+    } else if ext == "py" {
+        let re = Regex::new(r"^(?:\s*)(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        for line in content.lines() {
+            if let Some(cap) = re.captures(line) {
+                if let Some(m) = cap.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+    } else if ext == "go" {
+        let re = Regex::new(r"\bfunc(?:\s*\(.*?\))?\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
+fn detect_lang_from_ext(path: &std::path::Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    let lang = match ext.as_str() {
+        "rs" => "rust",
+        "go" => "go",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "java" => "java",
+        "cs" => "csharp",
+        "c" => "c",
+        "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "sh" | "bash" => "shell",
+        "md" => "markdown",
+        "yml" | "yaml" => "yaml",
+        "toml" => "toml",
+        "json" => "json",
+        _ => return None,
+    };
+    Some(lang.to_string())
 }
