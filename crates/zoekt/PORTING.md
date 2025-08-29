@@ -31,11 +31,16 @@ Status (high level):
     2. Add Go-derived regex edge-case tests into `crates/zoekt/tests/` for parity verification.
     3. Ensure the prefilter falls back to a safe default (no prefilter) when uncertain to avoid false negatives.
 
-- [~] Full postings format and ranking, line/match context extraction (core pieces present; more work required)
+- [~] Full postings format and ranking, line/match context extraction
+   - Basic ranking and snippet extraction are implemented in the shard-backed search path (see “Scoring & snippets” below). Advanced ranking remains to be ported.
 - [~] Repo/file scoping, symbol awareness (symbol extraction + per-doc symbols persisted; symbol-trigram postings and shard-side prefilter implemented but needs tuning)
 - [~] Broader test parity with Go Zoekt (good unit coverage; need Go-derived fixtures and golden comparisons)
 
 Recent notable changes (delta since earlier drafts):
+- [x] Initial relevance ranking and snippets (shard search)
+   - `SearchMatch` now includes a `score: f32` used to rank results across files; `SearchOpts` supports an optional `snippet_max_chars` to trim before/after context with ellipses.
+   - Literal and regex shard searches confirm positions, compute a simple per-document score, generate before/line/after snippets, optionally trim, sort by score desc, and apply `limit`.
+   - `zr-search --snippet-max-chars N` enables trimming for human-friendly output; JSON output now includes `score` and `line_text` (fixed key name).
 
 - [x] Multi-branch indexing (in-memory prototype): `IndexBuilder::branches(...)` and supporting code were added to allow indexing multiple branches by extracting each branch's tree and creating per-branch documents with in-memory contents. See `crates/zoekt/src/index.rs` and `crates/zoekt/tests/branch_selection.rs` for an end-to-end test.
 - [x] `content_only` semantics: `content_only` is now enforced at planning/execution time in the searcher, with unit/integration tests to validate path-vs-content behavior.
@@ -109,6 +114,7 @@ Status legend: [Done], [Partial], [Missing]
 
 - Core search/index packages (`index/`, `search/`): [Partial]
    - Fundamental pieces — query AST, trigram extraction, shard writer/reader, and an mmap-backed searcher — exist in `crates/zoekt/src`. However, several low-level postings, ranking heuristics, and exact shard-layout encodings from upstream are incomplete.
+   - Ranking: We currently use a simple heuristic (TF + early-position + filename boost). Upstream uses a richer ranking that considers word boundaries, symbol/name matches, proximity, length normalization, and other signals.
 
 - Regex prefiltering and trigram lowering: [Partial]
    - A conservative extractor exists (`regex_analyze.rs`) and is useful for many cases, but it does not yet match Go Zoekt's coverage on complex regexes and safe extraction of conjunctive trigram sets.
@@ -132,4 +138,37 @@ Concrete next actions to close gaps (minimal, test-first):
 3. Implement and test the missing compact postings encodings (delta+varint) behind a shard-version flag; add reader tests that assert round-trip parity for small fixtures.
 
 ---
+
+## Scoring & snippets
+
+What exists now (Rust, shard-backed literal/regex search):
+
+- Per-document score is computed once per file that has matches and then attached to each `SearchMatch` from that file:
+   - Term frequency (TF) boost: `tf_boost = log2(1 + occurrences_in_doc)`.
+   - Early-position boost: `pos_boost = 1 - min(first_match_byte / 8192, 1)`; earlier first matches score higher.
+   - Filename boost:
+      - Literal: `filename.to_lowercase().contains(needle.to_lowercase())` → +0.5 if true.
+      - Regex: pattern matches file name → +0.5 if true.
+   - Final score: `score = tf_boost + 0.5 * pos_boost + 0.5 * name_boost`.
+- Sorting: results are sorted by `score` descending, then by `(path, line, start)` as tie-breakers.
+- Snippets: for each match we emit `before`, `line_text`, and `after` using the line index and the requested `context` (in lines). If `SearchOpts.snippet_max_chars` is set, `before` and `after` are trimmed to ≤N Unicode chars with an ellipsis. `line_text` is not trimmed.
+- CLI: `zr-search` accepts `--snippet-max-chars` and includes `score` in JSON output.
+
+How this compares to upstream Zoekt (Go reference):
+
+- Upstream employs a more sophisticated ranking model. Public descriptions and code indicate it incorporates additional signals such as:
+   - Word-boundary matches vs. mid-token matches.
+   - Symbol/name matches and boosts for matches in identifiers.
+   - Proximity of multiple terms, and span/fragment cohesiveness.
+   - Document length/normalization and possibly inverse document frequency–like effects.
+   - Additional file- and repo-level heuristics (e.g., filename weighting, language/suffix hints).
+- The Rust port’s current heuristic is intentionally simple and fast; it captures useful first-order signals (TF, first occurrence position, filename) but lacks the richer semantics above. This means ordering can differ notably from upstream, especially for multi-term queries, identifiers, and large files.
+
+Planned follow-ups (parity-oriented):
+
+- Add word-boundary and token-aware boosts (use regex-syntax/Unicode segmentation).
+- Introduce per-term IDF or length normalization akin to BM25-lite to reduce over-weighting frequent terms.
+- Add proximity/fragment scoring for multi-term queries.
+- Add symbol-aware boosts using the shard’s per-doc symbol table.
+- Gate new behavior behind a `SearchOpts` flag to keep stability and enable A/B testing; add golden tests using upstream fixtures to compare ordering.
 

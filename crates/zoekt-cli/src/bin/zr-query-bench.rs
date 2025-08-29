@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::thread;
 use zoekt_rs::IndexBuilder;
-use zoekt_rs::{Query, Searcher, ShardReader, ShardSearcher, ShardWriter};
+use zoekt_rs::{Query, SearchOpts, Searcher, ShardReader, ShardSearcher, ShardWriter};
 
 fn get_max_rss_kb() -> Option<u64> {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
@@ -159,6 +159,55 @@ fn run_query_on_shard(rdr: &ShardReader, q: &Query) -> Vec<u32> {
     }
 }
 
+fn run_query_on_shard_ranked(rdr: &ShardReader, q: &Query) -> Vec<u32> {
+    let s = ShardSearcher::new(rdr);
+    let opts = SearchOpts {
+        // Keep snippets off and context 0 to focus on match confirmation + scoring
+        path_prefix: None,
+        path_regex: None,
+        limit: None,
+        context: 0,
+        branch: None,
+        snippet_max_chars: None,
+    };
+    match q {
+        Query::Literal(sq) => s
+            .search_literal_with_context_opts(sq, &opts)
+            .into_iter()
+            .map(|m| m.doc)
+            .collect(),
+        Query::Regex(r) => s
+            .search_regex_confirmed(r, &opts)
+            .into_iter()
+            .map(|m| m.doc)
+            .collect(),
+        Query::And(a, b) => {
+            let la = run_query_on_shard_ranked(rdr, a);
+            if la.is_empty() {
+                return vec![];
+            }
+            let lb = run_query_on_shard_ranked(rdr, b);
+            intersect_sorted_vec(&la, &lb)
+        }
+        Query::Or(a, b) => {
+            let la = run_query_on_shard_ranked(rdr, a);
+            if la.is_empty() {
+                return run_query_on_shard_ranked(rdr, b);
+            }
+            let lb = run_query_on_shard_ranked(rdr, b);
+            if lb.is_empty() {
+                return la;
+            }
+            union_sorted_vec(&la, &lb)
+        }
+        Query::Not(inner) => {
+            let all: Vec<u32> = (0..rdr.doc_count()).collect();
+            let sub = run_query_on_shard_ranked(rdr, inner);
+            difference_sorted_vec(&all, &sub)
+        }
+    }
+}
+
 fn run_symbol_select_on_shard(
     rdr: &ShardReader,
     pattern: &str,
@@ -207,6 +256,9 @@ struct Opts {
     /// Disable symbol extraction during indexing to speed up index build
     #[clap(long)]
     no_symbols: bool,
+    /// When set, shard mode uses confirmed/ranked search for leaves instead of prefiltered-only
+    #[clap(long)]
+    ranked: bool,
     /// Maximum number of branches to index when no explicit branches list is provided
     #[clap(long, default_value = "1")]
     max_branches: usize,
@@ -371,7 +423,11 @@ fn main() -> anyhow::Result<()> {
                 if total_start.elapsed() >= budget {
                     break 'outer_shard;
                 }
-                run_query_on_shard(&rdr, q);
+                if opts.ranked {
+                    let _ = run_query_on_shard_ranked(&rdr, q);
+                } else {
+                    let _ = run_query_on_shard(&rdr, q);
+                }
             }
             let mut times = Vec::new();
             let rss_before = get_max_rss_kb();
@@ -385,7 +441,11 @@ fn main() -> anyhow::Result<()> {
                     println!("  heartbeat: query {} iter {}/{}", qi + 1, i, opts.iters);
                 }
                 let start = Instant::now();
-                let _ = run_query_on_shard(&rdr, q);
+                if opts.ranked {
+                    let _ = run_query_on_shard_ranked(&rdr, q);
+                } else {
+                    let _ = run_query_on_shard(&rdr, q);
+                }
                 let dur = start.elapsed();
                 times.push(dur.as_micros());
                 per_pb.inc(1);

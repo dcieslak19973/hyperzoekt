@@ -16,6 +16,12 @@ pub enum Prefilter {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteAnchors {
+    // Distinct bytes that are very likely required by the regex (ASCII domain)
+    pub bytes: Vec<u8>,
+}
+
 /// Try to derive a prefilter from a regex by extracting literal runs >=3.
 ///
 /// This is a heuristic: we extract all contiguous literal runs (taking
@@ -213,6 +219,149 @@ pub fn prefilter_from_regex(pattern: &str) -> Prefilter {
     }
 }
 
+/// Extract a small set of single-byte anchors from the HIR when there are no
+/// usable trigram literals. We look for literal bytes in Class::Bytes, literal
+/// sequences shorter than 3, and obvious punctuation in concatenations.
+pub fn byte_anchors_from_regex(pattern: &str) -> Option<ByteAnchors> {
+    use regex_syntax::hir::{Class, Hir, HirKind, Literal};
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let mut set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+
+    fn walk(h: &Hir, out: &mut std::collections::BTreeSet<u8>) {
+        match h.kind() {
+            HirKind::Literal(Literal::Unicode(c)) => {
+                if c.is_ascii() {
+                    out.insert((*c) as u8);
+                }
+            }
+            HirKind::Literal(Literal::Byte(b)) => {
+                out.insert(*b);
+            }
+            HirKind::Class(Class::Bytes(bytes)) => {
+                for rng in bytes.iter() {
+                    // pick edges as anchors for tightness
+                    out.insert(rng.start());
+                    out.insert(rng.end());
+                }
+            }
+            HirKind::Concat(list) | HirKind::Alternation(list) => {
+                for sub in list {
+                    walk(sub, out);
+                }
+            }
+            HirKind::Repetition(rep) => {
+                // Always walk inner; repetition tightness is applied by outer logic.
+                walk(&rep.hir, out);
+            }
+            HirKind::Group(g) => walk(&g.hir, out),
+            _ => {}
+        }
+    }
+    walk(&hir, &mut set);
+
+    // Filter to ASCII punctuation and common anchor-worthy bytes
+    let mut bytes: Vec<u8> = set.into_iter().filter(|b| b.is_ascii_graphic()).collect();
+    // Prioritize '(', ')', '*', '+', '-', '_', '/', '\\'
+    bytes.sort_by_key(|b| match *b {
+        b'(' | b')' | b'*' | b'+' | b'-' | b'_' | b'/' | b'\\' => 0,
+        _ => 1,
+    });
+    bytes.truncate(4);
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(ByteAnchors { bytes })
+    }
+}
+
+/// Extract longer ASCII substrings that are likely required by the regex.
+/// Heuristic: collect maximal runs of fixed bytes in concatenations; for
+/// alternations, intersect across branches; ignore variable classes except
+/// single-byte classes; ignore zero-width and zero-occurrence repetitions.
+pub fn required_substrings_from_regex(pattern: &str) -> Vec<Vec<u8>> {
+    use regex_syntax::hir::{Class, Hir, HirKind, Literal, RepetitionKind};
+    let hir = match regex_syntax::Parser::new().parse(pattern) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+
+    fn singleton_byte_from_class(bs: &regex_syntax::hir::ClassBytes) -> Option<u8> {
+        let mut it = bs.iter();
+        let first = it.next()?;
+        if it.next().is_none() && first.start() == first.end() {
+            Some(first.start())
+        } else {
+            None
+        }
+    }
+
+    fn collect(h: &Hir) -> Vec<Vec<u8>> {
+        match h.kind() {
+            HirKind::Alternation(list) => {
+                let mut common: Option<std::collections::BTreeSet<Vec<u8>>> = None;
+                for sub in list {
+                    let v = collect(sub);
+                    let set: std::collections::BTreeSet<Vec<u8>> = v.into_iter().collect();
+                    common = Some(match common {
+                        None => set,
+                        Some(prev) => prev.intersection(&set).cloned().collect(),
+                    });
+                }
+                common.map(|s| s.into_iter().collect()).unwrap_or_default()
+            }
+            HirKind::Concat(list) => {
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                let mut cur: Vec<u8> = Vec::new();
+                for sub in list {
+                    match sub.kind() {
+                        HirKind::Literal(Literal::Unicode(c)) if c.is_ascii() => {
+                            cur.push((*c) as u8)
+                        }
+                        HirKind::Literal(Literal::Byte(b)) => cur.push(*b),
+                        HirKind::Class(Class::Bytes(bytes)) => {
+                            if let Some(b) = singleton_byte_from_class(bytes) {
+                                cur.push(b)
+                            } else {
+                                if cur.len() >= 2 {
+                                    out.push(cur.clone());
+                                }
+                                cur.clear();
+                            }
+                        }
+                        _ => {
+                            if cur.len() >= 2 {
+                                out.push(cur.clone());
+                            }
+                            cur.clear();
+                        }
+                    }
+                }
+                if cur.len() >= 2 {
+                    out.push(cur);
+                }
+                out
+            }
+            HirKind::Repetition(rep) => {
+                // Only consider repetitions that require at least one occurrence; otherwise skip.
+                match rep.kind {
+                    RepetitionKind::ZeroOrMore | RepetitionKind::ZeroOrOne => Vec::new(),
+                    _ => collect(&rep.hir),
+                }
+            }
+            HirKind::Group(g) => collect(&g.hir),
+            _ => Vec::new(),
+        }
+    }
+
+    let mut subs = collect(&hir);
+    // Keep unique substrings, prioritize longer ones.
+    subs.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    subs.dedup();
+    // Make sure outputs are ASCII only (since we scan bytes)
+    subs.retain(|v| v.iter().all(|b| b.is_ascii()));
+    subs.truncate(3);
+    subs
+}
 // Note: previous AST-based manual extraction helper removed in favor of
 // the HIR-based literal extraction helpers present in regex-syntax.
 

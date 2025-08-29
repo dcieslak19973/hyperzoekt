@@ -17,38 +17,40 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
     index::InMemoryIndex,
-    regex_analyze::prefilter_from_regex,
+    regex_analyze::{
+        byte_anchors_from_regex, prefilter_from_regex, required_substrings_from_regex,
+    },
     trigram::{emit_trigrams_with_pos, trigrams},
 };
+use lru::LruCache;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use std::num::NonZeroUsize;
 use std::time::Instant;
-
 // Type aliases to reduce clippy::type_complexity warnings.
 type SymbolTuple = (String, Option<u32>, Option<u32>);
 type SymbolsTable = Vec<Vec<SymbolTuple>>;
 type PostingsMap = HashMap<[u8; 3], BTreeMap<u32, Vec<u32>>>;
+#[cfg(test)]
 type SymbolPostingsMap = HashMap<[u8; 3], Vec<u32>>;
 
 // Varint helpers: simple LEB128-style unsigned varint for u32.
 fn write_var_u32<W: Write>(w: &mut W, mut v: u32) -> Result<()> {
+    // LEB128-style: emit 7-bit chunks, MSB marks continuation.
     let mut buf = [0u8; 5];
     let mut i = 0;
-    loop {
-        let byte = (v & 0x7F) as u8;
+    while v >= 0x80 {
+        buf[i] = (v as u8 & 0x7F) | 0x80;
         v >>= 7;
-        if v == 0 {
-            buf[i] = byte;
-            i += 1;
-            break;
-        } else {
-            buf[i] = byte | 0x80;
-            i += 1;
-        }
+        i += 1;
     }
+    buf[i] = v as u8;
+    i += 1;
     w.write_all(&buf[..i])?;
     Ok(())
 }
@@ -435,12 +437,51 @@ impl ShardWriter {
     }
 }
 
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn prev_char(bytes: &[u8], at: usize) -> Option<char> {
+    if at == 0 || at > bytes.len() {
+        return None;
+    }
+    // Find the last char start before `at`
+    let mut last: Option<char> = None;
+    for (i, ch) in std::str::from_utf8(bytes).ok()?.char_indices() {
+        if i >= at {
+            break;
+        }
+        last = Some(ch);
+    }
+    last
+}
+
+fn next_char(bytes: &[u8], at: usize) -> Option<char> {
+    if at >= bytes.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    for (i, ch) in s.char_indices() {
+        if i >= at {
+            return Some(ch);
+        }
+    }
+    None
+}
+
 pub struct ShardReader {
     mmap: Mmap,
     doc_count: u32,
+    #[allow(dead_code)]
     docs_off: u64,
     postings_off: u64,
     line_index_off: u64,
+    // cached doc paths (parsed once at open)
+    doc_paths: Vec<String>,
+    // quick term index for content postings: tri -> (off_to_docs, n_docs)
+    content_term_index: HashMap<[u8; 3], TermEntry>,
+    // quick term index for symbol postings
+    symbol_term_index: HashMap<[u8; 3], TermEntry>,
     // parsed metadata
     _repo_name: String,
     repo_root: String,
@@ -448,6 +489,12 @@ pub struct ShardReader {
     branches: Vec<String>,
     // parsed per-doc symbols stored as Vec<Vec<(name,start,line)>>
     symbols: SymbolsTable,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TermEntry {
+    off: usize,  // offset to start of docs (right after tri + n_docs)
+    n_docs: u32, // number of docs in postings list
 }
 
 impl ShardReader {
@@ -588,18 +635,130 @@ impl ShardReader {
             }
             symbols.push(syms);
         }
+        // Parse docs table once into cached paths
+        let mut doff = docs_off as usize;
+        let mut doc_paths: Vec<String> = Vec::with_capacity(doc_count as usize);
+        for _ in 0..doc_count {
+            let len =
+                u16::from_le_bytes(mmap[doff..doff + 2].try_into().with_context(|| {
+                    format!("shard truncated while reading doc len (off={})", doff)
+                })?) as usize;
+            doff += 2;
+            let s = std::str::from_utf8(&mmap[doff..doff + len])
+                .with_context(|| {
+                    format!(
+                        "shard metadata corrupted: doc path not valid UTF-8 (off={})",
+                        doff
+                    )
+                })?
+                .to_string();
+            doff += len;
+            doc_paths.push(s);
+        }
+
+        // Build term indices for content and symbol maps for O(1) tri lookup
+        let (content_term_index, symbol_term_index) =
+            Self::build_term_indices(&mmap, postings_off)?;
+
         Ok(Self {
             mmap,
             doc_count,
             docs_off,
             postings_off,
             line_index_off,
+            doc_paths,
+            content_term_index,
+            symbol_term_index,
             _repo_name,
             repo_root,
             _repo_hash,
             branches,
             symbols,
         })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_term_indices(
+        mmap: &Mmap,
+        postings_off: u64,
+    ) -> Result<(HashMap<[u8; 3], TermEntry>, HashMap<[u8; 3], TermEntry>)> {
+        let mut off = postings_off as usize;
+        let mut content_index: HashMap<[u8; 3], TermEntry> = HashMap::new();
+        let term_count =
+            u32::from_le_bytes(mmap[off..off + 4].try_into().with_context(|| {
+                format!("shard truncated while reading term_count (off={})", off)
+            })?) as usize;
+        off += 4;
+        for _ in 0..term_count {
+            let tri: [u8; 3] = mmap[off..off + 3]
+                .try_into()
+                .with_context(|| format!("shard truncated while reading trigram (off={})", off))?;
+            off += 3;
+            let n_docs =
+                u32::from_le_bytes(mmap[off..off + 4].try_into().with_context(|| {
+                    format!("shard truncated while reading n_docs (off={})", off)
+                })?);
+            off += 4;
+            let entry_off = off; // start of docs for this tri
+                                 // Skip over this term's postings to reach next term.
+            let mut local_off = off;
+            for _ in 0..n_docs as usize {
+                // doc delta (ignored here)
+                let _ = read_var_u32_from_mmap(mmap, &mut local_off)?;
+                let npos = read_var_u32_from_mmap(mmap, &mut local_off)? as usize;
+                // skip positions
+                for _ in 0..npos {
+                    let _ = read_var_u32_from_mmap(mmap, &mut local_off)?;
+                }
+            }
+            // record index and advance off to the next term
+            content_index.insert(
+                tri,
+                TermEntry {
+                    off: entry_off,
+                    n_docs,
+                },
+            );
+            off = local_off;
+        }
+        // Symbol term index starts here
+        let mut sym_index: HashMap<[u8; 3], TermEntry> = HashMap::new();
+        let sym_count = u32::from_le_bytes(mmap[off..off + 4].try_into().with_context(|| {
+            format!(
+                "shard truncated while reading symbol term_count (off={})",
+                off
+            )
+        })?) as usize;
+        off += 4;
+        for _ in 0..sym_count {
+            let tri: [u8; 3] = mmap[off..off + 3].try_into().with_context(|| {
+                format!("shard truncated while reading symbol trigram (off={})", off)
+            })?;
+            off += 3;
+            let n_docs = u32::from_le_bytes(mmap[off..off + 4].try_into().with_context(|| {
+                format!("shard truncated while reading symbol n_docs (off={})", off)
+            })?);
+            off += 4;
+            let entry_off = off;
+            // skip varint docs (each doc_delta + npos)
+            let mut local_off = off;
+            let mut prev_doc: u32 = 0;
+            for _ in 0..n_docs as usize {
+                let d = read_var_u32_from_mmap(mmap, &mut local_off)?;
+                let _doc = prev_doc.wrapping_add(d);
+                prev_doc = _doc;
+                let _npos = read_var_u32_from_mmap(mmap, &mut local_off)?;
+            }
+            sym_index.insert(
+                tri,
+                TermEntry {
+                    off: entry_off,
+                    n_docs,
+                },
+            );
+            off = local_off;
+        }
+        Ok((content_index, sym_index))
     }
 
     pub fn doc_count(&self) -> u32 {
@@ -618,6 +777,10 @@ impl ShardReader {
         &self.branches
     }
 
+    pub fn paths(&self) -> &[String] {
+        &self.doc_paths
+    }
+
     /// Return per-doc symbols parsed from the shard metadata, if any.
     pub fn symbols_for_doc(&self, doc: u32) -> Option<&[SymbolTuple]> {
         if (doc as usize) < self.symbols.len() {
@@ -628,29 +791,11 @@ impl ShardReader {
     }
 
     fn iter_docs(&self) -> Result<Vec<String>> {
-        let mut off = self.docs_off as usize;
-        let mut out = Vec::with_capacity(self.doc_count as usize);
-        for _ in 0..self.doc_count {
-            let len =
-                u16::from_le_bytes(self.mmap[off..off + 2].try_into().with_context(|| {
-                    format!("shard truncated while reading doc len (off={})", off)
-                })?) as usize;
-            off += 2;
-            let s = std::str::from_utf8(&self.mmap[off..off + len])
-                .with_context(|| {
-                    format!(
-                        "shard metadata corrupted: doc path not valid UTF-8 (off={})",
-                        off
-                    )
-                })?
-                .to_string();
-            off += len;
-            out.push(s);
-        }
-        Ok(out)
+        Ok(self.doc_paths.clone())
     }
 
     fn postings_map(&self) -> Result<PostingsMap> {
+        // Deprecated slow path; retained for tests. Prefer using term indices.
         let mut off = self.postings_off as usize;
         let mut map = HashMap::new();
         let term_count =
@@ -690,6 +835,97 @@ impl ShardReader {
         Ok(map)
     }
 
+    // Fast path: get docs for a specific content trigram using the term index.
+    fn content_term_docs(&self, tri: &[u8; 3]) -> Option<Vec<u32>> {
+        let entry = self.content_term_index.get(tri)?;
+        let mut off = entry.off;
+        let mut out = Vec::with_capacity(entry.n_docs as usize);
+        let mut prev_doc: u32 = 0;
+        for _ in 0..entry.n_docs {
+            let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            let doc = prev_doc.wrapping_add(doc_delta);
+            prev_doc = doc;
+            out.push(doc);
+            let npos = read_var_u32_from_mmap(&self.mmap, &mut off).ok()? as usize;
+            for _ in 0..npos {
+                let _ = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            }
+        }
+        Some(out)
+    }
+
+    // Fast path: decode full postings for a content trigram (doc -> positions)
+    fn decode_content_term(&self, tri: &[u8; 3]) -> Option<BTreeMap<u32, Vec<u32>>> {
+        let entry = self.content_term_index.get(tri)?;
+        let mut off = entry.off;
+        let mut out: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut prev_doc: u32 = 0;
+        for _ in 0..entry.n_docs {
+            let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            let doc = prev_doc.wrapping_add(doc_delta);
+            prev_doc = doc;
+            let npos = read_var_u32_from_mmap(&self.mmap, &mut off).ok()? as usize;
+            let mut pos = Vec::with_capacity(std::cmp::min(npos, 256));
+            let mut prev_pos: u32 = 0;
+            for _ in 0..npos {
+                let pos_delta = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+                let p = prev_pos.wrapping_add(pos_delta);
+                prev_pos = p;
+                pos.push(p);
+            }
+            out.insert(doc, pos);
+        }
+        Some(out)
+    }
+
+    // Targeted decode: return positions for a single doc in a trigram postings list.
+    fn content_term_positions_for_doc(&self, tri: &[u8; 3], target_doc: u32) -> Option<Vec<u32>> {
+        let entry = self.content_term_index.get(tri)?;
+        let mut off = entry.off;
+        let mut prev_doc: u32 = 0;
+        for _ in 0..entry.n_docs {
+            let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            let doc = prev_doc.wrapping_add(doc_delta);
+            prev_doc = doc;
+            let npos = read_var_u32_from_mmap(&self.mmap, &mut off).ok()? as usize;
+            if doc == target_doc {
+                // read and return exact positions for this doc
+                let mut pos = Vec::with_capacity(std::cmp::min(npos, 256));
+                let mut prev_pos: u32 = 0;
+                for _ in 0..npos {
+                    let pos_delta = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+                    let p = prev_pos.wrapping_add(pos_delta);
+                    prev_pos = p;
+                    pos.push(p);
+                }
+                return Some(pos);
+            } else {
+                // skip positions for non-target doc
+                for _ in 0..npos {
+                    let _ = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+                }
+            }
+        }
+        Some(Vec::new())
+    }
+
+    // Fast path: symbol trigram doc list
+    fn symbol_term_docs(&self, tri: &[u8; 3]) -> Option<Vec<u32>> {
+        let entry = self.symbol_term_index.get(tri)?;
+        let mut off = entry.off;
+        let mut out = Vec::with_capacity(entry.n_docs as usize);
+        let mut prev_doc: u32 = 0;
+        for _ in 0..entry.n_docs {
+            let d = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            let doc = prev_doc.wrapping_add(d);
+            prev_doc = doc;
+            let _npos = read_var_u32_from_mmap(&self.mmap, &mut off).ok()?;
+            out.push(doc);
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
     fn symbol_postings_map(&self) -> Result<SymbolPostingsMap> {
         // The postings section contains first the content trigram map, then the symbol trigram map.
         let mut off = self.postings_off as usize;
@@ -787,10 +1023,32 @@ impl ShardReader {
 
 pub struct ShardSearcher<'a> {
     rdr: &'a ShardReader,
+    // mmap file cache keyed by doc id for fast content access
+    file_cache: Mutex<LruCache<u32, Arc<Mmap>>>,
 }
 impl<'a> ShardSearcher<'a> {
     pub fn new(rdr: &'a ShardReader) -> Self {
-        Self { rdr }
+        // Increase mmap LRU capacity to reduce repeated open/mmap churn on
+        // workloads that iterate many small files. 256 is a conservative
+        // increase from the previous 64.
+        let cap = NonZeroUsize::new(256).unwrap();
+        Self {
+            rdr,
+            file_cache: Mutex::new(LruCache::new(cap)),
+        }
+    }
+
+    fn get_doc_mmap(&self, doc: u32) -> Option<Arc<Mmap>> {
+        if let Some(mm) = self.file_cache.lock().get(&doc).cloned() {
+            return Some(mm);
+        }
+        let path = self.rdr.paths().get(doc as usize)?.clone();
+        let full = std::path::Path::new(self.rdr.repo_root()).join(path);
+        let f = File::open(&full).ok()?;
+        let mmap = unsafe { Mmap::map(&f).ok()? };
+        let arc = Arc::new(mmap);
+        self.file_cache.lock().put(doc, arc.clone());
+        Some(arc)
     }
 
     pub fn search_literal(&self, needle: &str) -> Vec<(u32, String)> {
@@ -831,20 +1089,12 @@ impl<'a> ShardSearcher<'a> {
             Err(_) => return vec![],
         };
         let pf = prefilter_from_regex(pattern);
-        let map = match self.rdr.postings_map() {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-        let paths: Vec<_> = match self.rdr.iter_docs() {
-            Ok(p) => p,
-            Err(_) => return vec![],
-        };
+        let paths = self.rdr.paths();
         let mut cand: Option<Vec<u32>> = None;
         match pf {
             crate::regex_analyze::Prefilter::Conj(tris) => {
                 for t in tris {
-                    if let Some(v) = map.get(&t) {
-                        let docs: Vec<u32> = v.keys().copied().collect();
+                    if let Some(docs) = self.rdr.content_term_docs(&t) {
                         cand = Some(match cand {
                             None => docs,
                             Some(prev) => intersect_sorted(&prev, &docs),
@@ -856,15 +1106,13 @@ impl<'a> ShardSearcher<'a> {
             }
             crate::regex_analyze::Prefilter::Disj(disj) => {
                 // For disjunction, union all per-branch candidate sets.
-                let mut union_docs: Vec<u32> = Vec::new();
                 use std::collections::BTreeSet;
                 let mut set: BTreeSet<u32> = BTreeSet::new();
                 for tris in disj {
                     let mut branch_cand: Option<Vec<u32>> = None;
                     let mut branch_ok = true;
                     for t in tris {
-                        if let Some(v) = map.get(&t) {
-                            let docs: Vec<u32> = v.keys().copied().collect();
+                        if let Some(docs) = self.rdr.content_term_docs(&t) {
                             branch_cand = Some(match branch_cand {
                                 None => docs,
                                 Some(prev) => intersect_sorted(&prev, &docs),
@@ -876,14 +1124,13 @@ impl<'a> ShardSearcher<'a> {
                     }
                     if branch_ok {
                         if let Some(bc) = branch_cand {
-                            for d in bc.into_iter() {
+                            for d in bc {
                                 set.insert(d);
                             }
                         }
                     }
                 }
-                union_docs.extend(set);
-                cand = Some(union_docs);
+                cand = Some(set.into_iter().collect());
             }
             _ => {
                 cand = Some((0..paths.len() as u32).collect());
@@ -919,14 +1166,10 @@ impl<'a> ShardSearcher<'a> {
             return vec![];
         }
         let first = tris[0];
-        let map = match self.rdr.postings_map() {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
+        // Use fast term index
         let mut cand: Option<Vec<u32>> = None;
         for t in tris.iter() {
-            if let Some(v) = map.get(t) {
-                let docs: Vec<u32> = v.keys().copied().collect();
+            if let Some(docs) = self.rdr.content_term_docs(t) {
                 cand = Some(match cand {
                     None => docs,
                     Some(prev) => intersect_sorted(&prev, &docs),
@@ -935,12 +1178,24 @@ impl<'a> ShardSearcher<'a> {
                 return vec![];
             }
         }
-        let paths: Vec<_> = match self.rdr.iter_docs() {
-            Ok(p) => p,
-            Err(_) => return vec![],
-        };
-        let mut out = Vec::new();
+        let paths = self.rdr.paths();
+        let mut all_matches: Vec<SearchMatch> = Vec::new();
         if let Some(cdocs) = cand {
+            let total_docs = paths.len() as f32;
+            // approximate df using smallest postings list among trigram atoms
+            let mut df = cdocs.len() as f32;
+            for t in tris.iter() {
+                if let Some(entry) = self.rdr.content_term_index.get(t) {
+                    df = df.min(entry.n_docs as f32);
+                }
+            }
+            let idf_boost = if df > 0.0 {
+                (1.0 + (total_docs / (df + 1.0))).ln() // natural log IDF-like
+            } else {
+                0.0
+            };
+            // decode postings for first tri once
+            let first_postings = self.rdr.decode_content_term(&first);
             for d in cdocs {
                 let path = &paths[d as usize];
                 if let Some(pref) = &opts.path_prefix {
@@ -953,58 +1208,179 @@ impl<'a> ShardSearcher<'a> {
                         continue;
                     }
                 }
-                let pmap = match map.get(&first) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                let positions = match pmap.get(&d) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let full_path = std::path::Path::new(&self.rdr.repo_root).join(&paths[d as usize]);
-                let text = match std::fs::read(&full_path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                for &pos in positions.iter() {
-                    let pos = pos as usize;
-                    if pos + needle_b.len() <= text.len()
-                        && &text[pos..pos + needle_b.len()] == needle_b
-                    {
-                        let starts = match self.rdr.load_line_starts(d) {
-                            Some(s) => s,
-                            None => vec![0],
-                        };
-                        let (line_idx, line_start) = line_for_offset(&starts, pos as u32);
-                        let (ctx_beg, ctx_end) =
-                            context_byte_range(&starts, line_idx, opts.context, text.len());
-                        let (line_beg, line_end) = line_bounds(&starts, line_idx, text.len());
-                        let start_col = pos as u32 - line_start;
-                        let end_col = start_col + needle_b.len() as u32;
-                        let before = String::from_utf8_lossy(&text[ctx_beg..line_beg]).to_string();
-                        let line_text =
-                            String::from_utf8_lossy(&text[line_beg..line_end]).to_string();
-                        let after = String::from_utf8_lossy(&text[line_end..ctx_end]).to_string();
-                        out.push(SearchMatch {
-                            doc: d,
-                            path: paths[d as usize].clone(),
-                            line: line_idx as u32 + 1,
-                            start: start_col,
-                            end: end_col,
-                            before,
-                            line_text,
-                            after,
-                        });
-                        if let Some(limit) = opts.limit {
-                            if out.len() >= limit {
-                                return out;
-                            }
-                        }
+                let positions: Vec<u32> = if let Some(pm) = &first_postings {
+                    if let Some(v) = pm.get(&d) {
+                        v.clone()
+                    } else {
+                        Vec::new()
                     }
+                } else {
+                    Vec::new()
+                };
+                if positions.is_empty() {
+                    continue;
+                }
+                let text_arc = match self.get_doc_mmap(d) {
+                    Some(mm) => mm,
+                    None => continue,
+                };
+                let text: &[u8] = &text_arc;
+                let starts = match self.rdr.load_line_starts(d) {
+                    Some(s) => s,
+                    None => vec![0],
+                };
+                let mut confirmed: Vec<usize> = Vec::new();
+                for &pos in positions.iter() {
+                    let p = pos as usize;
+                    if p + needle_b.len() <= text.len() && &text[p..p + needle_b.len()] == needle_b
+                    {
+                        confirmed.push(p);
+                    }
+                }
+                if confirmed.is_empty() {
+                    continue;
+                }
+                confirmed.sort_unstable();
+                let tf = confirmed.len() as u32;
+                let first_pos = confirmed[0] as u32;
+                let filename = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let nee = String::from_utf8_lossy(needle_b).to_lowercase();
+                let name_boost = filename.to_lowercase().contains(&nee) as i32 as f32;
+                let tf_boost = (1.0 + (tf as f32)).log2();
+                let pos_norm = (first_pos as f32) / 8192.0;
+                let pos_boost = 1.0 - pos_norm.min(1.0);
+                // Word-boundary bonus (Unicode-aware): check first confirmed occurrence around match
+                let boundary_bonus = {
+                    let p0 = confirmed[0];
+                    let left_ok = prev_char(text, p0)
+                        .map(|c| !is_word_char(c))
+                        .unwrap_or(true);
+                    let right_ok = next_char(text, p0 + needle_b.len())
+                        .map(|c| !is_word_char(c))
+                        .unwrap_or(true);
+                    (left_ok && right_ok) as i32 as f32 * 0.5
+                };
+                // Symbol-aware bonus: prefer matches that align with a symbol start/line when known
+                let symbol_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                    let p0 = confirmed[0] as u32;
+                    let aligns = syms.iter().any(|(_n, start_opt, _line_opt)| {
+                        if let Some(st) = *start_opt {
+                            st == p0
+                        } else {
+                            false
+                        }
+                    });
+                    if aligns {
+                        0.5
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                // Length normalization to avoid over-weighting huge files
+                let len_norm = 1.0 / (1.0 + (text.len() as f32 / 4096.0));
+                // Proximity/density bonus: prefer clustered occurrences
+                let density_bonus = if confirmed.len() >= 2 {
+                    // mean gap of first few neighbors, scaled
+                    let mut gaps = 0.0f32;
+                    let take = confirmed.len().min(5);
+                    for i in 1..take {
+                        gaps += (confirmed[i] - confirmed[i - 1]) as f32;
+                    }
+                    let mean_gap = gaps / ((take - 1) as f32).max(1.0);
+                    (1.0 / (1.0 + (mean_gap / 80.0))).min(0.5) // cap at 0.5
+                } else {
+                    0.0
+                };
+                // Fragment bonus: group nearby positions into compact fragments
+                let frag_bonus = {
+                    let spans: Vec<(usize, usize)> =
+                        confirmed.iter().map(|&p| (p, p + needle_b.len())).collect();
+                    compute_fragment_bonus(&spans, 64)
+                };
+                // Symbol span region bonus using [symbol_start, next_symbol_start)
+                let sym_span_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                    let regions = build_symbol_spans(syms, text.len());
+                    let p0 = confirmed[0];
+                    if regions.iter().any(|(s, e)| p0 >= *s && p0 < *e) {
+                        0.4
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let doc_score = (tf_boost
+                    + idf_boost
+                    + 0.5 * pos_boost
+                    + 0.5 * name_boost
+                    + boundary_bonus
+                    + symbol_bonus
+                    + density_bonus
+                    + frag_bonus
+                    + sym_span_bonus)
+                    * len_norm;
+
+                for p in confirmed {
+                    let (line_idx, line_start) = line_for_offset(&starts, p as u32);
+                    let (ctx_beg, ctx_end) =
+                        context_byte_range(&starts, line_idx, opts.context, text.len());
+                    let (line_beg, line_end) = line_bounds(&starts, line_idx, text.len());
+                    let start_col = p as u32 - line_start;
+                    let end_col = start_col + needle_b.len() as u32;
+                    let mut before = String::from_utf8_lossy(&text[ctx_beg..line_beg]).to_string();
+                    let line_text = String::from_utf8_lossy(&text[line_beg..line_end]).to_string();
+                    let mut after = String::from_utf8_lossy(&text[line_end..ctx_end]).to_string();
+                    if let Some(maxc) = opts.snippet_max_chars {
+                        before = trim_last_n_chars(&before, maxc, true);
+                        after = trim_first_n_chars(&after, maxc, true);
+                    }
+                    // Small symbol-line bonus: same line as a symbol declaration
+                    let symbol_line_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                        let lno = line_idx as u32 + 1;
+                        if syms
+                            .iter()
+                            .any(|(_, _, l)| l.map(|ll| ll == lno).unwrap_or(false))
+                        {
+                            0.1
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    all_matches.push(SearchMatch {
+                        doc: d,
+                        path: paths[d as usize].clone(),
+                        line: line_idx as u32 + 1,
+                        start: start_col,
+                        end: end_col,
+                        before,
+                        line_text,
+                        after,
+                        score: doc_score + symbol_line_bonus,
+                    });
                 }
             }
         }
-        out
+        all_matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.start.cmp(&b.start))
+        });
+        if let Some(limit) = opts.limit {
+            if all_matches.len() > limit {
+                all_matches.truncate(limit);
+            }
+        }
+        all_matches
     }
 
     pub fn search_regex_confirmed(&self, pattern: &str, opts: &SearchOpts) -> Vec<SearchMatch> {
@@ -1017,32 +1393,83 @@ impl<'a> ShardSearcher<'a> {
             Ok(r) => r,
             Err(_) => return vec![],
         };
-        let map = match self.rdr.postings_map() {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-        let paths: Vec<_> = match self.rdr.iter_docs() {
-            Ok(p) => p,
-            Err(_) => return vec![],
-        };
+        let paths = self.rdr.paths();
         let mut cand: Option<Vec<u32>> = None;
-        if let crate::regex_analyze::Prefilter::Conj(tris) = prefilter_from_regex(pattern) {
-            for t in tris.iter() {
-                if let Some(v) = map.get(t) {
-                    let docs: Vec<u32> = v.keys().copied().collect();
-                    cand = Some(match cand {
-                        None => docs,
-                        Some(prev) => intersect_sorted(&prev, &docs),
-                    });
-                } else {
-                    return vec![];
+        // Gather prefilter and also collect anchor trigrams we'll use to narrow confirmation windows.
+        let pf = prefilter_from_regex(pattern);
+        let mut anchor_tris: Vec<[u8; 3]> = Vec::new();
+        match pf {
+            crate::regex_analyze::Prefilter::Conj(ref tris) => {
+                for t in tris.iter() {
+                    if let Some(docs) = self.rdr.content_term_docs(t) {
+                        cand = Some(match cand {
+                            None => docs,
+                            Some(prev) => intersect_sorted(&prev, &docs),
+                        });
+                    } else {
+                        return vec![];
+                    }
                 }
+                anchor_tris.extend(tris.iter().copied());
             }
-        } else {
-            cand = Some((0..paths.len() as u32).collect());
+            crate::regex_analyze::Prefilter::Disj(ref disj) => {
+                use std::collections::{BTreeSet, HashSet};
+                // union across branches for candidate docs
+                let mut set: BTreeSet<u32> = BTreeSet::new();
+                let mut tri_set: HashSet<[u8; 3]> = HashSet::new();
+                for tris in disj.iter() {
+                    let mut branch_cand: Option<Vec<u32>> = None;
+                    let mut branch_ok = true;
+                    for t in tris.iter() {
+                        if let Some(docs) = self.rdr.content_term_docs(t) {
+                            branch_cand = Some(match branch_cand {
+                                None => docs,
+                                Some(prev) => intersect_sorted(&prev, &docs),
+                            });
+                            tri_set.insert(*t);
+                        } else {
+                            branch_ok = false;
+                            break;
+                        }
+                    }
+                    if branch_ok {
+                        if let Some(bc) = branch_cand {
+                            for d in bc {
+                                set.insert(d);
+                            }
+                        }
+                    }
+                }
+                cand = Some(set.into_iter().collect());
+                anchor_tris.extend(tri_set);
+            }
+            _ => {
+                // No safe prefilter; fall back to scanning all docs.
+                cand = Some((0..paths.len() as u32).collect());
+            }
         }
-        let mut out = Vec::new();
+        let mut all_matches: Vec<SearchMatch> = Vec::new();
         if let Some(cdocs) = cand {
+            let total_docs = paths.len() as f32;
+            let df = cdocs.len() as f32; // approx df from prefilter
+            let idf_boost = if df > 0.0 {
+                (1.0 + (total_docs / (df + 1.0))).ln()
+            } else {
+                0.0
+            };
+            // choose a few best anchor trigrams with smallest df to minimize windows
+            if !anchor_tris.is_empty() {
+                anchor_tris.sort_by_key(|t| {
+                    self.rdr
+                        .content_term_index
+                        .get(t)
+                        .map(|e| e.n_docs)
+                        .unwrap_or(u32::MAX)
+                });
+                // keep at most 3 anchors to limit overhead
+                anchor_tris.truncate(3);
+            }
+
             for d in cdocs {
                 let path = &paths[d as usize];
                 if let Some(pref) = &opts.path_prefix {
@@ -1055,27 +1482,379 @@ impl<'a> ShardSearcher<'a> {
                         continue;
                     }
                 }
-                let full_path = std::path::Path::new(&self.rdr.repo_root).join(path);
-                let content = match std::fs::read_to_string(&full_path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let mmap_arc = match self.get_doc_mmap(d) {
+                    Some(mm) => mm,
+                    None => continue,
                 };
+                let content = unsafe { std::str::from_utf8_unchecked(&mmap_arc[..]) };
                 let starts = match self.rdr.load_line_starts(d) {
                     Some(s) => s,
                     None => vec![0],
                 };
-                for m in re.find_iter(&content) {
-                    let pos = m.start() as u32;
+                let mut spans: Vec<(usize, usize)> = Vec::new();
+                if anchor_tris.is_empty() {
+                    // Try byte anchors before scanning whole file.
+                    if let Some(ba) = byte_anchors_from_regex(pattern) {
+                        use memchr::{memchr, memchr2, memchr3, memmem};
+                        let bytes = content.as_bytes();
+                        let mut lines: std::collections::BTreeSet<usize> =
+                            std::collections::BTreeSet::new();
+                        match ba.bytes.as_slice() {
+                            [a] => {
+                                let mut start = 0usize;
+                                while let Some(i) = memchr(*a, &bytes[start..]) {
+                                    let p = start + i;
+                                    let (li, _ls) = line_for_offset(&starts, p as u32);
+                                    lines.insert(li);
+                                    if li > 0 {
+                                        lines.insert(li - 1);
+                                    }
+                                    lines.insert((li + 1).min(starts.len().saturating_sub(1)));
+                                    start = p + 1;
+                                    if lines.len() >= 4096 {
+                                        break;
+                                    }
+                                }
+                            }
+                            [a, b] => {
+                                let mut start = 0usize;
+                                while let Some(i) = memchr2(*a, *b, &bytes[start..]) {
+                                    let p = start + i;
+                                    let (li, _ls) = line_for_offset(&starts, p as u32);
+                                    lines.insert(li);
+                                    if li > 0 {
+                                        lines.insert(li - 1);
+                                    }
+                                    lines.insert((li + 1).min(starts.len().saturating_sub(1)));
+                                    start = p + 1;
+                                    if lines.len() >= 4096 {
+                                        break;
+                                    }
+                                }
+                            }
+                            [a, b, c] => {
+                                let mut start = 0usize;
+                                while let Some(i) = memchr3(*a, *b, *c, &bytes[start..]) {
+                                    let p = start + i;
+                                    let (li, _ls) = line_for_offset(&starts, p as u32);
+                                    lines.insert(li);
+                                    if li > 0 {
+                                        lines.insert(li - 1);
+                                    }
+                                    lines.insert((li + 1).min(starts.len().saturating_sub(1)));
+                                    start = p + 1;
+                                    if lines.len() >= 4096 {
+                                        break;
+                                    }
+                                }
+                            }
+                            [a, b, c, ..] => {
+                                // use memmem for 2-byte seeds when available
+                                let s1: &[u8] = &[*a, *b];
+                                let s2: &[u8] = &[*c, *b];
+                                for hit in memmem::find_iter(bytes, s1) {
+                                    let (li, _ls) = line_for_offset(&starts, hit as u32);
+                                    lines.insert(li);
+                                    if li > 0 {
+                                        lines.insert(li - 1);
+                                    }
+                                    lines.insert((li + 1).min(starts.len().saturating_sub(1)));
+                                    if lines.len() >= 4096 {
+                                        break;
+                                    }
+                                }
+                                if lines.len() < 4096 {
+                                    for hit in memmem::find_iter(bytes, s2) {
+                                        let (li, _ls) = line_for_offset(&starts, hit as u32);
+                                        lines.insert(li);
+                                        if li > 0 {
+                                            lines.insert(li - 1);
+                                        }
+                                        lines.insert((li + 1).min(starts.len().saturating_sub(1)));
+                                        if lines.len() >= 4096 {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        // Build windows and scan
+                        let mut windows: Vec<(usize, usize)> = Vec::new();
+                        let mut cur: Option<usize> = None;
+                        let mut prev: Option<usize> = None;
+                        for li in lines {
+                            match (cur, prev) {
+                                (None, _) => {
+                                    cur = Some(li);
+                                    prev = Some(li);
+                                }
+                                (Some(cs), Some(pv)) => {
+                                    if li <= pv + 2 {
+                                        prev = Some(li);
+                                    } else {
+                                        windows.push((cs, pv));
+                                        cur = Some(li);
+                                        prev = Some(li);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(cs), Some(pv)) = (cur, prev) {
+                            windows.push((cs, pv));
+                        }
+                        for (scanned, (l0, l1)) in windows.into_iter().enumerate() {
+                            if scanned >= 4096 {
+                                break;
+                            }
+                            let (beg, end) =
+                                context_byte_range(&starts, l0, (l1 - l0) + 2, content.len());
+                            let slice = &content[beg..end];
+                            for m in re.find_iter(slice) {
+                                let s = beg + m.start();
+                                let e = beg + m.end();
+                                spans.push((s, e));
+                                if spans.len() >= 2048 {
+                                    break;
+                                }
+                            }
+                            if spans.len() >= 2048 {
+                                break;
+                            }
+                        }
+                        if spans.is_empty() {
+                            // Fallback to whole-file scan if anchors proved too weak.
+                            for m in re.find_iter(content) {
+                                spans.push((m.start(), m.end()));
+                            }
+                        }
+                    } else {
+                        // No anchors available; scan whole file (fallback)
+                        for m in re.find_iter(content) {
+                            spans.push((m.start(), m.end()));
+                        }
+                    }
+                } else {
+                    // Build candidate windows around lines that contain occurrences of anchor trigrams.
+                    // Additionally, require co-occurrence: keep only lines that are hit by at least two distinct anchors
+                    // within a small neighborhood to reduce false positives from very common anchors.
+                    use std::collections::{BTreeSet, HashMap};
+                    let mut line_masks: HashMap<usize, u32> = HashMap::new();
+                    for (ai, t) in anchor_tris.iter().enumerate() {
+                        let bit = 1u32 << (ai as u32);
+                        if let Some(pos) = self.rdr.content_term_positions_for_doc(t, d) {
+                            for p in pos {
+                                let (li, _ls) = line_for_offset(&starts, p);
+                                // include immediate neighbors to help multiline matches
+                                for l in [
+                                    li.saturating_sub(1),
+                                    li,
+                                    (li + 1).min(starts.len().saturating_sub(1)),
+                                ] {
+                                    *line_masks.entry(l).or_insert(0) |= bit;
+                                }
+                            }
+                        }
+                    }
+                    let mut lines: BTreeSet<usize> = BTreeSet::new();
+                    let need = if anchor_tris.len() >= 2 { 2 } else { 1 };
+                    for (li, mask) in line_masks.into_iter() {
+                        if mask.count_ones() as usize >= need {
+                            lines.insert(li);
+                        }
+                    }
+
+                    // Optional co-occurrence: if we can extract required ASCII substrings
+                    // from the regex, filter candidate lines to only those that contain at
+                    // least one such substring. This reduces false positives for very common
+                    // trigrams and tightens confirmation windows.
+                    if !lines.is_empty() {
+                        let req_subs = required_substrings_from_regex(pattern);
+                        if !req_subs.is_empty() {
+                            use memchr::memmem;
+                            let mut keep: BTreeSet<usize> = BTreeSet::new();
+                            let bytes = content.as_bytes();
+                            for &li in lines.iter() {
+                                let (line_beg, line_end) = line_bounds(&starts, li, content.len());
+                                let slice = &bytes[line_beg..line_end];
+                                if req_subs
+                                    .iter()
+                                    .any(|s| !s.is_empty() && memmem::find(slice, s).is_some())
+                                {
+                                    keep.insert(li);
+                                }
+                            }
+                            if !keep.is_empty() {
+                                lines = keep;
+                            }
+                        }
+                    }
+
+                    // Merge adjacent/small gaps into windows of a few lines
+                    let mut windows: Vec<(usize, usize)> = Vec::new();
+                    let mut cur_start: Option<usize> = None;
+                    let mut prev: Option<usize> = None;
+                    for li in lines {
+                        match (cur_start, prev) {
+                            (None, _) => {
+                                cur_start = Some(li);
+                                prev = Some(li);
+                            }
+                            (Some(cs), Some(pv)) => {
+                                if li <= pv + 2 {
+                                    // extend window if close
+                                    prev = Some(li);
+                                } else {
+                                    windows.push((cs, pv));
+                                    cur_start = Some(li);
+                                    prev = Some(li);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let (Some(cs), Some(pv)) = (cur_start, prev) {
+                        windows.push((cs, pv));
+                    }
+
+                    // Convert line windows to byte windows and scan regex inside them
+                    // Cap number of windows to guard pathologies
+                    for (scanned, (l0, l1)) in windows.into_iter().enumerate() {
+                        if scanned >= 4096 {
+                            break;
+                        }
+                        let (beg, end) =
+                            context_byte_range(&starts, l0, (l1 - l0) + 2, content.len());
+                        let slice = &content[beg..end];
+                        for m in re.find_iter(slice) {
+                            let s = beg + m.start();
+                            let e = beg + m.end();
+                            spans.push((s, e));
+                            if spans.len() >= 2048 {
+                                break;
+                            }
+                        }
+                        if spans.len() >= 2048 {
+                            break;
+                        }
+                    }
+                }
+                if spans.is_empty() {
+                    continue;
+                }
+                // Dedup and sort spans (windows can overlap)
+                spans.sort_unstable();
+                spans.dedup();
+                spans.sort_unstable_by_key(|p| p.0);
+                let tf = spans.len() as u32;
+                let first_pos = spans[0].0 as u32;
+                let filename = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let name_boost = re.is_match(filename) as i32 as f32;
+                let tf_boost = (1.0 + (tf as f32)).log2();
+                let pos_norm = (first_pos as f32) / 8192.0;
+                let pos_boost = 1.0 - pos_norm.min(1.0);
+                // Word-boundary check on first span boundaries (Unicode-aware)
+                let boundary_bonus = {
+                    let (b0, e0) = spans[0];
+                    let bytes = content.as_bytes();
+                    let left_ok = prev_char(bytes, b0)
+                        .map(|c| !is_word_char(c))
+                        .unwrap_or(true);
+                    let right_ok = next_char(bytes, e0)
+                        .map(|c| !is_word_char(c))
+                        .unwrap_or(true);
+                    (left_ok && right_ok) as i32 as f32 * 0.5
+                };
+                // Symbol-aware bonus
+                let symbol_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                    let p0 = spans[0].0 as u32;
+                    let aligns = syms.iter().any(|(_n, start_opt, _line_opt)| {
+                        if let Some(st) = *start_opt {
+                            st == p0
+                        } else {
+                            false
+                        }
+                    });
+                    if aligns {
+                        0.5
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let len_norm = 1.0 / (1.0 + (content.len() as f32 / 4096.0));
+                // Density bonus from clustering spans
+                let density_bonus = if spans.len() >= 2 {
+                    let mut gaps = 0.0f32;
+                    let take = spans.len().min(5);
+                    for i in 1..take {
+                        gaps += (spans[i].0 - spans[i - 1].0) as f32;
+                    }
+                    let mean_gap = gaps / ((take - 1) as f32).max(1.0);
+                    (1.0 / (1.0 + (mean_gap / 80.0))).min(0.5)
+                } else {
+                    0.0
+                };
+                // Fragment bonus across regex spans
+                let frag_bonus = compute_fragment_bonus(&spans, 64);
+                // Symbol span region bonus using [symbol_start, next_symbol_start)
+                let sym_span_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                    let regions = build_symbol_spans(syms, content.len());
+                    let p0 = spans[0].0;
+                    if regions.iter().any(|(s, e)| p0 >= *s && p0 < *e) {
+                        0.4
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let doc_score = (tf_boost
+                    + idf_boost
+                    + 0.5 * pos_boost
+                    + 0.5 * name_boost
+                    + boundary_bonus
+                    + symbol_bonus
+                    + density_bonus
+                    + frag_bonus
+                    + sym_span_bonus)
+                    * len_norm;
+
+                for (beg, end) in spans {
+                    let pos = beg as u32;
                     let (line_idx, line_start) = line_for_offset(&starts, pos);
                     let (ctx_beg, ctx_end) =
                         context_byte_range(&starts, line_idx, opts.context, content.len());
                     let (line_beg, line_end) = line_bounds(&starts, line_idx, content.len());
                     let start_col = pos - line_start;
-                    let end_col = start_col + (m.end() - m.start()) as u32;
-                    let before = content[ctx_beg..line_beg].to_string();
+                    let end_col = start_col + (end - beg) as u32;
+                    let mut before = content[ctx_beg..line_beg].to_string();
                     let line_text = content[line_beg..line_end].to_string();
-                    let after = content[line_end..ctx_end].to_string();
-                    out.push(SearchMatch {
+                    let mut after = content[line_end..ctx_end].to_string();
+                    if let Some(maxc) = opts.snippet_max_chars {
+                        before = trim_last_n_chars(&before, maxc, true);
+                        after = trim_first_n_chars(&after, maxc, true);
+                    }
+                    // Small symbol-line bonus: same line as a symbol declaration
+                    let symbol_line_bonus = if let Some(syms) = self.rdr.symbols_for_doc(d) {
+                        let lno = line_idx as u32 + 1;
+                        if syms
+                            .iter()
+                            .any(|(_, _, l)| l.map(|ll| ll == lno).unwrap_or(false))
+                        {
+                            0.1
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    all_matches.push(SearchMatch {
                         doc: d,
                         path: path.clone(),
                         line: line_idx as u32 + 1,
@@ -1084,16 +1863,25 @@ impl<'a> ShardSearcher<'a> {
                         before,
                         line_text,
                         after,
+                        score: doc_score + symbol_line_bonus,
                     });
-                    if let Some(limit) = opts.limit {
-                        if out.len() >= limit {
-                            return out;
-                        }
-                    }
                 }
             }
         }
-        out
+        all_matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.start.cmp(&b.start))
+        });
+        if let Some(limit) = opts.limit {
+            if all_matches.len() > limit {
+                all_matches.truncate(limit);
+            }
+        }
+        all_matches
     }
 
     /// Search symbols in the shard. If `pattern` is Some, filter symbol names by the pattern
@@ -1105,10 +1893,7 @@ impl<'a> ShardSearcher<'a> {
         is_regex: bool,
         case_sensitive: bool,
     ) -> Vec<crate::query::QueryResult> {
-        let paths = match self.rdr.iter_docs() {
-            Ok(p) => p,
-            Err(_) => return vec![],
-        };
+        let paths = self.rdr.paths().to_vec();
         let mut out = Vec::new();
 
         // If we have a pattern, try to prefilter candidate docs using symbol trigram postings.
@@ -1139,62 +1924,59 @@ impl<'a> ShardSearcher<'a> {
             }
 
             if !tris.is_empty() {
-                if let Ok(sym_map) = self.rdr.symbol_postings_map() {
-                    let mut cand_docs: Option<Vec<u32>> = None;
-                    for t in tris {
-                        if let Some(list) = sym_map.get(&t) {
-                            let mut docs = list.clone();
-                            docs.sort_unstable();
-                            docs.dedup();
-                            cand_docs = Some(match cand_docs {
-                                None => docs,
-                                Some(prev) => intersect_sorted(&prev, &docs),
-                            });
-                        } else {
-                            cand_docs = Some(Vec::new());
-                            break;
-                        }
+                let mut cand_docs: Option<Vec<u32>> = None;
+                for t in tris {
+                    if let Some(mut docs) = self.rdr.symbol_term_docs(&t) {
+                        docs.sort_unstable();
+                        docs.dedup();
+                        cand_docs = Some(match cand_docs {
+                            None => docs,
+                            Some(prev) => intersect_sorted(&prev, &docs),
+                        });
+                    } else {
+                        cand_docs = Some(Vec::new());
+                        break;
                     }
-                    if let Some(cdocs) = cand_docs {
-                        let filtered_set: std::collections::HashSet<u32> =
-                            (0..paths.len() as u32).collect();
-                        for d in cdocs.into_iter().filter(|d| filtered_set.contains(d)) {
-                            if let Some(sym_list) = self.rdr.symbols_for_doc(d) {
-                                for sym_tuple in sym_list.iter() {
-                                    let name = &sym_tuple.0;
-                                    let matched = if is_regex {
-                                        let mut pat_s = pat.to_string();
-                                        if !case_sensitive && !pat_s.starts_with("(?i)") {
-                                            pat_s = format!("(?i){}", pat_s);
-                                        }
-                                        if let Ok(re) = regex::Regex::new(&pat_s) {
-                                            re.is_match(name)
-                                        } else {
-                                            false
-                                        }
-                                    } else if case_sensitive {
-                                        name.contains(pat)
-                                    } else {
-                                        name.to_lowercase().contains(&pat.to_lowercase())
-                                    };
-                                    if matched {
-                                        let sym = crate::types::Symbol {
-                                            name: name.clone(),
-                                            start: sym_tuple.1,
-                                            line: sym_tuple.2,
-                                        };
-                                        out.push(crate::query::QueryResult {
-                                            doc: d,
-                                            path: paths[d as usize].clone(),
-                                            symbol: Some(name.clone()),
-                                            symbol_loc: Some(sym),
-                                        });
+                }
+                if let Some(cdocs) = cand_docs {
+                    let filtered_set: std::collections::HashSet<u32> =
+                        (0..paths.len() as u32).collect();
+                    for d in cdocs.into_iter().filter(|d| filtered_set.contains(d)) {
+                        if let Some(sym_list) = self.rdr.symbols_for_doc(d) {
+                            for sym_tuple in sym_list.iter() {
+                                let name = &sym_tuple.0;
+                                let matched = if is_regex {
+                                    let mut pat_s = pat.to_string();
+                                    if !case_sensitive && !pat_s.starts_with("(?i)") {
+                                        pat_s = format!("(?i){}", pat_s);
                                     }
+                                    if let Ok(re) = regex::Regex::new(&pat_s) {
+                                        re.is_match(name)
+                                    } else {
+                                        false
+                                    }
+                                } else if case_sensitive {
+                                    name.contains(pat)
+                                } else {
+                                    name.to_lowercase().contains(&pat.to_lowercase())
+                                };
+                                if matched {
+                                    let sym = crate::types::Symbol {
+                                        name: name.clone(),
+                                        start: sym_tuple.1,
+                                        line: sym_tuple.2,
+                                    };
+                                    out.push(crate::query::QueryResult {
+                                        doc: d,
+                                        path: paths[d as usize].clone(),
+                                        symbol: Some(name.clone()),
+                                        symbol_loc: Some(sym),
+                                    });
                                 }
                             }
                         }
-                        return out;
                     }
+                    return out;
                 }
             }
         }
@@ -1482,6 +2264,8 @@ pub struct SearchMatch {
     pub before: String,
     pub line_text: String,
     pub after: String,
+    // Lightweight relevance score for ranking matches across files (higher is better).
+    pub score: f32,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1491,6 +2275,8 @@ pub struct SearchOpts {
     pub limit: Option<usize>,
     pub context: usize,
     pub branch: Option<String>,
+    // If set, trim the before/after context to this many characters each.
+    pub snippet_max_chars: Option<usize>,
 }
 
 fn line_for_offset(starts: &[u32], pos: u32) -> (usize, u32) {
@@ -1540,4 +2326,114 @@ fn line_bounds(starts: &[u32], line_idx: usize, file_len: usize) -> (usize, usiz
         file_len
     };
     (beg, end)
+}
+
+fn trim_last_n_chars(s: &str, max: usize, add_ellipsis: bool) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut count = 0usize;
+    let mut split_idx = s.len();
+    for (idx, _ch) in s.char_indices().rev() {
+        count += 1;
+        if count == max {
+            split_idx = idx;
+            break;
+        }
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let tail = &s[split_idx..];
+    if add_ellipsis {
+        format!("…{}", tail)
+    } else {
+        tail.to_string()
+    }
+}
+
+fn trim_first_n_chars(s: &str, max: usize, add_ellipsis: bool) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut count = 0usize;
+    let mut split_idx = s.len();
+    for (idx, _ch) in s.char_indices() {
+        count += 1;
+        if count == max {
+            split_idx = idx + _ch.len_utf8();
+            break;
+        }
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head = &s[..split_idx];
+    if add_ellipsis {
+        format!("{}…", head)
+    } else {
+        head.to_string()
+    }
+}
+
+// Group adjacent spans into fragments and return a proximity/density bonus.
+// Heuristic: reward fragments with many occurrences packed into a short span.
+fn compute_fragment_bonus(spans: &[(usize, usize)], max_gap: usize) -> f32 {
+    if spans.len() < 2 {
+        return 0.0;
+    }
+    // spans are expected sorted by start
+    let mut best = 0.0f32;
+    let mut frag_start = spans[0].0;
+    let mut frag_end = spans[0].1;
+    let mut count = 1usize;
+    for (s, e) in spans.iter().skip(1).copied() {
+        if s.saturating_sub(frag_end) <= max_gap {
+            // extend fragment
+            count += 1;
+            frag_end = frag_end.max(e);
+        } else {
+            // score previous fragment
+            let span_len = frag_end.saturating_sub(frag_start).max(1);
+            let density = (count as f32) / (1.0 + (span_len as f32 / 200.0));
+            best = best.max(density);
+            // start new fragment
+            frag_start = s;
+            frag_end = e;
+            count = 1;
+        }
+    }
+    // finalize last fragment
+    let span_len = frag_end.saturating_sub(frag_start).max(1);
+    let density = (count as f32) / (1.0 + (span_len as f32 / 200.0));
+    best = best.max(density);
+    // scale and cap
+    (best / 2.0).min(0.7)
+}
+
+// Build approximate symbol spans from per-doc symbols: [start, next_start) in bytes.
+fn build_symbol_spans(
+    syms: &[(String, Option<u32>, Option<u32>)],
+    file_len: usize,
+) -> Vec<(usize, usize)> {
+    let mut starts: Vec<usize> = syms
+        .iter()
+        .filter_map(|(_, st, _)| st.map(|v| v as usize))
+        .collect();
+    if starts.is_empty() {
+        return Vec::new();
+    }
+    starts.sort_unstable();
+    let mut out = Vec::with_capacity(starts.len());
+    for (i, s) in starts.iter().enumerate() {
+        let e = if i + 1 < starts.len() {
+            starts[i + 1]
+        } else {
+            file_len
+        };
+        if *s < e {
+            out.push((*s, e));
+        }
+    }
+    out
 }

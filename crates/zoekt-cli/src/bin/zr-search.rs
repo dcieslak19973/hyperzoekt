@@ -37,6 +37,9 @@ struct Args {
     /// Branch filter (shard search only for now; must match shard metadata)
     #[arg(long)]
     branch: Option<String>,
+    /// Trim before/after snippets to this many characters each (optional)
+    #[arg(long)]
+    snippet_max_chars: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -98,6 +101,7 @@ fn build_opts(args: &Args) -> Result<SearchOpts> {
         limit: args.limit,
         context: args.context,
         branch: args.branch.clone(),
+        snippet_max_chars: args.snippet_max_chars,
     })
 }
 
@@ -111,8 +115,9 @@ fn print_matches(matches: Vec<SearchMatch>, json: bool) -> Result<()> {
                 "start": m.start,
                 "end": m.end,
                 "before": m.before,
-                "line": m.line_text,
+                "line_text": m.line_text,
                 "after": m.after,
+                "score": m.score,
             });
             println!("{}", v);
         }
