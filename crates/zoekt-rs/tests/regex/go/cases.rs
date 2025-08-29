@@ -11,7 +11,7 @@ fn go_derived_regex_cases() {
         ("\\bthread\\b", "conj"),
         ("\\bint\\s+main\\b", "conj"),
         ("\\d", "none"),
-        ("(?i)\\w", "none"),
+        (("(?i)\\w"), "none"),
         ("a\\.bcd", "conj"),
         ("foo|bar", "conj"),
         ("foo{3}bar", "conj"),

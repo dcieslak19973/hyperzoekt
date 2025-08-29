@@ -17,8 +17,23 @@ fn escape_csv(s: &str) -> String {
 
 fn main() -> anyhow::Result<()> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let test_file = manifest.join("../zoekt-rs/tests/go_regex_parity.rs");
-    let src = std::fs::read_to_string(&test_file)?;
+    let test_dir = manifest.join("../zoekt-rs/tests/regex/go");
+    let mut src = String::new();
+    if test_dir.exists() {
+        for entry in std::fs::read_dir(&test_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let s = std::fs::read_to_string(&path)?;
+                src.push_str(&s);
+                src.push('\n');
+            }
+        }
+    } else {
+        // fallback: try the single parity file path for older layouts
+        let test_file = manifest.join("../zoekt-rs/tests/regex/go/parity.rs");
+        src = std::fs::read_to_string(&test_file)?;
+    }
 
     let re = regex::Regex::new(r#"\(\s*"((?:\\.|[^"\\])*)"\s*,\s*"(conj|none|either)"\s*\)"#)?;
 

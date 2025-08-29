@@ -36,8 +36,7 @@ use std::time::Instant;
 type SymbolTuple = (String, Option<u32>, Option<u32>);
 type SymbolsTable = Vec<Vec<SymbolTuple>>;
 type PostingsMap = HashMap<[u8; 3], BTreeMap<u32, Vec<u32>>>;
-#[cfg(test)]
-type SymbolPostingsMap = HashMap<[u8; 3], Vec<u32>>;
+pub(crate) type SymbolPostingsMap = HashMap<[u8; 3], Vec<u32>>;
 
 // Varint helpers: simple LEB128-style unsigned varint for u32.
 fn write_var_u32<W: Write>(w: &mut W, mut v: u32) -> Result<()> {
@@ -925,8 +924,7 @@ impl ShardReader {
         Some(out)
     }
 
-    #[cfg(test)]
-    fn symbol_postings_map(&self) -> Result<SymbolPostingsMap> {
+    pub(crate) fn symbol_postings_map(&self) -> Result<SymbolPostingsMap> {
         // The postings section contains first the content trigram map, then the symbol trigram map.
         let mut off = self.postings_off as usize;
         // parse and skip content map (delta+varint encoded)

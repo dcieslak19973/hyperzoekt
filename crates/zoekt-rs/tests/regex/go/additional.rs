@@ -9,18 +9,18 @@ fn go_additional_regex_cases() {
         // simple concatenation -> should derive trigrams
         ("abc.*def", "conj"),
         // alternation inside a non-capturing/capturing group
-        ("(foo|bar)baz", "conj"),
-        ("foo(bar)?baz", "conj"),
+        (("(foo|bar)baz"), "conj"),
+        (("foo(bar)?baz"), "conj"),
         // character class with quantifier followed by literal run
-        ("a[0-9]{2}bcd", "conj"),
+        (("a[0-9]{2}bcd"), "conj"),
         // non-capturing group with alternation
-        ("(?:foo|bar)baz", "conj"),
+        (("(?:foo|bar)baz"), "conj"),
         // lookahead isn't supported by Rust's regex; expect None
-        ("foo(?=bar)baz", "none"),
+        (("foo(?=bar)baz"), "none"),
         // case-insensitive inline flag — current heuristic may or may not
         // extract literals; accept either until heuristic is hardened
-        ("(?i)abc", "either"),
-        ("(?i)abc|def", "either"),
+        (("(?i)abc"), "either"),
+        (("(?i)abc|def"), "either"),
     ];
 
     for (pat, expect) in cases {

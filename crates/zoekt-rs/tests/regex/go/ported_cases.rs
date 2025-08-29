@@ -7,18 +7,18 @@ fn go_ported_regex_cases() {
         // from query/regexp_test.go -> LowerRegexp examples
         ("[a-zA-Z]fooBAR", "conj"),
         // optimize examples
-        ("(hello)world", "conj"),
-        ("test(ing|ed)", "conj"),
-        ("ba(na){1,2}", "conj"),
-        ("b(a(n(a(n(a)))))", "conj"),
+        (("(hello)world"), "conj"),
+        (("test(ing|ed)"), "conj"),
+        (("ba(na){1,2}"), "conj"),
+        (("b(a(n(a(n(a)))))"), "conj"),
         // from syntaxutil/parse_test.go: simple literals and classes
-        ("abc|def", "either"),
-        ("(?:ab)*", "none"), // repetition of group may not yield 3-byte literal
-        ("abcde", "conj"),
-        ("[Aa]", "either"), // case-folded literal behavior varies
+        (("abc|def"), "either"),
+        (("(?:ab)*"), "none"), // repetition of group may not yield 3-byte literal
+        (("abcde"), "conj"),
+        (("[Aa]"), "either"), // case-folded literal behavior varies
         // patterns with escapes and Unicode
-        ("\\.\\^\\$\\\\", "either"),
-        ("[a-z]", "none"),
+        (("\\.\\^\\$\\\\"), "either"),
+        (("[a-z]"), "none"),
     ];
 
     for (pat, expect) in cases {

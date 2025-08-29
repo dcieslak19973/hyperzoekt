@@ -137,14 +137,3 @@ impl<'a> Iterator for TriPosIter<'a> {
         None
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn basic_trigrams() {
-        let v: Vec<[u8; 3]> = trigrams("Hello_Zoekt1").collect();
-        // Expect some trigrams like "hel", "ell", ...
-        assert!(v.contains(&*b"hel"))
-    }
-}

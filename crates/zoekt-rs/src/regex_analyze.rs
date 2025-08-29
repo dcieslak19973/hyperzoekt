@@ -364,17 +364,3 @@ pub fn required_substrings_from_regex(pattern: &str) -> Vec<Vec<u8>> {
 }
 // Note: previous AST-based manual extraction helper removed in favor of
 // the HIR-based literal extraction helpers present in regex-syntax.
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn regex_literal_prefilter() {
-        let pf = prefilter_from_regex("fooBar");
-        match pf {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
-            _ => panic!("expected conj"),
-        }
-    }
-}

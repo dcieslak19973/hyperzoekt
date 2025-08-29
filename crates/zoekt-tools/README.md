@@ -6,7 +6,7 @@ This crate contains small developer tools for working with the `zoekt-rs` codeba
 
 inspect_prefilter
 
-- What it does: reads the test source at `crates/zoekt-rs/tests/go_regex_parity.rs`, extracts regex test vectors, runs the project's regex prefilter logic on each pattern, and writes a CSV with the pattern and the observed prefilter result.
+- What it does: reads the test source at `crates/zoekt-rs/tests/regex/go/parity.rs`, extracts regex test vectors, runs the project's regex prefilter logic on each pattern, and writes a CSV with the pattern and the observed prefilter result.
 - Output: writes `/tmp/prefilter_inspect.csv` with columns: `pattern,expect,actual` (CSV-escaped). It also prints a short summary to stderr.
 
 How to run
