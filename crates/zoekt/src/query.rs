@@ -243,6 +243,8 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        // debug prints removed
+
         // Apply path-only/content-only: when a pattern is present and the user did not
         // request content-only semantics, also consider filename (path) matches. If
         // `path_only` is set we replace the candidate set with path matches. Otherwise
@@ -298,6 +300,19 @@ impl<'a> Searcher<'a> {
                 Some(m) => m,
                 None => continue,
             };
+            // branch filter: if the plan requests branches, require the doc to be present in at least one.
+            if !plan.branches.is_empty() {
+                let mut ok = false;
+                for b in &plan.branches {
+                    if meta.branches.iter().any(|mb| mb == b) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue 'doc;
+                }
+            }
             let path_str = meta.path.display().to_string();
             // lang filter
             if !plan.langs.is_empty() {
@@ -627,22 +642,25 @@ impl<'a> Searcher<'a> {
             v.dedup();
             return v;
         }
-        // Fallback scan
-        let mut v: Vec<RepoDocId> = inner
-            .docs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, meta)| {
-                let path = inner.repo.root.join(&meta.path);
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    let hay = text.to_lowercase();
-                    if hay.contains(&needle.to_lowercase()) {
-                        return Some(i as RepoDocId);
-                    }
+        // Fallback scan: prefer in-memory doc_contents for branch-indexed docs
+        let mut v: Vec<RepoDocId> = Vec::new();
+        for (i, meta) in inner.docs.iter().enumerate() {
+            if let Some(opt) = inner.doc_contents.get(i).and_then(|o| o.as_ref()) {
+                let hay = opt.to_lowercase();
+                let nee = needle.to_lowercase();
+                if hay.contains(&nee) {
+                    v.push(i as RepoDocId);
                 }
-                None
-            })
-            .collect();
+                continue;
+            }
+            let path = inner.repo.root.join(&meta.path);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let hay = text.to_lowercase();
+                if hay.contains(&needle.to_lowercase()) {
+                    v.push(i as RepoDocId);
+                }
+            }
+        }
         v.sort_unstable();
         v
     }

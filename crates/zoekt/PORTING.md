@@ -44,11 +44,30 @@ Status (high level):
 - [~] Repo/file scoping, symbol awareness (symbol extraction + per-doc symbols persisted; symbol-trigram postings and shard-side prefilter implemented but needs tuning)
 - [~] Broader test parity with Go Zoekt (good unit coverage; need Go-derived fixtures and golden comparisons)
 
+Recent notable changes (delta since earlier drafts):
+
+- [x] Multi-branch indexing (in-memory prototype): `IndexBuilder::branches(...)` and supporting code were added to allow indexing multiple branches by extracting each branch's tree and creating per-branch documents with in-memory contents. See `crates/zoekt/src/index.rs` and `crates/zoekt/tests/branch_selection.rs` for an end-to-end test.
+- [x] `content_only` semantics: `content_only` is now enforced at planning/execution time in the searcher, with unit/integration tests to validate path-vs-content behavior.
+- [x] In-memory per-document contents: the in-memory index now stores per-doc contents (for branch-extracted docs) and the search/tokenization path prefers these in-memory contents so branch-scoped searches see the correct file contents instead of the workspace checkout.
+- [x] Robust default-branch detection in tests: branch-selection tests detect the repo's initial branch via a chain (rev-parse → symbolic-ref → config → fallback) so tests run reproducibly across environments where the default branch is `main` or `master`.
+- [x] Debug prints removed: temporary debug logging used during development was cleaned up.
+
+- [x] Library-based branch extraction attempt: `extract_branch_tree_libgit2` was added to try libgit2 extraction first and fall back to `git archive | tar`. The `branch_selection` test was validated in the devcontainer after this change.
+- [~] Upstream parity audit started: the upstream Go `zoekt` repository was inspected under `./.upstream/zoekt` and a per-module parity report has been drafted (recommendations and prioritized test gaps were collected). Next step: add Go-derived golden tests and carry out focused parity checks for regex prefiltering, symbol extraction, and shard semantics.
+
+Notes about implementation details and environment dependency:
+
+- The multi-branch indexing path now attempts a library-based extraction first (libgit2 via the `git2` crate) and falls back to the previous `git archive | tar -x` pipeline on error. This removes the hard dependency on shelling out in environments where `libgit2` is available, while preserving the previous behavior as a safe fallback.
+- Important: `libgit2` requires native libgit2 headers/libs available in the build environment (CI images may need libgit2-dev or equivalent). The fallback ensures CI or developer environments without libgit2 still work.
+- Because the extraction produces per-branch in-memory document contents, the searcher prefers these in-memory contents. This ensures correct trigram/symbol extraction and query behavior for branch-indexed docs without changing on-disk shard formats.
+- Tests for the zoekt crate (including the branch-selection test) ran in the devcontainer after the libgit2 change; the branch-selection test passed. Add a CI job to exercise both the libgit2 path and the fallback path to avoid regressions on different runners.
+
 Mapping (Go -> Rust modules):
 - zoekt/query -> crates/zoekt/src/query.rs (AST and execution, slice-based set ops)
 - zoekt/regex -> crates/zoekt/src/regex_analyze.rs (basic; improve prefiltering)
 - zoekt/trigram -> crates/zoekt/src/trigram.rs
 - zoekt/index (in-memory) -> crates/zoekt/src/index.rs (IndexBuilder, InMemoryIndex)
+ - zoekt/index (in-memory) -> crates/zoekt/src/index.rs (IndexBuilder, InMemoryIndex). Note: includes `IndexBuilder::branches(...)` and per-doc in-memory content support used for branch-scoped indexing/tests.
 - zoekt/shard formats -> crates/zoekt/src/shard.rs (writer/reader, mmap search)
 - cmd/zoekt-index, cmd/zoekt -> crates/zoekt-cli (zr-index, zr-search, zr-bench, zr-query-bench, zr-compare-bench)
 
@@ -199,34 +218,24 @@ Notes
 - Gate new features behind flags; add golden tests mirroring Go where practical.
 - Keep `cargo fmt` and `cargo clippy --workspace -- -D warnings` green in CI.
 
-### Symbol extraction via typesitter (recommended)
+### Symbol extraction
 
-- Viability: high — the workspace already includes language-specific `typesitter`/tree-sitter ASTs; reusing them for symbol extraction is fast and practical compared to regex heuristics.
+Symbol extraction is implemented: the indexer uses the workspace's Tree-sitter/typesitter-based extractors for supported languages, with the regex-based extractor retained as a fallback for unsupported languages or tiny files. The implementation provides precise symbol names, kinds, and offsets; ensure unit tests cover Go/Rust/Python symbol fixtures and keep the extractor caches and parallelism tuned for indexing performance.
 
-- Benefits:
-   - Precise symbol names and kinds (functions, methods, types, classes, etc.).
-   - Accurate byte/line offsets for jump-to-symbol UX.
-   - Fewer false positives/negatives than regex heuristics; supports nested and language-specific constructs.
+Supported typesitter languages (current):
 
-- Tradeoffs & costs:
-   - Additional build/runtime dependencies for tree-sitter grammars or typesitter bindings.
-   - Higher CPU work during indexing (acceptable because indexing is offline and parallelizable).
-   - Need to ensure grammar coverage for target languages; keep a lightweight fallback for unsupported languages.
+- Rust (`rs`)
+- Go (`go`)
+- Python (`py`)
+- JavaScript/JSX (`js`, `jsx`)
+- TypeScript/TSX (`ts`, `tsx`)
+- C/C++ (`c`, `cpp`, `cc`, `cxx`, `hpp`, `hxx`, `h`)
+- Java (`java`)
+- C# (`cs`)
+- Swift (`swift`)
+- Verilog/SystemVerilog (`sv`, `v`)
 
-- High-level integration plan:
-   1. Hook parser invocation into the indexer where file content is read (in `IndexBuilder`).
-   2. For each file, pick the appropriate typesitter parser based on extension/language and run a small AST query or walk to extract top-level symbols: name, kind, byte offset/line, and optional parent info.
-   3. Add extracted symbols to per-document metadata and to the symbol-postings/trigram index so symbol queries can be matched efficiently at search time.
-   4. Cache parser instances and parse in a thread pool to limit memory/CPU usage.
-   5. Keep current regex-based extractor as a fallback for languages without grammars or for very small files.
-
-- Immediate next tasks (short-term concrete steps):
-   - Add a small typesitter-based extractor module and wire it into `crates/zoekt/src/index.rs` as a selectable extractor.
-   - Extend `DocumentMeta`/shard metadata to store symbol entries (name, kind, offset) and add serialization tests for shards.
-   - Add unit tests per language (start with Go, Rust, Python) that validate extracted symbol names and offsets against small fixtures.
-   - Run `cargo bench`/`zr-query-bench` on a small corpus to measure indexing cost and iterate on parallelism and parser instance reuse.
-
-Implementing typesitter-based extraction first for high-value languages (Go, Rust, Python, JavaScript/TypeScript) and falling back to regex elsewhere will give the best balance of accuracy and engineering cost.
+Fallbacks: if a language isn't supported by Tree-sitter or parsing fails, the regex-based extractor is used.
 
 ### Shard writer performance (practical optimizations)
 

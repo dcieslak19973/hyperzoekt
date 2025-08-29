@@ -6,7 +6,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use zoekt_rs::IndexBuilder;
 use zoekt_rs::{Query, Searcher, ShardReader, ShardSearcher, ShardWriter};
 
@@ -200,6 +204,9 @@ struct Opts {
     /// When set, write two shards (with and without symbol postings) and compare symbol-select timings
     #[clap(long)]
     compare_symbol_postings: bool,
+    /// Maximum number of branches to index when no explicit branches list is provided
+    #[clap(long, default_value = "1")]
+    max_branches: usize,
 }
 
 // result structs are emitted via serde_json::json!
@@ -213,9 +220,33 @@ fn main() -> anyhow::Result<()> {
 
     // Always build the in-memory index so we have index metadata.
     let rss_before_index = get_max_rss_kb();
+    println!("starting index build for {}...", opts.path.display());
+
+    // start a heartbeat thread so users see the process is alive during long indexing
+    let hb_stop = Arc::new(AtomicBool::new(false));
+    let hb_clone = hb_stop.clone();
+    let hb_path = opts.path.clone();
+    let hb_handle = thread::spawn(move || {
+        let start = Instant::now();
+        while !hb_clone.load(Ordering::Relaxed) {
+            eprintln!(
+                "indexing {}: elapsed {}s",
+                hb_path.display(),
+                start.elapsed().as_secs()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+
     let ib_start = Instant::now();
-    let idx_inner = IndexBuilder::new(opts.path.clone()).build()?;
+    let mut ib = IndexBuilder::new(opts.path.clone()).max_file_size(1_000_000);
+    // respect user's max_branches choice
+    ib = ib.max_branches(opts.max_branches);
+    let idx_inner = ib.build()?;
     let ib_dur = ib_start.elapsed();
+    // stop heartbeat and join
+    hb_stop.store(true, Ordering::Relaxed);
+    let _ = hb_handle.join();
     let rss_after_index = get_max_rss_kb();
     // share index between search and optional writer thread
     let idx = Arc::new(idx_inner);

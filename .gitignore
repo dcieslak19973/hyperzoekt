@@ -12,3 +12,4 @@ Cargo.lock
 .tmp/
 .tmp_experiments/
 .bench_results/
+.upstream/

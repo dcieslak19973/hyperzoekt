@@ -1,6 +1,8 @@
 use crate::types::{DocumentMeta, RepoMeta};
+use git2::Repository;
 use parking_lot::RwLock;
 use regex::Regex;
+use std::io::Write;
 use std::{collections::HashMap, fs, path::PathBuf};
 
 pub type RepoDocId = u32;
@@ -15,6 +17,8 @@ pub struct InMemoryIndexInner {
     pub symbol_terms: HashMap<String, Vec<RepoDocId>>,
     /// trigram -> doc ids for symbols (used as a prefilter)
     pub symbol_trigrams: HashMap<[u8; 3], Vec<RepoDocId>>,
+    /// Optional in-memory per-doc content for branch-extracted documents
+    pub doc_contents: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +68,11 @@ pub struct IndexBuilder {
     max_file_size: usize,
     follow_symlinks: bool,
     include_hidden: bool,
+    branches: Option<Vec<String>>,
+    /// When `branches` is not explicitly set, select at most this many branches
+    /// from the repository (default: 1). If the repository cannot be opened
+    /// as a git repo we fall back to indexing the working tree as before.
+    max_branches: usize,
 }
 
 impl IndexBuilder {
@@ -75,6 +84,8 @@ impl IndexBuilder {
             max_file_size: 1_000_000,
             follow_symlinks: false,
             include_hidden: false,
+            branches: None,
+            max_branches: 1,
         }
     }
 
@@ -97,12 +108,81 @@ impl IndexBuilder {
         self.include = Some(re);
         self
     }
+    /// Index specific branches. When set, the indexer will extract each branch's
+    /// tree via `git archive` into a temporary directory and index the files as
+    /// separate documents tagged with that branch name. This produces per-branch
+    /// documents (duplicate paths across branches are indexed separately).
+    pub fn branches(mut self, bs: Vec<String>) -> Self {
+        self.branches = Some(bs);
+        self
+    }
+
+    /// Limit the number of branches to index when `branches` was not set.
+    /// Defaults to 1 (only the repository's default branch).
+    pub fn max_branches(mut self, n: usize) -> Self {
+        self.max_branches = n.max(1);
+        self
+    }
     pub fn exclude_regex(mut self, re: Regex) -> Self {
         self.exclude = Some(re);
         self
     }
 
     pub fn build(self) -> anyhow::Result<InMemoryIndex> {
+        // Repo meta will reflect the list of branches we indexed (or HEAD by default)
+        let mut repo_branches: Vec<String> = vec!["HEAD".to_string()];
+        // If branches were not explicitly provided, try to discover them from git
+        // and pick up to `max_branches` tips (default branch + most recently updated).
+        if let Some(bs) = &self.branches {
+            repo_branches = bs.clone();
+        } else {
+            // Attempt to open repository and enumerate refs; if anything fails,
+            // fall back to HEAD-only behavior.
+            if let Ok(repo) = Repository::open(&self.root) {
+                // Determine default branch (symbolic-ref HEAD), fall back to "HEAD"
+                let mut chosen: Vec<String> = Vec::new();
+                if let Ok(head) = repo.head() {
+                    if let Some(name) = head.shorthand() {
+                        chosen.push(name.to_string());
+                    }
+                }
+
+                // Collect local branch tips with their commit times
+                let mut tips: Vec<(String, i64)> = Vec::new();
+                if let Ok(mut refs) = repo.references() {
+                    while let Some(Ok(r)) = refs.next() {
+                        if let Some(name) = r.shorthand() {
+                            // consider only local heads (refs/heads/*)
+                            if let Some(rname) = r.name() {
+                                if rname.starts_with("refs/heads/") {
+                                    // resolve the ref to a commit
+                                    if let Ok(resolved) = r.resolve() {
+                                        if let Ok(target) = resolved.peel_to_commit() {
+                                            let time = target.time().seconds();
+                                            tips.push((name.to_string(), time));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // sort by commit time desc (most recent first)
+                tips.sort_by(|a, b| b.1.cmp(&a.1));
+                for (n, _) in tips.into_iter() {
+                    if chosen.contains(&n) {
+                        continue;
+                    }
+                    if chosen.len() >= self.max_branches {
+                        break;
+                    }
+                    chosen.push(n);
+                }
+                if !chosen.is_empty() {
+                    repo_branches = chosen;
+                }
+            }
+        }
         let repo = RepoMeta {
             name: self
                 .root
@@ -111,82 +191,173 @@ impl IndexBuilder {
                 .to_string_lossy()
                 .to_string(),
             root: self.root.clone(),
-            branches: vec!["HEAD".to_string()],
+            branches: repo_branches.clone(),
         };
-        let mut docs = Vec::new();
 
-        let mut builder = ignore::WalkBuilder::new(&self.root);
-        // WalkBuilder.hidden(true) makes hidden files be ignored. We expose include_hidden on the builder
-        // so invert the flag: when include_hidden==true, set hidden(false) to include them.
-        builder.hidden(!self.include_hidden);
-        builder.follow_links(self.follow_symlinks);
-        builder.git_ignore(true);
-        // If there's a .gitignore in the repo root, read simple patterns for quick basename matching
-        let mut ignore_patterns: Vec<String> = Vec::new();
-        if let Ok(gitignore_content) = std::fs::read_to_string(self.root.join(".gitignore")) {
-            for line in gitignore_content.lines() {
-                let pat = line.trim();
-                if pat.is_empty() || pat.starts_with('#') {
-                    continue;
-                }
-                ignore_patterns.push(pat.to_string());
-            }
-        }
-        let walker = builder.build();
-        for result in walker
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        {
-            let rel = pathdiff::diff_paths(result.path(), &self.root)
-                .unwrap_or_else(|| PathBuf::from(result.file_name()));
-            // apply simple .gitignore basename/leading-slash matching
-            if !ignore_patterns.is_empty() {
-                let rel_s = rel.to_string_lossy();
-                let base = result
-                    .path()
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string());
-                let mut skipped = false;
-                for pat in &ignore_patterns {
-                    if pat.starts_with('/') {
-                        let p = pat.trim_start_matches('/');
-                        if rel_s == p {
-                            skipped = true;
-                            break;
-                        }
-                    } else if let Some(b) = &base {
-                        if b == pat {
-                            skipped = true;
-                            break;
-                        }
+        let mut docs: Vec<DocumentMeta> = Vec::new();
+        // Optional per-doc in-memory content when indexing branches via git
+        let mut doc_contents: Vec<Option<String>> = Vec::new();
+
+        // If branches were specified, create a per-branch working tree via git archive
+        // and index files from each extracted tree, tagging DocumentMeta.branches accordingly.
+        if let Some(bs) = &self.branches {
+            for b in bs {
+                // Create a tempdir for the branch tree
+                let td = tempfile::tempdir()?;
+                // First try to extract using libgit2 to avoid shelling out to `tar` and `git`.
+                // If libgit2 extraction fails, fall back to the existing `git archive | tar -x` flow.
+                let libgit2_ok = extract_branch_tree_libgit2(&self.root, b, td.path());
+                if let Err(_e) = libgit2_ok {
+                    // fallback to external git|tar pipeline
+                    let mut git = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&self.root)
+                        .arg("archive")
+                        .arg("--format=tar")
+                        .arg(b)
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()?;
+                    let git_stdout = git.stdout.take().unwrap();
+                    let mut tar = std::process::Command::new("tar")
+                        .arg("-x")
+                        .arg("-C")
+                        .arg(td.path())
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()?;
+                    // pipe data
+                    if let Some(mut tar_stdin) = tar.stdin.take() {
+                        std::io::copy(&mut std::io::BufReader::new(git_stdout), &mut tar_stdin)?;
+                    }
+                    let git_status = git.wait()?;
+                    let tar_status = tar.wait()?;
+                    if !git_status.success() || !tar_status.success() {
+                        // extraction failed; skip this branch
+                        continue;
                     }
                 }
-                if skipped {
-                    continue;
+
+                // Walk the extracted tree similarly to the main walker but rooted at td.path()
+                let mut builder = ignore::WalkBuilder::new(td.path());
+                builder.hidden(!self.include_hidden);
+                builder.follow_links(self.follow_symlinks);
+                builder.git_ignore(true);
+                let walker = builder.build();
+                for result in walker
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                {
+                    let rel = pathdiff::diff_paths(result.path(), td.path())
+                        .unwrap_or_else(|| PathBuf::from(result.file_name()));
+                    if let Some(inc) = &self.include {
+                        if !inc.is_match(rel.to_string_lossy().as_ref()) {
+                            continue;
+                        }
+                    }
+                    if let Some(exc) = &self.exclude {
+                        if exc.is_match(rel.to_string_lossy().as_ref()) {
+                            continue;
+                        }
+                    }
+                    let size = result.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                    if size > self.max_file_size {
+                        continue;
+                    }
+                    let lang = detect_lang_from_ext(&rel);
+                    // Read file bytes from extracted tree to capture content for tokenization
+                    let fullp = td.path().join(&rel);
+                    let content = std::fs::read_to_string(&fullp).ok();
+                    let sz = content.as_ref().map(|s| s.len()).unwrap_or(size);
+                    docs.push(DocumentMeta {
+                        path: rel,
+                        lang,
+                        size: sz as u64,
+                        branches: vec![b.clone()],
+                        symbols: Vec::new(),
+                    });
+                    doc_contents.push(content);
+                }
+                // end branch walker
+            }
+        } else {
+            // No branches specified: index working tree at self.root as before
+            let mut builder = ignore::WalkBuilder::new(&self.root);
+            // WalkBuilder.hidden(true) makes hidden files be ignored. We expose include_hidden on the builder
+            // so invert the flag: when include_hidden==true, set hidden(false) to include them.
+            builder.hidden(!self.include_hidden);
+            builder.follow_links(self.follow_symlinks);
+            builder.git_ignore(true);
+            // If there's a .gitignore in the repo root, read simple patterns for quick basename matching
+            let mut ignore_patterns: Vec<String> = Vec::new();
+            if let Ok(gitignore_content) = std::fs::read_to_string(self.root.join(".gitignore")) {
+                for line in gitignore_content.lines() {
+                    let pat = line.trim();
+                    if pat.is_empty() || pat.starts_with('#') {
+                        continue;
+                    }
+                    ignore_patterns.push(pat.to_string());
                 }
             }
-            if let Some(inc) = &self.include {
-                if !inc.is_match(rel.to_string_lossy().as_ref()) {
+            let walker = builder.build();
+            for result in walker
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            {
+                let rel = pathdiff::diff_paths(result.path(), &self.root)
+                    .unwrap_or_else(|| PathBuf::from(result.file_name()));
+                // apply simple .gitignore basename/leading-slash matching
+                if !ignore_patterns.is_empty() {
+                    let rel_s = rel.to_string_lossy();
+                    let base = result
+                        .path()
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string());
+                    let mut skipped = false;
+                    for pat in &ignore_patterns {
+                        if pat.starts_with('/') {
+                            let p = pat.trim_start_matches('/');
+                            if rel_s == p {
+                                skipped = true;
+                                break;
+                            }
+                        } else if let Some(b) = &base {
+                            if b == pat {
+                                skipped = true;
+                                break;
+                            }
+                        }
+                    }
+                    if skipped {
+                        continue;
+                    }
+                }
+                if let Some(inc) = &self.include {
+                    if !inc.is_match(rel.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                }
+                if let Some(exc) = &self.exclude {
+                    if exc.is_match(rel.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                }
+                let size = result.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                if size > self.max_file_size {
                     continue;
                 }
+                let lang = detect_lang_from_ext(&rel);
+                docs.push(DocumentMeta {
+                    path: rel,
+                    lang,
+                    size: size as u64,
+                    branches: vec!["HEAD".to_string()],
+                    symbols: Vec::new(),
+                });
+                doc_contents.push(None);
             }
-            if let Some(exc) = &self.exclude {
-                if exc.is_match(rel.to_string_lossy().as_ref()) {
-                    continue;
-                }
-            }
-            let size = result.metadata().map(|m| m.len()).unwrap_or(0) as usize;
-            if size > self.max_file_size {
-                continue;
-            }
-            let lang = detect_lang_from_ext(&rel);
-            docs.push(DocumentMeta {
-                path: rel,
-                lang,
-                size: size as u64,
-                branches: vec!["HEAD".to_string()],
-                symbols: Vec::new(),
-            });
+        }
+
+        if self.branches.is_none() {
+            // (branch/no-branch handled above)
         }
 
         // Very naive tokenization: split on non-word, build term->docids map
@@ -195,12 +366,13 @@ impl IndexBuilder {
         let mut symbol_trigrams: HashMap<[u8; 3], Vec<RepoDocId>> = HashMap::new();
         // Tokenize only text-like files. Use a small heuristic to skip binary files.
         for (i, meta) in docs.iter().enumerate() {
-            let path = self.root.join(&meta.path);
-            if let Ok(bytes) = fs::read(&path) {
-                if !is_text(&bytes) {
+            // Prefer in-memory content (for branch-indexed docs); otherwise read from disk
+            if let Some(s) = doc_contents.get(i).and_then(|o| o.as_ref()) {
+                let bytes = s.as_bytes();
+                if !is_text(bytes) {
                     continue;
                 }
-                let text = String::from_utf8_lossy(&bytes);
+                let text = s.to_string();
                 let mut seen: fnv::FnvHashSet<String> = fnv::FnvHashSet::default();
                 for tok in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     if tok.is_empty() {
@@ -212,21 +384,46 @@ impl IndexBuilder {
                 for tok in seen.into_iter() {
                     acc.entry(tok).or_default().push(i as RepoDocId);
                 }
-                // naive symbol extraction will be attached after the main loop
+            } else {
+                let path = self.root.join(&meta.path);
+                if let Ok(bytes) = fs::read(&path) {
+                    if !is_text(&bytes) {
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let mut seen: fnv::FnvHashSet<String> = fnv::FnvHashSet::default();
+                    for tok in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if tok.is_empty() {
+                            continue;
+                        }
+                        let tok = tok.to_lowercase();
+                        seen.insert(tok);
+                    }
+                    for tok in seen.into_iter() {
+                        acc.entry(tok).or_default().push(i as RepoDocId);
+                    }
+                }
             }
+            // naive symbol extraction will be attached after the main loop
         }
 
-        // Re-open files to populate per-doc branches (HEAD) and symbols properly
-        for meta in docs.iter_mut() {
-            meta.branches = vec!["HEAD".to_string()];
-            let path = self.root.join(&meta.path);
-            if let Ok(s) = fs::read_to_string(&path) {
+        // Populate per-doc branches (already set during doc creation) and symbols.
+        for (i, meta) in docs.iter_mut().enumerate() {
+            if let Some(s) = doc_contents.get(i).and_then(|o| o.as_ref()) {
                 meta.symbols = extract_symbols(
-                    &s,
+                    s,
                     meta.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
                 );
             } else {
-                meta.symbols = Vec::new();
+                let path = self.root.join(&meta.path);
+                if let Ok(s) = fs::read_to_string(&path) {
+                    meta.symbols = extract_symbols(
+                        &s,
+                        meta.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                    );
+                } else {
+                    meta.symbols = Vec::new();
+                }
             }
         }
 
@@ -263,12 +460,15 @@ impl IndexBuilder {
             let ratio = non_print as f64 / sample.len() as f64;
             ratio < 0.30
         }
+        // debug prints removed
+
         let inner = InMemoryIndexInner {
             repo,
             docs,
             terms: acc,
             symbol_terms,
             symbol_trigrams,
+            doc_contents,
         };
         Ok(InMemoryIndex {
             inner: std::sync::Arc::new(RwLock::new(inner)),
@@ -376,4 +576,50 @@ fn detect_lang_from_ext(path: &std::path::Path) -> Option<String> {
         _ => return None,
     };
     Some(lang.to_string())
+}
+
+// Extract the tree for `branch` from a repo at `repo_path` into `dst`.
+// This is a best-effort helper using libgit2; it intentionally errs instead of
+// panicking so callers can fall back to the external `git archive | tar` flow.
+fn extract_branch_tree_libgit2(
+    repo_path: &std::path::Path,
+    branch: &str,
+    dst: &std::path::Path,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(repo_path)?;
+    // Resolve the reference for the branch name (allow tags, refs, simple names)
+    let obj = repo.revparse_single(branch)?;
+    let commit = obj.peel_to_commit()?;
+    let tree = commit.tree()?;
+
+    // Walk the tree entries and write blobs to dst preserving paths
+    let walk_res = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if let Some(name) = entry.name() {
+            // compute full path relative to dst
+            let rel = std::path::Path::new(root).join(name);
+            let full = dst.join(&rel);
+            if let Ok(obj) = entry.to_object(&repo) {
+                if obj.as_blob().is_some() {
+                    if let Some(blob) = obj.as_blob() {
+                        if let Some(parent) = full.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::File::create(&full) {
+                            Ok(mut f) => {
+                                let _ = f.write_all(blob.content());
+                            }
+                            Err(_) => {
+                                // ignore write failures for best-effort extraction
+                            }
+                        }
+                    }
+                } else if obj.as_tree().is_some() {
+                    let _ = std::fs::create_dir_all(&full);
+                }
+            }
+        }
+        0
+    });
+    walk_res?;
+    Ok(())
 }

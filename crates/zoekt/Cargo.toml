@@ -34,7 +34,8 @@ tree-sitter-c-sharp = { version = "0.23", package = "tree-sitter-c-sharp" }
 tree-sitter-swift = { version = "0.6", package = "tree-sitter-swift" }
 tree-sitter-verilog = "1.0"
 regex-syntax = "0.6"
+tempfile = "3"
+git2 = "0.16"
 
 [dev-dependencies]
 proptest = "1"
-tempfile = "3"
