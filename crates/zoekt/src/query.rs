@@ -645,14 +645,18 @@ impl<'a> Searcher<'a> {
         // Fallback scan: prefer in-memory doc_contents for branch-indexed docs
         let mut v: Vec<RepoDocId> = Vec::new();
         for (i, meta) in inner.docs.iter().enumerate() {
-            if let Some(opt) = inner.doc_contents.get(i).and_then(|o| o.as_ref()) {
-                let hay = opt.to_lowercase();
-                let nee = needle.to_lowercase();
-                if hay.contains(&nee) {
-                    v.push(i as RepoDocId);
+            // prefer in-memory content
+            if let Some(opt) = inner.doc_contents.get(i) {
+                if let Some(text) = opt.as_ref() {
+                    let hay = text.to_lowercase();
+                    let nee = needle.to_lowercase();
+                    if hay.contains(&nee) {
+                        v.push(i as RepoDocId);
+                    }
+                    continue;
                 }
-                continue;
             }
+            // fallback to reading from disk
             let path = inner.repo.root.join(&meta.path);
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let hay = text.to_lowercase();
@@ -671,20 +675,24 @@ impl<'a> Searcher<'a> {
             Err(_) => return Vec::new(),
         };
         let inner = self.idx.read_inner();
-        let mut v: Vec<RepoDocId> = inner
-            .docs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, meta)| {
-                let path = inner.repo.root.join(&meta.path);
-                let text = std::fs::read_to_string(&path).ok()?;
-                if re.is_match(&text) {
-                    Some(i as RepoDocId)
-                } else {
-                    None
+        let mut v: Vec<RepoDocId> = Vec::new();
+        for (i, meta) in inner.docs.iter().enumerate() {
+            // prefer in-memory content
+            if let Some(opt) = inner.doc_contents.get(i) {
+                if let Some(text) = opt.as_ref() {
+                    if re.is_match(text) {
+                        v.push(i as RepoDocId);
+                    }
+                    continue;
                 }
-            })
-            .collect();
+            }
+            let path = inner.repo.root.join(&meta.path);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if re.is_match(&text) {
+                    v.push(i as RepoDocId);
+                }
+            }
+        }
         v.sort_unstable();
         v
     }
@@ -711,20 +719,23 @@ impl<'a> Searcher<'a> {
 
     fn eval_literal_case_sensitive(&self, needle: &str) -> Vec<RepoDocId> {
         let inner = self.idx.read_inner();
-        let mut v: Vec<RepoDocId> = inner
-            .docs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, meta)| {
-                let path = inner.repo.root.join(&meta.path);
-                if let Ok(text) = std::fs::read_to_string(&path) {
+        let mut v: Vec<RepoDocId> = Vec::new();
+        for (i, meta) in inner.docs.iter().enumerate() {
+            if let Some(opt) = inner.doc_contents.get(i) {
+                if let Some(text) = opt.as_ref() {
                     if text.contains(needle) {
-                        return Some(i as RepoDocId);
+                        v.push(i as RepoDocId);
                     }
+                    continue;
                 }
-                None
-            })
-            .collect();
+            }
+            let path = inner.repo.root.join(&meta.path);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains(needle) {
+                    v.push(i as RepoDocId);
+                }
+            }
+        }
         v.sort_unstable();
         v
     }

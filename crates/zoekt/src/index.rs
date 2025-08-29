@@ -30,12 +30,21 @@ pub struct InMemoryIndex {
 impl InMemoryIndex {
     pub fn search_literal(&self, needle: &str) -> Vec<(RepoDocId, String)> {
         let inner = self.inner.read();
-        // naive: return docs that contain the needle anywhere
+        // Prefer in-memory per-doc contents (from branch extraction) when available
+        // to avoid re-reading files from disk.
         inner
             .docs
             .iter()
             .enumerate()
             .filter_map(|(i, meta)| {
+                if let Some(opt) = inner.doc_contents.get(i) {
+                    if let Some(text) = opt.as_ref() {
+                        if text.contains(needle) {
+                            return Some((i as RepoDocId, meta.path.display().to_string()));
+                        }
+                        return None;
+                    }
+                }
                 let path = inner.repo.root.join(&meta.path);
                 if let Ok(text) = fs::read_to_string(&path) {
                     if text.contains(needle) {
@@ -553,6 +562,17 @@ impl IndexBuilder {
             } else {
                 doc_contents.push(None);
             }
+        }
+
+        // Ensure symbol term/posting lists are sorted and deduplicated to
+        // provide deterministic serialization and correct prefilter semantics.
+        for (_k, v) in symbol_terms.iter_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        for (_k, v) in symbol_trigrams.iter_mut() {
+            v.sort_unstable();
+            v.dedup();
         }
 
         fn is_text(buf: &[u8]) -> bool {

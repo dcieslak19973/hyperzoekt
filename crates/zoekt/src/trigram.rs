@@ -62,6 +62,42 @@ pub fn trigrams_with_pos(hay: &str) -> impl Iterator<Item = ([u8; 3], u32)> + '_
     }
 }
 
+/// Emit trigrams plus starting byte offset of each 3-byte window into
+/// the provided `out` vector. The function does not allocate; callers
+/// should clear and reserve capacity on `out` as needed.
+pub fn emit_trigrams_with_pos(hay: &str, out: &mut Vec<([u8; 3], u32)>) {
+    let bytes = hay.as_bytes();
+    let mut i = 0usize;
+    let mut w = [0u8; 3];
+    let mut posw = [0u32; 3];
+    let mut n = 0usize;
+    while i < bytes.len() {
+        let mut b = bytes[i];
+        let pos = i as u32;
+        i += 1;
+        if b.is_ascii_uppercase() {
+            b = b.wrapping_add(32);
+        }
+        let is_word = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+        if !is_word {
+            n = 0;
+            continue;
+        }
+        if n < 3 {
+            w[n] = b;
+            posw[n] = pos;
+            n += 1;
+            if n < 3 {
+                continue;
+            }
+        } else {
+            w = [w[1], w[2], b];
+            posw = [posw[1], posw[2], pos];
+        }
+        out.push((w, posw[0]));
+    }
+}
+
 struct TriPosIter<'a> {
     bytes: &'a [u8],
     i: usize,

@@ -20,9 +20,9 @@ use std::{
 };
 
 use crate::{
-    index::{InMemoryIndex, RepoDocId},
+    index::InMemoryIndex,
     regex_analyze::prefilter_from_regex,
-    trigram::{trigrams, trigrams_with_pos},
+    trigram::{emit_trigrams_with_pos, trigrams},
 };
 use sha2::{Digest, Sha256};
 use std::time::Instant;
@@ -32,6 +32,46 @@ type SymbolTuple = (String, Option<u32>, Option<u32>);
 type SymbolsTable = Vec<Vec<SymbolTuple>>;
 type PostingsMap = HashMap<[u8; 3], BTreeMap<u32, Vec<u32>>>;
 type SymbolPostingsMap = HashMap<[u8; 3], Vec<u32>>;
+
+// Varint helpers: simple LEB128-style unsigned varint for u32.
+fn write_var_u32<W: Write>(w: &mut W, mut v: u32) -> Result<()> {
+    let mut buf = [0u8; 5];
+    let mut i = 0;
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf[i] = byte;
+            i += 1;
+            break;
+        } else {
+            buf[i] = byte | 0x80;
+            i += 1;
+        }
+    }
+    w.write_all(&buf[..i])?;
+    Ok(())
+}
+
+fn read_var_u32_from_mmap(mmap: &Mmap, off: &mut usize) -> Result<u32> {
+    let mut shift = 0u32;
+    let mut out: u32 = 0;
+    loop {
+        if *off >= mmap.len() {
+            bail!("unexpected EOF while reading varint");
+        }
+        let b = mmap[*off];
+        *off += 1;
+        out |= ((b & 0x7F) as u32) << shift;
+        if (b & 0x80) == 0 {
+            return Ok(out);
+        }
+        shift += 7;
+        if shift >= 35 {
+            bail!("varint too long");
+        }
+    }
+}
 
 const MAGIC: u32 = 0x5a4f_454b; // 'ZOEK'
 const VERSION: u32 = 5;
@@ -57,13 +97,13 @@ impl ShardWriter {
         idx: &InMemoryIndex,
         include_symbol_postings: bool,
     ) -> Result<()> {
+        // Simpler, robust sequential writer implementation.
         let global_start = Instant::now();
-        let mut stages: Vec<(&str, u128)> = Vec::new();
-        // capture total indexing + write time; we'll print stage durations at the end
 
         let mut f = File::create(&self.path).context("create shard file")?;
         let inner = idx.read_inner();
-        // Header placeholders; we'll fill offsets after writing sections.
+
+        // Header placeholders; we'll patch offsets later.
         let mut header = Vec::new();
         header.extend(&MAGIC.to_le_bytes());
         header.extend(&VERSION.to_le_bytes());
@@ -87,97 +127,231 @@ impl ShardWriter {
             f.write_all(b)?;
         }
 
-        // Build postings: trigram -> BTreeMap<doc, Vec<u32 /*pos*/>>
-        let mut term_map: PostingsMap = HashMap::new();
-        // Build line starts per doc (byte offsets)
+        // First pass: collect per-doc contents and line starts (sequential).
         let mut lines_per_doc: Vec<Vec<u32>> = Vec::with_capacity(inner.docs.len());
-        let t_read_start = Instant::now();
-        for (i, meta) in inner.docs.iter().enumerate() {
-            let text =
-                std::fs::read_to_string(inner.repo.root.join(&meta.path)).unwrap_or_default();
-            for (tri, pos) in trigrams_with_pos(&text) {
-                term_map
-                    .entry(tri)
-                    .or_default()
-                    .entry(i as RepoDocId)
-                    .or_default()
-                    .push(pos);
-            }
-            // line starts for this doc
-            let mut starts = vec![0u32];
-            let bytes = text.as_bytes();
-            for (idx, b) in bytes.iter().enumerate() {
-                if *b == b'\n' {
-                    let next = idx as u32 + 1;
+        let mut contents: Vec<String> = Vec::with_capacity(inner.docs.len());
+        for (doc_idx, meta) in inner.docs.iter().enumerate() {
+            // load content (prefer in-memory doc_contents when present)
+            let content = if let Some(opt) = inner.doc_contents.get(doc_idx) {
+                if let Some(s) = opt.as_ref() {
+                    s.clone()
+                } else {
+                    let p = inner.repo.root.join(&meta.path);
+                    match File::open(&p).and_then(|file| unsafe { Mmap::map(&file) }) {
+                        Ok(mmap) => std::str::from_utf8(&mmap[..])
+                            .map(|s| s.to_string())
+                            .unwrap_or_default(),
+                        Err(_) => std::fs::read_to_string(p).unwrap_or_default(),
+                    }
+                }
+            } else {
+                let p = inner.repo.root.join(&meta.path);
+                match File::open(&p).and_then(|file| unsafe { Mmap::map(&file) }) {
+                    Ok(mmap) => std::str::from_utf8(&mmap[..])
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    Err(_) => std::fs::read_to_string(p).unwrap_or_default(),
+                }
+            };
+            // collect line starts
+            let bytes = content.as_bytes();
+            let mut starts: Vec<u32> = vec![0u32];
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\n' {
+                    let next = i as u32 + 1;
                     if (next as usize) < bytes.len() {
                         starts.push(next);
                     }
                 }
             }
             lines_per_doc.push(starts);
+            contents.push(content);
         }
-        let t_read_end = Instant::now();
-        stages.push(("read_and_trigrams", (t_read_end - t_read_start).as_millis()));
 
-        // Write postings section: first content trigrams, then symbol trigrams (optional).
-        let postings_off = f.stream_position()?;
-        // content trigrams
-        let t_ser_content_start = Instant::now();
-        f.write_all(&(term_map.len() as u32).to_le_bytes())?;
-        for (tri, postings) in term_map.iter() {
-            f.write_all(tri)?; // 3 bytes
-            f.write_all(&(postings.len() as u32).to_le_bytes())?; // doc count
-            for (doc, pos_list) in postings.iter() {
-                f.write_all(&doc.to_le_bytes())?;
-                f.write_all(&(pos_list.len() as u32).to_le_bytes())?;
-                for p in pos_list {
-                    f.write_all(&p.to_le_bytes())?;
+        // Per-thread sharded collection + per-shard parallel radix sort and merge.
+        use rayon::prelude::*;
+
+        let num_threads = rayon::current_num_threads();
+        let shard_count = std::cmp::max(4, num_threads * 4);
+
+        // Radix sort for u128 optimized for our 88-bit encoded keys (tri24|doc32|pos32).
+        // Use 11-bit LSD passes (8 passes -> 88 bits) for better cache locality.
+        fn radix_sort_u128(buf: &mut [u128]) {
+            if buf.len() <= 1 {
+                return;
+            }
+            let mut tmp: Vec<u128> = vec![0u128; buf.len()];
+            // We'll perform 8 passes of 11 bits each (total 88 bits)
+            const RADIX: usize = 1 << 11; // 2048
+            let mut from = buf;
+            let mut to = tmp.as_mut_slice();
+            for pass in 0..8 {
+                let shift = pass * 11;
+                let mut counts = vec![0usize; RADIX];
+                // count
+                for &k in from.iter() {
+                    let bucket = ((k >> shift) & 0x7FF) as usize;
+                    counts[bucket] += 1;
+                }
+                // prefix sum
+                let mut sum = 0usize;
+                for c in counts.iter_mut() {
+                    let v = *c;
+                    *c = sum;
+                    sum += v;
+                }
+                // scatter
+                for &k in from.iter() {
+                    let bucket = ((k >> shift) & 0x7FF) as usize;
+                    to[counts[bucket]] = k;
+                    counts[bucket] += 1;
+                }
+                std::mem::swap(&mut from, &mut to);
+            }
+            // After 8 passes the sorted data resides in `buf` (no copy needed)
+        }
+
+        // Collect per-thread shard buffers
+        let shards_vec: Vec<Vec<u128>> = contents
+            .par_iter()
+            .enumerate()
+            .fold(
+                || {
+                    let mut v = Vec::with_capacity(shard_count);
+                    for _ in 0..shard_count {
+                        v.push(Vec::new());
+                    }
+                    v
+                },
+                |mut acc, (doc_idx, content)| {
+                    let mut buf: Vec<([u8; 3], u32)> = Vec::with_capacity(128);
+                    emit_trigrams_with_pos(content, &mut buf);
+                    for (tri, pos) in buf {
+                        let h = ((tri[0] as usize) << 16)
+                            ^ ((tri[1] as usize) << 8)
+                            ^ (tri[2] as usize);
+                        let shard = h % shard_count;
+                        let tri24 =
+                            ((tri[0] as u128) << 16) | ((tri[1] as u128) << 8) | (tri[2] as u128);
+                        let key: u128 = (tri24 << 64) | ((doc_idx as u128) << 32) | (pos as u128);
+                        acc[shard].push(key);
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || {
+                    let mut v = Vec::with_capacity(shard_count);
+                    for _ in 0..shard_count {
+                        v.push(Vec::new());
+                    }
+                    v
+                },
+                |mut a, b| {
+                    for (i, mut sub) in b.into_iter().enumerate() {
+                        a[i].append(&mut sub);
+                    }
+                    a
+                },
+            );
+
+        // Sort each shard in parallel, build per-shard postings maps, then merge.
+        let shard_postings: Vec<PostingsMap> = shards_vec
+            .into_par_iter()
+            .map(|mut keys| {
+                if keys.len() > 1 {
+                    radix_sort_u128(&mut keys);
+                }
+                let mut map: PostingsMap = HashMap::new();
+                let mut i = 0usize;
+                while i < keys.len() {
+                    let k = keys[i];
+                    let tri24 = ((k >> 64) & 0xFFFFFF) as u32;
+                    let b0 = ((tri24 >> 16) & 0xFF) as u8;
+                    let b1 = ((tri24 >> 8) & 0xFF) as u8;
+                    let b2 = (tri24 & 0xFF) as u8;
+                    let tri = [b0, b1, b2];
+                    let mut btree: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                    while i < keys.len() {
+                        let k2 = keys[i];
+                        let tri2 = ((k2 >> 64) & 0xFFFFFF) as u32;
+                        if tri2 != tri24 {
+                            break;
+                        }
+                        let doc = ((k2 >> 32) & 0xFFFF_FFFF) as u32;
+                        let pos = (k2 & 0xFFFF_FFFF) as u32;
+                        btree.entry(doc).or_default().push(pos);
+                        i += 1;
+                    }
+                    map.insert(tri, btree);
+                }
+                map
+            })
+            .collect();
+
+        // Merge per-shard postings
+        let mut term_map: PostingsMap = HashMap::new();
+        for shard_map in shard_postings.into_iter() {
+            for (tri, btree) in shard_map.into_iter() {
+                let entry = term_map.entry(tri).or_default();
+                for (doc, mut positions) in btree.into_iter() {
+                    entry.entry(doc).or_default().append(&mut positions);
                 }
             }
         }
-        let t_ser_content_end = Instant::now();
-        stages.push((
-            "serialize_content_trigrams",
-            (t_ser_content_end - t_ser_content_start).as_millis(),
-        ));
+
+        // Serialize postings (content trigram map) using delta+varint encoding into a buffer
+        let postings_off = f.stream_position()?;
+        let mut content_buf: Vec<u8> = Vec::new();
+        content_buf.extend(&(term_map.len() as u32).to_le_bytes());
+        for (tri, posting_tree) in term_map.iter() {
+            content_buf.extend(&tri[..]);
+            content_buf.extend(&(posting_tree.len() as u32).to_le_bytes());
+            let mut prev_doc: u32 = 0;
+            for (doc, pos_list) in posting_tree.iter() {
+                // ensure positions are sorted and delta-encoded
+                let mut positions = pos_list.clone();
+                positions.sort_unstable();
+                let doc_delta = doc.wrapping_sub(prev_doc);
+                write_var_u32(&mut content_buf, doc_delta)?;
+                // write npos
+                write_var_u32(&mut content_buf, positions.len() as u32)?;
+                let mut prev_pos: u32 = 0;
+                for p in positions.iter() {
+                    let pos_delta = p.wrapping_sub(prev_pos);
+                    write_var_u32(&mut content_buf, pos_delta)?;
+                    prev_pos = *p;
+                }
+                prev_doc = *doc;
+            }
+        }
+        f.write_all(&content_buf)?;
+
+        // Symbol postings (second map)
         if include_symbol_postings {
-            // symbol trigrams: write a second map with doc lists (npos may be zero)
-            let t_ser_sym_start = Instant::now();
             let sym_map = &inner.symbol_trigrams;
-            f.write_all(&(sym_map.len() as u32).to_le_bytes())?;
+            let mut sym_buf: Vec<u8> = Vec::new();
+            sym_buf.extend(&(sym_map.len() as u32).to_le_bytes());
             for (tri, docs) in sym_map.iter() {
-                f.write_all(tri)?;
-                // docs is Vec<RepoDocId>
-                f.write_all(&(docs.len() as u32).to_le_bytes())?;
+                sym_buf.extend(&tri[..]);
+                sym_buf.extend(&(docs.len() as u32).to_le_bytes());
+                let mut prev_doc: u32 = 0;
                 for d in docs.iter() {
-                    let doc = *d;
-                    f.write_all(&doc.to_le_bytes())?;
-                    // write zero positions to keep the same per-doc format
-                    f.write_all(&0u32.to_le_bytes())?;
+                    let doc_delta = d.wrapping_sub(prev_doc);
+                    write_var_u32(&mut sym_buf, doc_delta)?;
+                    // npos == 0 for symbol postings
+                    write_var_u32(&mut sym_buf, 0)?;
+                    prev_doc = *d;
                 }
             }
-            let t_ser_sym_end = Instant::now();
-            stages.push((
-                "serialize_symbol_trigrams",
-                (t_ser_sym_end - t_ser_sym_start).as_millis(),
-            ));
+            f.write_all(&sym_buf)?;
         } else {
             // write zero symbol map
-            let t_ser_sym_start = Instant::now();
             f.write_all(&0u32.to_le_bytes())?;
-            let t_ser_sym_end = Instant::now();
-            stages.push((
-                "serialize_symbol_trigrams",
-                (t_ser_sym_end - t_ser_sym_start).as_millis(),
-            ));
         }
 
         // Write metadata section (repo name/root/hash/branches)
         let meta_off = f.stream_position()?;
-        let t_meta_start = Instant::now();
-        let repo_name = inner.repo.name.as_bytes();
-        let repo_root = inner.repo.root.display().to_string();
-        let repo_root_b = repo_root.as_bytes();
         let mut hasher = Sha256::new();
         for d in &inner.docs {
             let p = inner.repo.root.join(&d.path);
@@ -186,12 +360,14 @@ impl ShardWriter {
             }
         }
         let hash = hasher.finalize();
+        let repo_name = inner.repo.name.as_bytes();
+        let repo_root = inner.repo.root.display().to_string();
+        let repo_root_b = repo_root.as_bytes();
         f.write_all(&(repo_name.len() as u16).to_le_bytes())?;
         f.write_all(repo_name)?;
         f.write_all(&(repo_root_b.len() as u16).to_le_bytes())?;
         f.write_all(repo_root_b)?;
         f.write_all(&hash[..])?; // 32 bytes
-                                 // branches: count + each [len:u16][bytes]
         let branches = &inner.repo.branches;
         f.write_all(&(branches.len() as u16).to_le_bytes())?;
         for b in branches {
@@ -199,13 +375,8 @@ impl ShardWriter {
             f.write_all(&(bb.len() as u16).to_le_bytes())?;
             f.write_all(bb)?;
         }
-        let t_meta_end = Instant::now();
-        stages.push((
-            "metadata_hash_and_write",
-            (t_meta_end - t_meta_start).as_millis(),
-        ));
-        // Write per-doc symbols: for each doc, [count:u16] followed by entries of
-        // [name_len:u16][name_bytes][start:u32 (0xFFFF_FFFF for none)][line:u32 (0xFFFF_FFFF for none)]
+
+        // Write per-doc symbols
         for d in &inner.docs {
             let syms = &d.symbols;
             f.write_all(&(syms.len() as u16).to_le_bytes())?;
@@ -222,37 +393,29 @@ impl ShardWriter {
                 f.write_all(&line.to_le_bytes())?;
             }
         }
-        // note: per-doc symbols write time is included in metadata timing above; if you need
-        // finer granularity, split it out similarly to other stages.
 
-        // Write line index section: for each doc, store (data_off, count); then write line data blocks
+        // Write line index section without per-doc backpatching
         let line_index_off = f.stream_position()?;
-        for _ in 0..inner.docs.len() {
-            f.write_all(&0u64.to_le_bytes())?;
-            f.write_all(&0u32.to_le_bytes())?;
-        }
-        let line_data_off = f.stream_position()?;
-        let t_line_start = Instant::now();
-        let mut idx_ptr = line_index_off;
+        let mut line_data: Vec<u8> = Vec::new();
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(lines_per_doc.len());
         for starts in &lines_per_doc {
-            let entry_off = f.stream_position()?;
-            f.write_all(&(starts.len() as u32).to_le_bytes())?;
+            let entry_off = line_data.len() as u64;
+            line_data.extend(&(starts.len() as u32).to_le_bytes());
             for s in starts {
-                f.write_all(&s.to_le_bytes())?;
+                line_data.extend(&s.to_le_bytes());
             }
-            // backpatch
-            let cur = f.stream_position()?;
-            f.seek(SeekFrom::Start(idx_ptr))?;
-            f.write_all(&entry_off.to_le_bytes())?;
-            f.write_all(&(starts.len() as u32).to_le_bytes())?;
-            idx_ptr += 12; // 8 + 4
-            f.seek(SeekFrom::Start(cur))?;
+            entries.push((entry_off, starts.len() as u32));
         }
-        let t_line_end = Instant::now();
-        stages.push(("line_index_write", (t_line_end - t_line_start).as_millis()));
+        let line_index_table_size = (entries.len() * 12) as u64;
+        let line_data_off = line_index_off + line_index_table_size;
+        for (rel_off, cnt) in entries.iter() {
+            let abs_off = line_data_off + *rel_off;
+            f.write_all(&abs_off.to_le_bytes())?;
+            f.write_all(&cnt.to_le_bytes())?;
+        }
+        f.write_all(&line_data)?;
 
         // Patch header with offsets
-        let t_flush_start = Instant::now();
         f.flush()?;
         f.seek(SeekFrom::Start(0))?;
         let mut header2 = Vec::new();
@@ -265,17 +428,9 @@ impl ShardWriter {
         header2.extend(&line_index_off.to_le_bytes());
         header2.extend(&line_data_off.to_le_bytes());
         f.write_all(&header2)?;
-        let t_flush_end = Instant::now();
-        stages.push((
-            "final_flush_and_header_patch",
-            (t_flush_end - t_flush_start).as_millis(),
-        ));
 
         let total_ms = (Instant::now() - global_start).as_millis();
         eprintln!("INDEXING_TIMINGS total_ms={}ms", total_ms);
-        for (name, ms) in stages.iter() {
-            eprintln!("  {}: {} ms", name, ms);
-        }
         Ok(())
     }
 }
@@ -514,26 +669,21 @@ impl ShardReader {
                 })?) as usize;
             off += 4;
             let mut postings = BTreeMap::new();
+            let mut prev_doc: u32 = 0;
             for _ in 0..n_docs {
-                let d =
-                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
-                        format!("shard truncated while reading doc id (off={})", off)
-                    })?);
-                off += 4;
-                let npos =
-                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
-                        format!("shard truncated while reading npos (off={})", off)
-                    })?) as usize;
-                off += 4;
+                let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off)?;
+                let doc = prev_doc.wrapping_add(doc_delta);
+                prev_doc = doc;
+                let npos = read_var_u32_from_mmap(&self.mmap, &mut off)? as usize;
                 let mut pos = Vec::with_capacity(npos);
+                let mut prev_pos: u32 = 0;
                 for _ in 0..npos {
-                    let p = u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(
-                        || format!("shard truncated while reading position (off={})", off),
-                    )?);
-                    off += 4;
+                    let pos_delta = read_var_u32_from_mmap(&self.mmap, &mut off)?;
+                    let p = prev_pos.wrapping_add(pos_delta);
                     pos.push(p);
+                    prev_pos = p;
                 }
-                postings.insert(d, pos);
+                postings.insert(doc, pos);
             }
             map.insert(tri, postings);
         }
@@ -543,7 +693,7 @@ impl ShardReader {
     fn symbol_postings_map(&self) -> Result<SymbolPostingsMap> {
         // The postings section contains first the content trigram map, then the symbol trigram map.
         let mut off = self.postings_off as usize;
-        // skip content map
+        // parse and skip content map (delta+varint encoded)
         let content_term_count =
             u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
                 format!(
@@ -559,17 +709,18 @@ impl ShardReader {
                     format!("shard truncated while reading content n_docs (off={})", off)
                 })?) as usize;
             off += 4;
+            let mut prev_doc: u32 = 0;
             for _ in 0..n_docs {
-                // doc id
-                off += 4;
-                // npos
-                let npos =
-                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
-                        format!("shard truncated while reading content npos (off={})", off)
-                    })?);
-                off += 4;
-                // skip positions
-                off += (npos as usize) * 4;
+                let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off)?;
+                let doc = prev_doc.wrapping_add(doc_delta);
+                prev_doc = doc;
+                let npos = read_var_u32_from_mmap(&self.mmap, &mut off)? as usize;
+                let mut prev_pos: u32 = 0;
+                for _ in 0..npos {
+                    let pos_delta = read_var_u32_from_mmap(&self.mmap, &mut off)?;
+                    let p = prev_pos.wrapping_add(pos_delta);
+                    prev_pos = p;
+                }
             }
         }
         // now read symbol map
@@ -593,18 +744,12 @@ impl ShardReader {
                 })?) as usize;
             off += 4;
             let mut docs = Vec::with_capacity(n_docs);
+            let mut prev_doc: u32 = 0;
             for _ in 0..n_docs {
-                let d =
-                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
-                        format!("shard truncated while reading symbol doc id (off={})", off)
-                    })?);
-                off += 4;
-                // read npos (may be zero)
-                let _npos =
-                    u32::from_le_bytes(self.mmap[off..off + 4].try_into().with_context(|| {
-                        format!("shard truncated while reading symbol npos (off={})", off)
-                    })?);
-                off += 4;
+                let doc_delta = read_var_u32_from_mmap(&self.mmap, &mut off)?;
+                let d = prev_doc.wrapping_add(doc_delta);
+                prev_doc = d;
+                let _npos = read_var_u32_from_mmap(&self.mmap, &mut off)?; // usually zero
                 docs.push(d);
             }
             sym_map.insert(tri, docs);
@@ -1132,6 +1277,16 @@ mod tests {
 
         let reader = ShardReader::open(&shard_path)?;
         let searcher = ShardSearcher::new(&reader);
+        // debug: dump postings and docs
+        if let Ok(pm) = reader.postings_map() {
+            eprintln!("postings_map keys: {}", pm.len());
+            for (k, v) in pm.iter() {
+                eprintln!("tri={:?} -> docs={:?}", k, v.keys().collect::<Vec<_>>());
+            }
+        }
+        if let Ok(docs) = reader.iter_docs() {
+            eprintln!("docs: {:?}", docs);
+        }
         let hits = searcher.search_literal_with_context("zoekt");
         assert!(hits
             .iter()
@@ -1286,6 +1441,33 @@ mod tests {
         let res2 = searcher.search_symbols_prefiltered(Some("sym_0199"), false, false);
         assert!(res2.iter().any(|r| r.symbol.as_deref() == Some("sym_0199")));
 
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_postings_deduped_roundtrip() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Create two files with identical symbol names to ensure postings would
+        // contain duplicates if not deduped.
+        let content1 = "fn Dup() {}\n";
+        let content2 = "fn Dup() {}\n";
+        std::fs::write(dir.path().join("a.rs"), content1)?;
+        std::fs::write(dir.path().join("b.rs"), content2)?;
+        let idx = crate::build_in_memory_index(dir.path())?;
+        let shard_path = dir.path().join("index.shard");
+        ShardWriter::new(&shard_path).write_from_index(&idx)?;
+
+        let reader = ShardReader::open(&shard_path)?;
+        // symbol_postings_map should contain trigrams mapping to doc ids with no duplicates
+        let sym_map = reader.symbol_postings_map()?;
+        for (_tri, docs) in sym_map.iter() {
+            // docs should be unique and sorted
+            let mut sorted = docs.clone();
+            sorted.sort_unstable();
+            let mut dedup = sorted.clone();
+            dedup.dedup();
+            assert_eq!(sorted, dedup);
+        }
         Ok(())
     }
 }
