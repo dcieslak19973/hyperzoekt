@@ -1,6 +1,8 @@
 [workspace]
 members = [
 	"crates/hyperzoekt",
+	"crates/zoekt",
+	"crates/zoekt-cli",
 ]
 
 # Use the edition-2021 dependency resolver semantics for workspace members.
