@@ -35,3 +35,15 @@ Rationale: SurrealDB offers a flexible document+graph model, indexes, and query 
 Planned approach: have `hyperzoekt` write directly to SurrealDB, upserting records as they are produced by the Tree-sitter indexer; provide an option to run an embedded SurrealDB instance for local dev and an option to connect to remote SurrealDB for production. JSONL export will be supported only for debugging and offline inspection.
 
 See `doc/SURREALDB-INTEGRATION.md` for the full design and migration steps.
+
+---
+
+## Additional Goals
+
+These ideas will need some refinement but for now:
+
+1. Stack trace analysis
+   A. Especially around determining whether an error was caused by a change in code (internal) or by a change in data/environment (external)
+2. Use HiRAG to build a KG about the code (and documentation in the repo in the form of markdown, etc.)
+   A. Leave the HiRAG open ended so a user or other system could present additional information (e.g. JIRA tickets, Emails/Slack conversations about the code, etc.)
+3. Calculate Code Churn and Defect Density for analysis/storage in the KG
