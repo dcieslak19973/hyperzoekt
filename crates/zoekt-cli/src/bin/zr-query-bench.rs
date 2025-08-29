@@ -204,9 +204,15 @@ struct Opts {
     /// When set, write two shards (with and without symbol postings) and compare symbol-select timings
     #[clap(long)]
     compare_symbol_postings: bool,
+    /// Disable symbol extraction during indexing to speed up index build
+    #[clap(long)]
+    no_symbols: bool,
     /// Maximum number of branches to index when no explicit branches list is provided
     #[clap(long, default_value = "1")]
     max_branches: usize,
+    /// Cap the number of indexing threads (overrides env ZOEKT_INDEX_THREADS when set)
+    #[clap(long)]
+    index_threads: Option<usize>,
 }
 
 // result structs are emitted via serde_json::json!
@@ -242,6 +248,12 @@ fn main() -> anyhow::Result<()> {
     let mut ib = IndexBuilder::new(opts.path.clone()).max_file_size(1_000_000);
     // respect user's max_branches choice
     ib = ib.max_branches(opts.max_branches);
+    if opts.no_symbols {
+        ib = ib.enable_symbols(false);
+    }
+    if let Some(n) = opts.index_threads {
+        ib = ib.index_threads(n);
+    }
     let idx_inner = ib.build()?;
     let ib_dur = ib_start.elapsed();
     // stop heartbeat and join

@@ -1,5 +1,6 @@
 use crate::types::{DocumentMeta, RepoMeta};
 use git2::Repository;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use regex::Regex;
 use std::io::Write;
@@ -73,6 +74,11 @@ pub struct IndexBuilder {
     /// from the repository (default: 1). If the repository cannot be opened
     /// as a git repo we fall back to indexing the working tree as before.
     max_branches: usize,
+    /// Enable symbol extraction (can be disabled to speed indexing)
+    enable_symbols: bool,
+    /// Optional cap on indexing threads (defaults to min(avail_cpus, 8));
+    /// can also be provided via env ZOEKT_INDEX_THREADS when not set here.
+    thread_cap: Option<usize>,
 }
 
 impl IndexBuilder {
@@ -86,6 +92,8 @@ impl IndexBuilder {
             include_hidden: false,
             branches: None,
             max_branches: 1,
+            enable_symbols: true,
+            thread_cap: None,
         }
     }
 
@@ -125,6 +133,20 @@ impl IndexBuilder {
     }
     pub fn exclude_regex(mut self, re: Regex) -> Self {
         self.exclude = Some(re);
+        self
+    }
+
+    /// Enable or disable symbol extraction during indexing (default: enabled).
+    pub fn enable_symbols(mut self, enable: bool) -> Self {
+        self.enable_symbols = enable;
+        self
+    }
+
+    /// Set a cap on indexing threads. When not provided, we'll use the
+    /// environment variable ZOEKT_INDEX_THREADS if set, otherwise
+    /// min(available_parallelism, 8).
+    pub fn index_threads(mut self, n: usize) -> Self {
+        self.thread_cap = Some(n.max(1));
         self
     }
 
@@ -194,9 +216,20 @@ impl IndexBuilder {
             branches: repo_branches.clone(),
         };
 
-        let mut docs: Vec<DocumentMeta> = Vec::new();
-        // Optional per-doc in-memory content when indexing branches via git
-        let mut doc_contents: Vec<Option<String>> = Vec::new();
+        // We'll gather file descriptors first, then process them in parallel with a single
+        // read per file (tokenization + optional symbols), then assemble docs and maps.
+        struct PendingFile {
+            rel: PathBuf,
+            size: usize,
+            lang: Option<String>,
+            branches: Vec<String>,
+            // Source of file content: either from an extracted branch tree (Some base path)
+            // or None meaning read from repo working tree.
+            base: Option<PathBuf>,
+        }
+        let mut pending: Vec<PendingFile> = Vec::new();
+        // Hold branch extraction tempdirs alive until processing completes
+        let mut _branch_tempdirs: Vec<tempfile::TempDir> = Vec::new();
 
         // If branches were specified, create a per-branch working tree via git archive
         // and index files from each extracted tree, tagging DocumentMeta.branches accordingly.
@@ -263,20 +296,17 @@ impl IndexBuilder {
                         continue;
                     }
                     let lang = detect_lang_from_ext(&rel);
-                    // Read file bytes from extracted tree to capture content for tokenization
-                    let fullp = td.path().join(&rel);
-                    let content = std::fs::read_to_string(&fullp).ok();
-                    let sz = content.as_ref().map(|s| s.len()).unwrap_or(size);
-                    docs.push(DocumentMeta {
-                        path: rel,
+                    pending.push(PendingFile {
+                        rel,
+                        size,
                         lang,
-                        size: sz as u64,
                         branches: vec![b.clone()],
-                        symbols: Vec::new(),
+                        base: Some(td.path().to_path_buf()),
                     });
-                    doc_contents.push(content);
                 }
                 // end branch walker
+                // keep the extracted tree alive
+                _branch_tempdirs.push(td);
             }
         } else {
             // No branches specified: index working tree at self.root as before
@@ -345,100 +375,183 @@ impl IndexBuilder {
                     continue;
                 }
                 let lang = detect_lang_from_ext(&rel);
-                docs.push(DocumentMeta {
-                    path: rel,
+                pending.push(PendingFile {
+                    rel,
+                    size,
                     lang,
-                    size: size as u64,
                     branches: vec!["HEAD".to_string()],
-                    symbols: Vec::new(),
+                    base: None,
                 });
-                doc_contents.push(None);
             }
         }
 
-        if self.branches.is_none() {
-            // (branch/no-branch handled above)
+        // Parallel processing of files with a bounded rayon pool
+        use rayon::prelude::*;
+        use rayon::ThreadPoolBuilder;
+        let enable_symbols = self.enable_symbols;
+        let root = self.root.clone();
+        #[derive(Debug)]
+        struct ProcessedDoc {
+            idx: usize,
+            doc: DocumentMeta,
+            content: Option<String>,
+            sym_names: Vec<String>,
+            keep_content: bool,
         }
+        // Cap the rayon pool to avoid unbounded parallel IO.
+        // Priority: explicit builder setting -> env ZOEKT_INDEX_THREADS -> min(avail, 8)
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_cap = std::cmp::min(avail, 8).max(1);
+        let env_cap = std::env::var("ZOEKT_INDEX_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1));
+        let cap = self
+            .thread_cap
+            .or(env_cap)
+            .unwrap_or(default_cap)
+            .min(avail)
+            .max(1);
+        let processed: Vec<ProcessedDoc> =
+            if let Ok(pool) = ThreadPoolBuilder::new().num_threads(cap).build() {
+                pool.install(|| {
+                    pending
+                        .par_iter()
+                        .enumerate()
+                        .map(|(idx, pf)| {
+                            // compute full path
+                            let fullp = match &pf.base {
+                                Some(base) => base.join(&pf.rel),
+                                None => root.join(&pf.rel),
+                            };
+                            // single read (avoid reading twice)
+                            let bytes = std::fs::read(&fullp).ok();
+                            let mut doc = DocumentMeta {
+                                path: pf.rel.clone(),
+                                lang: pf.lang.clone(),
+                                size: bytes.as_ref().map(|b| b.len()).unwrap_or(pf.size) as u64,
+                                branches: pf.branches.clone(),
+                                symbols: Vec::new(),
+                            };
+                            let mut symbol_terms: Vec<String> = Vec::new(); // names only; merge later
+                            let mut content: Option<String> = None;
+                            if let Some(b) = &bytes {
+                                // Decode to UTF-8 lossy once
+                                let text = String::from_utf8_lossy(b).into_owned();
+                                // Tokenization only for text-like files
+                                if is_text(b) {
+                                    content = Some(text.clone());
+                                }
+                                if enable_symbols {
+                                    // Extract symbols even if the file contains NULs; parser can handle/skip
+                                    doc.symbols = extract_symbols(
+                                        &text,
+                                        doc.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                                    );
+                                    symbol_terms =
+                                        doc.symbols.iter().map(|s| s.name.to_lowercase()).collect();
+                                }
+                            }
+                            let keep = pf.base.is_some();
+                            ProcessedDoc {
+                                idx,
+                                doc,
+                                content,
+                                sym_names: symbol_terms,
+                                keep_content: keep,
+                            }
+                        })
+                        .collect()
+                })
+            } else {
+                // Fallback to default rayon pool
+                pending
+                    .par_iter()
+                    .enumerate()
+                    .map(|(idx, pf)| {
+                        let fullp = match &pf.base {
+                            Some(base) => base.join(&pf.rel),
+                            None => root.join(&pf.rel),
+                        };
+                        let bytes = std::fs::read(&fullp).ok();
+                        let mut doc = DocumentMeta {
+                            path: pf.rel.clone(),
+                            lang: pf.lang.clone(),
+                            size: bytes.as_ref().map(|b| b.len()).unwrap_or(pf.size) as u64,
+                            branches: pf.branches.clone(),
+                            symbols: Vec::new(),
+                        };
+                        let mut symbol_terms: Vec<String> = Vec::new();
+                        let mut content: Option<String> = None;
+                        if let Some(b) = &bytes {
+                            let text = String::from_utf8_lossy(b).into_owned();
+                            if is_text(b) {
+                                content = Some(text.clone());
+                            }
+                            if enable_symbols {
+                                doc.symbols = extract_symbols(
+                                    &text,
+                                    doc.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                                );
+                                symbol_terms =
+                                    doc.symbols.iter().map(|s| s.name.to_lowercase()).collect();
+                            }
+                        }
+                        let keep = pf.base.is_some();
+                        ProcessedDoc {
+                            idx,
+                            doc,
+                            content,
+                            sym_names: symbol_terms,
+                            keep_content: keep,
+                        }
+                    })
+                    .collect()
+            };
 
-        // Very naive tokenization: split on non-word, build term->docids map
-        let mut acc: HashMap<String, Vec<RepoDocId>> = HashMap::new();
+        // Merge processed outputs in original order to keep doc ids stable
+        let mut processed = processed;
+        processed.sort_by_key(|p| p.idx);
+
+        let mut docs: Vec<DocumentMeta> = Vec::with_capacity(processed.len());
+        let mut doc_contents: Vec<Option<String>> = Vec::with_capacity(processed.len());
+        let mut terms: HashMap<String, Vec<RepoDocId>> = HashMap::new();
         let mut symbol_terms: HashMap<String, Vec<RepoDocId>> = HashMap::new();
         let mut symbol_trigrams: HashMap<[u8; 3], Vec<RepoDocId>> = HashMap::new();
-        // Tokenize only text-like files. Use a small heuristic to skip binary files.
-        for (i, meta) in docs.iter().enumerate() {
-            // Prefer in-memory content (for branch-indexed docs); otherwise read from disk
-            if let Some(s) = doc_contents.get(i).and_then(|o| o.as_ref()) {
-                let bytes = s.as_bytes();
-                if !is_text(bytes) {
-                    continue;
-                }
-                let text = s.to_string();
+
+        for (i, p) in processed.into_iter().enumerate() {
+            let doc_id = i as RepoDocId;
+            if let Some(ref text) = p.content {
+                // build term set per doc, then add
                 let mut seen: fnv::FnvHashSet<String> = fnv::FnvHashSet::default();
                 for tok in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     if tok.is_empty() {
                         continue;
                     }
-                    let tok = tok.to_lowercase();
-                    seen.insert(tok);
+                    seen.insert(tok.to_lowercase());
                 }
                 for tok in seen.into_iter() {
-                    acc.entry(tok).or_default().push(i as RepoDocId);
+                    terms.entry(tok).or_default().push(doc_id);
                 }
-            } else {
-                let path = self.root.join(&meta.path);
-                if let Ok(bytes) = fs::read(&path) {
-                    if !is_text(&bytes) {
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&bytes);
-                    let mut seen: fnv::FnvHashSet<String> = fnv::FnvHashSet::default();
-                    for tok in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                        if tok.is_empty() {
-                            continue;
-                        }
-                        let tok = tok.to_lowercase();
-                        seen.insert(tok);
-                    }
-                    for tok in seen.into_iter() {
-                        acc.entry(tok).or_default().push(i as RepoDocId);
+            }
+
+            if enable_symbols {
+                for key in p.sym_names {
+                    symbol_terms.entry(key).or_default().push(doc_id);
+                }
+                for sym in &p.doc.symbols {
+                    for tri in crate::trigram::trigrams(&sym.name) {
+                        symbol_trigrams.entry(tri).or_default().push(doc_id);
                     }
                 }
             }
-            // naive symbol extraction will be attached after the main loop
-        }
-
-        // Populate per-doc branches (already set during doc creation) and symbols.
-        for (i, meta) in docs.iter_mut().enumerate() {
-            if let Some(s) = doc_contents.get(i).and_then(|o| o.as_ref()) {
-                meta.symbols = extract_symbols(
-                    s,
-                    meta.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                );
+            docs.push(p.doc);
+            if p.keep_content {
+                doc_contents.push(p.content);
             } else {
-                let path = self.root.join(&meta.path);
-                if let Ok(s) = fs::read_to_string(&path) {
-                    meta.symbols = extract_symbols(
-                        &s,
-                        meta.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                    );
-                } else {
-                    meta.symbols = Vec::new();
-                }
-            }
-        }
-
-        // After symbols are populated in `docs`, build symbol term/trigram maps
-        for (i, meta) in docs.iter().enumerate() {
-            for sym in &meta.symbols {
-                let key = sym.name.to_lowercase();
-                symbol_terms
-                    .entry(key.clone())
-                    .or_default()
-                    .push(i as RepoDocId);
-                // trigram prefilter on symbol name
-                for tri in crate::trigram::trigrams(&sym.name) {
-                    symbol_trigrams.entry(tri).or_default().push(i as RepoDocId);
-                }
+                doc_contents.push(None);
             }
         }
 
@@ -465,7 +578,7 @@ impl IndexBuilder {
         let inner = InMemoryIndexInner {
             repo,
             docs,
-            terms: acc,
+            terms,
             symbol_terms,
             symbol_trigrams,
             doc_contents,
@@ -488,10 +601,12 @@ fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
     // the Tree-sitter extractor or when parsing fails.
     let mut out = Vec::new();
     if ext == "rs" {
-        // allow Unicode identifier characters using XID properties
-        let re_fn = Regex::new(r"\bfn\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
-        let re_struct = Regex::new(r"\bstruct\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
-        for cap in re_fn.captures_iter(content) {
+        // allow Unicode identifier characters using XID properties (cached regexes)
+        static RE_RS_FN: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\bfn\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap());
+        static RE_RS_STRUCT: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\bstruct\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap());
+        for cap in RE_RS_FN.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 out.push(crate::types::Symbol {
                     name: m.as_str().to_string(),
@@ -500,7 +615,7 @@ fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
                 });
             }
         }
-        for cap in re_struct.captures_iter(content) {
+        for cap in RE_RS_STRUCT.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 out.push(crate::types::Symbol {
                     name: m.as_str().to_string(),
@@ -510,10 +625,12 @@ fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
             }
         }
     } else if ext == "py" {
-        let re = Regex::new(r"^(?:\s*)(?:def|class)\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
+        static RE_PY: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"^(?:\s*)(?:def|class)\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap()
+        });
         let mut offset = 0usize;
         for line in content.lines() {
-            if let Some(cap) = re.captures(line) {
+            if let Some(cap) = RE_PY.captures(line) {
                 if let Some(m) = cap.get(1) {
                     out.push(crate::types::Symbol {
                         name: m.as_str().to_string(),
@@ -525,8 +642,10 @@ fn extract_symbols(content: &str, ext: &str) -> Vec<crate::types::Symbol> {
             offset += line.len() + 1; // approximate line length + newline
         }
     } else if ext == "go" {
-        let re = Regex::new(r"\bfunc(?:\s*\(.*?\))?\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap();
-        for cap in re.captures_iter(content) {
+        static RE_GO_FN: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"\bfunc(?:\s*\(.*?\))?\s+(\p{XID_Start}\p{XID_Continue}*)").unwrap()
+        });
+        for cap in RE_GO_FN.captures_iter(content) {
             if let Some(m) = cap.get(1) {
                 out.push(crate::types::Symbol {
                     name: m.as_str().to_string(),
