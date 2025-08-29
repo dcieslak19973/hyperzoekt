@@ -17,7 +17,7 @@ fn escape_csv(s: &str) -> String {
 
 fn main() -> anyhow::Result<()> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let test_file = manifest.join("tests/go_regex_parity.rs");
+    let test_file = manifest.join("../zoekt-rs/tests/go_regex_parity.rs");
     let src = std::fs::read_to_string(&test_file)?;
 
     let re = regex::Regex::new(r#"\(\s*"((?:\\.|[^"\\])*)"\s*,\s*"(conj|none|either)"\s*\)"#)?;
