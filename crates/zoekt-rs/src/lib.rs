@@ -21,14 +21,5 @@ pub fn build_in_memory_index(
     IndexBuilder::new(repo_root.as_ref().to_path_buf()).build()
 }
 
-pub mod test_helpers {
-    use crate::shard::ShardReader;
-    use anyhow::Result;
-    use std::collections::HashMap;
-
-    /// Test-only wrapper to access ShardReader::symbol_postings_map (pub(crate)).
-    /// Returns a public HashMap type so integration tests can use it.
-    pub fn symbol_postings_map(r: &ShardReader) -> Result<HashMap<[u8; 3], Vec<u32>>> {
-        r.symbol_postings_map()
-    }
-}
+#[doc(hidden)]
+pub mod test_helpers;
