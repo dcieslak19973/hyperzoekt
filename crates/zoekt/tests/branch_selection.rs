@@ -12,8 +12,28 @@ fn test_branch_selection_with_git_archive() -> anyhow::Result<()> {
     let repo = td.path().join("repo");
     fs::create_dir_all(&repo)?;
 
-    // init git repo
-    Command::new("git").arg("init").arg(&repo).status()?;
+    // init git repo with 'main' as the initial branch to avoid 'master' default
+    Command::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(&repo)
+        .status()?;
+    // Ensure commits can be created in CI by setting a local identity
+    Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("config")
+        .arg("user.email")
+        .arg("test@example.com")
+        .status()?;
+    Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("config")
+        .arg("user.name")
+        .arg("Test User")
+        .status()?;
     // commit file on main
     let f = repo.join("file.txt");
     fs::write(&f, "content on main")?;
