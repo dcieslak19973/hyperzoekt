@@ -31,8 +31,16 @@ Status (high level):
     2. Add Go-derived regex edge-case tests into `crates/zoekt/tests/` for parity verification.
     3. Ensure the prefilter falls back to a safe default (no prefilter) when uncertain to avoid false negatives.
 
+- [x] Regex-confirmation & anchor/windowing optimizations (shard search)
+   - Implemented trigram-position-based windowing to restrict expensive regex confirmation to small byte ranges derived from per-trigram positions. See `crates/zoekt/src/shard.rs` (anchor/window builders and targeted per-doc trigram position decoder).
+   - Added a byte-anchor fallback (ASCII byte seeds + memchr/memmem scanning) when useful trigrams are unavailable. This lowers full-file regex scans for many anchored or literal-rich regexes. The `memchr` dependency was added in `crates/zoekt/Cargo.toml`.
+   - Integrated a conservative `required_substrings_from_regex` pass (regex AST lowering) to enforce multi-byte substring co-occurrence before windowing. Implementation is in `crates/zoekt/src/regex_analyze.rs`.
+   - Tests and benchmark runs were used to validate behavior; results show significant improvement for many anchored regexes, though some small-query regressions remain driven by metadata I/O (see notes below).
+
 - [~] Full postings format and ranking, line/match context extraction
    - Basic ranking and snippet extraction are implemented in the shard-backed search path (see “Scoring & snippets” below). Advanced ranking remains to be ported.
+ - [~] Full postings format and ranking, line/match context extraction
+    - Basic ranking and snippet extraction are implemented in the shard-backed search path (see “Scoring & snippets” below). Advanced ranking remains to be ported.
 - [~] Repo/file scoping, symbol awareness (symbol extraction + per-doc symbols persisted; symbol-trigram postings and shard-side prefilter implemented but needs tuning)
 - [~] Broader test parity with Go Zoekt (good unit coverage; need Go-derived fixtures and golden comparisons)
 
