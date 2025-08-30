@@ -36,7 +36,9 @@ fn test_gitignore_and_size_and_binary_and_hidden_and_symlink() {
     std::os::unix::fs::symlink(root.join("foo.txt"), root.join("link_to_foo")).unwrap();
 
     // Build with defaults: should skip big.txt, data.bin, ignored.txt, and hidden (hidden=false)
-    let idx = IndexBuilder::new(root.to_path_buf()).build().unwrap();
+    let idx = IndexBuilder::new(root.to_path_buf())
+        .build()
+        .expect("build");
     assert!(idx.doc_count() >= 1);
     // foo.txt contains 'hello' and should be findable
     let res = idx.search_literal("hello");

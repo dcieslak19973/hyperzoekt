@@ -40,7 +40,9 @@ fn main() -> Result<()> {
 
     let before_rss = get_max_rss_kb();
     let start = Instant::now();
-    let idx = IndexBuilder::new(repo.clone()).build()?;
+    let idx = IndexBuilder::new(repo.clone())
+        .build()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let dur = start.elapsed();
     let after_rss = get_max_rss_kb();
 
@@ -82,6 +84,9 @@ fn main() -> Result<()> {
         "docs": idx.doc_count(),
         "scanned_bytes": scanned_bytes,
         "elapsed_ms": dur.as_millis(),
+    // include an empty results array so compare tools that expect query-bench style
+    // JSON won't panic when index-only runs are compared
+    "results": [],
         "rss_kb_before": before_rss,
         "rss_kb_after": after_rss,
         "wrote_shard": opts.write_shard,

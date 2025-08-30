@@ -1,5 +1,7 @@
-use anyhow::Result;
+use anyhow::Result as AnyhowResult;
 use clap::Parser;
+use std::result::Result as StdResult;
+use zoekt_rs::index::IndexError;
 use zoekt_rs::{
     build_in_memory_index,
     query::{QueryPlan, QueryResult, Searcher, SelectKind},
@@ -42,7 +44,7 @@ struct Args {
     snippet_max_chars: Option<usize>,
 }
 
-fn main() -> Result<()> {
+fn main() -> StdResult<(), IndexError> {
     let args = Args::parse();
     if let Some(shard) = args.shard.as_ref() {
         let rdr = ShardReader::open(shard)?;
@@ -87,7 +89,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_opts(args: &Args) -> Result<SearchOpts> {
+fn build_opts(args: &Args) -> AnyhowResult<SearchOpts> {
     let path_regex = if let Some(re) = &args.path_regex {
         Some(regex::Regex::new(re)?)
     } else {
@@ -105,7 +107,7 @@ fn build_opts(args: &Args) -> Result<SearchOpts> {
     })
 }
 
-fn print_matches(matches: Vec<SearchMatch>, json: bool) -> Result<()> {
+fn print_matches(matches: Vec<SearchMatch>, json: bool) -> AnyhowResult<()> {
     if json {
         for m in matches {
             let v = serde_json::json!({
@@ -132,7 +134,7 @@ fn print_matches(matches: Vec<SearchMatch>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_symbol_results(results: Vec<QueryResult>, json: bool) -> Result<()> {
+fn print_symbol_results(results: Vec<QueryResult>, json: bool) -> AnyhowResult<()> {
     if json {
         for r in results {
             let v = serde_json::json!({

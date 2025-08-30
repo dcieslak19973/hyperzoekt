@@ -1,5 +1,6 @@
-use anyhow::Result;
 use clap::Parser;
+use std::result::Result as StdResult;
+use zoekt_rs::index::IndexError;
 use zoekt_rs::{IndexBuilder, ShardWriter};
 
 #[derive(Parser, Debug)]
@@ -18,7 +19,7 @@ struct Args {
     max_file_size: Option<usize>,
 }
 
-fn main() -> Result<()> {
+fn main() -> StdResult<(), IndexError> {
     let args = Args::parse();
     let max_file_size = args.max_file_size.unwrap_or(1_000_000usize);
     let idx = IndexBuilder::new(args.repo.clone())
