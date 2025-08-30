@@ -33,3 +33,23 @@ Thanks for your interest in contributing!
 
 ## Contact
 - For larger design discussions, open an issue or join the discussion on the repo.
+
+## Test helpers
+
+When integration tests under `crates/*/tests/` need to exercise crate-internal
+behavior (for example, calling `pub(crate)` helpers), prefer placing small
+test-only helper modules in the crate's `src/` directory and keeping them
+clearly marked as test-only. This allows the `tests/` integration test
+crates to import them (e.g. `crate_name::test_helpers::foo`) while preserving
+the public API surface for downstream consumers.
+
+Pattern summary:
+- If the helper needs access to `pub(crate)` or private items: put it in
+  `crates/<crate>/src/test_helpers.rs` and expose it from `lib.rs` as
+  `#[doc(hidden)] pub mod test_helpers;`.
+- If the helper only needs public APIs: put it under
+  `crates/<crate>/tests/common/mod.rs` and import it from the other
+  integration tests.
+
+Keep test-only helpers small and well-documented. Mark them `#[doc(hidden)]`
+or add comments explaining why they live in `src/`.

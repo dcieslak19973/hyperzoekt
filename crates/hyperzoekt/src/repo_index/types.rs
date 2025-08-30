@@ -59,7 +59,7 @@ impl StoredEntity {
 pub struct RepoIndexService {
     pub files: Vec<FileRecord>,
     pub entities: Vec<StoredEntity>,
-    pub(crate) name_index: HashMap<String, Vec<u32>>, // lowercase name -> entity ids (crate visible)
+    pub name_index: HashMap<String, Vec<u32>>, // lowercase name -> entity ids
     // Graph adjacency lists (indices reference entities vector)
     pub containment_children: Vec<Vec<u32>>, // entity id -> child entity ids
     pub containment_parent: Vec<Option<u32>>, // entity id -> optional parent entity id

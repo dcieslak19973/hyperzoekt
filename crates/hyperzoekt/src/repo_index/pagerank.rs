@@ -90,18 +90,12 @@ pub fn compute_pagerank(svc: &mut RepoIndexService) {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_pagerank;
+    use super::*;
     use crate::repo_index::indexer::types::{EntityKind, RankWeights};
     use crate::repo_index::types::{FileRecord, RepoIndexService, StoredEntity};
 
     #[test]
     fn pagerank_simple_graph_orders_nodes() {
-        // Create a tiny graph of 3 entities where:
-        // - entity 0 (A) points to 1 and 2
-        // - entity 1 (B) points to 2
-        // - entity 2 (C) points to nobody (dangling)
-        // Expectation: C receives the most incoming weight, then B, then A.
-
         let files = vec![FileRecord {
             id: 0,
             path: "<inmem>".to_string(),
@@ -160,7 +154,7 @@ mod tests {
         let containment_parent = vec![None; n];
         let name_index = std::collections::HashMap::new();
         let file_entities = Vec::new();
-        let unresolved_imports = vec![Vec::new(); files.len()];
+        let unresolved_imports = vec![Vec::new(); file_entities.len() + 0];
 
         let mut svc = RepoIndexService {
             files,
@@ -189,14 +183,9 @@ mod tests {
         let r1 = svc.entities[1].rank;
         let r2 = svc.entities[2].rank;
 
-        // Ranks should be positive
         assert!(r0 > 0.0 && r1 > 0.0 && r2 > 0.0);
-
-        // C should have the largest rank, then B, then A
         assert!(r2 > r1, "expected C > B (got {} <= {})", r2, r1);
         assert!(r1 > r0, "expected B > A (got {} <= {})", r1, r0);
-
-        // Ranks should sum to approximately 1.0 (allow some tolerance)
         let sum = r0 + r1 + r2;
         assert!((sum - 1.0).abs() < 1e-3, "ranks sum to {}", sum);
     }
@@ -220,7 +209,6 @@ mod tests {
             rank_weights: RankWeights::default(),
         };
 
-        // should not panic
         compute_pagerank(&mut svc);
         assert!(svc.entities.is_empty());
     }
@@ -436,3 +424,5 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-3, "sum {}", sum);
     }
 }
+
+// Duplicate tests removed; kept the original tests module earlier in the file.
