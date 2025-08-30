@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::in_memory::{InMemoryIndex, InMemoryIndexInner, RepoDocId};
+use super::process::{process_pending, PendingFile};
 use super::utils::*;
 
 pub struct IndexBuilder {
@@ -84,43 +85,10 @@ impl IndexBuilder {
         let mut repo_branches: Vec<String> = vec!["HEAD".to_string()];
         if let Some(bs) = &self.branches {
             repo_branches = bs.clone();
-        } else if let Ok(repo) = git2::Repository::open(&self.root) {
-            let mut chosen: Vec<String> = Vec::new();
-            if let Ok(head) = repo.head() {
-                if let Some(name) = head.shorthand() {
-                    chosen.push(name.to_string());
-                }
-            }
-            let mut tips: Vec<(String, i64)> = Vec::new();
-            if let Ok(mut refs) = repo.references() {
-                while let Some(Ok(r)) = refs.next() {
-                    if let Some(name) = r.shorthand() {
-                        if let Some(rname) = r.name() {
-                            if rname.starts_with("refs/heads/") {
-                                if let Ok(resolved) = r.resolve() {
-                                    if let Ok(target) = resolved.peel_to_commit() {
-                                        let time = target.time().seconds();
-                                        tips.push((name.to_string(), time));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            tips.sort_by(|a, b| b.1.cmp(&a.1));
-            for (n, _) in tips.into_iter() {
-                if chosen.contains(&n) {
-                    continue;
-                }
-                if chosen.len() >= self.max_branches {
-                    break;
-                }
-                chosen.push(n);
-            }
-            if !chosen.is_empty() {
-                repo_branches = chosen;
-            }
+        } else if let Some(chosen) =
+            crate::index::git::choose_branches(&self.root, self.max_branches)
+        {
+            repo_branches = chosen;
         }
         let repo = RepoMeta {
             name: self
@@ -133,45 +101,12 @@ impl IndexBuilder {
             branches: repo_branches.clone(),
         };
 
-        struct PendingFile {
-            rel: PathBuf,
-            size: usize,
-            lang: Option<String>,
-            branches: Vec<String>,
-            base: Option<PathBuf>,
-        }
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut _branch_tempdirs: Vec<tempfile::TempDir> = Vec::new();
 
         if let Some(bs) = &self.branches {
             for b in bs {
-                let td = tempfile::tempdir()?;
-                let libgit2_ok = extract_branch_tree_libgit2(&self.root, b, td.path());
-                if let Err(_e) = libgit2_ok {
-                    let mut git = std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(&self.root)
-                        .arg("archive")
-                        .arg("--format=tar")
-                        .arg(b)
-                        .stdout(std::process::Stdio::piped())
-                        .spawn()?;
-                    let git_stdout = git.stdout.take().unwrap();
-                    let mut tar = std::process::Command::new("tar")
-                        .arg("-x")
-                        .arg("-C")
-                        .arg(td.path())
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()?;
-                    if let Some(mut tar_stdin) = tar.stdin.take() {
-                        std::io::copy(&mut std::io::BufReader::new(git_stdout), &mut tar_stdin)?;
-                    }
-                    let git_status = git.wait()?;
-                    let tar_status = tar.wait()?;
-                    if !git_status.success() || !tar_status.success() {
-                        continue;
-                    }
-                }
+                let td = crate::index::git::extract_branch_to_tempdir(&self.root, b)?;
 
                 let mut builder = ignore::WalkBuilder::new(td.path());
                 builder.hidden(!self.include_hidden);
@@ -281,122 +216,9 @@ impl IndexBuilder {
             }
         }
 
-        use rayon::prelude::*;
-        use rayon::ThreadPoolBuilder;
         let enable_symbols = self.enable_symbols;
         let root = self.root.clone();
-        #[derive(Debug)]
-        struct ProcessedDoc {
-            idx: usize,
-            doc: DocumentMeta,
-            content: Option<String>,
-            sym_names: Vec<String>,
-            keep_content: bool,
-        }
-        let avail = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let default_cap = std::cmp::min(avail, 8).max(1);
-        let env_cap = std::env::var("ZOEKT_INDEX_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.max(1));
-        let cap = self
-            .thread_cap
-            .or(env_cap)
-            .unwrap_or(default_cap)
-            .min(avail)
-            .max(1);
-        let processed: Vec<ProcessedDoc> =
-            if let Ok(pool) = ThreadPoolBuilder::new().num_threads(cap).build() {
-                pool.install(|| {
-                    pending
-                        .par_iter()
-                        .enumerate()
-                        .map(|(idx, pf)| {
-                            let fullp = match &pf.base {
-                                Some(base) => base.join(&pf.rel),
-                                None => root.join(&pf.rel),
-                            };
-                            let bytes = std::fs::read(&fullp).ok();
-                            let mut doc = DocumentMeta {
-                                path: pf.rel.clone(),
-                                lang: pf.lang.clone(),
-                                size: bytes.as_ref().map(|b| b.len()).unwrap_or(pf.size) as u64,
-                                branches: pf.branches.clone(),
-                                symbols: Vec::new(),
-                            };
-                            let mut symbol_terms: Vec<String> = Vec::new();
-                            let mut content: Option<String> = None;
-                            if let Some(b) = &bytes {
-                                let text = String::from_utf8_lossy(b).into_owned();
-                                if is_text(b) {
-                                    content = Some(text.clone());
-                                }
-                                if enable_symbols {
-                                    doc.symbols = extract_symbols(
-                                        &text,
-                                        doc.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                                    );
-                                    symbol_terms =
-                                        doc.symbols.iter().map(|s| s.name.to_lowercase()).collect();
-                                }
-                            }
-                            let keep = pf.base.is_some();
-                            ProcessedDoc {
-                                idx,
-                                doc,
-                                content,
-                                sym_names: symbol_terms,
-                                keep_content: keep,
-                            }
-                        })
-                        .collect()
-                })
-            } else {
-                pending
-                    .par_iter()
-                    .enumerate()
-                    .map(|(idx, pf)| {
-                        let fullp = match &pf.base {
-                            Some(base) => base.join(&pf.rel),
-                            None => root.join(&pf.rel),
-                        };
-                        let bytes = std::fs::read(&fullp).ok();
-                        let mut doc = DocumentMeta {
-                            path: pf.rel.clone(),
-                            lang: pf.lang.clone(),
-                            size: bytes.as_ref().map(|b| b.len()).unwrap_or(pf.size) as u64,
-                            branches: pf.branches.clone(),
-                            symbols: Vec::new(),
-                        };
-                        let mut symbol_terms: Vec<String> = Vec::new();
-                        let mut content: Option<String> = None;
-                        if let Some(b) = &bytes {
-                            let text = String::from_utf8_lossy(b).into_owned();
-                            if is_text(b) {
-                                content = Some(text.clone());
-                            }
-                            if enable_symbols {
-                                doc.symbols = extract_symbols(
-                                    &text,
-                                    doc.path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-                                );
-                                symbol_terms =
-                                    doc.symbols.iter().map(|s| s.name.to_lowercase()).collect();
-                            }
-                        }
-                        let keep = pf.base.is_some();
-                        ProcessedDoc {
-                            idx,
-                            doc,
-                            content,
-                            sym_names: symbol_terms,
-                            keep_content: keep,
-                        }
-                    })
-                    .collect()
-            };
+        let processed = process_pending(pending, root.clone(), enable_symbols, self.thread_cap);
 
         let mut processed = processed;
         processed.sort_by_key(|p| p.idx);

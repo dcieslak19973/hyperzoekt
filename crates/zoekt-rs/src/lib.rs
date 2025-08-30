@@ -10,6 +10,7 @@ pub mod types;
 pub mod typesitter;
 
 pub use crate::index::{InMemoryIndex, IndexBuilder, RepoDocId};
+// Query submodules are internal; re-export their public API here.
 pub use crate::query::{Query, QueryPlan, QueryResult, Searcher, SelectKind};
 pub use crate::shard::{SearchMatch, SearchOpts, ShardReader, ShardSearcher, ShardWriter};
 pub use crate::trigram::trigrams;

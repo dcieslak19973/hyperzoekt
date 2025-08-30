@@ -6,6 +6,10 @@ description = "Minimal Zoekt-like text indexer/searcher in Rust for hyperzoekt w
 license = "Apache-2.0"
 repository = "https://github.com/dcieslak19973/hyperzoekt"
 
+[lib]
+name = "zoekt_rs"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
