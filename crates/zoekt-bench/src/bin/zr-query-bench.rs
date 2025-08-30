@@ -233,13 +233,13 @@ struct Opts {
     #[clap(long)]
     no_write_shard: bool,
     /// Number of warmup iterations per query
-    #[clap(long, default_value = "5")]
+    #[clap(long, default_value = "1")]
     warmup: usize,
     /// Number of measured iterations per query
-    #[clap(long, default_value = "50")]
+    #[clap(long, default_value = "200")]
     iters: usize,
     /// Total time budget for the whole bench in seconds (includes indexing)
-    #[clap(long, default_value = "180")]
+    #[clap(long, default_value = "3600")]
     time_budget: u64,
     /// Print progress/heartbeat during measured iterations
     #[clap(long)]
@@ -306,7 +306,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(n) = opts.index_threads {
         ib = ib.index_threads(n);
     }
-    let idx_inner = ib.build()?;
+    let idx_inner = ib.build().map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let ib_dur = ib_start.elapsed();
     // stop heartbeat and join
     hb_stop.store(true, Ordering::Relaxed);

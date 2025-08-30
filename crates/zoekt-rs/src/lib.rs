@@ -18,7 +18,7 @@ pub use crate::trigram::trigrams;
 /// Convenience re-export for callers who want a simple one-shot build and search
 pub fn build_in_memory_index(
     repo_root: impl AsRef<std::path::Path>,
-) -> anyhow::Result<InMemoryIndex> {
+) -> std::result::Result<InMemoryIndex, crate::index::IndexError> {
     IndexBuilder::new(repo_root.as_ref().to_path_buf()).build()
 }
 

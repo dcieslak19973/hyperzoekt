@@ -1,10 +1,146 @@
 use crate::types::{DocumentMeta, RepoMeta};
 use std::collections::HashMap;
 use std::path::PathBuf;
+// std::process::Stdio removed (unused)
 
 use super::in_memory::{InMemoryIndex, InMemoryIndexInner, RepoDocId};
 use super::process::{process_pending, PendingFile};
 use super::utils::*;
+
+use std::path::Path;
+
+/// Attempt a non-interactive `git clone --depth 1 <url> <dst>`.
+///
+/// `runner` is an optional test hook that receives (url, dst) and returns
+/// a simulated `std::process::Output` to ease unit testing.
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_git_clone_fallback(
+    url: &str,
+    dst: &Path,
+    runner: Option<&dyn Fn(&str, &Path) -> std::io::Result<std::process::Output>>,
+) -> Result<(), crate::index::IndexError> {
+    if let Some(r) = runner {
+        let output = r(url, dst).map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let serr = stderr.trim();
+        let serr_l = serr.to_lowercase();
+        if serr_l.contains("authentication failed")
+            || serr_l.contains("permission denied")
+            || serr_l.contains("fatal: could not read")
+        {
+            return Err(crate::index::IndexError::CloneDenied(serr.to_string()));
+        } else if serr_l.contains("not found")
+            || serr_l.contains("repository not found")
+            || serr.contains("404")
+        {
+            return Err(crate::index::IndexError::RepoNotFound(serr.to_string()));
+        } else {
+            return Err(crate::index::IndexError::CloneError(serr.to_string()));
+        }
+    }
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("clone").arg("--depth").arg("1").arg(url).arg(dst);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    if url.starts_with("git@") || url.starts_with("ssh://") {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let output = cmd
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            crate::index::IndexError::Other(format!("failed to spawn git clone: {}", e))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let serr = stderr.trim();
+    let serr_l = serr.to_lowercase();
+    if serr_l.contains("authentication failed")
+        || serr_l.contains("permission denied")
+        || serr_l.contains("fatal: could not read")
+    {
+        Err(crate::index::IndexError::CloneDenied(serr.to_string()))
+    } else if serr_l.contains("not found")
+        || serr_l.contains("repository not found")
+        || serr.contains("404")
+    {
+        Err(crate::index::IndexError::RepoNotFound(serr.to_string()))
+    } else {
+        Err(crate::index::IndexError::CloneError(serr.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn make_output_cmd(stderr: &str, exit_code: i32) -> std::process::Output {
+        // Use shell to produce controlled stderr and exit code.
+        #[cfg(unix)]
+        {
+            let cmd = format!(
+                "(>&2 echo '{}'); exit {}",
+                stderr.replace('"', "\""),
+                exit_code
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .expect("failed to run shell to simulate git output")
+        }
+        #[cfg(windows)]
+        {
+            let cmd = format!(
+                "Write-Error '{}' ; exit {}",
+                stderr.replace('"', "\""),
+                exit_code
+            );
+            std::process::Command::new("powershell")
+                .arg("-Command")
+                .arg(cmd)
+                .output()
+                .expect("failed to run PowerShell to simulate git output")
+        }
+    }
+
+    #[test]
+    fn test_clone_denied_maps_to_clone_denied() {
+        let runner = |_: &str, _: &std::path::Path| -> std::io::Result<std::process::Output> {
+            Ok(make_output_cmd("Authentication failed", 1))
+        };
+        let td = tempfile::tempdir().unwrap();
+        let res = try_git_clone_fallback("https://example.com/repo.git", td.path(), Some(&runner));
+        assert!(matches!(res, Err(crate::index::IndexError::CloneDenied(_))));
+    }
+
+    #[test]
+    fn test_repo_not_found_maps_to_repo_not_found() {
+        let runner = |_: &str, _: &std::path::Path| -> std::io::Result<std::process::Output> {
+            Ok(make_output_cmd("Repository not found", 1))
+        };
+        let td = tempfile::tempdir().unwrap();
+        let res = try_git_clone_fallback("https://example.com/repo.git", td.path(), Some(&runner));
+        assert!(matches!(
+            res,
+            Err(crate::index::IndexError::RepoNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_generic_clone_error_maps_to_clone_error() {
+        let runner = |_: &str, _: &std::path::Path| -> std::io::Result<std::process::Output> {
+            Ok(make_output_cmd("some other failure", 1))
+        };
+        let td = tempfile::tempdir().unwrap();
+        let res = try_git_clone_fallback("https://example.com/repo.git", td.path(), Some(&runner));
+        assert!(matches!(res, Err(crate::index::IndexError::CloneError(_))));
+    }
+}
 
 pub struct IndexBuilder {
     root: PathBuf,
@@ -80,33 +216,100 @@ impl IndexBuilder {
         self
     }
 
-    pub fn build(self) -> anyhow::Result<InMemoryIndex> {
+    pub fn build(self) -> std::result::Result<InMemoryIndex, crate::index::IndexError> {
+        // Clone remote git URLs into a tempdir and use that as repo_root.
+        let mut repo_root = self.root.clone();
+        let root_s = repo_root.to_string_lossy();
+        let mut _repo_clone_tempdir: Option<tempfile::TempDir> = None;
+        if root_s.starts_with("http://")
+            || root_s.starts_with("https://")
+            || root_s.starts_with("git@")
+            || root_s.starts_with("ssh://")
+        {
+            let td =
+                tempfile::tempdir().map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
+            // Try libgit2 clone first, fall back to git CLI if libgit2 fails.
+            match git2::Repository::clone(root_s.as_ref(), td.path()) {
+                Ok(_) => {
+                    repo_root = td.path().to_path_buf();
+                    _repo_clone_tempdir = Some(td);
+                }
+                Err(e) => {
+                    // fall back to `git clone --depth 1` but run non-interactively
+                    let res = crate::index::builder::try_git_clone_fallback(
+                        root_s.as_ref(),
+                        td.path(),
+                        None,
+                    );
+                    match res {
+                        Ok(()) => {
+                            repo_root = td.path().to_path_buf();
+                            _repo_clone_tempdir = Some(td);
+                        }
+                        Err(err) => {
+                            return Err(crate::index::IndexError::Other(format!(
+                                "libgit2: {} ; fallback: {}",
+                                e, err
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         // Repo meta will reflect the list of branches we indexed (or HEAD by default)
         let mut repo_branches: Vec<String> = vec!["HEAD".to_string()];
         if let Some(bs) = &self.branches {
             repo_branches = bs.clone();
         } else if let Some(chosen) =
-            crate::index::git::choose_branches(&self.root, self.max_branches)
+            crate::index::git::choose_branches(&repo_root, self.max_branches)
         {
             repo_branches = chosen;
         }
+
+        // Derive a friendly repo name. For local paths use the directory
+        // basename; for remote URLs prefer the last URL path component
+        // (strip trailing `.git` if present).
+        let name = {
+            let s = self.root.to_string_lossy();
+            if s.starts_with("http://")
+                || s.starts_with("https://")
+                || s.starts_with("git@")
+                || s.starts_with("ssh://")
+            {
+                // take last path segment
+                let trimmed = s.trim_end_matches('/');
+                let last = trimmed.rsplit('/').next().unwrap_or(trimmed.as_ref());
+                let last = last.rsplit(':').next().unwrap_or(last); // handle git@host:owner/repo.git
+                last.trim_end_matches(".git").to_string()
+            } else {
+                repo_root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            }
+        };
+
         let repo = RepoMeta {
-            name: self
-                .root
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            root: self.root.clone(),
+            name,
+            root: repo_root.clone(),
             branches: repo_branches.clone(),
         };
 
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut _branch_tempdirs: Vec<tempfile::TempDir> = Vec::new();
+        // keep the repo clone tempdir alive alongside branch tempdirs
+        // remember whether we cloned so we can decide to keep content in-memory
+        let repo_was_cloned = _repo_clone_tempdir.is_some();
+        if let Some(td) = _repo_clone_tempdir {
+            _branch_tempdirs.push(td);
+        }
 
         if let Some(bs) = &self.branches {
             for b in bs {
-                let td = crate::index::git::extract_branch_to_tempdir(&self.root, b)?;
+                let td = crate::index::git::extract_branch_to_tempdir(&repo_root, b)
+                    .map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
 
                 let mut builder = ignore::WalkBuilder::new(td.path());
                 builder.hidden(!self.include_hidden);
@@ -145,12 +348,12 @@ impl IndexBuilder {
                 _branch_tempdirs.push(td);
             }
         } else {
-            let mut builder = ignore::WalkBuilder::new(&self.root);
+            let mut builder = ignore::WalkBuilder::new(&repo_root);
             builder.hidden(!self.include_hidden);
             builder.follow_links(self.follow_symlinks);
             builder.git_ignore(true);
             let mut ignore_patterns: Vec<String> = Vec::new();
-            if let Ok(gitignore_content) = std::fs::read_to_string(self.root.join(".gitignore")) {
+            if let Ok(gitignore_content) = std::fs::read_to_string(repo_root.join(".gitignore")) {
                 for line in gitignore_content.lines() {
                     let pat = line.trim();
                     if pat.is_empty() || pat.starts_with('#') {
@@ -164,7 +367,7 @@ impl IndexBuilder {
                 .filter_map(Result::ok)
                 .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             {
-                let rel = pathdiff::diff_paths(result.path(), &self.root)
+                let rel = pathdiff::diff_paths(result.path(), &repo_root)
                     .unwrap_or_else(|| PathBuf::from(result.file_name()));
                 if !ignore_patterns.is_empty() {
                     let rel_s = rel.to_string_lossy();
@@ -211,13 +414,17 @@ impl IndexBuilder {
                     size,
                     lang,
                     branches: vec!["HEAD".to_string()],
-                    base: None,
+                    base: if repo_was_cloned {
+                        Some(repo_root.clone())
+                    } else {
+                        None
+                    },
                 });
             }
         }
 
         let enable_symbols = self.enable_symbols;
-        let root = self.root.clone();
+        let root = repo_root.clone();
         let processed = process_pending(pending, root.clone(), enable_symbols, self.thread_cap);
 
         let mut processed = processed;
