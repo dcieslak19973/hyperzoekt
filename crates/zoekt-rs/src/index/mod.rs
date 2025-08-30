@@ -1,10 +1,12 @@
 pub mod builder;
+pub mod error;
 mod git;
 pub mod in_memory;
 pub(crate) mod process;
 mod utils;
 
 pub use builder::IndexBuilder;
+pub use error::IndexError;
 pub use in_memory::{InMemoryIndex, InMemoryIndexInner};
 
 pub type RepoDocId = u32;

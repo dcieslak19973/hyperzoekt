@@ -1,8 +1,9 @@
 use std::path::Path;
 pub use tempfile;
 
-use anyhow::Result;
+use std::result::Result as StdResult;
 use zoekt_rs::build_in_memory_index;
+use zoekt_rs::index::IndexError;
 use zoekt_rs::InMemoryIndex;
 
 /// Create a temporary directory and return its path and a guard.
@@ -20,7 +21,7 @@ pub fn write_file(repo: &Path, rel: &str, contents: &[u8]) {
 }
 
 /// Build an in-memory index for the repo and return a Searcher.
-pub fn build_index(repo: &Path) -> Result<InMemoryIndex> {
+pub fn build_index(repo: &Path) -> StdResult<InMemoryIndex, IndexError> {
     let idx = build_in_memory_index(repo)?;
     Ok(idx)
 }

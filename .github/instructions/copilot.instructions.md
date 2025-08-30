@@ -31,3 +31,5 @@ When you finish edits
 Questions to ask the repo owner (if unclear)
 
 Done — update this file if the workspace layout changes.
+
+We don't need to worry about backwards compatibility and we don't intend for interoperability with the upstream version of zoekt.

@@ -22,10 +22,12 @@ fn shard_write_bench(c: &mut Criterion) {
                 }
 
                 // Build index and write a shard
-                let idx = zoekt_rs::build_in_memory_index(repo).unwrap();
+                let idx = zoekt_rs::build_in_memory_index(repo)
+                    .unwrap_or_else(|e| panic!("build_in_memory_index failed: {}", e));
                 let shard_path = repo.join("index.shard");
                 let sw = zoekt_rs::ShardWriter::new(&shard_path);
-                sw.write_from_index(&idx).unwrap();
+                sw.write_from_index(&idx)
+                    .unwrap_or_else(|e| panic!("write_from_index failed: {}", e));
             }
             t0.elapsed()
         })

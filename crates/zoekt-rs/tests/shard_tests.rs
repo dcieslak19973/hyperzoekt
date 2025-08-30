@@ -8,7 +8,7 @@ use zoekt_rs::shard::{ShardReader, ShardSearcher, ShardWriter};
 fn write_read_search_roundtrip() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("a.txt"), b"hello zoekt shard")?;
-    let idx = build_in_memory_index(dir.path())?;
+    let idx = build_in_memory_index(dir.path()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let shard_path = dir.path().join("index.shard");
     ShardWriter::new(&shard_path).write_from_index(&idx)?;
 
@@ -25,7 +25,7 @@ fn write_read_search_roundtrip() -> Result<()> {
 fn corrupt_shard_metadata_returns_error() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("a.txt"), b"hello zoekt shard")?;
-    let idx = build_in_memory_index(dir.path())?;
+    let idx = build_in_memory_index(dir.path()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let shard_path = dir.path().join("index.shard");
     ShardWriter::new(&shard_path).write_from_index(&idx)?;
 
@@ -59,7 +59,7 @@ fn symbol_trigram_prefilter_roundtrip() -> Result<()> {
         fn Other() {}
         "#;
     std::fs::write(dir.path().join("a.rs"), content)?;
-    let idx = build_in_memory_index(dir.path())?;
+    let idx = build_in_memory_index(dir.path()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let shard_path = dir.path().join("index.shard");
     ShardWriter::new(&shard_path).write_from_index(&idx)?;
 
@@ -79,7 +79,7 @@ fn symbol_regex_case_sensitive_and_insensitive() -> Result<()> {
         fn dothing() {}
         "#;
     std::fs::write(dir.path().join("a.rs"), content)?;
-    let idx = build_in_memory_index(dir.path())?;
+    let idx = build_in_memory_index(dir.path()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let shard_path = dir.path().join("index.shard");
     ShardWriter::new(&shard_path).write_from_index(&idx)?;
 
@@ -110,7 +110,7 @@ fn symbol_unicode_and_multibyte_names() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let content = "fn caf\u{e9}() {}\nfn 漢字_func() {}\n";
     std::fs::write(dir.path().join("a.rs"), content)?;
-    let idx = build_in_memory_index(dir.path())?;
+    let idx = build_in_memory_index(dir.path()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let shard_path = dir.path().join("index.shard");
     ShardWriter::new(&shard_path).write_from_index(&idx)?;
 
