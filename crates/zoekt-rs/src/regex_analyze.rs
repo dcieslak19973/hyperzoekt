@@ -364,3 +364,80 @@ pub fn required_substrings_from_regex(pattern: &str) -> Vec<Vec<u8>> {
 }
 // Note: previous AST-based manual extraction helper removed in favor of
 // the HIR-based literal extraction helpers present in regex-syntax.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regex_literal_prefilter() {
+        let pf = prefilter_from_regex("fooBar");
+        match pf {
+            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            _ => panic!("expected conj"),
+        }
+    }
+
+    #[test]
+    fn regex_prefilter_edge_cases() {
+        // patterns with clear literal runs
+        let p = prefilter_from_regex("\\bint\\s+main\\b");
+        match p {
+            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
+            Prefilter::None => panic!("expected conj for int main"),
+        }
+
+        let p = prefilter_from_regex("foo|bar");
+        match p {
+            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
+            Prefilter::None => panic!("expected conj or disjunction for foo|bar"),
+        }
+
+        // short runs should yield None
+        let p = prefilter_from_regex("a.b");
+        assert_eq!(p, Prefilter::None);
+
+        // purely meta patterns should be None
+        let p = prefilter_from_regex("\\w+\\d*");
+        assert_eq!(p, Prefilter::None);
+    }
+
+    #[test]
+    fn regex_prefilter_more_upstream_patterns() {
+        // common word-boundary searches
+        let p = prefilter_from_regex("\\bthe\\b");
+        match p {
+            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
+            Prefilter::None => (),
+        }
+
+        let p = prefilter_from_regex("\\b\\w{2,}\\b");
+        assert_eq!(p, Prefilter::None);
+
+        let p = prefilter_from_regex("foo{3}bar");
+        match p {
+            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            _ => panic!("expected conj for foo{{3}}bar"),
+        }
+    }
+
+    #[test]
+    fn regex_prefilter_strict_golden() {
+        use crate::regex_analyze::Prefilter;
+
+        let pf = prefilter_from_regex("abcdef");
+        match pf {
+            Prefilter::Conj(v) => {
+                let mut expect: Vec<[u8; 3]> = vec![*b"abc", *b"bcd", *b"cde", *b"def"];
+                expect.sort();
+                let mut got = v.clone();
+                got.sort();
+                assert_eq!(got, expect);
+            }
+            _ => panic!("expected Conj for simple literal"),
+        }
+    }
+}

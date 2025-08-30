@@ -218,6 +218,62 @@ pub(crate) fn symbol_prefilter(
     }
     cand_docs
 }
-// Integration tests were moved to `crates/zoekt-rs/tests/` to keep all tests
-// outside of `src/` as requested. Helper functions remain `pub(crate)` and
-// are exercised by the integration tests via `src/test_helpers.rs`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DocumentMeta;
+
+    #[test]
+    fn repo_matches_substring_glob_regex_and_branch() {
+        let mut plan = crate::QueryPlan::default();
+        plan.repos.push("owner/repo".to_string());
+        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+
+        plan.repos.clear();
+        plan.repo_globs.push("owner/*".to_string());
+        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+
+        plan.repo_globs.clear();
+        plan.repo_regexes
+            .push(regex::Regex::new("^owner/.*$").unwrap());
+        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+
+        plan.repo_regexes.clear();
+        plan.branches.push("feature".to_string());
+        // repo has only HEAD
+        assert!(!repo_matches(
+            "owner/repo",
+            &vec!["HEAD".to_string()],
+            &plan
+        ));
+        // when branches include feature it's ok
+        assert!(repo_matches(
+            "owner/repo",
+            &vec!["HEAD".to_string(), "feature".to_string()],
+            &plan
+        ));
+    }
+
+    #[test]
+    fn build_path_docs_detects_paths_case_insensitive() {
+        let docs = vec![
+            DocumentMeta {
+                path: std::path::PathBuf::from("src/lib.rs"),
+                lang: None,
+                size: 1,
+                branches: vec!["HEAD".to_string()],
+                symbols: vec![],
+            },
+            DocumentMeta {
+                path: std::path::PathBuf::from("README.md"),
+                lang: None,
+                size: 1,
+                branches: vec!["HEAD".to_string()],
+                symbols: vec![],
+            },
+        ];
+        let res = build_path_docs(&docs, "lib.rs", false);
+        assert_eq!(res, vec![0u32]);
+    }
+}
