@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use tempfile::tempdir;
 
-use zoekt_rs::build_in_memory_index;
+use zoekt_rs::IndexBuilder;
 
 /// Integration test that attempts a real git clone fallback.
 ///
@@ -44,9 +45,10 @@ fn real_clone_fallback_integration() -> Result<(), Box<dyn std::error::Error>> {
     // constructing a builder via the public crate surface if available. If that surface
     // differs, this test still early-returns with an informative error.
 
-    // Try to call build_in_memory_index with the URL; if that API signature doesn't accept
-    // URLs, this will return an error and the test will fail, surfacing the mismatch.
-    let idx = match build_in_memory_index(url) {
+    // Build the index using the public IndexBuilder entrypoint. This constructs the
+    // builder with a PathBuf created from the URL string; the builder will detect
+    // remote URLs and perform a clone when appropriate.
+    let idx = match IndexBuilder::new(PathBuf::from(url)).build() {
         Ok(i) => i,
         Err(e) => {
             // Propagate the error to fail the test so maintainers can see the failure mode.

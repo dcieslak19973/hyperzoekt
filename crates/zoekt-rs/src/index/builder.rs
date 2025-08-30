@@ -81,22 +81,31 @@ mod tests {
     fn make_output_cmd(stderr: &str, exit_code: i32) -> std::process::Output {
         // Use shell to produce controlled stderr and exit code.
         #[cfg(unix)]
-        let cmd = format!(
-            "(>&2 echo '{}'); exit {}",
-            stderr.replace('"', "\""),
-            exit_code
-        );
+        {
+            let cmd = format!(
+                "(>&2 echo '{}'); exit {}",
+                stderr.replace('"', "\""),
+                exit_code
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .expect("failed to run shell to simulate git output")
+        }
         #[cfg(windows)]
-        let cmd = format!(
-            "powershell -Command \"Write-Error '{}' ; exit {}\"",
-            stderr.replace('"', "\""),
-            exit_code
-        );
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .expect("failed to run shell to simulate git output")
+        {
+            let cmd = format!(
+                "Write-Error '{}' ; exit {}",
+                stderr.replace('"', "\""),
+                exit_code
+            );
+            std::process::Command::new("powershell")
+                .arg("-Command")
+                .arg(cmd)
+                .output()
+                .expect("failed to run PowerShell to simulate git output")
+        }
     }
 
     #[test]
