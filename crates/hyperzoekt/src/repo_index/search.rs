@@ -108,6 +108,7 @@ pub fn symbol_ids_exact<'a>(svc: &'a RepoIndexService, name: &str) -> &'a [u32] 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_index::indexer::types::{EntityKind, RankWeights};
     use crate::repo_index::types::{FileRecord, RepoIndexService, StoredEntity};
 
     fn make_simple_svc() -> RepoIndexService {
@@ -120,7 +121,7 @@ mod tests {
         let e0 = StoredEntity {
             id: 0,
             file_id: 0,
-            kind: crate::repo_index::indexer::types::EntityKind::Function,
+            kind: EntityKind::Function,
             name: "foo".into(),
             parent: None,
             signature: "".into(),
@@ -133,7 +134,7 @@ mod tests {
         let e1 = StoredEntity {
             id: 1,
             file_id: 0,
-            kind: crate::repo_index::indexer::types::EntityKind::Function,
+            kind: EntityKind::Function,
             name: "bar".into(),
             parent: None,
             signature: "".into(),
@@ -158,7 +159,7 @@ mod tests {
             import_lines: vec![Vec::new(); 2],
             file_entities: vec![0],
             unresolved_imports: vec![Vec::new()],
-            rank_weights: crate::repo_index::indexer::types::RankWeights::default(),
+            rank_weights: RankWeights::default(),
         }
     }
 
@@ -175,7 +176,6 @@ mod tests {
         let svc = make_simple_svc();
         let res = search_symbol_fuzzy_ranked(&svc, "b", 10);
         assert!(!res.is_empty());
-        // highest ranked 'bar' should be first
         assert_eq!(res[0].name, "bar");
     }
 }

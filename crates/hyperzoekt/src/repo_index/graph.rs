@@ -39,13 +39,14 @@ pub fn callees_up_to(svc: &RepoIndexService, entity_id: u32, depth: u32) -> Vec<
 pub fn callers_up_to(svc: &RepoIndexService, entity_id: u32, depth: u32) -> Vec<u32> {
     bfs_depth(svc, entity_id, depth, false)
 }
+
 // Graph helpers / traversal for RepoIndexService.
 
 // Future: additional graph helpers can be added here.
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_index::indexer::types::{EntityKind, RankWeights};
     use crate::repo_index::types::{FileRecord, RepoIndexService, StoredEntity};
 
     fn make_graph_svc() -> RepoIndexService {
@@ -58,7 +59,7 @@ mod tests {
         let e0 = StoredEntity {
             id: 0,
             file_id: 0,
-            kind: crate::repo_index::indexer::types::EntityKind::Function,
+            kind: EntityKind::Function,
             name: "a".into(),
             parent: None,
             signature: "".into(),
@@ -71,7 +72,7 @@ mod tests {
         let e1 = StoredEntity {
             id: 1,
             file_id: 0,
-            kind: crate::repo_index::indexer::types::EntityKind::Function,
+            kind: EntityKind::Function,
             name: "b".into(),
             parent: None,
             signature: "".into(),
@@ -84,7 +85,7 @@ mod tests {
         let e2 = StoredEntity {
             id: 2,
             file_id: 0,
-            kind: crate::repo_index::indexer::types::EntityKind::Function,
+            kind: EntityKind::Function,
             name: "c".into(),
             parent: None,
             signature: "".into(),
@@ -110,7 +111,7 @@ mod tests {
             import_lines: vec![Vec::new(); 3],
             file_entities: vec![0],
             unresolved_imports: vec![Vec::new()],
-            rank_weights: crate::repo_index::indexer::types::RankWeights::default(),
+            rank_weights: RankWeights::default(),
         }
     }
 
@@ -128,3 +129,6 @@ mod tests {
         assert_eq!(out, vec![1, 2]);
     }
 }
+// Graph helpers / traversal for RepoIndexService.
+
+// Future: additional graph helpers can be added here.
