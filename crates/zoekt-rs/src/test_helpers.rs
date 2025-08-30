@@ -120,3 +120,31 @@ pub fn make_index_with_trigrams(
     };
     crate::index::InMemoryIndex::from_inner(inner)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_write_var_u32_roundtrip() {
+        let mut buf = vec![];
+        test_write_var_u32(&mut buf, 0).unwrap();
+        test_write_var_u32(&mut buf, 1).unwrap();
+        test_write_var_u32(&mut buf, 300).unwrap();
+        test_write_var_u32(&mut buf, std::u32::MAX).unwrap();
+        // now read back
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(test_read_var_u32(&mut cursor).unwrap(), 0);
+        assert_eq!(test_read_var_u32(&mut cursor).unwrap(), 1);
+        assert_eq!(test_read_var_u32(&mut cursor).unwrap(), 300);
+        assert_eq!(test_read_var_u32(&mut cursor).unwrap(), std::u32::MAX);
+    }
+
+    #[test]
+    fn radix_sort_u128_sorts() {
+        let mut arr = [3u128, 1u128, 2u128, 0u128, std::u128::MAX];
+        test_radix_sort_u128(&mut arr);
+        assert_eq!(arr, [0u128, 1u128, 2u128, 3u128, std::u128::MAX]);
+    }
+}

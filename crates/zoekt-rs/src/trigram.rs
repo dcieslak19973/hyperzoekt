@@ -62,6 +62,8 @@ pub fn trigrams_with_pos(hay: &str) -> impl Iterator<Item = ([u8; 3], u32)> + '_
     }
 }
 
+// tests in module at end of file
+
 /// Emit trigrams plus starting byte offset of each 3-byte window into
 /// the provided `out` vector. The function does not allocate; callers
 /// should clear and reserve capacity on `out` as needed.

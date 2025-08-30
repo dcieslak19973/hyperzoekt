@@ -18,13 +18,11 @@ Developer workflows (commands)
 	- `cargo fmt --all`
 	- `cargo clippy --workspace -- -D warnings`
 
+Removing files
+
+	- Use `git rm <file>` to remove files from the working directory and stage the removal for commit.
+	
 Conventions and patterns
-
-Integration notes
-
-Files to inspect for examples
-- `crates/hyperzoekt/src/service.rs` — current skeleton and preferred types.
-`Cargo.toml` (top-level) — workspace configuration.
 
 If you need to make a larger change
 
