@@ -13,9 +13,11 @@ RUN apt-get update \
   gnupg \
   apt-transport-https \
   jq \
+  vim \
   ripgrep \
   lld \
   mold \
+  redis-server \
   && rm -rf /var/lib/apt/lists/*
 
 # Register mold/ld.lld as alternatives for /usr/bin/ld so they can be used as the system linker
