@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+# Ensure the workflow token can create check runs for the aggregator
+permissions:
+  checks: write
+
 jobs:
   checks:
     name: fmt + clippy + test
@@ -58,7 +62,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
 
       - name: Fail on deprecated GitHub Actions commands
         run: |
@@ -135,8 +138,12 @@ jobs:
             const jobsResp = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: runId });
             const jobs = (jobsResp.data && jobsResp.data.jobs) || [];
 
+              console.log(`Found ${jobs.length} job(s) in this run`);
+              console.log(jobs.map(j => ({ id: j.id, name: j.name, status: j.status, conclusion: j.conclusion })));
+
             // Determine if any job (other than this aggregator) failed.
             const failedJobs = jobs.filter(j => j.name && !j.name.toLowerCase().includes('report-ci') && j.status === 'completed' && j.conclusion !== 'success');
+            console.log(`Failed jobs: ${failedJobs.length}`);
             const conclusion = failedJobs.length > 0 ? 'failure' : 'success';
 
             const summaryLines = [];
@@ -150,15 +157,21 @@ jobs:
               summaryLines.push('All upstream jobs succeeded.');
             }
 
-            await github.rest.checks.create({
-              owner,
-              repo,
-              name: 'CI (aggregated)',
-              head_sha: sha,
-              status: 'completed',
-              conclusion,
-              output: {
-                title: 'CI aggregated',
-                summary: summaryLines.join('\n')
-              }
-            });
+            try {
+              await github.rest.checks.create({
+                owner,
+                repo,
+                name: 'CI (aggregated)',
+                head_sha: sha,
+                status: 'completed',
+                conclusion,
+                output: {
+                  title: 'CI aggregated',
+                  summary: summaryLines.join('\n')
+                }
+              });
+              console.log('Created aggregated check-run');
+            } catch (err) {
+              console.error('Failed to create aggregated check-run:', err);
+              throw err;
+            }
