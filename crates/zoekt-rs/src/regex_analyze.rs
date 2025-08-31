@@ -373,7 +373,7 @@ mod tests {
     fn regex_literal_prefilter() {
         let pf = prefilter_from_regex("fooBar");
         match pf {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             _ => panic!("expected conj"),
         }
     }
@@ -383,14 +383,14 @@ mod tests {
         // patterns with clear literal runs
         let p = prefilter_from_regex("\\bint\\s+main\\b");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => panic!("expected conj for int main"),
         }
 
         let p = prefilter_from_regex("foo|bar");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => panic!("expected conj or disjunction for foo|bar"),
         }
@@ -409,7 +409,7 @@ mod tests {
         // common word-boundary searches
         let p = prefilter_from_regex("\\bthe\\b");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => (),
         }
@@ -419,7 +419,7 @@ mod tests {
 
         let p = prefilter_from_regex("foo{3}bar");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             _ => panic!("expected conj for foo{{3}}bar"),
         }
     }

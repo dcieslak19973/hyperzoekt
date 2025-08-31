@@ -154,7 +154,7 @@ mod tests {
         let containment_parent = vec![None; n];
         let name_index = std::collections::HashMap::new();
         let file_entities = Vec::new();
-        let unresolved_imports = vec![Vec::new(); file_entities.len() + 0];
+        let unresolved_imports = vec![Vec::new(); file_entities.len()];
 
         let mut svc = RepoIndexService {
             files,

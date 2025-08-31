@@ -24,26 +24,32 @@ fn test_path_only_vs_content_only() -> anyhow::Result<()> {
     let s = zoekt_rs::query::Searcher::new(&idx);
 
     // path-only should match file1 only
-    let mut plan = QueryPlan::default();
-    plan.pattern = Some("needle".to_string());
-    plan.path_only = true;
-    plan.content_only = false;
+    let plan = QueryPlan {
+        pattern: Some("needle".to_string()),
+        path_only: true,
+        content_only: false,
+        ..Default::default()
+    };
     let res = s.search_plan(&plan);
     assert_eq!(res.len(), 1);
     assert!(res.iter().any(|r| r.path.ends_with("needle_name.txt")));
 
     // content-only should match file2 only
-    let mut plan2 = QueryPlan::default();
-    plan2.pattern = Some("needle".to_string());
-    plan2.content_only = true;
-    plan2.path_only = false;
+    let plan2 = QueryPlan {
+        pattern: Some("needle".to_string()),
+        content_only: true,
+        path_only: false,
+        ..Default::default()
+    };
     let res2 = s.search_plan(&plan2);
     assert_eq!(res2.len(), 1);
     assert!(res2.iter().any(|r| r.path.ends_with("other.txt")));
 
     // default (neither) should match both
-    let mut plan3 = QueryPlan::default();
-    plan3.pattern = Some("needle".to_string());
+    let plan3 = QueryPlan {
+        pattern: Some("needle".to_string()),
+        ..Default::default()
+    };
     let res3 = s.search_plan(&plan3);
     assert_eq!(res3.len(), 2);
 

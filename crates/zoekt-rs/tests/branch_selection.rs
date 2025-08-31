@@ -112,17 +112,21 @@ fn test_branch_selection_with_git_archive() -> anyhow::Result<()> {
     let s = zoekt_rs::query::Searcher::new(&idx);
 
     // query branch main should match 'content on main'
-    let mut plan = QueryPlan::default();
-    plan.pattern = Some("content on main".to_string());
-    plan.branches = vec![initial_branch.clone()];
+    let plan = QueryPlan {
+        pattern: Some("content on main".to_string()),
+        branches: vec![initial_branch.clone()],
+        ..Default::default()
+    };
     let res = s.search_plan(&plan);
     assert_eq!(res.len(), 1);
     assert!(res[0].path.ends_with("file.txt"));
 
     // query branch feature should match 'content on feature'
-    let mut plan2 = QueryPlan::default();
-    plan2.pattern = Some("content on feature".to_string());
-    plan2.branches = vec!["feature".to_string()];
+    let plan2 = QueryPlan {
+        pattern: Some("content on feature".to_string()),
+        branches: vec!["feature".to_string()],
+        ..Default::default()
+    };
     let res2 = s.search_plan(&plan2);
     assert_eq!(res2.len(), 1);
     assert!(res2[0].path.ends_with("file.txt"));

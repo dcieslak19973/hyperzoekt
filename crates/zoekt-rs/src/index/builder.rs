@@ -76,17 +76,14 @@ pub(crate) fn try_git_clone_fallback(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     fn make_output_cmd(stderr: &str, exit_code: i32) -> std::process::Output {
         // Use shell to produce controlled stderr and exit code.
         #[cfg(unix)]
         {
-            let cmd = format!(
-                "(>&2 echo '{}'); exit {}",
-                stderr.replace('"', "\""),
-                exit_code
-            );
+            let cmd = format!("(>&2 echo '{}'); exit {}", stderr, exit_code);
             std::process::Command::new("sh")
                 .arg("-c")
                 .arg(cmd)

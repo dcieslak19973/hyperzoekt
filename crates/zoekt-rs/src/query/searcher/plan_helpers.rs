@@ -228,29 +228,25 @@ mod tests {
     fn repo_matches_substring_glob_regex_and_branch() {
         let mut plan = crate::QueryPlan::default();
         plan.repos.push("owner/repo".to_string());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repos.clear();
         plan.repo_globs.push("owner/*".to_string());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repo_globs.clear();
         plan.repo_regexes
             .push(regex::Regex::new("^owner/.*$").unwrap());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repo_regexes.clear();
         plan.branches.push("feature".to_string());
         // repo has only HEAD
-        assert!(!repo_matches(
-            "owner/repo",
-            &vec!["HEAD".to_string()],
-            &plan
-        ));
+        assert!(!repo_matches("owner/repo", &["HEAD".to_string()], &plan));
         // when branches include feature it's ok
         assert!(repo_matches(
             "owner/repo",
-            &vec!["HEAD".to_string(), "feature".to_string()],
+            &["HEAD".to_string(), "feature".to_string()],
             &plan
         ));
     }

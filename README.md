@@ -22,51 +22,14 @@ Roadmap (high level)
 
 Get involved
 ------------
-- See `TODO.md` for the current task list and `doc/PLANS.md` for architecture notes.
 - Read `CONTRIBUTING.md` for how to run, test and submit changes.
 - Open issues or enhancement requests using the provided templates.
-
-Access control
---------------
-Access control and enterprise-grade permission features will be provided as a closed-source
-option available under a subscription model. The open-source core focuses on indexing,
-search, and the data model; commercial extensions will integrate permission syncing,
-authentication providers, and fine-grained enforcement at query time.
 
 Quick start
 -----------
 Build locally with Rust and Cargo (install via https://rustup.rs/):
 
 	cargo build
-
-Repo indexer
-------------
-This workspace includes a small Tree-sitter backed repository indexer in `crates/hyperzoekt`.
-
-To build and run the indexer binary (may take time the first build because Tree-sitter grammars compile native code):
-
-```bash
-cd crates/hyperzoekt
-cargo build --release
-cargo run --release --bin hyperzoekt -- --root /path/to/repo --out ./.data/out.jsonl --debug
-```
-
-There is also an incremental/streaming mode that writes JSONL as files are processed; see `crates/hyperzoekt/src/bin/hyperzoekt` for code.
-
-CLI flags (summary)
--------------------
-- `--config <file>`: Optional config TOML (defaults to `crates/hyperzoekt/hyperzoekt.toml`).
-- `--root <path>`: Repository root (directory) or single file to index. Required for most modes.
-- `--out <file>` / `-o <file>`: Output JSONL path (used by `--debug` and `--incremental`).
-- `--debug`: Index and write a single JSONL snapshot, then exit.
-- `--incremental`: Stream JSONL as files are processed (continues running unless combined with flags below).
-- `--stream-once`: Perform a one-off streaming run and exit (use with `--root <file or dir>`).
-- `--mcp-stdio`: Run the MCP server over stdio (used by the MCP E2E test).
-- `--mcp-http`: Run the MCP server over HTTP (dev/testing).
-
-Notes
-- Positional arguments for root/output have been removed. Always pass `--root` and `--out`.
-- Example incremental run: `cargo run --bin hyperzoekt -- --root ./some/repo --out ./.data/out.jsonl --incremental`
 
 License
 -------

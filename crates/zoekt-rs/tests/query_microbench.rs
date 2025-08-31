@@ -46,7 +46,7 @@ fn microbench_searcher_search() {
         let median = times[times.len() / 2];
         println!(
             "query={} mean_ms={} median_ms={} p95_ms={}",
-            q.to_string(),
+            q,
             mean.as_millis(),
             median.as_millis(),
             times[(times.len() * 95) / 100].as_millis()

@@ -5,6 +5,7 @@ members = [
 	"crates/zoekt-cli",
 	"crates/zoekt-bench",
 	"crates/zoekt-tools",
+	"crates/zoekt-distributed",
 ]
 
 # Use the edition-2021 dependency resolver semantics for workspace members.

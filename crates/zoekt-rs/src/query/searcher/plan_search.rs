@@ -239,7 +239,7 @@ mod tests {
         let mut plan = QueryPlan::default();
         plan.repo_globs.push("owner/*".to_string());
         let res = search_plan(&s, &plan);
-        assert!(res.is_empty() == false);
+        assert!(!res.is_empty());
     }
 
     #[test]

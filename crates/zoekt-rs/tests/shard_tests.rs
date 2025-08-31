@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tempfile;
+// use tempfile; (redundant import removed)
 
 use zoekt_rs::build_in_memory_index;
 use zoekt_rs::shard::{ShardReader, ShardSearcher, ShardWriter};

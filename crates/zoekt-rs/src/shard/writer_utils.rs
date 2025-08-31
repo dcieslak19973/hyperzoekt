@@ -77,19 +77,19 @@ mod tests {
         write_var_u32(&mut buf, 0).unwrap();
         write_var_u32(&mut buf, 1).unwrap();
         write_var_u32(&mut buf, 300).unwrap();
-        write_var_u32(&mut buf, std::u32::MAX).unwrap();
+        write_var_u32(&mut buf, u32::MAX).unwrap();
         // now read back
         let mut cursor = Cursor::new(buf);
         assert_eq!(read_var_u32(&mut cursor).unwrap(), 0);
         assert_eq!(read_var_u32(&mut cursor).unwrap(), 1);
         assert_eq!(read_var_u32(&mut cursor).unwrap(), 300);
-        assert_eq!(read_var_u32(&mut cursor).unwrap(), std::u32::MAX);
+        assert_eq!(read_var_u32(&mut cursor).unwrap(), u32::MAX);
     }
 
     #[test]
     fn test_radix_sort_u128() {
-        let mut v = vec![3u128, 1u128, 2u128, 0u128, std::u128::MAX];
+        let mut v = vec![3u128, 1u128, 2u128, 0u128, u128::MAX];
         radix_sort_u128(&mut v);
-        assert_eq!(v, vec![0u128, 1u128, 2u128, 3u128, std::u128::MAX]);
+        assert_eq!(v, vec![0u128, 1u128, 2u128, 3u128, u128::MAX]);
     }
 }

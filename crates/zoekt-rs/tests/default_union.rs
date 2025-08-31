@@ -24,8 +24,10 @@ fn test_default_unions_path_and_content() -> anyhow::Result<()> {
     let s = zoekt_rs::query::Searcher::new(&idx);
 
     // default (neither path-only nor content-only) should match both
-    let mut plan = QueryPlan::default();
-    plan.pattern = Some("needle".to_string());
+    let plan = QueryPlan {
+        pattern: Some("needle".to_string()),
+        ..Default::default()
+    };
     let res = s.search_plan(&plan);
     let paths: Vec<String> = res.into_iter().map(|r| r.path).collect();
     assert!(
