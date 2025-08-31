@@ -156,6 +156,7 @@ async fn login_flow_integration() {
         .unwrap();
     assert!(resp2.status().is_success() || resp2.status().is_redirection());
 
-    // cleanup: kill child
+    // cleanup: kill child and wait to avoid leaving a zombie process (clippy: zombie-processes)
     let _ = child.kill();
+    let _ = child.wait();
 }

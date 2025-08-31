@@ -990,6 +990,76 @@ async fn session_sweeper(state: AppState) {
     }
 }
 
+// ...existing code...
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Emit structured JSON logs for easier aggregation. Honor RUST_LOG via EnvFilter.
+    // include pid in logs via field when needed; avoid unused variable warning
+    let _pid = std::process::id();
+    tracing_subscriber::fmt()
+        .with_timer(UtcTime::rfc_3339())
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+    let opts = Opts::parse();
+
+    let _cfg = load_node_config(
+        NodeConfig {
+            node_type: NodeType::Admin,
+            ..Default::default()
+        },
+        MergeOpts {
+            config_path: opts.config,
+            cli_id: opts.id,
+            cli_lease_ttl_seconds: opts.lease_ttl_seconds,
+            cli_poll_interval_seconds: opts.poll_interval_seconds,
+        },
+    )?;
+
+    // Build redis pool from REDIS_URL if present
+    let redis_pool = match std::env::var("REDIS_URL").ok() {
+        Some(url) => RedisConfig::from_url(&url)
+            .create_pool(None)
+            .ok()
+            .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>),
+        None => None,
+    };
+
+    // Admin credentials from env (user requested ZOEKT_ADMIN_{USERNAME,PASSWORD})
+    let admin_user = std::env::var("ZOEKT_ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
+    let admin_pass = std::env::var("ZOEKT_ADMIN_PASSWORD").unwrap_or_else(|_| "password".into());
+
+    // optional HMAC key for signing session ids (read from env ZOEKT_SESSION_KEY as base64)
+    let session_hmac_key = std::env::var("ZOEKT_SESSION_KEY")
+        .ok()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+
+    let state = Arc::new(AppStateInner {
+        redis_pool,
+        admin_user: admin_user.clone(),
+        admin_pass: admin_pass.clone(),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        session_hmac_key,
+    });
+
+    let app = make_app(state.clone());
+
+    // spawn background session sweeper
+    let sweeper_state = state.clone();
+    tokio::spawn(async move { session_sweeper(sweeper_state).await });
+
+    let addr: SocketAddr = opts.bind.parse()?;
+    tracing::info!("admin UI listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn login_create_delete_flow_inprocess() {
     use axum::body::Body;
@@ -1524,72 +1594,4 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert!(resp.status().is_redirection());
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Emit structured JSON logs for easier aggregation. Honor RUST_LOG via EnvFilter.
-    // include pid in logs via field when needed; avoid unused variable warning
-    let _pid = std::process::id();
-    tracing_subscriber::fmt()
-        .with_timer(UtcTime::rfc_3339())
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
-    let opts = Opts::parse();
-
-    let _cfg = load_node_config(
-        NodeConfig {
-            node_type: NodeType::Admin,
-            ..Default::default()
-        },
-        MergeOpts {
-            config_path: opts.config,
-            cli_id: opts.id,
-            cli_lease_ttl_seconds: opts.lease_ttl_seconds,
-            cli_poll_interval_seconds: opts.poll_interval_seconds,
-        },
-    )?;
-
-    // Build redis pool from REDIS_URL if present
-    let redis_pool = match std::env::var("REDIS_URL").ok() {
-        Some(url) => RedisConfig::from_url(&url)
-            .create_pool(None)
-            .ok()
-            .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>),
-        None => None,
-    };
-
-    // Admin credentials from env (user requested ZOEKT_ADMIN_{USERNAME,PASSWORD})
-    let admin_user = std::env::var("ZOEKT_ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
-    let admin_pass = std::env::var("ZOEKT_ADMIN_PASSWORD").unwrap_or_else(|_| "password".into());
-
-    // optional HMAC key for signing session ids (read from env ZOEKT_SESSION_KEY as base64)
-    let session_hmac_key = std::env::var("ZOEKT_SESSION_KEY")
-        .ok()
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
-
-    let state = Arc::new(AppStateInner {
-        redis_pool,
-        admin_user: admin_user.clone(),
-        admin_pass: admin_pass.clone(),
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        session_hmac_key,
-    });
-
-    let app = make_app(state.clone());
-
-    // spawn background session sweeper
-    let sweeper_state = state.clone();
-    tokio::spawn(async move { session_sweeper(sweeper_state).await });
-
-    let addr: SocketAddr = opts.bind.parse()?;
-    tracing::info!("admin UI listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    Ok(())
 }

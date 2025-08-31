@@ -22,6 +22,16 @@ jobs:
           toolchain: stable
           override: true
 
+      - name: Install rustfmt and clippy components
+        run: |
+          set -eux
+          rustup component add rustfmt clippy || true
+
+      - name: Install sccache
+        run: |
+          set -eux
+          cargo install sccache --locked || true
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
