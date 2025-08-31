@@ -254,6 +254,8 @@ impl LeaseManager {
         drop(guard);
         res
     }
+
+    // bidding and auction evaluation implemented in the main flow; test helper removed.
 }
 
 /// The Indexer trait abstracts building/holding an index for a repo. Tests can provide
@@ -426,17 +428,24 @@ impl<I: Indexer> Node<I> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     struct FakeIndexer {
-        count: AtomicUsize,
+        count: Arc<AtomicUsize>,
     }
 
     impl FakeIndexer {
         fn new() -> Self {
             Self {
-                count: AtomicUsize::new(0),
+                count: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn with_count(c: Arc<AtomicUsize>) -> Self {
+            Self { count: c }
         }
     }
 
@@ -534,53 +543,44 @@ mod tests {
             git_url: "/tmp/fake-repo-contend".into(),
         };
 
-        // spawn two tasks that will both try to acquire the same lease repeatedly
-        let lease1 = lease.clone();
-        let lease2 = lease.clone();
+        // Two fake indexers that count how many times they were invoked (i.e. wins)
+        let a_cnt = Arc::new(AtomicUsize::new(0));
+        let b_cnt = Arc::new(AtomicUsize::new(0));
+        let idx_a = FakeIndexer::with_count(a_cnt.clone());
+        let idx_b = FakeIndexer::with_count(b_cnt.clone());
 
-        let repo1 = repo.clone();
-        let repo2 = repo.clone();
+        let cfg_a = NodeConfig {
+            id: "node-a".into(),
+            lease_ttl: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+            node_type: NodeType::Indexer,
+        };
+        let cfg_b = NodeConfig {
+            id: "node-b".into(),
+            lease_ttl: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+            node_type: NodeType::Indexer,
+        };
 
-        let t1 = tokio::spawn(async move {
-            let mut wins = 0u32;
-            for _ in 0..20 {
-                if lease1
-                    .try_acquire(&repo1, "node-a".to_string(), Duration::from_secs(1))
-                    .await
-                {
-                    wins += 1;
-                    lease1.release(&repo1, "node-a").await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            wins
-        });
+        let node_a = Node::new(cfg_a, lease.clone(), idx_a);
+        let node_b = Node::new(cfg_b, lease.clone(), idx_b);
 
-        let t2 = tokio::spawn(async move {
-            let mut wins = 0u32;
-            for _ in 0..20 {
-                if lease2
-                    .try_acquire(&repo2, "node-b".to_string(), Duration::from_secs(1))
-                    .await
-                {
-                    wins += 1;
-                    lease2.release(&repo2, "node-b").await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            wins
-        });
+        // Both nodes observe the same repo and will run their loops, placing bids when they fail to acquire.
+        node_a.add_remote(repo.clone());
+        node_b.add_remote(repo.clone());
 
-        let (a, b) = tokio::join!(t1, t2);
-        let a = a.unwrap_or(0);
-        let b = b.unwrap_or(0);
+        let t1 = tokio::spawn(async move { node_a.run_for(Duration::from_millis(200)).await });
+        let t2 = tokio::spawn(async move { node_b.run_for(Duration::from_millis(200)).await });
 
-        // Both tasks attempted acquisition; at least one should have succeeded a few times.
+        let _ = tokio::join!(t1, t2);
+
+        let a_wins = a_cnt.load(Ordering::SeqCst);
+        let b_wins = b_cnt.load(Ordering::SeqCst);
         assert!(
-            a + b > 0,
+            a_wins + b_wins > 0,
             "expected some successful acquisitions, got {}+{}",
-            a,
-            b
+            a_wins,
+            b_wins
         );
         Ok(())
     }
