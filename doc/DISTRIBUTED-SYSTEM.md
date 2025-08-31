@@ -112,7 +112,15 @@ Dynamic MAX_BIDS for autoscaling
 - Motivation: in a static cluster it's convenient to set `ZOEKT_MAX_BIDS` to the number of indexer nodes so auctions end as soon as all nodes have bid. In an autoscaling environment the number of indexers will change over time, so a fixed env var will either under-count (slow auctions) or over-count (never reach the threshold). To support autoscaling we must be able to update the effective `MAX_BIDS` value at runtime.
 
 - Recommended approaches:
-  - Central cluster configuration (preferred): store the desired max-bids value in the cluster catalog or a lightweight config store (e.g., a small Redis key, ConfigMap, or the same catalog service used for ownership). Nodes can poll this key periodically (every few seconds) and atomically apply updates without a restart.
+  - Heartbeat-based approach (recommended): each indexer periodically reports liveness into Redis and the controller (or each node) counts the number of indexers that have heartbeated within the last epoch (for example 30–60s). Use that count as the effective `max_bids`.
+    - Implementation sketch (Redis ZSET):
+      - Each indexer periodically runs: `ZADD cluster:indexers <unix_ts> <node_id>` (or updates its score to the current timestamp).
+      - To compute active indexers in the last N seconds: remove old entries and count the remainder:
+        - `ZREMRANGEBYSCORE cluster:indexers 0 <cutoff_ts>`
+        - `ZCOUNT cluster:indexers <cutoff_ts> +inf` (or `ZCARD cluster:indexers` after trim)
+      - This avoids using `KEYS` and is efficient for moderate cluster sizes.
+    - Benefits: accurate, low-latency count; no global config update required when indexers scale; robust to indexer restarts.
+
   - Leader-driven push: have a leader (or controller) publish changes to a Redis pub/sub channel or a control topic; nodes subscribe and update their in-memory `max_bids` immediately on message receipt. This reduces polling load and is suitable when changes are infrequent but must be fast.
   - Orchestration rollout: use Kubernetes ConfigMap + rollout to update env var across all nodes. This is simple but causes a full rolling restart and is less suitable for frequent autoscaler-driven changes.
 
