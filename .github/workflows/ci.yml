@@ -43,7 +43,7 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           REDIS_URL_TEST: redis://127.0.0.1:6379
         run: |
-          cargo test --workspace --all-features -- --nocapturename: CI
+          cargo test --workspace --all-features -- --nocapture
 
 on:
   push:
