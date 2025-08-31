@@ -108,6 +108,32 @@ How it works (summary):
 Short-circuiting auctions (MAX_BIDS)
 - To make auctions finish earlier in practice (especially in tests or small clusters) the prototype supports a short-circuit mechanism: when a configured number of bids for a repo is reached, the auction evaluation is triggered immediately instead of waiting for the full 60s window. The behaviour is controlled by the `ZOEKT_MAX_BIDS` configuration (environment variable). A common pattern is to set `ZOEKT_MAX_BIDS` to the number of indexer nodes in the cluster so the auction ends as soon as all indexers have placed their bids.
 
+Dynamic MAX_BIDS for autoscaling
+- Motivation: in a static cluster it's convenient to set `ZOEKT_MAX_BIDS` to the number of indexer nodes so auctions end as soon as all nodes have bid. In an autoscaling environment the number of indexers will change over time, so a fixed env var will either under-count (slow auctions) or over-count (never reach the threshold). To support autoscaling we must be able to update the effective `MAX_BIDS` value at runtime.
+
+- Recommended approaches:
+  - Central cluster configuration (preferred): store the desired max-bids value in the cluster catalog or a lightweight config store (e.g., a small Redis key, ConfigMap, or the same catalog service used for ownership). Nodes can poll this key periodically (every few seconds) and atomically apply updates without a restart.
+  - Leader-driven push: have a leader (or controller) publish changes to a Redis pub/sub channel or a control topic; nodes subscribe and update their in-memory `max_bids` immediately on message receipt. This reduces polling load and is suitable when changes are infrequent but must be fast.
+  - Orchestration rollout: use Kubernetes ConfigMap + rollout to update env var across all nodes. This is simple but causes a full rolling restart and is less suitable for frequent autoscaler-driven changes.
+
+- Safety and behavior guarantees:
+  - Grace window: when `MAX_BIDS` decreases, nodes that already placed bids should still be honored for the current auction window. Implement the update so it doesn't retroactively cancel ongoing auctions.
+  - Backstop timeout: always keep the auction wall-clock window (60s) as a hard upper bound even when `MAX_BIDS` is large or misconfigured. This prevents auctions from hanging indefinitely if the dynamic config becomes unreachable.
+  - Per-repo override: allow an optional per-repo max-bids override (configurable in the catalog) for special cases (very large repos or reserved workloads).
+  - Metrics & alerts: emit metrics for configured_max_bids, bids_received, auctions_short_circuited, auctions_timed_out. Alert when configured_max_bids diverges significantly from observed active indexers or when many auctions are being short-circuited unexpectedly.
+
+- Implementation notes:
+  - Make the in-process `max_bids` an atomic integer or lock-guarded field that can be updated without restarting the node, and ensure reads are cheap in hot paths.
+  - Apply updates outside of any held locks that would prevent the node from handling auction evaluation; prefer using small critical sections so a config update cannot deadlock bidding logic.
+  - Coordinate config changes with the autoscaler/controller: when scaling up, increment the cluster `max_bids` value before new nodes register as indexers; when scaling down, decrement after nodes have drained and released leases.
+
+- Example (leader push using Redis pub/sub):
+  1. Controller updates `cluster:config:max_bids` in Redis and publishes `max_bids_changed` with the new value.
+  2. Each node subscribes to `max_bids_changed`, receives the new value, and replaces its runtime `max_bids` atomically.
+  3. Ongoing auctions continue to completion, new auctions use the updated threshold.
+
+By making `MAX_BIDS` configurable at runtime and coordinating changes via a small control plane, auctions will remain responsive during autoscaling while preserving correctness and observability.
+
 IMPORTANT: In this prototype the bidding flow is the authoritative and exclusive mechanism for obtaining an initial lease. Nodes must place bids and win an auction to become the initial holder for a repo. There is intentionally no alternative direct-acquire path available for initial lease assignment; any direct SET NX/CAS behavior that would give a node initial ownership is considered outside the prototype's rules and should not be used.
 - The implementation supports both a Redis-backed mode (ZSET per-repo + per-holder pending keys + start keys) and an in-memory fallback for tests. The in-memory mode keeps per-repo bid lists and scheduled evaluation tasks.
 
