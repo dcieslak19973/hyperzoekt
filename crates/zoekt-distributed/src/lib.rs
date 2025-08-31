@@ -20,13 +20,15 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 // Type aliases to reduce clippy type-complexity warnings around the meta sender.
-type MetaMsg = (String, i64, i64, String);
+// MetaMsg: (name, last_indexed_ms, last_duration_ms, memory_bytes, leased_node)
+type MetaMsg = (String, i64, i64, i64, String);
 type MetaSender = Sender<MetaMsg>;
 
 pub use zoekt_rs::InMemoryIndex;
 mod config;
 pub use config::{load_node_config, MergeOpts};
 pub mod redis_adapter;
+pub mod web_utils;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RemoteRepo {
@@ -74,6 +76,7 @@ impl LeaseManager {
         name: &str,
         last_indexed_ms: i64,
         last_duration_ms: i64,
+        memory_bytes: i64,
         leased_node: &str,
     ) {
         // call test hook if present (non-blocking)
@@ -87,7 +90,13 @@ impl LeaseManager {
             let leased_s = leased_node.to_string();
             // best-effort send; do not fail if receiver gone
             let _ = tx
-                .send((name_s, last_indexed_ms, last_duration_ms, leased_s))
+                .send((
+                    name_s,
+                    last_indexed_ms,
+                    last_duration_ms,
+                    memory_bytes,
+                    leased_s,
+                ))
                 .await;
         }
         if let Some(pool) = &self.redis_pool {
@@ -102,6 +111,7 @@ impl LeaseManager {
                 };
                 v["last_indexed"] = json!(last_indexed_ms);
                 v["last_duration_ms"] = json!(last_duration_ms);
+                v["memory_bytes"] = json!(memory_bytes);
                 v["leased_node"] = json!(leased_node);
                 // Persist back (ignore errors)
                 let _ = deadpool_redis::redis::cmd("HSET")
@@ -115,7 +125,7 @@ impl LeaseManager {
     }
 
     /// Register an async sender to observe repo meta writes (for tests).
-    pub fn set_meta_sender(&self, s: Sender<(String, i64, i64, String)>) {
+    pub fn set_meta_sender(&self, s: Sender<MetaMsg>) {
         let mut guard = self.meta_sender.write();
         *guard = Some(s);
     }
@@ -393,9 +403,10 @@ impl<I: Indexer> Node<I> {
                             let now_ms = chrono::Utc::now().timestamp_millis();
                             let dur_ms = dur.as_millis() as i64;
                             // best-effort: persist meta
+                            let mem_est = index.total_scanned_bytes() as i64;
                             let _ = self
                                 .lease_mgr
-                                .set_repo_meta(&repo.name, now_ms, dur_ms, &self.config.id)
+                                .set_repo_meta(&repo.name, now_ms, dur_ms, mem_est, &self.config.id)
                                 .await;
                         }
                         Err(_) => {
@@ -500,8 +511,10 @@ mod tests {
         assert!(rec.1 <= now_ms && rec.1 > now_ms - 10000);
         // duration should be positive
         assert!(rec.2 > 0);
+        // memory estimate should be non-negative
+        assert!(rec.3 >= 0);
         // leased node should match config id
-        assert_eq!(rec.3, "test-node-meta");
+        assert_eq!(rec.4, "test-node-meta");
 
         Ok(())
     }

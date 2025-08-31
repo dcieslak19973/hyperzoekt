@@ -71,8 +71,30 @@
             text-align: left
         }
 
+        /* numeric columns right aligned */
+        td.numeric,
+        th.numeric {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* small tooltip style for raw bytes */
+        td.memory[title] {
+            position: relative;
+        }
+
         th {
             background: rgba(255, 255, 255, 0.02)
+        }
+
+        /* clickable sortable header hint */
+        th.sortable {
+            cursor: pointer
+        }
+
+        th .sort-indicator {
+            font-size: 0.8em;
+            opacity: 0.8
         }
 
         .muted {
@@ -174,12 +196,13 @@
             <table>
                 <thead>
                     <tr>
-                        <th>Name</th>
-                        <th>URL</th>
-                        <th>Frequency (min)</th>
-                        <th>Last indexed</th>
-                        <th>Last duration (ms)</th>
-                        <th>Leased node</th>
+                        <th class="sortable" data-type="text">Name</th>
+                        <th class="sortable" data-type="text">URL</th>
+                        <th class="sortable numeric" data-type="number">Frequency (min)</th>
+                        <th class="sortable" data-type="date">Last indexed</th>
+                        <th class="sortable numeric" data-type="number">Last duration (ms)</th>
+                        <th class="sortable numeric" data-type="number">Memory (bytes)</th>
+                        <th class="sortable" data-type="text">Leased node</th>
                         <th>Actions</th>
                     </tr>
                 </thead>

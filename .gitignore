@@ -13,3 +13,4 @@ Cargo.lock
 .tmp_experiments/
 .bench_results/
 .upstream/
+dump.rdb
