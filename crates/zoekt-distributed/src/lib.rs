@@ -8,18 +8,25 @@
 use anyhow::Result;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use deadpool_redis::redis::{self, RedisResult};
+use deadpool_redis::redis::{self, AsyncCommands, RedisResult};
 use deadpool_redis::{Config as RedisConfig, Pool};
 use parking_lot::RwLock;
+use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
+
+// Type aliases to reduce clippy type-complexity warnings around the meta sender.
+type MetaMsg = (String, i64, i64, String);
+type MetaSender = Sender<MetaMsg>;
 
 pub use zoekt_rs::InMemoryIndex;
 mod config;
 pub use config::{load_node_config, MergeOpts};
+pub mod redis_adapter;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RemoteRepo {
@@ -39,6 +46,8 @@ pub struct LeaseManager {
     // shared pool for async redis connections
     redis_pool: Option<Pool>,
     inner: Arc<RwLock<HashMap<RemoteRepo, Lease>>>,
+    // optional test hook to observe repo meta writes (name, last_indexed_ms, last_duration_ms, leased_node)
+    meta_sender: Arc<RwLock<Option<MetaSender>>>,
 }
 
 impl LeaseManager {
@@ -54,7 +63,61 @@ impl LeaseManager {
         Self {
             redis_pool,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            meta_sender: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set or update repo metadata in the `zoekt:repo_meta` hash. This will merge
+    /// with any existing JSON blob and set last_indexed, last_duration_ms and leased_node.
+    pub async fn set_repo_meta(
+        &self,
+        name: &str,
+        last_indexed_ms: i64,
+        last_duration_ms: i64,
+        leased_node: &str,
+    ) {
+        // call test hook if present (non-blocking)
+        // clone the optional sender out of the lock so we don't hold the RwLock guard across an await
+        let maybe_tx: Option<MetaSender> = {
+            let guard = self.meta_sender.read();
+            guard.clone()
+        };
+        if let Some(tx) = maybe_tx {
+            let name_s = name.to_string();
+            let leased_s = leased_node.to_string();
+            // best-effort send; do not fail if receiver gone
+            let _ = tx
+                .send((name_s, last_indexed_ms, last_duration_ms, leased_s))
+                .await;
+        }
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:repo_meta";
+                // Fetch existing meta if present
+                let existing: Option<String> = conn.hget(key, name).await.ok().flatten();
+                let mut v = if let Some(s) = existing {
+                    serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
+                } else {
+                    json!({})
+                };
+                v["last_indexed"] = json!(last_indexed_ms);
+                v["last_duration_ms"] = json!(last_duration_ms);
+                v["leased_node"] = json!(leased_node);
+                // Persist back (ignore errors)
+                let _ = deadpool_redis::redis::cmd("HSET")
+                    .arg(key)
+                    .arg(name)
+                    .arg(v.to_string())
+                    .query_async::<i32>(&mut conn)
+                    .await;
+            }
+        }
+    }
+
+    /// Register an async sender to observe repo meta writes (for tests).
+    pub fn set_meta_sender(&self, s: Sender<(String, i64, i64, String)>) {
+        let mut guard = self.meta_sender.write();
+        *guard = Some(s);
     }
 
     fn repo_key(repo: &RemoteRepo) -> String {
@@ -291,6 +354,7 @@ impl<I: Indexer> Node<I> {
                     let lease_mgr = self.lease_mgr.clone();
                     let indexer = self.indexer.clone();
 
+                    let index_started = std::time::Instant::now();
                     let mut index_handle = tokio::task::spawn_blocking(move || {
                         indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
                     });
@@ -323,7 +387,16 @@ impl<I: Indexer> Node<I> {
 
                     match index_result {
                         Ok(index) => {
-                            tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed")
+                            tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+                            // compute duration and record meta in redis
+                            let dur = index_started.elapsed();
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let dur_ms = dur.as_millis() as i64;
+                            // best-effort: persist meta
+                            let _ = self
+                                .lease_mgr
+                                .set_repo_meta(&repo.name, now_ms, dur_ms, &self.config.id)
+                                .await;
                         }
                         Err(_) => {
                             tracing::warn!(repo = %repo.name, "failed to index");
@@ -383,6 +456,53 @@ mod tests {
         node.run_for(Duration::from_millis(50)).await?;
         let l = lease.get_lease(&repo).await.expect("lease should exist");
         assert_eq!(l.holder, "test-node");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_records_repo_meta_on_index() -> Result<()> {
+        // Create a lease manager and set a meta callback to capture values
+        let lease = LeaseManager::new().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        lease.set_meta_sender(tx);
+
+        let cfg = NodeConfig {
+            id: "test-node-meta".into(),
+            lease_ttl: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(10),
+            node_type: NodeType::Indexer,
+        };
+
+        // Fake indexer that sleeps briefly to simulate work
+        struct SleepIndexer;
+        impl Indexer for SleepIndexer {
+            fn index_repo(&self, _repo_path: PathBuf) -> Result<InMemoryIndex> {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let idx =
+                    zoekt_rs::test_helpers::make_index_with_trigrams(vec![], "fake", vec![], None);
+                Ok(idx)
+            }
+        }
+
+        let node = Node::new(cfg, lease.clone(), SleepIndexer);
+        let repo = RemoteRepo {
+            name: "r-meta".into(),
+            git_url: "/tmp/fake-repo-meta".into(),
+        };
+        node.add_remote(repo.clone());
+        node.run_for(Duration::from_millis(200)).await?;
+
+        // Wait for meta message and verify values look reasonable
+        let rec = rx.recv().await.expect("meta message should be received");
+        assert_eq!(rec.0, "r-meta");
+        // last_indexed should be close to now (within 10s)
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        assert!(rec.1 <= now_ms && rec.1 > now_ms - 10000);
+        // duration should be positive
+        assert!(rec.2 > 0);
+        // leased node should match config id
+        assert_eq!(rec.3, "test-node-meta");
+
         Ok(())
     }
 

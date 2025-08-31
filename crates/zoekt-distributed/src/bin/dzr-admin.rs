@@ -8,7 +8,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use deadpool_redis::redis::AsyncCommands;
+use chrono::{DateTime, TimeZone, Utc};
+use clap::Parser;
 use deadpool_redis::Config as RedisConfig;
 use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
@@ -20,13 +21,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zoekt_distributed::redis_adapter::{DynRedis, RealRedis};
 
 // Session entry: (csrf token, expiry Instant, optional username)
 type SessionEntry = (String, Instant, Option<String>);
 
 use anyhow::Result;
 use base64::Engine;
-use clap::Parser;
 
 use tracing_subscriber::fmt::time::UtcTime;
 
@@ -47,7 +48,8 @@ struct Opts {
 }
 
 struct AppStateInner {
-    redis_pool: Option<deadpool_redis::Pool>,
+    // Abstract redis backend so tests can provide a mock implementation.
+    redis_pool: Option<std::sync::Arc<dyn DynRedis>>,
     admin_user: String,
     admin_pass: String,
     // per-session CSRF tokens stored in-memory for this prototype
@@ -59,10 +61,13 @@ struct AppStateInner {
 
 type AppState = Arc<AppStateInner>;
 
+// DynRedis and RealRedis are implemented in the crate::redis module.
+
 #[derive(Deserialize)]
-struct CreateRepo {
+struct CreateRepoWithFreq {
     name: String,
     url: String,
+    frequency: Option<u64>,
     csrf: String,
 }
 
@@ -264,26 +269,13 @@ fn verify_and_extract_session(headers: &HeaderMap, key: &Option<Vec<u8>>) -> Opt
 async fn health(state: Extension<AppState>) -> impl IntoResponse {
     // If we have a redis pool, try a PING to ensure connectivity.
     if let Some(pool) = &state.redis_pool {
-        match pool.get().await {
-            Ok(mut conn) => match deadpool_redis::redis::cmd("PING")
-                .query_async::<_, String>(&mut conn)
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!(pid=%std::process::id(), outcome=%"health_ok");
-                    return (StatusCode::OK, Json(json!({"status": "ok"}))).into_response();
-                }
-                Err(e) => {
-                    tracing::warn!(pid=%std::process::id(), outcome=%"health_redis_ping_failed", error=?e);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"status": "redis_unreachable"})),
-                    )
-                        .into_response();
-                }
-            },
+        match pool.ping().await {
+            Ok(_) => {
+                tracing::info!(pid=%std::process::id(), outcome=%"health_ok");
+                return (StatusCode::OK, Json(json!({"status": "ok"}))).into_response();
+            }
             Err(e) => {
-                tracing::warn!(pid=%std::process::id(), outcome=%"health_redis_get_failed", error=?e);
+                tracing::warn!(pid=%std::process::id(), outcome=%"health_redis_ping_failed", error=?e);
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({"status": "redis_unreachable"})),
@@ -333,15 +325,56 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response
     // ensure session exists and get csrf token (create if needed)
     let (_sid, csrf_token, cookie) = get_or_create_session(&state, &headers);
     if let Some(pool) = &state.redis_pool {
-        if let Ok(mut conn) = pool.get().await {
-            let entries: Vec<(String, String)> =
-                conn.hgetall("zoekt:repos").await.unwrap_or_default();
+        if let Ok(entries) = pool.hgetall("zoekt:repos").await {
             for (name, url) in entries {
                 let safe_name = htmlescape::encode_minimal(&name);
+                // fetch meta JSON from zoekt:repo_meta
+                let mut freq = "".to_string();
+                let mut last_indexed = "".to_string();
+                let mut last_duration_ms = "".to_string();
+                let mut leased = "".to_string();
+                if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                        if let Some(f) = v.get("frequency") {
+                            freq = f.to_string();
+                        }
+                        if let Some(li) = v.get("last_indexed") {
+                            if !li.is_null() {
+                                // last_indexed stored as epoch milliseconds -> format RFC3339
+                                if let Some(n) = li.as_i64() {
+                                    let dt: DateTime<Utc> = Utc
+                                        .timestamp_millis_opt(n)
+                                        .single()
+                                        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+                                    last_indexed = dt.to_rfc3339();
+                                } else if let Some(s) = li.as_str() {
+                                    // fallback if stored as string
+                                    last_indexed = s.to_string();
+                                } else {
+                                    last_indexed = li.to_string();
+                                }
+                            }
+                        }
+                        if let Some(ld) = v.get("last_duration_ms") {
+                            if !ld.is_null() {
+                                last_duration_ms = ld.to_string();
+                            }
+                        }
+                        if let Some(n) = v.get("leased_node") {
+                            if !n.is_null() {
+                                leased = n.to_string();
+                            }
+                        }
+                    }
+                }
                 rows.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td><form class=\"delete-form\" method=post action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form class=\"delete-form\" method=post action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
                     htmlescape::encode_minimal(&name),
                     htmlescape::encode_minimal(&url),
+                    htmlescape::encode_minimal(&freq),
+                    htmlescape::encode_minimal(&last_indexed),
+                    htmlescape::encode_minimal(&last_duration_ms),
+                    htmlescape::encode_minimal(&leased),
                     safe_name,
                     htmlescape::encode_minimal(&csrf_token),
                 ));
@@ -389,7 +422,7 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response
 async fn create(
     state: Extension<AppState>,
     headers: HeaderMap,
-    Form(form): Form<CreateRepo>,
+    Form(form): Form<CreateRepoWithFreq>,
 ) -> axum::response::Response {
     let req_id = headers
         .get("x-request-id")
@@ -466,11 +499,106 @@ async fn create(
         }
     }
     if let Some(pool) = &state.redis_pool {
-        if let Ok(mut conn) = pool.get().await {
-            let _: () = conn
-                .hset("zoekt:repos", &form.name, &form.url)
-                .await
-                .unwrap_or(());
+        let script = r#"
+            local name = ARGV[1]
+            local url = ARGV[2]
+            if redis.call('HEXISTS', KEYS[1], name) == 1 then
+                return 1
+            end
+            if redis.call('SISMEMBER', KEYS[2], url) == 1 then
+                return 2
+            end
+            redis.call('HSET', KEYS[1], name, url)
+            redis.call('SADD', KEYS[2], url)
+            return 0
+        "#;
+
+        match pool
+            .eval_i32(
+                script,
+                &["zoekt:repos", "zoekt:repo_urls"],
+                &[&form.name, &form.url],
+            )
+            .await
+        {
+            Ok(res) => match res {
+                0 => {}
+                1 => {
+                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_name", name=%form.name);
+                    if wants_json(&headers) {
+                        let body = json!({"error": "conflict", "reason": "name_exists", "name": form.name});
+                        let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
+                        resp.headers_mut().insert(
+                            axum::http::header::HeaderName::from_static("x-request-id"),
+                            HeaderValue::from_str(&req_id)
+                                .unwrap_or_else(|_| HeaderValue::from_static("")),
+                        );
+                        return resp;
+                    }
+                    let mut resp = into_boxed_response((
+                        StatusCode::CONFLICT,
+                        Html("<h1>Conflict: name already exists</h1>".to_string()),
+                    ));
+                    resp.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        HeaderValue::from_str(&req_id)
+                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                    return resp;
+                }
+                2 => {
+                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_url", url=%form.url);
+                    if wants_json(&headers) {
+                        let body =
+                            json!({"error": "conflict", "reason": "url_exists", "url": form.url});
+                        let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
+                        resp.headers_mut().insert(
+                            axum::http::header::HeaderName::from_static("x-request-id"),
+                            HeaderValue::from_str(&req_id)
+                                .unwrap_or_else(|_| HeaderValue::from_static("")),
+                        );
+                        return resp;
+                    }
+                    let mut resp = into_boxed_response((
+                        StatusCode::CONFLICT,
+                        Html("<h1>Conflict: url already exists</h1>".to_string()),
+                    ));
+                    resp.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        HeaderValue::from_str(&req_id)
+                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                    return resp;
+                }
+                _ => {
+                    tracing::warn!(request_id=%req_id, pid=%std::process::id(), outcome=%"create_unknown_script_result", result=%res);
+                    return into_boxed_response((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Html("<h1>Internal Server Error</h1>".to_string()),
+                    ));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"create_redis_error");
+                return into_boxed_response((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html("<h1>Internal Server Error</h1>".to_string()),
+                ));
+            }
+        }
+    }
+
+    // Persist repo metadata (frequency, last_indexed, last_duration_ms, leased_node)
+    if let Some(pool) = &state.redis_pool {
+        let meta_key = "zoekt:repo_meta".to_string();
+        let meta = json!({
+            "frequency": form.frequency.unwrap_or(60),
+            "last_indexed": null,
+            "last_duration_ms": null,
+            "leased_node": null,
+        });
+        if let Err(e) = pool.hset(&meta_key, &form.name, &meta.to_string()).await {
+            tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"create_meta_set_failed");
         }
     }
 
@@ -572,8 +700,58 @@ async fn delete(
         }
     }
     if let Some(pool) = &state.redis_pool {
-        if let Ok(mut conn) = pool.get().await {
-            let _: () = conn.hdel("zoekt:repos", &form.name).await.unwrap_or(());
+        let script = r#"
+            local name = ARGV[1]
+            local key_repos = KEYS[1]
+            local key_urls = KEYS[2]
+            local url = redis.call('HGET', key_repos, name)
+            if not url then
+                return 1
+            end
+            redis.call('HDEL', key_repos, name)
+            redis.call('SREM', key_urls, url)
+            return 0
+        "#;
+
+        match pool
+            .eval_i32(script, &["zoekt:repos", "zoekt:repo_urls"], &[&form.name])
+            .await
+        {
+            Ok(res) => {
+                if res == 1 {
+                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_not_found", name=%form.name);
+                    if wants_json(&headers) {
+                        let body = json!({"error": "not_found", "name": form.name});
+                        let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
+                        resp.headers_mut().insert(
+                            axum::http::header::HeaderName::from_static("x-request-id"),
+                            HeaderValue::from_str(&req_id)
+                                .unwrap_or_else(|_| HeaderValue::from_static("")),
+                        );
+                        return resp;
+                    }
+                    let mut resp = into_boxed_response((
+                        StatusCode::NOT_FOUND,
+                        Html("<h1>Not Found</h1>".to_string()),
+                    ));
+                    resp.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        HeaderValue::from_str(&req_id)
+                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                    return resp;
+                }
+                // otherwise success (res == 0)
+                // remove repo meta as well
+                let _ = pool.hdel("zoekt:repo_meta", &form.name).await;
+            }
+            Err(e) => {
+                tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"delete_redis_error");
+                return into_boxed_response((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html("<h1>Internal Server Error</h1>".to_string()),
+                ));
+            }
         }
     }
 
@@ -768,9 +946,50 @@ async fn login_create_delete_flow_inprocess() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, Request};
-    use tower::ServiceExt; // for oneshot
+    use tower::ServiceExt;
+    use zoekt_distributed::redis_adapter; // for oneshot
+
+    // Simple mock Redis implementation used only in unit tests below.
+    struct MockRedis {
+        // pre-programmed responses for eval scripts keyed by a simple token
+        pub eval_response: std::sync::Mutex<Option<i32>>,
+    }
+
+    #[async_trait]
+    impl redis_adapter::DynRedis for MockRedis {
+        async fn ping(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn hgetall(&self, _key: &str) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(vec![])
+        }
+
+        async fn eval_i32(
+            &self,
+            _script: &str,
+            _keys: &[&str],
+            _args: &[&str],
+        ) -> anyhow::Result<i32> {
+            let mut lock = self.eval_response.lock().unwrap();
+            Ok(lock.take().unwrap_or(0))
+        }
+
+        async fn hset(&self, _key: &str, _field: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn hget(&self, _key: &str, _field: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn hdel(&self, _key: &str, _field: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
 
     #[tokio::test]
     async fn index_requires_auth() {
@@ -899,6 +1118,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_conflict_name_returns_409() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                Some("user1".into()),
+            ),
+        );
+
+        let mock = std::sync::Arc::new(MockRedis {
+            eval_response: std::sync::Mutex::new(Some(1)),
+        });
+        let state = Arc::new(AppStateInner {
+            redis_pool: Some(mock),
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+        });
+        let app = make_app(state);
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/create")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=conflict&url=https%3A%2F%2Fexample.com&csrf=testtoken",
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_not_found_returns_404() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                Some("user1".into()),
+            ),
+        );
+
+        let mock = std::sync::Arc::new(MockRedis {
+            eval_response: std::sync::Mutex::new(Some(1)),
+        });
+        let state = Arc::new(AppStateInner {
+            redis_pool: Some(mock),
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+        });
+        let app = make_app(state);
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/delete")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("name=missing&csrf=testtoken"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn login_sets_session_username() {
         use axum::body::Body;
         use axum::http::Request;
@@ -1011,7 +1306,10 @@ async fn main() -> Result<()> {
 
     // Build redis pool from REDIS_URL if present
     let redis_pool = match std::env::var("REDIS_URL").ok() {
-        Some(url) => RedisConfig::from_url(&url).create_pool(None).ok(),
+        Some(url) => RedisConfig::from_url(&url)
+            .create_pool(None)
+            .ok()
+            .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>),
         None => None,
     };
 

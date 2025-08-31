@@ -9,7 +9,7 @@ use reqwest::Client;
 #[tokio::test]
 async fn login_flow_integration() {
     // Locate the compiled binary via env var set by cargo when running tests.
-    let exe = std::env::var("CARGO_BIN_EXE_dzr-admin").unwrap_or_else(|_| {
+    let _exe = std::env::var("CARGO_BIN_EXE_dzr-admin").unwrap_or_else(|_| {
         // Fallback: assume binary is built and available at workspace target
         let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // crates/zoekt-distributed -> crates
@@ -19,7 +19,7 @@ async fn login_flow_integration() {
     });
 
     // If binary is not present, build it (use workspace root) and then try to locate it.
-    if !std::path::Path::new(&exe).exists() {
+    if !std::path::Path::new(&_exe).exists() {
         let mut workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         workspace.pop(); // crates
         workspace.pop(); // workspace root
@@ -70,7 +70,7 @@ async fn login_flow_integration() {
     }
 
     // allow discovered fallback
-    let exe = std::env::var("DZRA_EXE_FALLBACK").unwrap_or(exe);
+    let _exe = std::env::var("DZRA_EXE_FALLBACK").unwrap_or(_exe);
 
     // Reserve an ephemeral port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");

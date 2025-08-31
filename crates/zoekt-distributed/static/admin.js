@@ -44,9 +44,9 @@ document.addEventListener('DOMContentLoaded', function () {
     const createForm = document.getElementById('create-form');
     const repoTableBody = document.getElementById('repo-table-body');
 
-    function makeRow(name, url, csrf) {
+    function makeRow(name, url, csrf, freq, lastIndexed, lastDurMs, leased) {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
+        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(String(freq || ''))}</td><td>${escapeHtml(String(lastIndexed || ''))}</td><td>${escapeHtml(String(lastDurMs || ''))}</td><td>${escapeHtml(String(leased || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
         return tr;
     }
 
@@ -71,7 +71,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 throw new Error('create failed');
             }).then(data => {
                 // append row (guard in case table body missing)
-                if (repoTableBody) repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf));
+                if (repoTableBody) repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, data.last_indexed, data.last_duration_ms, data.leased_node));
                 createForm.reset();
             }).catch(err => alert(err));
         });

@@ -14,8 +14,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # depend on the local workspace crate
 zoekt-rs = { path = "../zoekt-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
-deadpool-redis = "0.10"
+deadpool-redis = "0.18"
 base64 = "0.22"
+# Pin redis to 0.21 to avoid mixed-version future-compat warnings (0.23 is present in the
+# workspace lockfile via other dependencies). deadpool-redis currently depends on 0.21.x,
+# and using 0.21 keeps the crate graph consistent.
+redis = { version = "0.27", features = ["script"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.7"
@@ -24,6 +28,7 @@ tower-http = { version = "0.3", features = ["auth"] }
 htmlescape = "0.3"
 rand = "0.8"
 hmac = "0.12"
+async-trait = "0.1"
 sha2 = "0.10"
 
 [[bin]]
