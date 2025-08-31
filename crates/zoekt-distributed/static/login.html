@@ -1,0 +1,240 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Login - zoekt-distributed</title>
+    <style>
+        :root {
+            --bg: #0f1724;
+            --panel: #0b1220;
+            --text: #e6eef6;
+            --muted: #94a3b8;
+            --accent: #0ea5a4;
+            --input-bg: #0b1220;
+            --input-border: #23303b
+        }
+
+        .light-mode {
+            --bg: #f7fafc;
+            --panel: #ffffff;
+            --text: #0f172a;
+            --muted: #64748b;
+            --input-bg: #ffffff;
+            --input-border: #cbd5e1
+        }
+
+        body {
+            font-family: Inter, Arial, Helvetica, sans-serif;
+            margin: 24px;
+            background: var(--bg);
+            color: var(--text);
+            transition: background-color .28s ease, color .28s ease
+        }
+
+        .container {
+            max-width: 540px;
+            margin: 40px auto
+        }
+
+        .card {
+            background: var(--panel);
+            border-radius: 8px;
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+            transition: background-color .28s ease, box-shadow .28s ease
+        }
+
+        h1 {
+            margin: 0 0 12px;
+            font-size: 1.6rem
+        }
+
+        .muted {
+            color: var(--muted)
+        }
+
+        label {
+            display: block;
+            margin: 10px 0;
+            font-size: 0.95rem
+        }
+
+        input[type=text],
+        input[type=password] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--input-border);
+            border-radius: 6px;
+            background: var(--input-bg);
+            color: var(--text);
+            transition: background-color .28s ease, border-color .28s ease, color .28s ease
+        }
+
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-top: 12px
+        }
+
+        .brand {
+            font-weight: 600;
+            margin-bottom: 10px
+        }
+
+        .footer {
+            margin-top: 12px;
+            font-size: 0.9rem;
+            color: var(--muted)
+        }
+
+        .theme-toggle {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: var(--text);
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px
+        }
+
+        .theme-toggle .icon {
+            font-size: 1.0em
+        }
+
+        .theme-toggle .label {
+            font-weight: 600
+        }
+    </style>
+    <script src="/static/admin.js" defer></script>
+</head>
+
+<body>
+    <div class="container">
+        <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                    <div class="brand">zoekt-distributed</div>
+                    <h1>Admin console — sign in</h1>
+                    <p class="muted">This login page is for the zoekt-rs-distributed administrator interface.</p>
+                </div>
+                <div>
+                    <button id="theme-toggle-login" class="theme-toggle"><span class="icon">🌙</span> <span
+                            class="label">Dark</span></button>
+                </div>
+            </div>
+            <form method="post" action="/login">
+                <label>Username
+                    <input type="text" name="username" required autocomplete="username" />
+                </label>
+                <label>Password
+                    <input type="password" name="password" required autocomplete="current-password" />
+                </label>
+                <button type="submit">Sign in</button>
+            </form>
+            <div class="footer muted">Use your admin credentials to manage repositories.</div>
+        </div>
+    </div>
+</body>
+
+<style>
+    :root {
+        --bg: #0f1724;
+        --panel: #0b1220;
+        --text: #e6eef6;
+        --muted: #94a3b8;
+        --accent: #0ea5a4;
+        --input-bg: #0b1220;
+        --input-border: #23303b
+    }
+
+    .light-mode {
+        --bg: #f7fafc;
+        --panel: #ffffff;
+        --text: #0f172a;
+        --muted: #64748b;
+        --input-bg: #ffffff;
+        --input-border: #cbd5e1
+    }
+
+    body {
+        font-family: Inter, Arial, Helvetica, sans-serif;
+        margin: 24px;
+        background: var(--bg);
+        color: var(--text)
+    }
+
+    .container {
+        max-width: 540px;
+        margin: 40px auto
+    }
+
+    .card {
+        background: var(--panel);
+        border-radius: 8px;
+        padding: 24px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25)
+    }
+
+    h1 {
+        margin: 0 0 12px;
+        font-size: 1.6rem
+    }
+
+    .muted {
+        color: var(--muted)
+    }
+
+    label {
+        display: block;
+        margin: 10px 0;
+        font-size: 0.95rem
+    }
+
+    input[type=text],
+    input[type=password] {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid var(--input-border);
+        border-radius: 6px;
+        background: var(--input-bg);
+        color: var(--text)
+    }
+
+    button {
+        background: var(--accent);
+        color: white;
+        border: none;
+        padding: 10px 14px;
+        border-radius: 8px;
+        cursor: pointer;
+        margin-top: 12px
+    }
+
+    .brand {
+        font-weight: 600;
+        margin-bottom: 10px
+    }
+
+    .footer {
+        margin-top: 12px;
+        font-size: 0.9rem;
+        color: var(--muted)
+    }
+
+    .theme-toggle {
+        background: transparent;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 6px;
+        cursor: pointer
+    }
+</style>

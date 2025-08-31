@@ -13,12 +13,18 @@ parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 # depend on the local workspace crate
 zoekt-rs = { path = "../zoekt-rs" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
 deadpool-redis = "0.10"
 base64 = "0.22"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.7"
+axum = { version = "0.6", features = ["headers"] }
+tower-http = { version = "0.3", features = ["auth"] }
+htmlescape = "0.3"
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
 
 [[bin]]
 name = "dzr-http-search"
@@ -41,4 +47,7 @@ path = "src/bin/dzr-admin.rs"
 proptest = "1"
 tempfile = "3"
 serial_test = "2"
+http = "0.2"
+tower = "0.4"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 

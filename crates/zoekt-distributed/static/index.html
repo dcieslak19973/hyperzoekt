@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>zoekt-distributed admin</title>
+    <style>
+        :root {
+            --bg: #0f1724;
+            /* dark base */
+            --panel: #0b1220;
+            --surface: #0f1724;
+            --muted: #94a3b8;
+            --text: #e6eef6;
+            --accent: #0ea5a4;
+            --danger: #ef4444;
+            --input-bg: #0b1220;
+            --input-border: #23303b;
+        }
+
+        .light-mode {
+            --bg: #f7fafc;
+            --panel: #ffffff;
+            --surface: #f7fafc;
+            --muted: #64748b;
+            --text: #0f172a;
+            --accent: #0ea5a4;
+            --danger: #ef4444;
+            --input-bg: #ffffff;
+            --input-border: #cbd5e1;
+        }
+
+        body {
+            font-family: Inter, Arial, Helvetica, sans-serif;
+            margin: 24px;
+            background: var(--bg);
+            color: var(--text);
+            transition: background-color .28s ease, color .28s ease;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto
+        }
+
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0
+        }
+
+        .card {
+            background: var(--panel);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+            transition: background-color .28s ease, box-shadow .28s ease;
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%
+        }
+
+        th,
+        td {
+            border: 1px solid #e6eef6;
+            padding: 10px;
+            text-align: left
+        }
+
+        th {
+            background: rgba(255, 255, 255, 0.02)
+        }
+
+        .muted {
+            color: var(--muted);
+            font-size: 0.9rem
+        }
+
+        input[type=text],
+        input[type=url] {
+            padding: 8px;
+            border: 1px solid var(--input-border);
+            border-radius: 4px;
+            background: var(--input-bg);
+            color: var(--text);
+            transition: background-color .28s ease, border-color .28s ease, color .28s ease;
+        }
+
+        /* create form: put inputs on one line */
+        #create-form {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap
+        }
+
+        #create-form label {
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px
+        }
+
+        #create-form input[name="name"] {
+            width: 180px
+        }
+
+        #create-form input[name="url"] {
+            flex: 1;
+            min-width: 260px
+        }
+
+        button {
+            background: #0ea5a4;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer
+        }
+
+        a.button {
+            background: var(--danger);
+            color: white;
+            padding: 6px 10px;
+            border-radius: 6px;
+            text-decoration: none
+        }
+
+        /* theme toggle */
+        .theme-toggle {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: var(--text);
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .theme-toggle .icon {
+            font-size: 1.0em
+        }
+
+        .theme-toggle .label {
+            font-weight: 600
+        }
+
+        form.inline {
+            display: inline
+        }
+    </style>
+    <script src="/static/admin.js" defer></script>
+</head>
+
+<body>
+    <div class="container">
+        <nav>
+            <div><strong>zoekt-distributed admin</strong></div>
+            <div style="display:flex;gap:10px;align-items:center"><button id="theme-toggle" class="theme-toggle">Toggle
+                    theme</button>
+                <div class="muted">Signed in as {{ADMIN_USER}} · <a href="/logout" class="button">Logout</a></div>
+            </div>
+        </nav>
+
+        <div class="card">
+            <h2>Repositories</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>URL</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="repo-table-body">{{ROWS}}</tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <div class="card">
+            <h2>Add repository</h2>
+            <form id="create-form" method="post" action="/create">
+                <label>Name: <input type="text" name="name" placeholder="my-repo" required /></label>
+                <label>URL: <input type="url" name="url" placeholder="https://example.com/repo.git" required /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <button type="submit">Add</button>
+            </form>
+        </div>
+    </div>
+</body>
+
+</html>

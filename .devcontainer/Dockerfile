@@ -17,6 +17,7 @@ RUN apt-get update \
   ripgrep \
   lld \
   mold \
+  locales \
   redis-server \
   && rm -rf /var/lib/apt/lists/*
 
@@ -64,6 +65,18 @@ RUN set -eux; \
 # Default to the non-root vscode user for the devcontainer
 USER ${USERNAME}
 ENV PATH="/home/${USERNAME}/.cargo/bin:/usr/local/bin:${PATH}"
+
+# Ensure a UTF-8 locale is available and default to it so services like redis
+# can configure their locale without warnings. Do locale generation here so
+# the result is baked into the image rather than done at runtime.
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+
+# Generate the en_US.UTF-8 locale during image build so the locale is
+# available to all processes without requiring runtime setup.
+USER root
+RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 || true
+USER ${USERNAME}
 
 # Keep image small by clearing caches
 RUN rustup component add rustfmt clippy || true
