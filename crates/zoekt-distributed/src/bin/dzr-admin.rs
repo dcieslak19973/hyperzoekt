@@ -829,7 +829,149 @@ fn make_app(state: AppState) -> Router {
         .route("/create", post(create))
         .route("/delete", post(delete))
         .route("/static/admin.js", get(serve_admin_js))
+        .route("/export.csv", get(export_csv))
         .layer(axum::Extension(state))
+}
+
+async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::response::Response {
+    let req_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(gen_token);
+
+    // authentication: allow basic auth or a valid server-side session (same as index)
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let has_session = if let Some(sid) = &sid_opt {
+        let map = state.sessions.read();
+        map.get(sid)
+            .map(|(_tok, exp, _u)| Instant::now() < *exp)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_basic && !has_session {
+        // prefer JSON clients for API-style requests, otherwise redirect
+        if wants_json(&headers) {
+            let body = json!({"error": "unauthorized"});
+            tracing::warn!(request_id=%req_id, outcome=%"export_unauthorized");
+            let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        tracing::warn!(request_id=%req_id, outcome=%"export_redirect_login");
+        return into_boxed_response(Redirect::to("/login"));
+    }
+
+    // Build CSV
+    fn esc(s: &str) -> String {
+        // escape double quotes per CSV and wrap in quotes
+        let mut out = String::new();
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                out.push_str("\"\"");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    let mut csv = String::new();
+    csv.push_str("name,url,frequency,last_indexed,last_duration_ms,memory_bytes,leased_node\n");
+    if let Some(pool) = &state.redis_pool {
+        if let Ok(entries) = pool.hgetall("zoekt:repos").await {
+            for (name, url) in entries {
+                let mut frequency = String::new();
+                let mut last_indexed = String::new();
+                let mut last_duration_ms = String::new();
+                let mut memory_bytes = String::new();
+                let mut leased_node = String::new();
+
+                if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                        if let Some(f) = v.get("frequency") {
+                            frequency = f.to_string();
+                        }
+                        if let Some(li) = v.get("last_indexed") {
+                            if !li.is_null() {
+                                if let Some(n) = li.as_i64() {
+                                    let dt: DateTime<Utc> = Utc
+                                        .timestamp_millis_opt(n)
+                                        .single()
+                                        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+                                    last_indexed = dt.to_rfc3339();
+                                } else if let Some(s) = li.as_str() {
+                                    last_indexed = s.to_string();
+                                } else {
+                                    last_indexed = li.to_string();
+                                }
+                            }
+                        }
+                        if let Some(ld) = v.get("last_duration_ms") {
+                            if !ld.is_null() {
+                                last_duration_ms = ld.to_string();
+                            }
+                        }
+                        if let Some(mb) = v.get("memory_bytes") {
+                            if !mb.is_null() {
+                                if let Some(n) = mb.as_i64() {
+                                    memory_bytes = n.to_string();
+                                } else if let Some(s) = mb.as_str() {
+                                    memory_bytes = s.to_string();
+                                } else {
+                                    memory_bytes = mb.to_string();
+                                }
+                            }
+                        }
+                        if let Some(n) = v.get("leased_node") {
+                            if !n.is_null() {
+                                if let Some(s) = n.as_str() {
+                                    leased_node = s.to_string();
+                                } else {
+                                    leased_node = n.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{}\n",
+                    esc(&name),
+                    esc(&url),
+                    esc(&frequency),
+                    esc(&last_indexed),
+                    esc(&last_duration_ms),
+                    esc(&memory_bytes),
+                    esc(&leased_node)
+                ));
+            }
+        }
+    }
+
+    // return CSV with proper headers
+    let mut resp = into_boxed_response((StatusCode::OK, csv));
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("content-disposition"),
+        HeaderValue::from_static("attachment; filename=zoekt_repos.csv"),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-request-id"),
+        HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    resp
 }
 
 /// Background task: sweeps expired sessions every minute

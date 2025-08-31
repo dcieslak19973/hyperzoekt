@@ -43,6 +43,7 @@ document.addEventListener('DOMContentLoaded', function () {
     });
     const createForm = document.getElementById('create-form');
     const repoTableBody = document.getElementById('repo-table-body');
+    const exportBtn = document.getElementById('export-csv');
     // remember current sort state so dynamic updates can reapply it
     const TABLE_SORT_KEY = 'dzr_table_sort';
     // Load saved sort state from localStorage if present
@@ -112,6 +113,42 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
                 createForm.reset();
             }).catch(err => alert(err && err.message ? err.message : String(err)));
+        });
+    }
+
+    if (exportBtn) {
+        exportBtn.addEventListener('click', function () {
+            // Fetch CSV using same-origin credentials; browser will include cookies for session or basic auth header will be used by the browser when set.
+            fetch('/export.csv', { credentials: 'same-origin' }).then(async r => {
+                if (!r.ok) {
+                    // try to read JSON error body
+                    try {
+                        const j = await r.json();
+                        alert(j && j.error ? `Export failed: ${j.error}` : `Export failed: ${r.status}`);
+                    } catch (e) {
+                        alert(`Export failed: ${r.status} ${r.statusText}`);
+                    }
+                    return;
+                }
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                // prefer server-provided filename via Content-Disposition if possible; fallback otherwise
+                let filename = 'zoekt_repos.csv';
+                const cd = r.headers.get('content-disposition');
+                if (cd) {
+                    const m = /filename=(?:"([^"]+)"|([^;\n\r]+))/i.exec(cd);
+                    if (m) filename = m[1] || m[2];
+                }
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            }).catch(e => {
+                alert(`Export failed: ${e && e.message ? e.message : String(e)}`);
+            });
         });
     }
 
