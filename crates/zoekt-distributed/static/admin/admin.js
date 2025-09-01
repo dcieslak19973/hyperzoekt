@@ -22,6 +22,9 @@ document.addEventListener('DOMContentLoaded', function () {
     const reposTab = document.getElementById('repos-tab');
     const branchesTab = document.getElementById('branches-tab');
     const branchTableBody = document.getElementById('branch-table-body');
+    const tabIndexersBtn = document.getElementById('tab-indexers');
+    const indexersTab = document.getElementById('indexers-tab');
+    const indexerTableBody = document.getElementById('indexer-table-body');
     // remember current sort state so dynamic updates can reapply it
     const TABLE_SORT_KEY = 'dzr_table_sort';
     // Load saved sort state from localStorage if present
@@ -363,38 +366,101 @@ document.addEventListener('DOMContentLoaded', function () {
         if (window.applyCurrentSort) window.applyCurrentSort();
     }
 
+    // Indexers tab handling: fetch and display indexer status
+    function refreshIndexersTable() {
+        if (!indexerTableBody) return;
+
+        fetch('/api/indexers', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                // clear and repopulate
+                indexerTableBody.innerHTML = '';
+                for (const indexer of data) {
+                    const tr = document.createElement('tr');
+
+                    // Format last heartbeat
+                    let heartbeatDisplay = 'Never';
+                    if (indexer.last_heartbeat) {
+                        const date = new Date(indexer.last_heartbeat);
+                        heartbeatDisplay = date.toLocaleString();
+                    }
+
+                    // Status styling
+                    let statusClass = '';
+                    let statusText = indexer.status;
+                    if (indexer.status === 'online') {
+                        statusClass = 'style="color: #10b981;"'; // green
+                    } else if (indexer.status === 'stale') {
+                        statusClass = 'style="color: #f59e0b;"'; // amber
+                    } else if (indexer.status === 'offline') {
+                        statusClass = 'style="color: #ef4444;"'; // red
+                    }
+
+                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td ${statusClass}>${escapeHtml(statusText)}</td>`;
+                    indexerTableBody.appendChild(tr);
+                }
+                // apply saved sort state if the indexers table header supports it
+                if (window.applyCurrentSort) window.applyCurrentSort();
+            })
+            .catch(e => {
+                console.warn('Failed to fetch indexers:', e);
+                indexerTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--muted);">Failed to load indexer data</td></tr>';
+            });
+    }
+
     // tab switching
-    if (tabReposBtn && tabBranchesBtn && reposTab && branchesTab) {
+    if (tabReposBtn && tabBranchesBtn && tabIndexersBtn && reposTab && branchesTab && indexersTab) {
         tabReposBtn.addEventListener('click', () => {
             reposTab.style.display = '';
             branchesTab.style.display = 'none';
+            indexersTab.style.display = 'none';
             tabReposBtn.setAttribute('aria-pressed', 'true');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
+            tabIndexersBtn.setAttribute('aria-pressed', 'false');
             // visual tab styling
             reposTab.classList.add('tabbed');
             branchesTab.classList.remove('tabbed');
+            indexersTab.classList.remove('tabbed');
             // show add/import cards
             showAddImport(true);
         });
         tabBranchesBtn.addEventListener('click', () => {
             reposTab.style.display = 'none';
             branchesTab.style.display = '';
+            indexersTab.style.display = 'none';
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'true');
+            tabIndexersBtn.setAttribute('aria-pressed', 'false');
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.add('tabbed');
+            indexersTab.classList.remove('tabbed');
             // hide add/import cards when viewing branches
             showAddImport(false);
             refreshBranchesTable();
         });
+        tabIndexersBtn.addEventListener('click', () => {
+            reposTab.style.display = 'none';
+            branchesTab.style.display = 'none';
+            indexersTab.style.display = '';
+            tabReposBtn.setAttribute('aria-pressed', 'false');
+            tabBranchesBtn.setAttribute('aria-pressed', 'false');
+            tabIndexersBtn.setAttribute('aria-pressed', 'true');
+            // visual tab styling
+            reposTab.classList.remove('tabbed');
+            branchesTab.classList.remove('tabbed');
+            indexersTab.classList.add('tabbed');
+            // hide add/import cards when viewing indexers
+            showAddImport(false);
+            refreshIndexersTable();
+        });
     }
 
     function showAddImport(show) {
-        // Add repository and Bulk import cards are the two cards after reposTab/branchesTab
+        // Add repository and Bulk import cards are the two cards after reposTab/branchesTab/indexersTab
         // Find all .card elements under container and toggle their visibility appropriately.
         const cards = Array.from(document.querySelectorAll('.container > .card'));
-        // We expect the layout: [reposTab card (index 0), branchesTab card (index 1), add card (index 2), spacer, bulk card (index 4)]
+        // We expect the layout: [reposTab card (index 0), branchesTab card (index 1), indexersTab card (index 2), add card (index 3), spacer, bulk card (index 5)]
         // Rather than rely strictly on indexes, find by header text
         for (const c of cards) {
             const h = c.querySelector('h2');
@@ -530,6 +596,11 @@ document.addEventListener('DOMContentLoaded', function () {
                 updateTableFromData(data);
                 // keep user's current sort
                 if (window.applyCurrentSort) window.applyCurrentSort();
+
+                // Also refresh indexers table if it's visible
+                if (indexersTab && indexersTab.style.display !== 'none') {
+                    refreshIndexersTable();
+                }
             } catch (e) { console.warn('poll error', e); }
         }
         // initial fetch + interval

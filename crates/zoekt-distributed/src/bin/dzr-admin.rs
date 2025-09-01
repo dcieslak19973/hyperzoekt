@@ -996,6 +996,54 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
     Json(out)
 }
 
+#[derive(Serialize)]
+struct IndexerInfo {
+    node_id: String,
+    endpoint: String,
+    last_heartbeat: Option<i64>,
+    status: String,
+}
+
+async fn api_indexers(state: Extension<AppState>) -> impl IntoResponse {
+    let mut out: Vec<IndexerInfo> = Vec::new();
+    if let Some(pool) = &state.redis_pool {
+        if let Ok(entries) = pool.hgetall("zoekt:indexers").await {
+            for (node_id, json_str) in entries {
+                let mut endpoint = String::new();
+                let mut last_heartbeat: Option<i64> = None;
+                let mut status = "unknown".to_string();
+
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(ep) = v.get("endpoint").and_then(|e| e.as_str()) {
+                        endpoint = ep.to_string();
+                    }
+                    if let Some(hb) = v.get("last_heartbeat").and_then(|h| h.as_i64()) {
+                        last_heartbeat = Some(hb);
+                        // Determine status based on heartbeat age
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let age_minutes = (now - hb) / (1000 * 60);
+                        if age_minutes < 5 {
+                            status = "online".to_string();
+                        } else if age_minutes < 15 {
+                            status = "stale".to_string();
+                        } else {
+                            status = "offline".to_string();
+                        }
+                    }
+                }
+
+                out.push(IndexerInfo {
+                    node_id,
+                    endpoint,
+                    last_heartbeat,
+                    status,
+                });
+            }
+        }
+    }
+    Json(out)
+}
+
 async fn login_post(
     state: Extension<AppState>,
     headers: HeaderMap,
@@ -1064,6 +1112,7 @@ fn make_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/", get(index))
         .route("/api/repos", get(api_repos))
+        .route("/api/indexers", get(api_indexers))
         .route("/login", get(login_get))
         .route("/login", post(login_post))
         .route("/logout", get(logout))

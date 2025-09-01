@@ -118,49 +118,52 @@
 
         /* Tab button visuals: higher contrast and clear active state */
         .tab-button {
-            background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 60%);
-            border: 1px solid rgba(255, 255, 255, 0.04);
-            padding: 10px 14px;
-            border-top-left-radius: 8px;
-            border-top-right-radius: 8px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 12px 16px;
             cursor: pointer;
-            color: var(--text);
-            font-weight: 700;
-            margin-right: 6px;
-            transition: background-color .15s ease, box-shadow .15s ease, transform .06s ease;
+            color: var(--muted);
+            font-weight: 600;
+            margin-right: 8px;
+            transition: all 0.2s ease;
+            position: relative;
         }
 
         .tab-button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.12);
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.03);
         }
 
         .tab-button:focus {
-            outline: 2px solid rgba(14, 165, 164, 0.18);
+            outline: 2px solid rgba(14, 165, 164, 0.3);
             outline-offset: 2px;
         }
 
         .tab-button[aria-pressed="true"] {
             background: var(--panel);
-            border-color: rgba(255, 255, 255, 0.08);
             color: var(--text);
-            box-shadow: none;
-            transform: none;
+            border-bottom: 2px solid var(--accent);
+            border-radius: 6px 6px 0 0;
+        }
+
+        .tab-button[aria-pressed="true"]:hover {
+            background: var(--panel);
         }
 
         /* Make the active tab visually connected to the card */
         .card.tabbed {
-            margin-top: -8px;
+            margin-top: -2px;
             border-top-left-radius: 0;
             border-top-right-radius: 0;
-            padding-top: 18px;
+            padding-top: 20px;
             box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
-            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-top: 1px solid var(--accent);
         }
 
         /* Reduce visual noise for inactive tabs */
         .tab-button[aria-pressed="false"] {
-            opacity: 0.92;
+            opacity: 0.8;
         }
 
         .spacer {
@@ -192,6 +195,7 @@
         <div style="display:flex;gap:8px;margin-bottom:12px;">
             <button id="tab-repos" class="tab-button" aria-pressed="true">Repositories</button>
             <button id="tab-branches" class="tab-button" aria-pressed="false">Branches</button>
+            <button id="tab-indexers" class="tab-button" aria-pressed="false">Indexers</button>
         </div>
 
         <div id="repos-tab" class="card">
@@ -227,6 +231,24 @@
                     </tr>
                 </thead>
                 <tbody id="branch-table-body"></tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Indexers tab (hidden by default) -->
+        <div id="indexers-tab" class="card" style="display:none">
+            <h2>Indexers</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Node ID</th>
+                        <th class="sortable" data-type="text">Endpoint</th>
+                        <th class="sortable" data-type="date">Last Heartbeat</th>
+                        <th class="sortable" data-type="text">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="indexer-table-body"></tbody>
             </table>
         </div>
 
