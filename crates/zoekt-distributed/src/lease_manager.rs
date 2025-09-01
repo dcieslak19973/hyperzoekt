@@ -45,8 +45,51 @@ impl LeaseManager {
     pub async fn new() -> Self {
         // If REDIS_URL is present try to create a deadpool redis pool.
         let redis_pool = match env::var("REDIS_URL").ok() {
-            Some(url) => RedisConfig::from_url(url.as_str()).create_pool(None).ok(),
-            None => None,
+            Some(mut url) => {
+                // Check if URL already has authentication
+                let has_auth = url.contains('@');
+
+                // If no auth in URL, try to add it from environment variables
+                if !has_auth {
+                    if let Ok(username) = env::var("REDIS_USERNAME") {
+                        if let Ok(password) = env::var("REDIS_PASSWORD") {
+                            // Insert username:password@ after redis://
+                            if let Some(pos) = url.find("://") {
+                                let auth_part = format!("{}:{}@", username, password);
+                                url.insert_str(pos + 3, &auth_part);
+                            }
+                        } else {
+                            // Username without password
+                            if let Some(pos) = url.find("://") {
+                                let auth_part = format!("{}@", username);
+                                url.insert_str(pos + 3, &auth_part);
+                            }
+                        }
+                    } else if let Ok(password) = env::var("REDIS_PASSWORD") {
+                        // Password without username
+                        if let Some(pos) = url.find("://") {
+                            let auth_part = format!(":{}@", password);
+                            url.insert_str(pos + 3, &auth_part);
+                        }
+                    }
+                }
+
+                RedisConfig::from_url(url.as_str()).create_pool(None).ok()
+            }
+            None => {
+                // No REDIS_URL provided, but check if we have auth credentials to construct one
+                if let (Ok(username), Ok(password)) =
+                    (env::var("REDIS_USERNAME"), env::var("REDIS_PASSWORD"))
+                {
+                    let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
+                    RedisConfig::from_url(&url).create_pool(None).ok()
+                } else if let Ok(password) = env::var("REDIS_PASSWORD") {
+                    let url = format!("redis://:{}@127.0.0.1:6379", password);
+                    RedisConfig::from_url(&url).create_pool(None).ok()
+                } else {
+                    None
+                }
+            }
         };
 
         Self {

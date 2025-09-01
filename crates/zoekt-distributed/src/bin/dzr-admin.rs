@@ -1596,13 +1596,61 @@ async fn main() -> Result<()> {
         },
     )?;
 
-    // Build redis pool from REDIS_URL if present
+    // Build redis pool from REDIS_URL if present, with optional authentication
     let redis_pool = match std::env::var("REDIS_URL").ok() {
-        Some(url) => RedisConfig::from_url(&url)
-            .create_pool(None)
-            .ok()
-            .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>),
-        None => None,
+        Some(mut url) => {
+            // Check if URL already has authentication
+            let has_auth = url.contains('@');
+
+            // If no auth in URL, try to add it from environment variables
+            if !has_auth {
+                if let Ok(username) = std::env::var("REDIS_USERNAME") {
+                    if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                        // Insert username:password@ after redis://
+                        if let Some(pos) = url.find("://") {
+                            let auth_part = format!("{}:{}@", username, password);
+                            url.insert_str(pos + 3, &auth_part);
+                        }
+                    } else {
+                        // Username without password
+                        if let Some(pos) = url.find("://") {
+                            let auth_part = format!("{}@", username);
+                            url.insert_str(pos + 3, &auth_part);
+                        }
+                    }
+                } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                    // Password without username
+                    if let Some(pos) = url.find("://") {
+                        let auth_part = format!(":{}@", password);
+                        url.insert_str(pos + 3, &auth_part);
+                    }
+                }
+            }
+
+            RedisConfig::from_url(&url)
+                .create_pool(None)
+                .ok()
+                .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>)
+        }
+        None => {
+            // No REDIS_URL provided, but check if we have auth credentials to construct one
+            if let (Ok(username), Ok(password)) = (
+                std::env::var("REDIS_USERNAME"),
+                std::env::var("REDIS_PASSWORD"),
+            ) {
+                let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
+                RedisConfig::from_url(&url).create_pool(None).ok().map(|p| {
+                    std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>
+                })
+            } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                let url = format!("redis://:{}@127.0.0.1:6379", password);
+                RedisConfig::from_url(&url).create_pool(None).ok().map(|p| {
+                    std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>
+                })
+            } else {
+                None
+            }
+        }
     };
 
     // Admin credentials from env (user requested ZOEKT_ADMIN_{USERNAME,PASSWORD})

@@ -43,6 +43,35 @@ RUST_LOG=info cargo run -p zoekt-distributed --bin dzr-indexer -- --remote-url /
 
 You can also control reindexing via `--disable-reindex` (prevent periodic reindex entirely) and the `ZOEKTD_ENABLE_REINDEX` env var.
 
+Configuration
+-------------
+The distributed system supports various environment variables for configuration:
+
+### Redis Configuration
+- `REDIS_URL`: Redis connection URL (e.g., `redis://127.0.0.1:6379`)
+- `REDIS_USERNAME`: Optional Redis username for authentication
+- `REDIS_PASSWORD`: Optional Redis password for authentication
+
+If `REDIS_URL` doesn't contain authentication credentials, the system will automatically add them using `REDIS_USERNAME` and/or `REDIS_PASSWORD` if provided. For example:
+- `REDIS_URL=redis://127.0.0.1:6379` with `REDIS_PASSWORD=mypass` becomes `redis://:mypass@127.0.0.1:6379`
+- `REDIS_URL=redis://127.0.0.1:6379` with `REDIS_USERNAME=user` and `REDIS_PASSWORD=pass` becomes `redis://user:pass@127.0.0.1:6379`
+
+### Node Configuration
+- `ZOEKTD_NODE_ID`: Unique identifier for this node
+- `ZOEKTD_LEASE_TTL_SECONDS`: Lease time-to-live in seconds (default: 150)
+- `ZOEKTD_POLL_INTERVAL_SECONDS`: Polling interval in seconds (default: 5)
+- `ZOEKTD_NODE_TYPE`: Node type - `indexer`, `admin`, or `search` (default: indexer)
+- `ZOEKTD_ENDPOINT`: Manual endpoint override
+- `ZOEKTD_ENABLE_REINDEX`: Enable/disable reindexing (default: true)
+- `ZOEKTD_INDEX_ONCE`: Index each repo once and skip further re-index attempts (default: false)
+
+### Kubernetes Service Discovery
+- `ZOEKTD_SERVICE_NAME`: Kubernetes service name for auto-discovery
+- `ZOEKTD_SERVICE_PORT`: Kubernetes service port
+- `ZOEKTD_SERVICE_PROTOCOL`: Protocol for service endpoints (default: http)
+- `POD_NAME`: Pod name for StatefulSet endpoint discovery
+- `POD_NAMESPACE`: Pod namespace (default: default)
+
 License
 -------
 This repository is licensed under the Apache License, Version 2.0. See the `LICENSE` and `NOTICE` files for details.
