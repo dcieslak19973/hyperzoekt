@@ -40,6 +40,8 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
         let node = Node::new(cfg, lease.clone(), FakeIndexer::new());
         let repo = RemoteRepo {
@@ -77,6 +79,8 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
 
         let indexer_node = Node::new(cfg, lease.clone(), SleepIndexer);
@@ -152,6 +156,8 @@ mod tests {
             poll_interval: Duration::from_millis(5),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
         let cfg_b = NodeConfig {
             id: "node-b".into(),
@@ -159,6 +165,8 @@ mod tests {
             poll_interval: Duration::from_millis(5),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
 
         let node_a = Node::new(cfg_a, lease.clone(), idx_a);

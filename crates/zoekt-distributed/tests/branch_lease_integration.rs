@@ -75,6 +75,8 @@ async fn branch_level_leasing_integration() {
         poll_interval: Duration::from_millis(50),
         node_type: NodeType::Indexer,
         endpoint: None,
+        enable_reindex: true,
+        index_once: false,
     };
 
     let count = Arc::new(AtomicUsize::new(0));

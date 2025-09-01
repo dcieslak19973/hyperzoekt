@@ -1,6 +1,71 @@
 use async_trait::async_trait;
 use deadpool_redis::redis::AsyncCommands;
-use deadpool_redis::Pool;
+use deadpool_redis::{Config as RedisConfig, Pool};
+
+/// Create a Redis pool with authentication support from environment variables.
+///
+/// This function handles Redis authentication by checking for:
+/// - REDIS_URL: Base Redis URL (may already contain auth)
+/// - REDIS_USERNAME: Optional username for authentication
+/// - REDIS_PASSWORD: Optional password for authentication
+///
+/// If REDIS_URL doesn't contain authentication and REDIS_USERNAME/REDIS_PASSWORD
+/// are provided, they will be automatically injected into the URL.
+///
+/// If no REDIS_URL is provided but authentication credentials exist,
+/// a default URL will be constructed with the credentials.
+///
+/// Returns None if no valid Redis configuration is found.
+pub fn create_redis_pool() -> Option<Pool> {
+    match std::env::var("REDIS_URL").ok() {
+        Some(mut url) => {
+            // Check if URL already has authentication
+            let has_auth = url.contains('@');
+
+            // If no auth in URL, try to add it from environment variables
+            if !has_auth {
+                if let Ok(username) = std::env::var("REDIS_USERNAME") {
+                    if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                        // Insert username:password@ after redis://
+                        if let Some(pos) = url.find("://") {
+                            let auth_part = format!("{}:{}@", username, password);
+                            url.insert_str(pos + 3, &auth_part);
+                        }
+                    } else {
+                        // Username without password
+                        if let Some(pos) = url.find("://") {
+                            let auth_part = format!("{}@", username);
+                            url.insert_str(pos + 3, &auth_part);
+                        }
+                    }
+                } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                    // Password without username
+                    if let Some(pos) = url.find("://") {
+                        let auth_part = format!(":{}@", password);
+                        url.insert_str(pos + 3, &auth_part);
+                    }
+                }
+            }
+
+            RedisConfig::from_url(&url).create_pool(None).ok()
+        }
+        None => {
+            // No REDIS_URL provided, but check if we have auth credentials to construct one
+            if let (Ok(username), Ok(password)) = (
+                std::env::var("REDIS_USERNAME"),
+                std::env::var("REDIS_PASSWORD"),
+            ) {
+                let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
+                RedisConfig::from_url(&url).create_pool(None).ok()
+            } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                let url = format!("redis://:{}@127.0.0.1:6379", password);
+                RedisConfig::from_url(&url).create_pool(None).ok()
+            } else {
+                None
+            }
+        }
+    }
+}
 
 #[async_trait]
 pub trait DynRedis: Send + Sync {
