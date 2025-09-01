@@ -44,6 +44,11 @@ document.addEventListener('DOMContentLoaded', function () {
     const createForm = document.getElementById('create-form');
     const repoTableBody = document.getElementById('repo-table-body');
     const exportBtn = document.getElementById('export-csv');
+    const tabReposBtn = document.getElementById('tab-repos');
+    const tabBranchesBtn = document.getElementById('tab-branches');
+    const reposTab = document.getElementById('repos-tab');
+    const branchesTab = document.getElementById('branches-tab');
+    const branchTableBody = document.getElementById('branch-table-body');
     // remember current sort state so dynamic updates can reapply it
     const TABLE_SORT_KEY = 'dzr_table_sort';
     // Load saved sort state from localStorage if present
@@ -236,6 +241,11 @@ document.addEventListener('DOMContentLoaded', function () {
             if (!tr) return;
             toggleBranchRow(tr, exp);
         });
+        // when rows change, also refresh aggregate branch listing if branches tab visible
+        const observer = new MutationObserver(() => {
+            if (branchesTab && branchesTab.style.display !== 'none') refreshBranchesTable();
+        });
+        observer.observe(repoTableBody, { childList: true, subtree: false });
     }
 
     function toggleBranchRow(tr, expanderEl) {
@@ -362,6 +372,80 @@ document.addEventListener('DOMContentLoaded', function () {
             else tableSortState = { idx: -1, asc: true };
         }
     })();
+
+    // Branches tab handling: aggregate per-row branch-details into a flat table
+    function refreshBranchesTable() {
+        if (!branchTableBody || !repoTableBody) return;
+        // gather branch-details from each repo row
+        const branchRows = [];
+        const repoRows = Array.from(repoTableBody.querySelectorAll('tr'));
+        for (const r of repoRows) {
+            const repoName = r.dataset && r.dataset.name ? r.dataset.name : (r.children[0] && r.children[0].textContent) || '';
+            const raw = r.dataset && r.dataset.branchDetails ? r.dataset.branchDetails : null;
+            if (!raw) continue;
+            let details = null;
+            try { details = JSON.parse(raw); } catch (e) { details = null; }
+            if (!details || !Array.isArray(details)) continue;
+            for (const d of details) {
+                branchRows.push({ repo: repoName, branch: d.branch || '', last_indexed: d.last_indexed || '', last_duration_ms: d.last_duration_ms || '', memory_display: d.memory_display || (d.memory_bytes ? humanReadableBytes(Number(d.memory_bytes)) : ''), memory_bytes: d.memory_bytes || null, leased_node: d.leased_node || '' });
+            }
+        }
+        // clear and repopulate
+        branchTableBody.innerHTML = '';
+        for (const br of branchRows) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${escapeHtml(br.repo)}</td><td>${escapeHtml(br.branch)}</td><td>${escapeHtml(br.last_indexed)}</td><td class="numeric">${escapeHtml(String(br.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(br.memory_display || '')}</td><td>${escapeHtml(br.leased_node || '')}</td>`;
+            // attach data-bytes on memory cell to help numeric sorting
+            const memCell = tr.children[4];
+            if (memCell && br.memory_bytes) memCell.setAttribute('data-bytes', String(br.memory_bytes));
+            branchTableBody.appendChild(tr);
+        }
+        // apply saved sort state if the branches table header supports it
+        if (window.applyCurrentSort) window.applyCurrentSort();
+    }
+
+    // tab switching
+    if (tabReposBtn && tabBranchesBtn && reposTab && branchesTab) {
+        tabReposBtn.addEventListener('click', () => {
+            reposTab.style.display = '';
+            branchesTab.style.display = 'none';
+            tabReposBtn.setAttribute('aria-pressed', 'true');
+            tabBranchesBtn.setAttribute('aria-pressed', 'false');
+            // visual tab styling
+            reposTab.classList.add('tabbed');
+            branchesTab.classList.remove('tabbed');
+            // show add/import cards
+            showAddImport(true);
+        });
+        tabBranchesBtn.addEventListener('click', () => {
+            reposTab.style.display = 'none';
+            branchesTab.style.display = '';
+            tabReposBtn.setAttribute('aria-pressed', 'false');
+            tabBranchesBtn.setAttribute('aria-pressed', 'true');
+            // visual tab styling
+            reposTab.classList.remove('tabbed');
+            branchesTab.classList.add('tabbed');
+            // hide add/import cards when viewing branches
+            showAddImport(false);
+            refreshBranchesTable();
+        });
+    }
+
+    function showAddImport(show) {
+        // Add repository and Bulk import cards are the two cards after reposTab/branchesTab
+        // Find all .card elements under container and toggle their visibility appropriately.
+        const cards = Array.from(document.querySelectorAll('.container > .card'));
+        // We expect the layout: [reposTab card (index 0), branchesTab card (index 1), add card (index 2), spacer, bulk card (index 4)]
+        // Rather than rely strictly on indexes, find by header text
+        for (const c of cards) {
+            const h = c.querySelector('h2');
+            if (!h) continue;
+            const txt = (h.textContent || '').trim().toLowerCase();
+            if (txt === 'add repository' || txt === 'bulk import from csv') {
+                c.style.display = show ? '' : 'none';
+            }
+        }
+    }
 
     // Polling: fetch /api/repos every 10s and refresh table
     (function enablePolling() {

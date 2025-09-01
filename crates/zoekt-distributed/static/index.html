@@ -203,6 +203,53 @@
             color: var(--muted);
             user-select: none;
         }
+
+        /* tab button visuals: higher contrast and clear active state */
+        .tab-button {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 60%);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            padding: 10px 14px;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            cursor: pointer;
+            color: var(--text);
+            font-weight: 700;
+            margin-right: 6px;
+            transition: background-color .15s ease, box-shadow .15s ease, transform .06s ease;
+        }
+
+        .tab-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.12);
+        }
+
+        .tab-button:focus {
+            outline: 2px solid rgba(14, 165, 164, 0.18);
+            outline-offset: 2px;
+        }
+
+        .tab-button[aria-pressed="true"] {
+            background: var(--panel);
+            border-color: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+            box-shadow: none;
+            transform: none;
+        }
+
+        /* Make the active tab visually connected to the card */
+        .card.tabbed {
+            margin-top: -8px;
+            border-top-left-radius: 0;
+            border-top-right-radius: 0;
+            padding-top: 18px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        /* reduce visual noise for inactive tabs */
+        .tab-button[aria-pressed="false"] {
+            opacity: 0.92;
+        }
     </style>
     <script src="/static/admin.js" defer></script>
 </head>
@@ -218,7 +265,13 @@
             </div>
         </nav>
 
-        <div class="card">
+        <!-- Tab bar -->
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+            <button id="tab-repos" class="tab-button" aria-pressed="true">Repositories</button>
+            <button id="tab-branches" class="tab-button" aria-pressed="false">Branches</button>
+        </div>
+
+        <div id="repos-tab" class="card">
             <h2>Repositories</h2>
             <table>
                 <thead>
@@ -235,6 +288,24 @@
         </div>
 
         <div style="height:16px"></div>
+
+        <!-- Branches tab (hidden by default) -->
+        <div id="branches-tab" class="card" style="display:none">
+            <h2>Branches</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Repository</th>
+                        <th class="sortable" data-type="text">Branch</th>
+                        <th class="sortable" data-type="date">Last indexed</th>
+                        <th class="sortable numeric" data-type="number">Duration (ms)</th>
+                        <th class="sortable numeric" data-type="number">Memory</th>
+                        <th>Leased node</th>
+                    </tr>
+                </thead>
+                <tbody id="branch-table-body"></tbody>
+            </table>
+        </div>
 
         <div class="card">
             <h2>Add repository</h2>
