@@ -3,7 +3,6 @@ members = [
 	"crates/hyperzoekt",
 	"crates/zoekt-rs",
 	"crates/zoekt-cli",
-	"crates/zoekt-tools",
 	"crates/zoekt-distributed",
 ]
 
