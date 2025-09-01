@@ -20,8 +20,8 @@ redis = { version = "0.27", features = ["script"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.7"
-axum = { version = "0.6", features = ["headers"] }
-tower-http = { version = "0.3", features = ["auth"] }
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.5", features = ["auth"] }
 htmlescape = "0.3"
 rand = "0.8"
 hmac = "0.12"
@@ -29,7 +29,8 @@ async-trait = "0.1"
 sha2 = "0.10"
 regex = "1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-urlencoding = "2"
+http-body = "1.0"
+urlencoding = "2.1"
 
 [[bin]]
 name = "dzr-http-search"
@@ -53,6 +54,6 @@ proptest = "1"
 tempfile = "3"
 serial_test = "2"
 http = "0.2"
-tower = "0.4"
+tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 

@@ -212,10 +212,7 @@ pub fn session_cookie_header_value(sid: &str, key: Option<&[u8]>, secure_flag: b
 
 /// Convert any IntoResponse into a boxed Response (helps returning from handlers).
 pub fn into_boxed_response<R: IntoResponse>(r: R) -> Response {
-    let resp = r.into_response();
-    let (parts, body) = resp.into_parts();
-    let boxed = axum::body::boxed(body);
-    Response::from_parts(parts, boxed)
+    r.into_response()
 }
 
 /// Parse raw Cookie header and return the value of `dzr_session` if present.

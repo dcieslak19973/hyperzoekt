@@ -157,8 +157,9 @@ async fn main() -> Result<()> {
             }),
         );
 
-    let addr = bind_addr.parse().expect("invalid bind address");
-    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+    let addr: std::net::SocketAddr = bind_addr.parse().expect("invalid bind address");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let server = axum::serve(listener, app);
 
     // run server until interrupted
     server.await.map_err(|e| anyhow::anyhow!(e.to_string()))?;

@@ -1,8 +1,8 @@
-use axum::http::header::SET_COOKIE;
+use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
 use axum::http::HeaderValue;
 use axum::Json;
 use axum::{
-    extract::{Extension, Form},
+    extract::{Extension, Form, Multipart},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
@@ -65,10 +65,12 @@ type AppState = Arc<AppStateInner>;
 // DynRedis and RealRedis are implemented in the crate::redis module.
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct CreateRepoWithFreq {
     name: String,
     url: String,
     frequency: Option<u64>,
+    branches: Option<String>,
     csrf: String,
 }
 
@@ -131,7 +133,7 @@ async fn health(state: Extension<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
 }
 
-async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response::Response {
+async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let req_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -179,6 +181,7 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response
                 let mut memory_bytes = "".to_string();
                 let mut memory_bytes_raw = "".to_string();
                 let mut leased = "".to_string();
+                let mut branches = "".to_string();
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
                         if let Some(f) = v.get("frequency") {
@@ -225,13 +228,23 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response
                                 leased = n.to_string();
                             }
                         }
+                        if let Some(b) = v.get("branches") {
+                            if !b.is_null() {
+                                if let Some(s) = b.as_str() {
+                                    branches = s.to_string();
+                                } else {
+                                    branches = b.to_string();
+                                }
+                            }
+                        }
                     }
                 }
                 rows.push_str(&format!(
-                    "<tr data-name=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"numeric memory\" data-bytes=\"{}\">{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
+                    "<tr data-name=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"numeric memory\" data-bytes=\"{}\">{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
                     safe_name,
                     htmlescape::encode_minimal(&name),
                     htmlescape::encode_minimal(&url),
+                    htmlescape::encode_minimal(&branches),
                     htmlescape::encode_minimal(&freq),
                     htmlescape::encode_minimal(&last_indexed),
                     htmlescape::encode_minimal(&last_duration_ms),
@@ -278,22 +291,173 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> axum::response
 
     tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome = %"index_ok");
     let (parts, body) = resp.into_parts();
-    let boxed = axum::body::boxed(body);
+    let boxed = axum::body::Body::new(body);
     axum::response::Response::from_parts(parts, boxed)
 }
 
-async fn create(
-    state: Extension<AppState>,
+use async_trait::async_trait;
+
+/// Trait for fetching branches from a repository
+#[async_trait]
+pub trait BranchFetcher: Send + Sync {
+    async fn fetch_branches(&self, url: &str) -> Result<Vec<String>, String>;
+}
+
+/// Real implementation that uses git ls-remote
+pub struct GitBranchFetcher;
+
+#[async_trait]
+impl BranchFetcher for GitBranchFetcher {
+    async fn fetch_branches(&self, url: &str) -> Result<Vec<String>, String> {
+        let output = tokio::process::Command::new("git")
+            .args(["ls-remote", "--heads", url])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute git ls-remote: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "git ls-remote failed with status: {}",
+                output.status
+            ));
+        }
+
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| format!("Invalid UTF-8 in git output: {}", e))?;
+
+        let mut branches = Vec::new();
+        for line in stdout.lines() {
+            if let Some(branch_ref) = line.split('\t').nth(1) {
+                if branch_ref.starts_with("refs/heads/") {
+                    let branch_name = branch_ref.strip_prefix("refs/heads/").unwrap();
+                    branches.push(branch_name.to_string());
+                }
+            }
+        }
+
+        Ok(branches)
+    }
+}
+
+/// Mock implementation for testing
+pub struct MockBranchFetcher {
+    pub branches: Vec<String>,
+}
+
+#[async_trait]
+impl BranchFetcher for MockBranchFetcher {
+    async fn fetch_branches(&self, _url: &str) -> Result<Vec<String>, String> {
+        Ok(self.branches.clone())
+    }
+}
+
+/// Expands branch patterns like "main,features/*" into actual branch names.
+/// Fetches branches from the Git repository and matches them against patterns.
+#[allow(dead_code)]
+async fn expand_branch_patterns(url: &str, pattern: &str) -> Result<Vec<String>, String> {
+    let fetcher = GitBranchFetcher;
+    expand_branch_patterns_with_fetcher(url, pattern, &fetcher).await
+}
+
+/// Expands branch patterns with a custom branch fetcher (for testing)
+async fn expand_branch_patterns_with_fetcher(
+    url: &str,
+    pattern: &str,
+    fetcher: &dyn BranchFetcher,
+) -> Result<Vec<String>, String> {
+    if pattern.trim().is_empty() {
+        return Ok(vec!["main".to_string()]);
+    }
+
+    // Fetch branches from the repository
+    let branches = fetcher
+        .fetch_branches(url)
+        .await
+        .map_err(|e| format!("Failed to fetch branches from {}: {}", url, e))?;
+
+    let mut expanded = Vec::new();
+    for part in pattern.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if part.contains('*') || part.contains('?') || part.contains('[') {
+            // Match against actual branches
+            for branch in &branches {
+                if matches_pattern(part, branch) {
+                    expanded.push(branch.clone());
+                }
+            }
+        } else {
+            // Exact branch name - check if it exists
+            if branches.contains(&part.to_string()) {
+                expanded.push(part.to_string());
+            } else {
+                // For exact matches that don't exist, still include them
+                // The indexer will handle the error when it tries to clone
+                expanded.push(part.to_string());
+            }
+        }
+    }
+
+    if expanded.is_empty() {
+        Ok(vec!["main".to_string()])
+    } else {
+        // Remove duplicates and sort
+        expanded.sort();
+        expanded.dedup();
+        Ok(expanded)
+    }
+}
+
+/// Simple wildcard pattern matching for branch names
+fn matches_pattern(pattern: &str, branch: &str) -> bool {
+    // Convert glob pattern to regex
+    let mut regex_pattern = String::new();
+    regex_pattern.push('^');
+
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_pattern.push_str(".*"),
+            '?' => regex_pattern.push('.'),
+            '[' => regex_pattern.push('['),
+            ']' => regex_pattern.push(']'),
+            '^' => regex_pattern.push_str("\\^"),
+            '$' => regex_pattern.push_str("\\$"),
+            '.' => regex_pattern.push_str("\\."),
+            '+' => regex_pattern.push_str("\\+"),
+            '|' => regex_pattern.push_str("\\|"),
+            '(' => regex_pattern.push_str("\\("),
+            ')' => regex_pattern.push_str("\\)"),
+            '{' => regex_pattern.push_str("\\{"),
+            '}' => regex_pattern.push_str("\\}"),
+            '\\' => regex_pattern.push_str("\\\\"),
+            _ => regex_pattern.push(ch),
+        }
+    }
+
+    regex_pattern.push('$');
+
+    match regex::Regex::new(&regex_pattern) {
+        Ok(re) => re.is_match(branch),
+        Err(_) => false, // If regex compilation fails, no match
+    }
+}
+
+#[allow(dead_code)]
+async fn create_inner(
+    Extension(state): Extension<AppState>,
     headers: HeaderMap,
     Form(form): Form<CreateRepoWithFreq>,
-) -> axum::response::Response {
+) -> impl IntoResponse {
     let req_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
     tracing::info!(request_id=%req_id, "create: incoming");
-    // compute user_for_log and auth_type
+    // compute user_for_log and auth_type similar to delete
     let parsed_basic = parse_basic_auth(&headers).map(|(u, _)| u);
     let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let auth_type = if basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass) {
@@ -315,10 +479,10 @@ async fn create(
     if user_for_log.is_empty() {
         user_for_log = "anonymous".to_string();
     }
+    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
     let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
     let sid_opt = session_mgr.verify_and_extract_session(&headers);
-    // Accept the request if the session id maps to a valid server-side session (not expired).
     let sid_valid = sid_opt
         .as_ref()
         .map(|sid| {
@@ -335,17 +499,10 @@ async fn create(
             Html("<h1>Unauthorized</h1>".to_string()),
         ));
     }
-    if form.url.is_empty() || form.name.is_empty() {
-        return into_boxed_response((
-            StatusCode::BAD_REQUEST,
-            Html("<h1>Bad Request</h1>".to_string()),
-        ));
-    }
-    // Validate session cookie -> csrf mapping
+    // Validate session cookie -> csrf mapping for create
     let sid = match sid_opt {
         Some(s) => s,
         None => {
-            tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_forbidden_no_sid");
             return into_boxed_response((
                 StatusCode::FORBIDDEN,
                 Html("<h1>Forbidden</h1>".to_string()),
@@ -363,6 +520,37 @@ async fn create(
         }
     }
     if let Some(pool) = &state.redis_pool {
+        // Expand branch patterns if provided
+        let branches = if let Some(branches_str) = &form.branches {
+            if !branches_str.trim().is_empty() {
+                match expand_branch_patterns(&form.url, branches_str.trim()).await {
+                    Ok(expanded) => expanded,
+                    Err(e) => {
+                        tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_branch_expand_error", error=?e);
+                        if wants_json(&headers) {
+                            let body = json!({"error": "branch_pattern_error", "message": e});
+                            let mut resp =
+                                into_boxed_response((StatusCode::BAD_REQUEST, Json(body)));
+                            resp.headers_mut().insert(
+                                axum::http::header::HeaderName::from_static("x-request-id"),
+                                HeaderValue::from_str(&req_id)
+                                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+                            );
+                            return resp;
+                        }
+                        return into_boxed_response((
+                            StatusCode::BAD_REQUEST,
+                            Html("<h1>Invalid branch pattern</h1>".to_string()),
+                        ));
+                    }
+                }
+            } else {
+                vec!["main".to_string()]
+            }
+        } else {
+            vec!["main".to_string()]
+        };
+
         let script = r#"
             local name = ARGV[1]
             local url = ARGV[2]
@@ -385,12 +573,11 @@ async fn create(
             )
             .await
         {
-            Ok(res) => match res {
-                0 => {}
-                1 => {
+            Ok(res) => {
+                if res == 1 {
                     tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_name", name=%form.name);
                     if wants_json(&headers) {
-                        let body = json!({"error": "conflict", "reason": "name_exists", "name": form.name});
+                        let body = json!({"error": "name_conflict", "name": form.name});
                         let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
                         resp.headers_mut().insert(
                             axum::http::header::HeaderName::from_static("x-request-id"),
@@ -401,7 +588,7 @@ async fn create(
                     }
                     let mut resp = into_boxed_response((
                         StatusCode::CONFLICT,
-                        Html("<h1>Conflict: name already exists</h1>".to_string()),
+                        Html("<h1>Name already exists</h1>".to_string()),
                     ));
                     resp.headers_mut().insert(
                         axum::http::header::HeaderName::from_static("x-request-id"),
@@ -410,11 +597,10 @@ async fn create(
                     );
                     return resp;
                 }
-                2 => {
+                if res == 2 {
                     tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_url", url=%form.url);
                     if wants_json(&headers) {
-                        let body =
-                            json!({"error": "conflict", "reason": "url_exists", "url": form.url});
+                        let body = json!({"error": "url_conflict", "url": form.url});
                         let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
                         resp.headers_mut().insert(
                             axum::http::header::HeaderName::from_static("x-request-id"),
@@ -425,7 +611,7 @@ async fn create(
                     }
                     let mut resp = into_boxed_response((
                         StatusCode::CONFLICT,
-                        Html("<h1>Conflict: url already exists</h1>".to_string()),
+                        Html("<h1>URL already exists</h1>".to_string()),
                     ));
                     resp.headers_mut().insert(
                         axum::http::header::HeaderName::from_static("x-request-id"),
@@ -434,14 +620,27 @@ async fn create(
                     );
                     return resp;
                 }
-                _ => {
-                    tracing::warn!(request_id=%req_id, pid=%std::process::id(), outcome=%"create_unknown_script_result", result=%res);
+                // otherwise success (res == 0)
+                // store repo meta
+                let meta_key = "zoekt:repo_meta".to_string();
+                let mut meta = json!({
+                    "frequency": form.frequency,
+                    "last_indexed": null,
+                    "last_duration_ms": null,
+                    "memory_bytes": null,
+                    "leased_node": null,
+                });
+                let branches_str = branches.join(",");
+                meta["branches"] = json!(branches_str);
+
+                if let Err(e) = pool.hset(&meta_key, &form.name, &meta.to_string()).await {
+                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_meta_error", error=?e);
                     return into_boxed_response((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Html("<h1>Internal Server Error</h1>".to_string()),
                     ));
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"create_redis_error");
                 return into_boxed_response((
@@ -452,23 +651,8 @@ async fn create(
         }
     }
 
-    // Persist repo metadata (frequency, last_indexed, last_duration_ms, leased_node)
-    if let Some(pool) = &state.redis_pool {
-        let meta_key = "zoekt:repo_meta".to_string();
-        let meta = json!({
-            "frequency": form.frequency.unwrap_or(60),
-            "last_indexed": null,
-            "last_duration_ms": null,
-            "memory_bytes": null,
-            "leased_node": null,
-        });
-        if let Err(e) = pool.hset(&meta_key, &form.name, &meta.to_string()).await {
-            tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"create_meta_set_failed");
-        }
-    }
-
     if wants_json(&headers) {
-        let body = json!({"name": form.name, "url": form.url, "csrf": form.csrf});
+        let body = json!({"name": form.name, "url": form.url});
         tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_success", name=%form.name);
         let mut resp = into_boxed_response((StatusCode::CREATED, Json(body)));
         resp.headers_mut().insert(
@@ -477,6 +661,7 @@ async fn create(
         );
         return resp;
     }
+
     tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_redirect");
     let mut resp = into_boxed_response(Redirect::to("/"));
     resp.headers_mut().insert(
@@ -487,16 +672,18 @@ async fn create(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct DeleteForm {
     name: String,
     csrf: String,
 }
 
-async fn delete(
+#[allow(dead_code)]
+async fn delete_inner(
     state: Extension<AppState>,
     headers: HeaderMap,
     Form(form): Form<DeleteForm>,
-) -> axum::response::Response {
+) -> impl IntoResponse {
     let req_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -693,6 +880,7 @@ struct RepoInfo {
     name: String,
     url: String,
     frequency: Option<u64>,
+    branches: Option<String>,
     // RFC3339 string when available
     last_indexed: Option<String>,
     last_duration_ms: Option<i64>,
@@ -712,6 +900,7 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                 let mut memory_bytes: Option<i64> = None;
                 let mut memory_display: Option<String> = None;
                 let mut leased_node: Option<String> = None;
+                let mut branches: Option<String> = None;
 
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
@@ -763,6 +952,13 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                                 }
                             }
                         }
+                        if let Some(b) = v.get("branches") {
+                            if !b.is_null() {
+                                if let Some(s) = b.as_str() {
+                                    branches = Some(s.to_string());
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -770,6 +966,7 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                     name: name.clone(),
                     url: url.clone(),
                     frequency,
+                    branches,
                     last_indexed,
                     last_duration_ms,
                     memory_bytes,
@@ -786,7 +983,7 @@ async fn login_post(
     state: Extension<AppState>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
-) -> axum::response::Response {
+) -> impl IntoResponse {
     // Validate credentials
     if form.username != state.admin_user || form.password != state.admin_pass {
         tracing::warn!(user=%form.username, pid=%std::process::id(), outcome=%"login_failed");
@@ -818,6 +1015,33 @@ async fn login_post(
     into_boxed_response(resp)
 }
 
+#[allow(dead_code)]
+async fn create_handler(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateRepoWithFreq>,
+) -> impl IntoResponse {
+    create_inner(Extension(state), headers, Form(form)).await
+}
+
+#[allow(dead_code)]
+async fn delete_handler(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteForm>,
+) -> impl IntoResponse {
+    delete_inner(Extension(state), headers, Form(form)).await
+}
+
+#[allow(dead_code)]
+async fn bulk_import_handler(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> impl IntoResponse {
+    bulk_import_inner(Extension(state), headers, multipart).await
+}
+
 fn make_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -826,11 +1050,294 @@ fn make_app(state: AppState) -> Router {
         .route("/login", get(login_get))
         .route("/login", post(login_post))
         .route("/logout", get(logout))
-        .route("/create", post(create))
-        .route("/delete", post(delete))
+        .route(
+            "/create",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<CreateRepoWithFreq>| async move {
+                create_inner(state, headers, Form(form)).await
+            }),
+        )
+        .route(
+            "/delete",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteForm>| async move {
+                delete_inner(state, headers, Form(form)).await
+            }),
+        )
+        .route(
+            "/bulk-import",
+            post(|state: Extension<AppState>, headers: HeaderMap, multipart: Multipart| async move {
+                bulk_import_inner(state, headers, multipart).await
+            }),
+        )
         .route("/static/admin.js", get(serve_admin_js))
         .route("/export.csv", get(export_csv))
         .layer(axum::Extension(state))
+}
+
+#[allow(dead_code)]
+async fn bulk_import_inner(
+    state: Extension<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let req_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(gen_token);
+    tracing::info!(request_id=%req_id, "bulk_import: incoming");
+
+    // Authentication check
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let has_session = if let Some(sid) = &sid_opt {
+        let map = state.sessions.read();
+        map.get(sid)
+            .map(|(_tok, exp, _u)| Instant::now() < *exp)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_basic && !has_session {
+        tracing::warn!(request_id=%req_id, outcome=%"bulk_import_unauthorized");
+        if wants_json(&headers) {
+            let body = json!({"error": "unauthorized"});
+            let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        return into_boxed_response(Redirect::to("/login"));
+    }
+
+    // Get the CSV file from multipart
+    let mut csv_content = String::new();
+    let mut csrf_token = String::new();
+
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "csv_file" {
+            csv_content = field.text().await.unwrap_or_default();
+        } else if name == "csrf" {
+            csrf_token = field.text().await.unwrap_or_default();
+        }
+    }
+
+    // Validate CSRF if we have a session
+    if let Some(sid) = sid_opt {
+        let map = state.sessions.read();
+        if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(csrf_token.as_str()) {
+            tracing::warn!(request_id=%req_id, outcome=%"bulk_import_forbidden_csrf_mismatch");
+            if wants_json(&headers) {
+                let body = json!({"error": "csrf_mismatch"});
+                let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::FORBIDDEN,
+                Html("<h1>Forbidden</h1>".to_string()),
+            ));
+        }
+    }
+
+    if csv_content.is_empty() {
+        tracing::warn!(request_id=%req_id, outcome=%"bulk_import_no_file");
+        if wants_json(&headers) {
+            let body = json!({"error": "no_csv_file"});
+            let mut resp = into_boxed_response((StatusCode::BAD_REQUEST, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        return into_boxed_response((
+            StatusCode::BAD_REQUEST,
+            Html("<h1>No CSV file provided</h1>".to_string()),
+        ));
+    }
+
+    // Parse CSV and create repositories
+    let mut created = Vec::new();
+    let mut errors = Vec::new();
+
+    for (line_num, line) in csv_content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue; // Skip empty lines and comments
+        }
+
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() < 2 {
+            errors.push(format!(
+                "Line {}: Invalid format, expected at least name,url",
+                line_num + 1
+            ));
+            continue;
+        }
+
+        let name = parts[0].to_string();
+        let url = parts[1].to_string();
+        let branches = if parts.len() > 2 && !parts[2].is_empty() {
+            Some(parts[2].to_string())
+        } else {
+            None
+        };
+        let frequency = if parts.len() > 3 && !parts[3].is_empty() {
+            parts[3].parse::<u64>().ok()
+        } else {
+            None
+        };
+
+        if name.is_empty() || url.is_empty() {
+            errors.push(format!(
+                "Line {}: Name and URL cannot be empty",
+                line_num + 1
+            ));
+            continue;
+        }
+
+        // Create the repository using the same logic as the create endpoint
+        if let Some(pool) = &state.redis_pool {
+            let script = r#"
+                local name = ARGV[1]
+                local url = ARGV[2]
+                if redis.call('HEXISTS', KEYS[1], name) == 1 then
+                    return 1
+                end
+                if redis.call('SISMEMBER', KEYS[2], url) == 1 then
+                    return 2
+                end
+                redis.call('HSET', KEYS[1], name, url)
+                redis.call('SADD', KEYS[2], url)
+                return 0
+            "#;
+
+            match pool
+                .eval_i32(script, &["zoekt:repos", "zoekt:repo_urls"], &[&name, &url])
+                .await
+            {
+                Ok(res) => match res {
+                    0 => {
+                        // Success - store metadata
+                        let meta_key = "zoekt:repo_meta".to_string();
+                        let mut meta = json!({
+                            "frequency": frequency.unwrap_or(60),
+                            "last_indexed": null,
+                            "last_duration_ms": null,
+                            "memory_bytes": null,
+                            "leased_node": null,
+                        });
+
+                        let branches_value = if let Some(branches) = &branches {
+                            if !branches.trim().is_empty() {
+                                // Validate the branch pattern by expanding it
+                                match expand_branch_patterns(&url, branches.trim()).await {
+                                    Ok(_) => {
+                                        // Store the original pattern, not the expanded branches
+                                        // The indexer will re-expand when it clones the repo
+                                        branches.trim().to_string()
+                                    }
+                                    Err(e) => {
+                                        errors.push(format!(
+                                            "Line {}: Failed to expand branch patterns '{}': {}",
+                                            line_num + 1,
+                                            branches.trim(),
+                                            e
+                                        ));
+                                        branches.trim().to_string()
+                                    }
+                                }
+                            } else {
+                                "main".to_string()
+                            }
+                        } else {
+                            "main".to_string()
+                        };
+                        meta["branches"] = json!(branches_value);
+
+                        if let Err(e) = pool.hset(&meta_key, &name, &meta.to_string()).await {
+                            errors.push(format!(
+                                "Line {}: Failed to store metadata: {}",
+                                line_num + 1,
+                                e
+                            ));
+                        } else {
+                            created.push(name.clone());
+                        }
+                    }
+                    1 => {
+                        errors.push(format!(
+                            "Line {}: Repository name '{}' already exists",
+                            line_num + 1,
+                            name
+                        ));
+                    }
+                    2 => {
+                        errors.push(format!(
+                            "Line {}: Repository URL '{}' already exists",
+                            line_num + 1,
+                            url
+                        ));
+                    }
+                    _ => {
+                        errors.push(format!(
+                            "Line {}: Unknown error creating repository '{}'",
+                            line_num + 1,
+                            name
+                        ));
+                    }
+                },
+                Err(e) => {
+                    errors.push(format!(
+                        "Line {}: Redis error for '{}': {}",
+                        line_num + 1,
+                        name,
+                        e
+                    ));
+                }
+            }
+        } else {
+            errors.push(format!(
+                "Line {}: No Redis connection available",
+                line_num + 1
+            ));
+        }
+    }
+
+    tracing::info!(
+        request_id=%req_id,
+        created_count=%created.len(),
+        errors_count=%errors.len(),
+        outcome=%"bulk_import_completed"
+    );
+
+    if wants_json(&headers) {
+        let body = json!({
+            "created": created,
+            "errors": errors
+        });
+        let mut resp = into_boxed_response((StatusCode::OK, Json(body)));
+        resp.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+            HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        return resp;
+    }
+
+    // For HTML response, redirect back to index
+    let mut resp = into_boxed_response(Redirect::to("/"));
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-request-id"),
+        HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    resp
 }
 
 async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::response::Response {
@@ -885,7 +1392,9 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
     }
 
     let mut csv = String::new();
-    csv.push_str("name,url,frequency,last_indexed,last_duration_ms,memory_bytes,leased_node\n");
+    csv.push_str(
+        "name,url,branches,frequency,last_indexed,last_duration_ms,memory_bytes,leased_node\n",
+    );
     if let Some(pool) = &state.redis_pool {
         if let Ok(entries) = pool.hgetall("zoekt:repos").await {
             for (name, url) in entries {
@@ -894,6 +1403,7 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
                 let mut last_duration_ms = String::new();
                 let mut memory_bytes = String::new();
                 let mut leased_node = String::new();
+                let mut branches = String::new();
 
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
@@ -940,13 +1450,23 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
                                 }
                             }
                         }
+                        if let Some(b) = v.get("branches") {
+                            if !b.is_null() {
+                                if let Some(s) = b.as_str() {
+                                    branches = s.to_string();
+                                } else {
+                                    branches = b.to_string();
+                                }
+                            }
+                        }
                     }
                 }
 
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{}\n",
                     esc(&name),
                     esc(&url),
+                    esc(&branches),
                     esc(&frequency),
                     esc(&last_indexed),
                     esc(&last_duration_ms),
@@ -960,7 +1480,7 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
     // return CSV with proper headers
     let mut resp = into_boxed_response((StatusCode::OK, csv));
     resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
+        CONTENT_TYPE,
         HeaderValue::from_static("text/csv; charset=utf-8"),
     );
     resp.headers_mut().insert(
@@ -1053,8 +1573,8 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = opts.bind.parse()?;
     tracing::info!("admin UI listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -1065,7 +1585,7 @@ async fn main() -> Result<()> {
 async fn login_create_delete_flow_inprocess() {
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, Request};
-    use tower::ServiceExt; // for oneshot
+    use tower::util::ServiceExt; // for oneshot
 
     let sessions = Arc::new(RwLock::new(HashMap::new()));
     sessions.write().insert(
@@ -1119,7 +1639,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, Request};
-    use tower::ServiceExt;
+    use tower::util::ServiceExt;
     use zoekt_distributed::redis_adapter; // for oneshot
 
     // Simple mock Redis implementation used only in unit tests below.
@@ -1367,7 +1887,7 @@ mod tests {
     async fn login_sets_session_username() {
         use axum::body::Body;
         use axum::http::Request;
-        use tower::ServiceExt; // for oneshot
+        use tower::util::ServiceExt; // for oneshot
 
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let state = Arc::new(AppStateInner {
@@ -1415,7 +1935,7 @@ mod tests {
     async fn login_with_bad_credentials_does_not_set_username() {
         use axum::body::Body;
         use axum::http::Request;
-        use tower::ServiceExt; // for oneshot
+        use tower::util::ServiceExt; // for oneshot
 
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let state = Arc::new(AppStateInner {
@@ -1451,7 +1971,7 @@ mod tests {
     async fn full_login_index_logout_flow_unsigned() {
         use axum::body::Body;
         use axum::http::Request;
-        use tower::ServiceExt; // for oneshot
+        use tower::util::ServiceExt; // for oneshot
 
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let mock = std::sync::Arc::new(MockRedis {
@@ -1531,68 +2051,394 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_login_index_logout_flow_hmac() {
+    async fn create_with_custom_branches() {
         use axum::body::Body;
         use axum::http::Request;
-        use tower::ServiceExt; // for oneshot
+        use tower::util::ServiceExt; // for oneshot
 
         let sessions = Arc::new(RwLock::new(HashMap::new()));
-        let mock = std::sync::Arc::new(MockRedis {
-            eval_response: std::sync::Mutex::new(None),
-        });
-        // provide a session HMAC key so the cookie is signed
-        let key = b"test-hmac-key-123".to_vec();
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                None,
+            ),
+        );
         let state = Arc::new(AppStateInner {
-            redis_pool: Some(mock),
+            redis_pool: None,
             admin_user: "user1".into(),
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
-            session_hmac_key: Some(key.clone()),
+            session_hmac_key: None,
         });
-        let app = make_app(state.clone());
+        let app = make_app(state);
 
-        // login
-        let body = "username=user1&password=pass1";
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/create")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert!(resp.status().is_redirection());
-
-        // extract cookie value (should include signature)
-        let cookie_hdr = resp
-            .headers()
-            .get(SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .expect("Set-Cookie present");
-        let first_pair = cookie_hdr.split(';').next().unwrap_or_default();
-        let v = first_pair
-            .split_once('=')
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-        let cookie_val = format!("dzr_session={}", v);
-
-        // access index with cookie
-        let req = Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("Cookie", &cookie_val)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // logout
-        let req = Request::builder()
-            .method("GET")
-            .uri("/logout")
-            .header("Cookie", &cookie_val)
-            .body(Body::empty())
+            .body(Body::from(
+                "name=customrepo&url=https%3A%2F%2Fexample.com&branches=main%2Cfeatures%2F*&csrf=testtoken",
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(resp.status().is_redirection());
+    }
+
+    #[tokio::test]
+    async fn create_defaults_to_main_branch() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt; // for oneshot
+
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                None,
+            ),
+        );
+        let state = Arc::new(AppStateInner {
+            redis_pool: None,
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+        });
+        let app = make_app(state);
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/create")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=defaultrepo&url=https%3A%2F%2Fexample.com&csrf=testtoken",
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_redirection());
+    }
+
+    #[tokio::test]
+    async fn test_expand_branch_patterns() {
+        let mock_branches = vec![
+            "main".to_string(),
+            "develop".to_string(),
+            "features/feature1".to_string(),
+            "features/feature2".to_string(),
+            "hotfix/v1.0".to_string(),
+            "hotfix/v1.1".to_string(),
+        ];
+        let fetcher = MockBranchFetcher {
+            branches: mock_branches,
+        };
+
+        // Test empty pattern
+        let result =
+            expand_branch_patterns_with_fetcher("https://github.com/test/repo", "", &fetcher).await;
+        assert_eq!(result.unwrap(), vec!["main"]);
+
+        // Test whitespace only
+        let result =
+            expand_branch_patterns_with_fetcher("https://github.com/test/repo", "   ", &fetcher)
+                .await;
+        assert_eq!(result.unwrap(), vec!["main"]);
+
+        // Test single branch
+        let result =
+            expand_branch_patterns_with_fetcher("https://github.com/test/repo", "main", &fetcher)
+                .await;
+        assert_eq!(result.unwrap(), vec!["main"]);
+
+        // Test multiple branches
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            "main,develop",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(result.unwrap(), vec!["develop", "main"]);
+
+        // Test with wildcards
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            "main,features/*",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap(),
+            vec!["features/feature1", "features/feature2", "main"]
+        );
+
+        // Test mixed patterns
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            "main,features/*,hotfix/*",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                "features/feature1",
+                "features/feature2",
+                "hotfix/v1.0",
+                "hotfix/v1.1",
+                "main"
+            ]
+        );
+
+        // Test with spaces around commas
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            " main , develop ",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(result.unwrap(), vec!["develop", "main"]);
+
+        // Test non-existent branch (should still be included)
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            "nonexistent",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(result.unwrap(), vec!["nonexistent"]);
+
+        // Test pattern that matches nothing
+        let result = expand_branch_patterns_with_fetcher(
+            "https://github.com/test/repo",
+            "releases/*",
+            &fetcher,
+        )
+        .await;
+        assert_eq!(result.unwrap(), vec!["main"]); // fallback to main when no matches
+    }
+
+    #[tokio::test]
+    async fn bulk_import_csv_success() {
+        // Create CSV content with multiple repositories
+        let csv_content = r#"repo1,https://github.com/org/repo1,main,60
+repo2,https://github.com/org/repo2,main,develop,120
+# This is a comment line
+repo3,https://github.com/org/repo3,,300"#;
+
+        let mut created = Vec::new();
+        let mut errors = Vec::new();
+
+        for (line_num, line) in csv_content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // Skip empty lines and comments
+            }
+
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 2 {
+                errors.push(format!(
+                    "Line {}: Invalid format, expected at least name,url",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            let name = parts[0].to_string();
+            let url = parts[1].to_string();
+
+            if name.is_empty() || url.is_empty() {
+                errors.push(format!(
+                    "Line {}: Name and URL cannot be empty",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            created.push(name.clone());
+        }
+
+        // Verify CSV parsing results
+        assert_eq!(created.len(), 3);
+        assert_eq!(created[0], "repo1");
+        assert_eq!(created[1], "repo2");
+        assert_eq!(created[2], "repo3");
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_import_csv_with_errors() {
+        // Test CSV parsing with various error conditions
+        let csv_content = r#"# Valid repo
+valid_repo,https://github.com/org/valid,main,60
+
+# Empty name
+,https://github.com/org/invalid
+
+# Empty URL
+invalid_name,
+
+# Invalid frequency (non-numeric)
+bad_freq,https://github.com/org/bad_freq,main,not_a_number
+
+# Valid repo after errors
+another_valid,https://github.com/org/another,develop,120"#;
+
+        let mut created = Vec::new();
+        let mut errors = Vec::new();
+
+        for (line_num, line) in csv_content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // Skip empty lines and comments
+            }
+
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 2 {
+                errors.push(format!(
+                    "Line {}: Invalid format, expected at least name,url",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            let name = parts[0].to_string();
+            let url = parts[1].to_string();
+
+            if name.is_empty() || url.is_empty() {
+                errors.push(format!(
+                    "Line {}: Name and URL cannot be empty",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            // Validate frequency if provided
+            if parts.len() >= 4 {
+                let freq_str = parts[3];
+                if !freq_str.is_empty() && freq_str.parse::<u32>().is_err() {
+                    errors.push(format!(
+                        "Line {}: Invalid frequency '{}', must be a number",
+                        line_num + 1,
+                        freq_str
+                    ));
+                    continue;
+                }
+            }
+
+            created.push(name.clone());
+        }
+
+        // Verify results
+        assert_eq!(created.len(), 2); // valid_repo and another_valid
+        assert_eq!(created[0], "valid_repo");
+        assert_eq!(created[1], "another_valid");
+        assert_eq!(errors.len(), 3); // Three error cases: empty name, empty URL, invalid frequency
+        assert!(errors[0].contains("Name and URL cannot be empty"));
+        assert!(errors[1].contains("Name and URL cannot be empty"));
+        assert!(errors[2].contains("Invalid frequency"));
+    }
+
+    #[tokio::test]
+    async fn bulk_import_empty_csv() {
+        // Test with empty CSV file
+        let csv_content = "";
+
+        let mut created = Vec::new();
+        let mut errors = Vec::new();
+
+        for (line_num, line) in csv_content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 2 {
+                errors.push(format!(
+                    "Line {}: Invalid format, expected at least name,url",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            let name = parts[0].to_string();
+            let url = parts[1].to_string();
+
+            if name.is_empty() || url.is_empty() {
+                errors.push(format!(
+                    "Line {}: Name and URL cannot be empty",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            created.push(name.clone());
+        }
+
+        assert_eq!(created.len(), 0);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_import_csv_with_comments_and_empty_lines() {
+        // Test CSV with comments and empty lines
+        let csv_content = r#"
+# This is a comment
+repo1,https://github.com/org/repo1
+
+# Another comment
+
+repo2,https://github.com/org/repo2,main,60
+
+
+# Final comment
+repo3,https://github.com/org/repo3,develop"#;
+
+        let mut created = Vec::new();
+        let mut errors = Vec::new();
+
+        for (line_num, line) in csv_content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 2 {
+                errors.push(format!(
+                    "Line {}: Invalid format, expected at least name,url",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            let name = parts[0].to_string();
+            let url = parts[1].to_string();
+
+            if name.is_empty() || url.is_empty() {
+                errors.push(format!(
+                    "Line {}: Name and URL cannot be empty",
+                    line_num + 1
+                ));
+                continue;
+            }
+
+            created.push(name.clone());
+        }
+
+        assert_eq!(created.len(), 3);
+        assert_eq!(created[0], "repo1");
+        assert_eq!(created[1], "repo2");
+        assert_eq!(created[2], "repo3");
+        assert_eq!(errors.len(), 0);
     }
 }

@@ -825,8 +825,9 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:3000".into());
     tracing::info!(binding = %bind_addr, "starting http search server");
-    let addr = bind_addr.parse().expect("invalid bind address");
-    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+    let addr: std::net::SocketAddr = bind_addr.parse().expect("invalid bind address");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let server = axum::serve(listener, app);
 
     // run server until interrupted; if it returns, propagate error
     tokio::select! {

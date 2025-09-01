@@ -37,6 +37,7 @@
             background: var(--bg);
             color: var(--text);
             transition: background-color .28s ease, color .28s ease;
+            font-size: 14px;
         }
 
         .container {
@@ -115,7 +116,7 @@
         /* create form: put inputs on one line */
         #create-form {
             display: flex;
-            gap: 12px;
+            gap: 8px;
             align-items: center;
             flex-wrap: wrap
         }
@@ -124,16 +125,25 @@
             margin: 0;
             display: flex;
             align-items: center;
-            gap: 8px
+            gap: 8px;
+            white-space: nowrap;
         }
 
         #create-form input[name="name"] {
-            width: 180px
+            width: 120px
         }
 
         #create-form input[name="url"] {
             flex: 1;
-            min-width: 260px
+            min-width: 180px
+        }
+
+        #create-form input[name="frequency"] {
+            width: 60px
+        }
+
+        #create-form input[name="branches"] {
+            width: 140px
         }
 
         button {
@@ -199,6 +209,7 @@
                     <tr>
                         <th class="sortable" data-type="text">Name</th>
                         <th class="sortable" data-type="text">URL</th>
+                        <th class="sortable" data-type="text">Branches</th>
                         <th class="sortable numeric" data-type="number">Frequency (min)</th>
                         <th class="sortable" data-type="date">Last indexed</th>
                         <th class="sortable numeric" data-type="number">Last duration (ms)</th>
@@ -218,11 +229,27 @@
             <form id="create-form" method="post" action="/create">
                 <label>Name: <input type="text" name="name" placeholder="my-repo" required /></label>
                 <label>URL: <input type="url" name="url" placeholder="https://example.com/repo.git" required /></label>
-                <label>Frequency (min): <input type="number" name="frequency" min="1" step="1" value="60"
-                        required /></label>
+                <label>Freq: <input type="number" name="frequency" min="1" step="1" value="60" required /></label>
+                <label>Branches: <input type="text" name="branches" value="main"
+                        placeholder="main,features/*" /></label>
                 <input type="hidden" name="csrf" value="{{CSRF}}" />
                 <button type="submit">Add</button>
             </form>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <div class="card">
+            <h2>Bulk import from CSV</h2>
+            <form id="bulk-import-form" enctype="multipart/form-data" method="post" action="/bulk-import">
+                <label>CSV File: <input type="file" name="csv_file" accept=".csv" required /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <button type="submit">Import CSV</button>
+            </form>
+            <div style="margin-top: 8px; font-size: 12px; color: var(--muted)">
+                CSV format: name,url,branches,frequency<br>
+                Example: my-repo,https://github.com/user/repo.git,main,60
+            </div>
         </div>
     </div>
 </body>

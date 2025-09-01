@@ -56,16 +56,17 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     } catch (e) { /* ignore parse errors */ }
 
-    function makeRow(name, url, csrf, freq, lastIndexed, lastDurMs, leased) {
+    function makeRow(name, url, csrf, freq, lastIndexed, lastDurMs, leased, branches) {
         const tr = document.createElement('tr');
         // ensure a stable key on the row so client-side diffs can match server-rendered rows
         tr.dataset.name = name;
-        // lastDurMs maps to fifth column, memory (formatted) will be sixth, leased seventh
+        // lastDurMs maps to fifth column, memory (formatted) will be sixth, leased seventh, branches eighth
         const memRaw = (lastDurMs && typeof lastDurMs === 'object' && lastDurMs.memory_bytes !== undefined) ? String(lastDurMs.memory_bytes) : '';
         const memDisplay = (lastDurMs && typeof lastDurMs === 'object' && lastDurMs.memory_display) ? String(lastDurMs.memory_display) : '';
         // Fallback when server supplied scalar values for last_duration or memory
         const lastDurVal = (typeof lastDurMs === 'number' || typeof lastDurMs === 'string') ? lastDurMs : '';
-        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(String(freq || ''))}</td><td>${escapeHtml(String(lastIndexed || ''))}</td><td>${escapeHtml(String(lastDurVal || ''))}</td><td class="numeric memory" data-bytes="${escapeHtml(memRaw)}" title="${escapeHtml(memRaw)}">${escapeHtml(memDisplay || '')}</td><td>${escapeHtml(String(leased || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
+        const branchesVal = (typeof branches === 'string') ? branches : '';
+        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td>${escapeHtml(String(lastIndexed || ''))}</td><td>${escapeHtml(String(lastDurVal || ''))}</td><td class="numeric memory" data-bytes="${escapeHtml(memRaw)}" title="${escapeHtml(memRaw)}">${escapeHtml(memDisplay || '')}</td><td>${escapeHtml(String(leased || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
         return tr;
     }
 
@@ -107,11 +108,61 @@ document.addEventListener('DOMContentLoaded', function () {
             }).then(data => {
                 // append row (guard in case table body missing)
                 if (repoTableBody) {
-                    repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, data.last_indexed, data.last_duration_ms, data.leased_node));
+                    const branches = formData.get('branches') || 'main';
+                    repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, data.last_indexed, data.last_duration_ms, data.leased_node, branches));
                     // reapply current sort if any
                     applyCurrentSort();
                 }
                 createForm.reset();
+            }).catch(err => alert(err && err.message ? err.message : String(err)));
+        });
+    }
+
+    const bulkImportForm = document.getElementById('bulk-import-form');
+    if (bulkImportForm) {
+        bulkImportForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            const formData = new FormData(bulkImportForm);
+            fetch('/bulk-import', {
+                method: 'POST',
+                body: formData,
+                credentials: 'same-origin',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json'
+                }
+            }).then(r => {
+                if (r.ok) {
+                    return r.json();
+                }
+                // Try to parse JSON error body
+                return r.json().then(j => {
+                    let msg = 'Bulk import failed';
+                    if (j && j.error) {
+                        msg = `Bulk import failed: ${j.error}`;
+                    } else if (j && j.details) {
+                        msg = `Bulk import completed with issues:\n${j.details.join('\n')}`;
+                    } else {
+                        msg = `Bulk import failed: ${r.status} ${r.statusText}`;
+                    }
+                    throw new Error(msg);
+                }).catch(() => {
+                    throw new Error(`Bulk import failed: ${r.status} ${r.statusText}`);
+                });
+            }).then(data => {
+                let msg = `Bulk import completed successfully!\n`;
+                if (data.created && data.created.length > 0) {
+                    msg += `Created: ${data.created.length} repositories\n`;
+                }
+                if (data.errors && data.errors.length > 0) {
+                    msg += `Errors: ${data.errors.length} repositories failed\n`;
+                    msg += `Details: ${data.errors.join(', ')}`;
+                }
+                alert(msg);
+                // Refresh the table to show new repositories
+                if (window.location) {
+                    window.location.reload();
+                }
             }).catch(err => alert(err && err.message ? err.message : String(err)));
         });
     }
@@ -340,15 +391,20 @@ document.addEventListener('DOMContentLoaded', function () {
                 // update fields if changed
                 const row = incoming.get(name);
                 seen.add(name);
-                // cells: 0=name,1=url,2=freq,3=lastIndexed,4=lastDuration,5=memory,6=leased,7=actions
+                // cells: 0=name,1=url,2=branches,3=freq,4=lastIndexed,5=lastDuration,6=memory,7=leased,8=actions
                 const urlCell = tr.children[1];
-                const freqCell = tr.children[2];
-                const lastIndexedCell = tr.children[3];
-                const lastDurCell = tr.children[4];
-                const memCell = tr.children[5];
-                const leasedCell = tr.children[6];
+                const branchesCell = tr.children[2];
+                const freqCell = tr.children[3];
+                const lastIndexedCell = tr.children[4];
+                const lastDurCell = tr.children[5];
+                const memCell = tr.children[6];
+                const leasedCell = tr.children[7];
 
                 if (urlCell && row.url !== undefined && urlCell.textContent !== String(row.url)) urlCell.textContent = String(row.url);
+                if (branchesCell) {
+                    const want = row.branches == null ? '' : String(row.branches);
+                    if (branchesCell.textContent !== want) branchesCell.textContent = want;
+                }
                 if (freqCell) {
                     const want = row.frequency == null ? '' : String(row.frequency);
                     if (freqCell.textContent !== want) freqCell.textContent = want;
@@ -378,7 +434,7 @@ document.addEventListener('DOMContentLoaded', function () {
             for (const [name, row] of incoming) {
                 if (seen.has(name)) continue;
                 const memObj = { memory_bytes: row.memory_bytes, memory_display: row.memory_display };
-                const newRow = makeRow(row.name, row.url, document.querySelector('input[name="csrf"]').value || '', row.frequency, row.last_indexed, memObj, row.leased_node);
+                const newRow = makeRow(row.name, row.url, document.querySelector('input[name="csrf"]').value || '', row.frequency, row.last_indexed, memObj, row.leased_node, row.branches);
                 // if a sort is active, insert in sorted position; otherwise append
                 if (tableSortState.idx >= 0) {
                     // find first existing row that should come after newRow
