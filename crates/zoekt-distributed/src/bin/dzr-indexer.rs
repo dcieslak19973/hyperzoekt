@@ -318,9 +318,17 @@ async fn main() -> Result<()> {
 
     let opts = Opts::parse();
 
+    // determine bind address from CLI flag, env var, or default
+    let _bind_addr = opts
+        .listen
+        .clone()
+        .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:3000".into());
+
     let cfg = zoekt_distributed::load_node_config(
         NodeConfig {
             node_type: NodeType::Indexer,
+            endpoint: None, // Let NodeConfig discover the endpoint automatically
             ..Default::default()
         },
         zoekt_distributed::MergeOpts {
@@ -328,6 +336,7 @@ async fn main() -> Result<()> {
             cli_id: opts.id,
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
+            cli_endpoint: opts.listen.as_ref().map(|addr| format!("http://{}", addr)), // Only override if explicitly provided
         },
     )?;
 

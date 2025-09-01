@@ -359,6 +359,7 @@ impl<'a> ShardSearcher<'a> {
                                 start: *start,
                                 line: *line,
                             }),
+                            score: 2.0, // Higher score for symbol matches
                         });
                     }
                 }

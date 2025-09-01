@@ -18,6 +18,8 @@ pub struct QueryResult {
     pub symbol: Option<String>,
     /// optional symbol location with offsets/line when available
     pub symbol_loc: Option<crate::types::Symbol>,
+    /// relevance score for ranking (higher is better)
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

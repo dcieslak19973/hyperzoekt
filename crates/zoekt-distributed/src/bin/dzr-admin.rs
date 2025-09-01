@@ -1015,6 +1015,7 @@ async fn main() -> Result<()> {
             cli_id: opts.id,
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
+            cli_endpoint: None,
         },
     )?;
 

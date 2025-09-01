@@ -136,6 +136,54 @@ impl LeaseManager {
         *guard = Some(s);
     }
 
+    /// Set or update indexer endpoint in the `zoekt:indexers` hash. This will merge
+    /// with any existing JSON blob and set the endpoint and last_heartbeat.
+    pub async fn set_indexer_endpoint(&self, node_id: &str, endpoint: &str) {
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:indexers";
+                // Fetch existing meta if present
+                let existing: Option<String> = conn.hget(key, node_id).await.ok().flatten();
+                let mut v = if let Some(s) = existing {
+                    serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
+                } else {
+                    json!({})
+                };
+                v["endpoint"] = json!(endpoint);
+                v["last_heartbeat"] = json!(chrono::Utc::now().timestamp_millis());
+                // Persist back (ignore errors)
+                let _ = deadpool_redis::redis::cmd("HSET")
+                    .arg(key)
+                    .arg(node_id)
+                    .arg(v.to_string())
+                    .query_async::<i32>(&mut conn)
+                    .await;
+            }
+        }
+    }
+
+    /// Get all indexer endpoints from the `zoekt:indexers` hash.
+    /// Returns a map of node_id to endpoint URL.
+    pub async fn get_indexer_endpoints(&self) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:indexers";
+                let all: RedisResult<HashMap<String, String>> = conn.hgetall(key).await;
+                if let Ok(map) = all {
+                    for (node_id, json_str) in map {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                            if let Some(endpoint) = v.get("endpoint").and_then(|e| e.as_str()) {
+                                result.insert(node_id, endpoint.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn repo_key(repo: &RemoteRepo) -> String {
         base64::engine::general_purpose::URL_SAFE.encode(format!("{}|{}", repo.name, repo.git_url))
     }
@@ -278,6 +326,7 @@ pub struct NodeConfig {
     pub lease_ttl: Duration,
     pub poll_interval: Duration,
     pub node_type: NodeType,
+    pub endpoint: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -287,6 +336,10 @@ impl Default for NodeConfig {
         // - ZOEKTD_NODE_ID
         // - ZOEKTD_LEASE_TTL_SECONDS
         // - ZOEKTD_POLL_INTERVAL_SECONDS
+        // - ZOEKTD_ENDPOINT (manual override)
+        // - ZOEKTD_SERVICE_NAME (for k8s service discovery)
+        // - ZOEKTD_SERVICE_PORT (for k8s service discovery)
+        // - ZOEKTD_SERVICE_PROTOCOL (http/https, defaults to http)
         let id = std::env::var("ZOEKTD_NODE_ID").unwrap_or_else(|_| "node-1".into());
         let lease_ttl = std::env::var("ZOEKTD_LEASE_TTL_SECONDS")
             .ok()
@@ -299,14 +352,27 @@ impl Default for NodeConfig {
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(5));
 
+        let node_type: NodeType = std::env::var("ZOEKTD_NODE_TYPE")
+            .ok()
+            .and_then(|s| s.parse::<NodeType>().ok())
+            .unwrap_or(NodeType::Indexer);
+
+        // Determine endpoint: manual override takes precedence, then try k8s auto-discovery
+        let endpoint = if let Ok(manual_endpoint) = std::env::var("ZOEKTD_ENDPOINT") {
+            Some(manual_endpoint)
+        } else if node_type == NodeType::Indexer {
+            // Try Kubernetes service discovery for indexers
+            Self::discover_kubernetes_endpoint()
+        } else {
+            None
+        };
+
         Self {
             id,
             lease_ttl,
             poll_interval,
-            node_type: std::env::var("ZOEKTD_NODE_TYPE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(NodeType::Indexer),
+            node_type,
+            endpoint,
         }
     }
 }
@@ -319,14 +385,124 @@ pub enum NodeType {
 }
 
 impl std::str::FromStr for NodeType {
-    type Err = ();
+    type Err = String;
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
+        match s.to_lowercase().as_str() {
             "indexer" => Ok(NodeType::Indexer),
             "admin" => Ok(NodeType::Admin),
             "search" => Ok(NodeType::Search),
-            _ => Err(()),
+            _ => Err(format!("Unknown node type: {}", s)),
         }
+    }
+}
+
+impl NodeConfig {
+    /// Attempt to auto-discover the endpoint using Kubernetes service environment variables.
+    /// This supports both direct service discovery and custom service name configuration.
+    /// For StatefulSets, each pod discovers its own individual endpoint.
+    fn discover_kubernetes_endpoint() -> Option<String> {
+        let protocol = std::env::var("ZOEKTD_SERVICE_PROTOCOL").unwrap_or_else(|_| "http".into());
+
+        // First, try using ZOEKTD_SERVICE_NAME if explicitly set
+        if let Ok(service_name) = std::env::var("ZOEKTD_SERVICE_NAME") {
+            let normalized_service_name = service_name.replace("-", "_").to_uppercase();
+            let service_host_env = format!("{}_SERVICE_HOST", normalized_service_name);
+            let service_port_env = format!("{}_SERVICE_PORT", normalized_service_name);
+
+            if let (Ok(host), Ok(port)) = (
+                std::env::var(&service_host_env),
+                std::env::var(&service_port_env),
+            ) {
+                tracing::info!(service_name = %service_name, host = %host, port = %port, protocol = %protocol, "discovered kubernetes service endpoint");
+                return Some(format!("{}://{}:{}", protocol, host, port));
+            } else {
+                tracing::warn!(service_name = %service_name, "kubernetes service environment variables not found");
+            }
+        }
+
+        // For StatefulSets: try to discover pod-specific endpoint
+        // Each pod in a StatefulSet gets a stable DNS name like: <statefulset-name>-<ordinal>.<service-name>
+        if let Some(pod_endpoint) = Self::discover_statefulset_pod_endpoint(&protocol) {
+            return Some(pod_endpoint);
+        }
+
+        // Fallback: try common Kubernetes service patterns
+        // Look for any environment variables that match the pattern *_SERVICE_HOST
+        for (key, value) in std::env::vars() {
+            if key.ends_with("_SERVICE_HOST") && !key.starts_with("KUBERNETES_") {
+                let service_name = key.trim_end_matches("_SERVICE_HOST").to_lowercase();
+                let port_env = format!("{}_SERVICE_PORT", service_name.to_uppercase());
+
+                if let Ok(port) = std::env::var(&port_env) {
+                    let protocol =
+                        std::env::var("ZOEKTD_SERVICE_PROTOCOL").unwrap_or_else(|_| "http".into());
+                    tracing::info!(service_name = %service_name, host = %value, port = %port, protocol = %protocol, "auto-discovered kubernetes service endpoint");
+                    return Some(format!("{}://{}:{}", protocol, value, port));
+                }
+            }
+        }
+
+        tracing::debug!("no kubernetes service endpoint discovered, will use manual configuration");
+        None
+    }
+
+    /// Discover the endpoint for a StatefulSet pod using pod metadata and service information.
+    /// Each pod in a StatefulSet gets a stable DNS name: <pod-name>.<service-name>
+    fn discover_statefulset_pod_endpoint(protocol: &str) -> Option<String> {
+        // Try to get pod name from environment (injected by Downward API or via env)
+        let pod_name = std::env::var("POD_NAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok()?;
+
+        // Try to get namespace
+        let namespace = std::env::var("POD_NAMESPACE")
+            .or_else(|_| std::env::var("NAMESPACE"))
+            .unwrap_or_else(|_| "default".into());
+
+        // Try to get service name from various sources
+        let service_name = std::env::var("ZOEKTD_SERVICE_NAME")
+            .or_else(|_| {
+                // Try to infer from pod name (remove ordinal suffix)
+                pod_name
+                    .rfind('-')
+                    .map(|pos| pod_name[..pos].to_string())
+                    .ok_or_else(|| "Could not infer service name from pod name".to_string())
+            })
+            .or_else(|_| {
+                // Look for service environment variables and infer service name
+                std::env::vars()
+                    .find(|(key, _)| {
+                        key.ends_with("_SERVICE_HOST") && !key.starts_with("KUBERNETES_")
+                    })
+                    .map(|(key, _)| key.trim_end_matches("_SERVICE_HOST").to_lowercase())
+                    .ok_or_else(|| "No service environment variables found".to_string())
+            })
+            .ok()?;
+
+        // Try to get port from service environment variables
+        let service_port_env = format!(
+            "{}_SERVICE_PORT",
+            service_name.replace("-", "_").to_uppercase()
+        );
+        let port = std::env::var(&service_port_env)
+            .or_else(|_| std::env::var("ZOEKTD_SERVICE_PORT"))
+            .unwrap_or_else(|_| "8080".into());
+
+        // Construct the pod-specific DNS name for StatefulSet
+        let pod_dns = format!("{}.{}.svc.cluster.local", pod_name, service_name);
+
+        tracing::info!(
+            pod_name = %pod_name,
+            service_name = %service_name,
+            namespace = %namespace,
+            pod_dns = %pod_dns,
+            port = %port,
+            protocol = %protocol,
+            "discovered statefulset pod endpoint"
+        );
+
+        Some(format!("{}://{}:{}", protocol, pod_dns, port))
     }
 }
 
@@ -356,7 +532,24 @@ impl<I: Indexer> Node<I> {
     /// Run the node loop for `duration`. Async version for use in async apps/tests.
     pub async fn run_for(&self, duration: Duration) -> Result<()> {
         let start = std::time::Instant::now();
+        // If this is an indexer with an endpoint, register it
+        if self.config.node_type == NodeType::Indexer {
+            if let Some(ref endpoint) = self.config.endpoint {
+                tracing::info!(node_id = %self.config.id, endpoint = %endpoint, "registering indexer endpoint");
+                let _ = self
+                    .lease_mgr
+                    .set_indexer_endpoint(&self.config.id, endpoint)
+                    .await;
+            }
+        }
         while start.elapsed() < duration {
+            // Periodically update endpoint if indexer
+            if self.config.node_type == NodeType::Indexer && self.config.endpoint.is_some() {
+                let _ = self
+                    .lease_mgr
+                    .set_indexer_endpoint(&self.config.id, self.config.endpoint.as_ref().unwrap())
+                    .await;
+            }
             let repos = self.repos.read().clone();
             for repo in repos {
                 // If the repo git_url points to a local path (absolute path or file://) we skip
@@ -519,6 +712,7 @@ fn looks_like_remote_git_url(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Once;
     use std::sync::{
@@ -526,6 +720,43 @@ mod tests {
         Arc,
     };
     use tracing_subscriber::EnvFilter;
+
+    /// Test helper to manage environment variables and ensure proper cleanup
+    struct EnvGuard {
+        original_values: HashMap<String, Option<String>>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                original_values: HashMap::new(),
+            }
+        }
+
+        fn save_and_clear(&mut self, vars: &[&str]) {
+            for &var in vars {
+                let original = std::env::var(var).ok();
+                self.original_values.insert(var.to_string(), original);
+                std::env::remove_var(var);
+            }
+        }
+
+        fn set(&self, var: &str, value: &str) {
+            std::env::set_var(var, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Restore original environment variable values
+            for (var, original_value) in &self.original_values {
+                match original_value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
 
     struct FakeIndexer {
         count: Arc<AtomicUsize>,
@@ -575,6 +806,7 @@ mod tests {
             lease_ttl: Duration::from_secs(2),
             poll_interval: Duration::from_millis(10),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
         let node = Node::new(cfg, lease.clone(), FakeIndexer::new());
         let repo = RemoteRepo {
@@ -610,6 +842,7 @@ mod tests {
             lease_ttl: Duration::from_secs(2),
             poll_interval: Duration::from_millis(10),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
 
         // Fake indexer that sleeps briefly to simulate work
@@ -691,12 +924,14 @@ mod tests {
             lease_ttl: Duration::from_secs(1),
             poll_interval: Duration::from_millis(5),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
         let cfg_b = NodeConfig {
             id: "node-b".into(),
             lease_ttl: Duration::from_secs(1),
             poll_interval: Duration::from_millis(5),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
 
         let node_a = Node::new(cfg_a, lease.clone(), idx_a);
@@ -741,5 +976,358 @@ mod tests {
         assert!(!super::looks_like_remote_git_url("/tmp/repo"));
         assert!(!super::looks_like_remote_git_url("file:///tmp/repo"));
         assert!(!super::looks_like_remote_git_url("./relative/path"));
+    }
+
+    #[test]
+    fn test_node_type_from_str() {
+        assert_eq!("indexer".parse::<NodeType>().unwrap(), NodeType::Indexer);
+        assert_eq!("INDEXER".parse::<NodeType>().unwrap(), NodeType::Indexer);
+        assert_eq!("admin".parse::<NodeType>().unwrap(), NodeType::Admin);
+        assert_eq!("search".parse::<NodeType>().unwrap(), NodeType::Search);
+
+        assert!("invalid".parse::<NodeType>().is_err());
+        assert!("".parse::<NodeType>().is_err());
+    }
+
+    #[test]
+    fn test_discover_statefulset_pod_endpoint_success() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "my_service_SERVICE_HOST",
+            "my_service_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Set up environment variables to simulate a StatefulSet pod
+        env_guard.set("POD_NAME", "zoekt-indexer-2");
+        env_guard.set("ZOEKTD_SERVICE_NAME", "zoekt-indexer");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "8080");
+        env_guard.set("ZOEKTD_SERVICE_PROTOCOL", "http");
+
+        let result = NodeConfig::discover_statefulset_pod_endpoint("http");
+        assert_eq!(
+            result,
+            Some("http://zoekt-indexer-2.zoekt-indexer.svc.cluster.local:8080".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_statefulset_pod_endpoint_hostname_fallback() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "my_service_SERVICE_HOST",
+            "my_service_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Test using HOSTNAME instead of POD_NAME
+        env_guard.set("HOSTNAME", "zoekt-indexer-1");
+        env_guard.set("ZOEKTD_SERVICE_NAME", "zoekt-indexer");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "9090");
+
+        let result = NodeConfig::discover_statefulset_pod_endpoint("https");
+        assert_eq!(
+            result,
+            Some("https://zoekt-indexer-1.zoekt-indexer.svc.cluster.local:9090".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_statefulset_pod_endpoint_infer_service_name() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "my_service_SERVICE_HOST",
+            "my_service_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Test inferring service name from pod name
+        env_guard.set("POD_NAME", "my-indexer-0");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "8080");
+
+        let result = NodeConfig::discover_statefulset_pod_endpoint("http");
+        assert_eq!(
+            result,
+            Some("http://my-indexer-0.my-indexer.svc.cluster.local:8080".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_statefulset_pod_endpoint_no_pod_name() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&["POD_NAME", "HOSTNAME"]);
+
+        let result = NodeConfig::discover_statefulset_pod_endpoint("http");
+        assert_eq!(result, None);
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_statefulset_pod_endpoint_no_service_name() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "my_service_SERVICE_HOST",
+            "my_service_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Test when pod name is available but no service name can be determined
+        // Use a pod name that doesn't contain '-' to avoid service name inference
+        env_guard.set("POD_NAME", "singlepodnoordinal");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "8080");
+
+        let result = NodeConfig::discover_statefulset_pod_endpoint("http");
+        assert_eq!(result, None);
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_kubernetes_endpoint_manual_override() {
+        // Clear any existing environment variables that might interfere
+        std::env::remove_var("ZOEKTD_ENDPOINT");
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("HOSTNAME");
+        std::env::remove_var("ZOEKTD_SERVICE_NAME");
+        std::env::remove_var("ZOEKTD_SERVICE_PORT");
+        std::env::remove_var("ZOEKTD_SERVICE_PROTOCOL");
+        std::env::remove_var("ZOEKTD_NODE_TYPE");
+
+        // Test manual override in NodeConfig::default() (not in discover_kubernetes_endpoint directly)
+        std::env::set_var("ZOEKTD_ENDPOINT", "http://custom-endpoint:9999");
+        std::env::set_var("ZOEKTD_NODE_TYPE", "indexer");
+
+        let config = NodeConfig::default();
+        assert_eq!(
+            config.endpoint,
+            Some("http://custom-endpoint:9999".to_string())
+        );
+
+        // Clean up
+        std::env::remove_var("ZOEKTD_ENDPOINT");
+        std::env::remove_var("ZOEKTD_NODE_TYPE");
+    }
+
+    #[test]
+    fn test_discover_kubernetes_endpoint_service_name_priority() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+        ]);
+
+        // Test ZOEKTD_SERVICE_NAME takes priority over auto-discovery
+        env_guard.set("ZOEKTD_SERVICE_NAME", "my-service");
+        env_guard.set("MY_SERVICE_SERVICE_HOST", "10.0.1.1");
+        env_guard.set("MY_SERVICE_SERVICE_PORT", "8080");
+
+        let result = NodeConfig::discover_kubernetes_endpoint();
+        assert_eq!(result, Some("http://10.0.1.1:8080".to_string()));
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_kubernetes_endpoint_statefulset_fallback() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "my_service_SERVICE_HOST",
+            "my_service_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Test StatefulSet discovery as fallback when no service env vars
+        env_guard.set("POD_NAME", "zoekt-indexer-0");
+        env_guard.set("ZOEKTD_SERVICE_NAME", "zoekt-indexer");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "8080");
+
+        let result = NodeConfig::discover_kubernetes_endpoint();
+        assert_eq!(
+            result,
+            Some("http://zoekt-indexer-0.zoekt-indexer.svc.cluster.local:8080".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_kubernetes_endpoint_service_env_vars() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "ZOekt_SERVICE_HOST",
+            "ZOekt_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+            "TESTSERVICE_SERVICE_HOST",
+            "TESTSERVICE_SERVICE_PORT",
+        ]);
+
+        // Test auto-discovery from service environment variables
+        // Use a simple service name to avoid conflicts
+        env_guard.set("testservice_SERVICE_HOST", "10.0.2.1");
+        env_guard.set("TESTSERVICE_SERVICE_PORT", "9090");
+
+        let result = NodeConfig::discover_kubernetes_endpoint();
+        assert_eq!(result, Some("http://10.0.2.1:9090".to_string()));
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_discover_kubernetes_endpoint_no_discovery() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "MY_SERVICE_SERVICE_HOST",
+            "MY_SERVICE_SERVICE_PORT",
+            "zoekt_SERVICE_HOST",
+            "zoekt_SERVICE_PORT",
+            "testservice_SERVICE_HOST",
+            "testservice_SERVICE_PORT",
+        ]);
+
+        // Test when no discovery method works
+        let result = NodeConfig::discover_kubernetes_endpoint();
+        assert_eq!(result, None);
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_node_config_default_with_statefulset_env() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "ZOEKTD_NODE_TYPE",
+        ]);
+
+        // Test NodeConfig::default() with StatefulSet environment
+        env_guard.set("POD_NAME", "zoekt-indexer-1");
+        env_guard.set("ZOEKTD_SERVICE_NAME", "zoekt-indexer");
+        env_guard.set("ZOEKTD_SERVICE_PORT", "8080");
+        env_guard.set("ZOEKTD_NODE_TYPE", "indexer");
+
+        let config = NodeConfig::default();
+        assert_eq!(config.node_type, NodeType::Indexer);
+        assert_eq!(
+            config.endpoint,
+            Some("http://zoekt-indexer-1.zoekt-indexer.svc.cluster.local:8080".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
+    }
+
+    #[test]
+    fn test_node_config_default_manual_endpoint_override() {
+        let mut env_guard = EnvGuard::new();
+        env_guard.save_and_clear(&[
+            "ZOEKTD_ENDPOINT",
+            "POD_NAME",
+            "HOSTNAME",
+            "ZOEKTD_SERVICE_NAME",
+            "ZOEKTD_SERVICE_PORT",
+            "ZOEKTD_SERVICE_PROTOCOL",
+            "ZOEKTD_NODE_TYPE",
+        ]);
+
+        // Test that manual endpoint override works in NodeConfig::default()
+        env_guard.set("ZOEKTD_ENDPOINT", "http://manual-override:9999");
+        env_guard.set("POD_NAME", "zoekt-indexer-0"); // This should be ignored
+
+        let config = NodeConfig::default();
+        assert_eq!(
+            config.endpoint,
+            Some("http://manual-override:9999".to_string())
+        );
+
+        // EnvGuard will automatically clean up when it goes out of scope
     }
 }

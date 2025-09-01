@@ -68,6 +68,7 @@ pub(crate) fn search_plan(
                     path: inner.repo.name.clone(),
                     symbol: None,
                     symbol_loc: None,
+                    score: 1.0,
                 }]
             }
         }
@@ -95,6 +96,7 @@ pub(crate) fn search_plan(
                                                 path: meta.path.display().to_string(),
                                                 symbol: Some(sym.name.clone()),
                                                 symbol_loc: Some(sym.clone()),
+                                                score: 2.0, // Higher score for symbol matches
                                             });
                                         }
                                     }
@@ -117,6 +119,7 @@ pub(crate) fn search_plan(
                                             path: meta.path.display().to_string(),
                                             symbol: Some(sym.name.clone()),
                                             symbol_loc: Some(sym.clone()),
+                                            score: 2.0, // Higher score for symbol matches
                                         });
                                     }
                                 }
@@ -143,6 +146,7 @@ pub(crate) fn search_plan(
                                             path: meta.path.display().to_string(),
                                             symbol: Some(sym.name.clone()),
                                             symbol_loc: Some(sym.clone()),
+                                            score: 2.0, // Higher score for symbol matches
                                         });
                                     }
                                 }
@@ -165,6 +169,7 @@ pub(crate) fn search_plan(
                                         path: meta.path.display().to_string(),
                                         symbol: Some(sym.name.clone()),
                                         symbol_loc: Some(sym.clone()),
+                                        score: 2.0, // Higher score for symbol matches
                                     });
                                 }
                             }
@@ -176,6 +181,7 @@ pub(crate) fn search_plan(
                                 path: meta.path.display().to_string(),
                                 symbol: Some(sym.name.clone()),
                                 symbol_loc: Some(sym.clone()),
+                                score: 2.0, // Higher score for symbol matches
                             });
                         }
                     }
@@ -192,6 +198,7 @@ pub(crate) fn search_plan(
                     path: meta.path.display().to_string(),
                     symbol: None,
                     symbol_loc: None,
+                    score: 1.0, // Lower score for file matches
                 })
             })
             .collect(),

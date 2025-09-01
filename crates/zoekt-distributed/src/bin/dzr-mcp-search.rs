@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let opts = Opts::parse();
 
-    let cfg = zoekt_distributed::load_node_config(
+    let _cfg = zoekt_distributed::load_node_config(
         NodeConfig {
             node_type: NodeType::Search,
             ..Default::default()
@@ -31,13 +31,14 @@ async fn main() -> Result<()> {
             cli_id: opts.id,
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
+            cli_endpoint: None,
         },
     )?;
 
     let _lease_mgr = LeaseManager::new().await;
 
-    // MCP search placeholder
-    tracing::info!("started mcp search node: {}", cfg.id);
+    // MCP search placeholder - implement MCP protocol for distributed search
+    tracing::info!("started mcp search node");
     tokio::time::sleep(Duration::from_secs(5)).await;
     Ok(())
 }

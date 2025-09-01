@@ -39,6 +39,7 @@ impl<'a> Searcher<'a> {
                     path: meta.path.display().to_string(),
                     symbol: None,
                     symbol_loc: None,
+                    score: 1.0, // Default score for basic file matches
                 })
             })
             .collect()

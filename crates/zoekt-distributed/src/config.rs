@@ -12,6 +12,7 @@ pub struct MergeOpts {
     pub cli_id: Option<String>,
     pub cli_lease_ttl_seconds: Option<u64>,
     pub cli_poll_interval_seconds: Option<u64>,
+    pub cli_endpoint: Option<String>,
 }
 
 /// Load and merge NodeConfig from: defaults <- config file <- env vars <- CLI
@@ -28,6 +29,9 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
             }
             if let Some(p) = v.get("poll_interval_seconds").and_then(|x| x.as_integer()) {
                 base.poll_interval = Duration::from_secs(p as u64);
+            }
+            if let Some(e) = v.get("endpoint").and_then(|x| x.as_str()) {
+                base.endpoint = Some(e.to_string());
             }
         }
     }
@@ -46,6 +50,9 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
             base.poll_interval = Duration::from_secs(v);
         }
     }
+    if let Ok(e) = std::env::var("ZOEKTD_ENDPOINT") {
+        base.endpoint = Some(e);
+    }
 
     // CLI overrides everything
     if let Some(id) = opts.cli_id {
@@ -56,6 +63,9 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
     }
     if let Some(pi) = opts.cli_poll_interval_seconds {
         base.poll_interval = Duration::from_secs(pi);
+    }
+    if let Some(e) = opts.cli_endpoint {
+        base.endpoint = Some(e);
     }
 
     // NodeType may still be set by the caller
@@ -93,6 +103,7 @@ mod tests {
             lease_ttl: Duration::from_secs(150),
             poll_interval: Duration::from_secs(5),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
 
         // create a temp file with config
@@ -115,6 +126,7 @@ poll_interval_seconds = 3
             cli_id: Some("from_cli".into()),
             cli_lease_ttl_seconds: Some(33),
             cli_poll_interval_seconds: Some(5),
+            cli_endpoint: None,
         };
 
         let got = load_node_config(base, opts).expect("load");
@@ -143,6 +155,7 @@ poll_interval_seconds = 3
             lease_ttl: Duration::from_secs(150),
             poll_interval: Duration::from_secs(5),
             node_type: NodeType::Indexer,
+            endpoint: None,
         };
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let toml = r#"
@@ -163,6 +176,7 @@ poll_interval_seconds = 2
             cli_id: None,
             cli_lease_ttl_seconds: None,
             cli_poll_interval_seconds: None,
+            cli_endpoint: None,
         };
         let got = load_node_config(base, opts).expect("load");
         // env should override file for id
@@ -205,6 +219,7 @@ poll_interval_seconds = 1
             cli_id: None,
             cli_lease_ttl_seconds: Some(99),
             cli_poll_interval_seconds: Some(7),
+            cli_endpoint: None,
         };
 
         let got = load_node_config(base, opts).expect("load");
@@ -246,6 +261,7 @@ poll_interval_seconds = 6
             cli_id: None,
             cli_lease_ttl_seconds: None,
             cli_poll_interval_seconds: None,
+            cli_endpoint: None,
         };
 
         let got = load_node_config(base, opts).expect("load");
