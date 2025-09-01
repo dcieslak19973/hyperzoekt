@@ -161,7 +161,8 @@ jobs:
               await github.rest.checks.create({
                 owner,
                 repo,
-                name: 'CI (aggregated)',
+                // Report the aggregated result under the top-level required check name
+                name: 'CI',
                 head_sha: sha,
                 status: 'completed',
                 conclusion,
