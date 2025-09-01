@@ -67,10 +67,22 @@ mod tests {
     use super::*;
     use crate::NodeType;
     use std::time::Duration;
+    use tracing_subscriber::EnvFilter;
+
+    fn init_test_logging() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        });
+    }
 
     #[test]
     #[serial_test::serial]
     fn test_merge_file_env_cli_precedence() {
+        init_test_logging();
+        tracing::info!("TEST START: config::tests::test_merge_file_env_cli_precedence");
         // ensure a clean environment for the test
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
@@ -113,11 +125,14 @@ poll_interval_seconds = 3
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
         std::env::remove_var("ZOEKTD_POLL_INTERVAL_SECONDS");
+        tracing::info!("TEST END: config::tests::test_merge_file_env_cli_precedence");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_file_then_env() {
+        init_test_logging();
+        tracing::info!("TEST START: config::tests::test_file_then_env");
         // ensure a clean environment for the test
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
@@ -157,11 +172,14 @@ poll_interval_seconds = 2
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
         std::env::remove_var("ZOEKTD_POLL_INTERVAL_SECONDS");
+        tracing::info!("TEST END: config::tests::test_file_then_env");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_ttl_and_poll_precedence_file_env_cli() {
+        init_test_logging();
+        tracing::info!("TEST START: config::tests::test_ttl_and_poll_precedence_file_env_cli");
         // ensure a clean environment for the test
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
@@ -197,11 +215,14 @@ poll_interval_seconds = 1
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
         std::env::remove_var("ZOEKTD_POLL_INTERVAL_SECONDS");
+        tracing::info!("TEST END: config::tests::test_ttl_and_poll_precedence_file_env_cli");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_invalid_env_is_ignored() {
+        init_test_logging();
+        tracing::info!("TEST START: config::tests::test_invalid_env_is_ignored");
         // ensure a clean environment for the test
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
@@ -235,5 +256,6 @@ poll_interval_seconds = 6
         std::env::remove_var("ZOEKTD_NODE_ID");
         std::env::remove_var("ZOEKTD_LEASE_TTL_SECONDS");
         std::env::remove_var("ZOEKTD_POLL_INTERVAL_SECONDS");
+        tracing::info!("TEST END: config::tests::test_invalid_env_is_ignored");
     }
 }

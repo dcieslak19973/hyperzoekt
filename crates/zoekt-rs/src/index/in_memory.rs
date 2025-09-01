@@ -70,4 +70,22 @@ impl InMemoryIndex {
         let inner = self.inner.read();
         inner.docs.iter().map(|d| d.size).sum()
     }
+
+    /// Public accessor to retrieve a cloned DocumentMeta for a given doc index.
+    pub fn doc_meta(&self, doc_idx: usize) -> Option<crate::types::DocumentMeta> {
+        let inner = self.inner.read();
+        inner.docs.get(doc_idx).cloned()
+    }
+
+    /// Public accessor to retrieve in-memory doc content for a given doc index, if present.
+    pub fn doc_content(&self, doc_idx: usize) -> Option<String> {
+        let inner = self.inner.read();
+        inner.doc_contents.get(doc_idx).and_then(|o| o.clone())
+    }
+
+    /// Public accessor to retrieve the repo root path for this index.
+    pub fn repo_root(&self) -> std::path::PathBuf {
+        let inner = self.inner.read();
+        inner.repo.root.clone()
+    }
 }

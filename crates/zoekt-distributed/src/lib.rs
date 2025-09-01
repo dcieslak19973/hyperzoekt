@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,16 +89,21 @@ impl LeaseManager {
         if let Some(tx) = maybe_tx {
             let name_s = name.to_string();
             let leased_s = leased_node.to_string();
+            tracing::debug!(repo=%name_s, "sending repo meta to test hook");
             // best-effort send; do not fail if receiver gone
-            let _ = tx
+            match tx
                 .send((
-                    name_s,
+                    name_s.clone(),
                     last_indexed_ms,
                     last_duration_ms,
                     memory_bytes,
-                    leased_s,
+                    leased_s.clone(),
                 ))
-                .await;
+                .await
+            {
+                Ok(_) => tracing::debug!(repo=%name_s, "meta hook send succeeded"),
+                Err(e) => tracing::warn!(repo=%name_s, error=%e, "meta hook send failed"),
+            }
         }
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
@@ -353,6 +359,57 @@ impl<I: Indexer> Node<I> {
         while start.elapsed() < duration {
             let repos = self.repos.read().clone();
             for repo in repos {
+                // If the repo git_url points to a local path (absolute path or file://) we skip
+                // the lease acquisition and index directly. This makes local dev workflows fast
+                // and avoids requiring Redis/leases for local repos.
+                let git_url = repo.git_url.clone();
+                let is_local =
+                    PathBuf::from(&git_url).is_absolute() || git_url.starts_with("file://");
+
+                if is_local {
+                    tracing::info!(repo = %repo.name, "local repo, indexing without lease");
+                    let repo_for_index = repo.clone();
+                    let indexer = self.indexer.clone();
+
+                    // Log ownership/permission bits for debugging prior to indexing.
+                    log_path_permissions(&repo_for_index.git_url);
+
+                    let index_started = std::time::Instant::now();
+                    // run the synchronous indexer in a blocking task
+                    let index_result = match tokio::task::spawn_blocking(move || {
+                        indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+                    };
+
+                    match index_result {
+                        Ok(index) => {
+                            tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+                            let dur = index_started.elapsed();
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let dur_ms = dur.as_millis() as i64;
+                            let mem_est = index.total_scanned_bytes() as i64;
+                            // best-effort: persist meta (no lease holder semantics for local)
+                            tracing::debug!(repo=%repo.name, "about to set repo meta (local)");
+                            let _ = self
+                                .lease_mgr
+                                .set_repo_meta(&repo.name, now_ms, dur_ms, mem_est, &self.config.id)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(repo = %repo.name, error = %e, "failed to index");
+                        }
+                    }
+                    continue;
+                }
+
+                // For remote (non-local) repos, also log path metadata before attempting to acquire a lease
+                // so permission/ownership issues are visible in logs.
+                log_path_permissions(&git_url);
+
                 if self
                     .lease_mgr
                     .try_acquire(&repo, self.config.id.clone(), self.config.lease_ttl)
@@ -406,13 +463,14 @@ impl<I: Indexer> Node<I> {
                             let dur_ms = dur.as_millis() as i64;
                             // best-effort: persist meta
                             let mem_est = index.total_scanned_bytes() as i64;
+                            tracing::debug!(repo=%repo.name, "about to set repo meta (remote)");
                             let _ = self
                                 .lease_mgr
                                 .set_repo_meta(&repo.name, now_ms, dur_ms, mem_est, &self.config.id)
                                 .await;
                         }
-                        Err(_) => {
-                            tracing::warn!(repo = %repo.name, "failed to index");
+                        Err(e) => {
+                            tracing::warn!(repo = %repo.name, error = %e, "failed to index");
                             self.lease_mgr.release(&repo, &self.config.id).await;
                         }
                     }
@@ -424,17 +482,66 @@ impl<I: Indexer> Node<I> {
     }
 }
 
+/// Log basic ownership and permission bits for the provided path for debugging.
+fn log_path_permissions(path: &str) {
+    let p = PathBuf::from(path);
+    // Only attempt to stat when the path looks like a local filesystem path.
+    // Remote git URLs (http(s)://, git@, ssh://) will not be statted.
+    let is_remote = looks_like_remote_git_url(path);
+    let is_file_scheme = path.starts_with("file://");
+
+    if is_remote && !is_file_scheme {
+        tracing::debug!(path = %path, "skipping stat for remote git URL");
+        return;
+    }
+
+    match std::fs::metadata(&p) {
+        Ok(md) => {
+            let mode = md.permissions().mode();
+            let uid = md.uid();
+            let gid = md.gid();
+            tracing::info!(path = %path, uid = uid, gid = gid, mode = format_args!("{:o}", mode), "path metadata");
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "failed to stat path");
+        }
+    }
+}
+
+// Lightweight helper used by `log_path_permissions` and unit tests.
+fn looks_like_remote_git_url(path: &str) -> bool {
+    path.starts_with("http://")
+        || path.starts_with("https://")
+        || path.starts_with("git@")
+        || path.starts_with("ssh://")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Once;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use tracing_subscriber::EnvFilter;
 
     struct FakeIndexer {
         count: Arc<AtomicUsize>,
+    }
+
+    // Initialize tracing only once for tests so logs are visible when running
+    // `cargo test -- --nocapture`. Respects RUST_LOG when set; defaults to debug
+    // to keep output readable.
+    static TRACING_INIT: Once = Once::new();
+    fn init_test_logging() {
+        TRACING_INIT.call_once(|| {
+            // Prefer env when set; fall back to a quieter default to keep output readable.
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        });
     }
 
     impl FakeIndexer {
@@ -460,6 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn node_acquires_and_indexes() -> Result<()> {
+        init_test_logging();
+        tracing::info!("TEST START: node_acquires_and_indexes");
         let lease = LeaseManager::new().await;
         let cfg = NodeConfig {
             id: "test-node".into(),
@@ -470,20 +579,30 @@ mod tests {
         let node = Node::new(cfg, lease.clone(), FakeIndexer::new());
         let repo = RemoteRepo {
             name: "r1".into(),
-            git_url: "/tmp/fake-repo".into(),
+            // Use a non-local URL so the node attempts to acquire a lease in tests.
+            git_url: "https://example.com/fake-repo.git".into(),
         };
         node.add_remote(repo.clone());
         node.run_for(Duration::from_millis(50)).await?;
         let l = lease.get_lease(&repo).await.expect("lease should exist");
         assert_eq!(l.holder, "test-node");
+        tracing::info!("TEST END: node_acquires_and_indexes");
         Ok(())
     }
 
     #[tokio::test]
     async fn node_records_repo_meta_on_index() -> Result<()> {
+        init_test_logging();
+        // This test requires Redis to be available; skip when REDIS_URL is not set so local runs stay fast.
+        if env::var("REDIS_URL").is_err() {
+            tracing::info!("TEST SKIP: node_records_repo_meta_on_index (no REDIS_URL)");
+            return Ok(());
+        }
+        tracing::info!("TEST START: node_records_repo_meta_on_index");
+
         // Create a lease manager and set a meta callback to capture values
         let lease = LeaseManager::new().await;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         lease.set_meta_sender(tx);
 
         let cfg = NodeConfig {
@@ -510,10 +629,24 @@ mod tests {
             git_url: "/tmp/fake-repo-meta".into(),
         };
         node.add_remote(repo.clone());
-        node.run_for(Duration::from_millis(200)).await?;
+        // Run the node for a short duration to trigger indexing
+        let run_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            node.run_for(Duration::from_millis(50)),
+        )
+        .await;
+        match run_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("node run failed: {}", e),
+            Err(_) => panic!("node run timed out after 10 seconds"),
+        }
 
         // Wait for meta message and verify values look reasonable
-        let rec = rx.recv().await.expect("meta message should be received");
+        let rec = match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(r)) => r,
+            Ok(None) => panic!("meta sender channel closed unexpectedly"),
+            Err(_) => panic!("timed out waiting for meta message after 5 seconds"),
+        };
         assert_eq!(rec.0, "r-meta");
         // last_indexed should be close to now (within 10s)
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -525,6 +658,7 @@ mod tests {
         // leased node should match config id
         assert_eq!(rec.4, "test-node-meta");
 
+        tracing::info!("TEST END: node_records_repo_meta_on_index");
         Ok(())
     }
 
@@ -532,15 +666,18 @@ mod tests {
     // skipped when REDIS_URL is not set so local runs stay fast.
     #[tokio::test]
     async fn concurrent_nodes_contend_for_lease() -> Result<()> {
+        init_test_logging();
         if env::var("REDIS_URL").is_err() {
-            eprintln!("skipping redis integration test; set REDIS_URL to run it");
+            tracing::info!("TEST SKIP: concurrent_nodes_contend_for_lease (no REDIS_URL)");
             return Ok(());
         }
+        tracing::info!("TEST START: concurrent_nodes_contend_for_lease");
 
         let lease = LeaseManager::new().await;
         let repo = RemoteRepo {
             name: "r-contend".into(),
-            git_url: "/tmp/fake-repo-contend".into(),
+            // Use a non-local URL so nodes contend for a Redis-backed lease in this test
+            git_url: "https://example.com/fake-repo-contend.git".into(),
         };
 
         // Two fake indexers that count how many times they were invoked (i.e. wins)
@@ -582,6 +719,27 @@ mod tests {
             a_wins,
             b_wins
         );
+        tracing::info!("TEST END: concurrent_nodes_contend_for_lease");
         Ok(())
+    }
+
+    #[test]
+    fn test_looks_like_remote_git_url() {
+        // remote forms
+        assert!(super::looks_like_remote_git_url(
+            "https://example.com/repo.git"
+        ));
+        assert!(super::looks_like_remote_git_url("http://example.com/repo"));
+        assert!(super::looks_like_remote_git_url(
+            "git@github.com:owner/repo.git"
+        ));
+        assert!(super::looks_like_remote_git_url(
+            "ssh://git@host/owner/repo.git"
+        ));
+
+        // local/file forms
+        assert!(!super::looks_like_remote_git_url("/tmp/repo"));
+        assert!(!super::looks_like_remote_git_url("file:///tmp/repo"));
+        assert!(!super::looks_like_remote_git_url("./relative/path"));
     }
 }

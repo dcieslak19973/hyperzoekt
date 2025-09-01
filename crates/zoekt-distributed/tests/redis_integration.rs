@@ -7,6 +7,7 @@ use base64::Engine;
 use parking_lot::RwLock;
 use rand::RngCore;
 use serde_json::Value;
+use tracing_subscriber::EnvFilter;
 use zoekt_distributed::LeaseManager;
 
 // We recreate minimal AppStateInner shape used by the bin for testing.
@@ -29,15 +30,25 @@ fn gen_token() -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
+fn init_test_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    });
+}
+
 #[tokio::test]
 async fn redis_persistence_integration() {
-    let redis_url = match std::env::var("REDIS_URL_TEST") {
+    init_test_logging();
+    let redis_url = match std::env::var("REDIS_URL") {
         Ok(u) => u,
         Err(_) => {
-            eprintln!("REDIS_URL_TEST not set; skipping redis_integration test");
+            tracing::info!("TEST SKIP: redis_persistence_integration (no REDIS_URL)");
             return;
         }
     };
+    tracing::info!("TEST START: redis_persistence_integration");
 
     // build pool
     let pool = RedisConfig::from_url(&redis_url).create_pool(None).unwrap();
@@ -78,20 +89,20 @@ async fn redis_persistence_integration() {
 
     // cleanup
     let _: () = conn.hdel("zoekt:repos", &test_name).await.unwrap_or(());
+    tracing::info!("TEST END: redis_persistence_integration");
 }
 
 #[tokio::test]
 async fn redis_repo_meta_contains_memory_bytes() {
-    let redis_url = match std::env::var("REDIS_URL_TEST") {
+    init_test_logging();
+    let redis_url = match std::env::var("REDIS_URL") {
         Ok(u) => u,
         Err(_) => {
-            eprintln!("REDIS_URL_TEST not set; skipping redis repo_meta integration test");
+            tracing::info!("TEST SKIP: redis_repo_meta_contains_memory_bytes (no REDIS_URL)");
             return;
         }
     };
-
-    // Make LeaseManager pick up the URL
-    std::env::set_var("REDIS_URL", &redis_url);
+    tracing::info!("TEST START: redis_repo_meta_contains_memory_bytes");
 
     // build pool
     let pool = RedisConfig::from_url(&redis_url).create_pool(None).unwrap();
@@ -123,4 +134,5 @@ async fn redis_repo_meta_contains_memory_bytes() {
 
     // cleanup
     let _: () = conn.hdel("zoekt:repo_meta", &test_name).await.unwrap_or(());
+    tracing::info!("TEST END: redis_repo_meta_contains_memory_bytes");
 }

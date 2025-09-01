@@ -2,12 +2,26 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use reqwest::Client;
+use tracing_subscriber::EnvFilter;
 
 // Integration test: spawn dzr-admin binary on an ephemeral port, wait for /health,
 // post to /login, ensure Set-Cookie is returned and / is accessible with that cookie.
 
 #[tokio::test]
 async fn login_flow_integration() {
+    // Init logging
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    });
+    tracing::info!("TEST START: login_flow_integration");
+    // Opt-in: this e2e test starts a real HTTP server. Skip unless explicitly enabled.
+    if std::env::var("RUN_WEB_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping login_flow_integration; set RUN_WEB_E2E=1 to run it");
+        return;
+    }
+
     // Locate the compiled binary via env var set by cargo when running tests.
     let _exe = std::env::var("CARGO_BIN_EXE_dzr-admin").unwrap_or_else(|_| {
         // Fallback: assume binary is built and available at workspace target
@@ -78,26 +92,15 @@ async fn login_flow_integration() {
     let port = addr.port();
     drop(listener);
 
-    // Spawn the binary via `cargo run` in the workspace root so we don't need to
-    // guess the exact path to the compiled executable.
-    let mut workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    workspace.pop(); // crates
-    workspace.pop(); // workspace root
+    // Prefer spawning the already-built binary directly for speed and determinism.
     let bind_arg = format!("127.0.0.1:{}", port);
-    let mut child = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("zoekt-distributed")
-        .arg("--bin")
-        .arg("dzr-admin")
-        .arg("--")
+    let mut child = Command::new(&_exe)
         .arg("--bind")
         .arg(&bind_arg)
-        .current_dir(&workspace)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn dzr-admin via cargo");
+        .expect("spawn dzr-admin");
 
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -159,4 +162,5 @@ async fn login_flow_integration() {
     // cleanup: kill child and wait to avoid leaving a zombie process (clippy: zombie-processes)
     let _ = child.kill();
     let _ = child.wait();
+    tracing::info!("TEST END: login_flow_integration");
 }

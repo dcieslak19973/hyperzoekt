@@ -274,9 +274,21 @@ pub fn verify_and_extract_session(headers: &HeaderMap, key: &Option<Vec<u8>>) ->
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use tracing_subscriber::EnvFilter;
+
+    fn init_test_logging() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        });
+    }
 
     #[test]
     fn test_session_cookie_without_key() {
+        init_test_logging();
+        tracing::info!("TEST START: web_utils::tests::test_session_cookie_without_key");
         let sid = "session123";
         let cookie = session_cookie_header_value(sid, None, false);
         let mut headers = HeaderMap::new();
@@ -288,10 +300,13 @@ mod tests {
         // No key configured should return the bare sid
         let got = verify_and_extract_session(&headers, &None);
         assert_eq!(got.as_deref(), Some(sid));
+        tracing::info!("TEST END: web_utils::tests::test_session_cookie_without_key");
     }
 
     #[test]
     fn test_session_cookie_with_key_and_verify() {
+        init_test_logging();
+        tracing::info!("TEST START: web_utils::tests::test_session_cookie_with_key_and_verify");
         let sid = "sessionABC";
         let key = b"super-secret-key".to_vec();
         let cookie = session_cookie_header_value(sid, Some(key.as_slice()), true);
@@ -314,5 +329,6 @@ mod tests {
         );
         let got2 = verify_and_extract_session(&th, &Some(key));
         assert!(got2.is_none());
+        tracing::info!("TEST END: web_utils::tests::test_session_cookie_with_key_and_verify");
     }
 }
