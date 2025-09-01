@@ -2,7 +2,194 @@ use anyhow::Result;
 use std::fs;
 use std::time::Duration;
 
-use crate::NodeConfig;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeType {
+    Indexer,
+    Admin,
+    Search,
+}
+
+impl std::str::FromStr for NodeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "indexer" => Ok(NodeType::Indexer),
+            "admin" => Ok(NodeType::Admin),
+            "search" => Ok(NodeType::Search),
+            _ => Err(format!("Unknown node type: {}", s)),
+        }
+    }
+}
+
+/// Node configuration.
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    pub id: String,
+    pub lease_ttl: Duration,
+    pub poll_interval: Duration,
+    pub node_type: NodeType,
+    pub endpoint: Option<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        // Read configuration from environment variables when present. Useful for k8s.
+        // Env vars:
+        // - ZOEKTD_NODE_ID
+        // - ZOEKTD_LEASE_TTL_SECONDS
+        // - ZOEKTD_POLL_INTERVAL_SECONDS
+        // - ZOEKTD_ENDPOINT (manual override)
+        // - ZOEKTD_SERVICE_NAME (for k8s service discovery)
+        // - ZOEKTD_SERVICE_PORT (for k8s service discovery)
+        // - ZOEKTD_SERVICE_PROTOCOL (http/https, defaults to http)
+        let id = std::env::var("ZOEKTD_NODE_ID").unwrap_or_else(|_| "node-1".into());
+        let lease_ttl = std::env::var("ZOEKTD_LEASE_TTL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(150));
+        let poll_interval = std::env::var("ZOEKTD_POLL_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(5));
+
+        let node_type: NodeType = std::env::var("ZOEKTD_NODE_TYPE")
+            .ok()
+            .and_then(|s| s.parse::<NodeType>().ok())
+            .unwrap_or(NodeType::Indexer);
+
+        // Determine endpoint: manual override takes precedence, then try k8s auto-discovery
+        let endpoint = if let Ok(manual_endpoint) = std::env::var("ZOEKTD_ENDPOINT") {
+            Some(manual_endpoint)
+        } else if node_type == NodeType::Indexer {
+            // Try Kubernetes service discovery for indexers
+            Self::discover_kubernetes_endpoint()
+        } else {
+            None
+        };
+
+        Self {
+            id,
+            lease_ttl,
+            poll_interval,
+            node_type,
+            endpoint,
+        }
+    }
+}
+
+impl NodeConfig {
+    /// Attempt to auto-discover the endpoint using Kubernetes service environment variables.
+    /// This supports both direct service discovery and custom service name configuration.
+    /// For StatefulSets, each pod discovers its own individual endpoint.
+    pub(crate) fn discover_kubernetes_endpoint() -> Option<String> {
+        let protocol = std::env::var("ZOEKTD_SERVICE_PROTOCOL").unwrap_or_else(|_| "http".into());
+
+        // First, try using ZOEKTD_SERVICE_NAME if explicitly set
+        if let Ok(service_name) = std::env::var("ZOEKTD_SERVICE_NAME") {
+            let normalized_service_name = service_name.replace("-", "_").to_uppercase();
+            let service_host_env = format!("{}_SERVICE_HOST", normalized_service_name);
+            let service_port_env = format!("{}_SERVICE_PORT", normalized_service_name);
+
+            if let (Ok(host), Ok(port)) = (
+                std::env::var(&service_host_env),
+                std::env::var(&service_port_env),
+            ) {
+                tracing::info!(service_name = %service_name, host = %host, port = %port, protocol = %protocol, "discovered kubernetes service endpoint");
+                return Some(format!("{}://{}:{}", protocol, host, port));
+            } else {
+                tracing::warn!(service_name = %service_name, "kubernetes service environment variables not found");
+            }
+        }
+
+        // For StatefulSets: try to discover pod-specific endpoint
+        // Each pod in a StatefulSet gets a stable DNS name like: <statefulset-name>-<ordinal>.<service-name>
+        if let Some(pod_endpoint) = Self::discover_statefulset_pod_endpoint(&protocol) {
+            return Some(pod_endpoint);
+        }
+
+        // Fallback: try common Kubernetes service patterns
+        // Look for any environment variables that match the pattern *_SERVICE_HOST
+        for (key, value) in std::env::vars() {
+            if key.ends_with("_SERVICE_HOST") && !key.starts_with("KUBERNETES_") {
+                let service_name = key.trim_end_matches("_SERVICE_HOST").to_lowercase();
+                let port_env = format!("{}_SERVICE_PORT", service_name.to_uppercase());
+
+                if let Ok(port) = std::env::var(&port_env) {
+                    let protocol =
+                        std::env::var("ZOEKTD_SERVICE_PROTOCOL").unwrap_or_else(|_| "http".into());
+                    tracing::info!(service_name = %service_name, host = %value, port = %port, protocol = %protocol, "auto-discovered kubernetes service endpoint");
+                    return Some(format!("{}://{}:{}", protocol, value, port));
+                }
+            }
+        }
+
+        tracing::debug!("no kubernetes service endpoint discovered, will use manual configuration");
+        None
+    }
+
+    /// Discover the endpoint for a StatefulSet pod using pod metadata and service information.
+    /// Each pod in a StatefulSet gets a stable DNS name: <pod-name>.<service-name>
+    pub(crate) fn discover_statefulset_pod_endpoint(protocol: &str) -> Option<String> {
+        // Try to get pod name from environment (injected by Downward API or via env)
+        // Only use POD_NAME, not HOSTNAME, as HOSTNAME may be set to arbitrary values in containers
+        let pod_name = std::env::var("POD_NAME").ok()?;
+        if pod_name.is_empty() {
+            return None;
+        }
+
+        // Try to get namespace
+        let namespace = std::env::var("POD_NAMESPACE")
+            .or_else(|_| std::env::var("NAMESPACE"))
+            .unwrap_or_else(|_| "default".into());
+
+        // Try to get service name from various sources
+        let service_name = std::env::var("ZOEKTD_SERVICE_NAME")
+            .or_else(|_| {
+                // Try to infer from pod name (remove ordinal suffix)
+                pod_name
+                    .rfind('-')
+                    .map(|pos| pod_name[..pos].to_string())
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+            .or_else(|_| {
+                // Look for service environment variables and infer service name
+                std::env::vars()
+                    .find(|(key, _)| {
+                        key.ends_with("_SERVICE_HOST") && !key.starts_with("KUBERNETES_")
+                    })
+                    .map(|(key, _)| key.trim_end_matches("_SERVICE_HOST").to_lowercase())
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+            .ok()?;
+
+        // Try to get port from service environment variables
+        let service_port_env = format!(
+            "{}_SERVICE_PORT",
+            service_name.replace("-", "_").to_uppercase()
+        );
+        let port = std::env::var(&service_port_env)
+            .or_else(|_| std::env::var("ZOEKTD_SERVICE_PORT"))
+            .unwrap_or_else(|_| "8080".into());
+
+        // Construct the pod-specific DNS name for StatefulSet
+        let pod_dns = format!("{}.{}.svc.cluster.local", pod_name, service_name);
+
+        tracing::info!(
+            pod_name = %pod_name,
+            service_name = %service_name,
+            namespace = %namespace,
+            pod_dns = %pod_dns,
+            port = %port,
+            protocol = %protocol,
+            "discovered statefulset pod endpoint"
+        );
+
+        Some(format!("{}://{}:{}", protocol, pod_dns, port))
+    }
+}
 
 /// CLI-level options that binaries pass to `load_node_config`.
 /// Keep this small and explicit; binaries can expand for extra fields.
@@ -75,7 +262,6 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeType;
     use std::time::Duration;
     use tracing_subscriber::EnvFilter;
 
