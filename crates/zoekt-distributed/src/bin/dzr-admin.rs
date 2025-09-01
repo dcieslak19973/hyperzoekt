@@ -75,9 +75,9 @@ struct CreateRepoWithFreq {
 }
 
 // Embed static templates and JS so the binary can serve them directly.
-const INDEX_TEMPLATE: &str = include_str!("../../static/index.html");
-const LOGIN_TEMPLATE: &str = include_str!("../../static/login.html");
-const ADMIN_JS: &str = include_str!("../../static/admin.js");
+const INDEX_TEMPLATE: &str = include_str!("../../static/admin/index.html");
+const LOGIN_TEMPLATE: &str = include_str!("../../static/admin/login.html");
+const ADMIN_JS: &str = include_str!("../../static/admin/admin.js");
 
 // Reuse shared web helper functions from the crate for common HTTP helpers.
 use web_utils::{
@@ -1085,6 +1085,7 @@ fn make_app(state: AppState) -> Router {
                 bulk_import_inner(state, headers, multipart).await
             }),
         )
+        .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
         .route("/static/admin.js", get(serve_admin_js))
         .route("/export.csv", get(export_csv))
         .layer(axum::Extension(state))
@@ -1541,6 +1542,8 @@ async fn main() -> Result<()> {
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         },
     )?;
 

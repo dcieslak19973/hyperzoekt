@@ -1,0 +1,386 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>dzr-http-search UI</title>
+    <link rel="stylesheet" href="/static/common/styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <style>
+        /* Search-specific styles */
+        body {
+            font-family: system-ui, -apple-system, Roboto, Arial;
+            padding: 20px;
+        }
+
+        .search-form {
+            max-width: 600px;
+            margin: 0 auto 20px;
+        }
+
+        .search-form label {
+            margin-bottom: 8px;
+        }
+
+        .search-form input[type=text] {
+            width: 100%;
+            margin-bottom: 10px;
+        }
+
+        .search-form select {
+            width: 120px;
+            padding: 8px;
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            background: var(--input-bg);
+            color: var(--text);
+            margin-bottom: 10px;
+        }
+
+        .search-form button {
+            width: 100%;
+        }
+
+        .results {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .result-item {
+            background: var(--panel);
+            border-radius: var(--border-radius);
+            padding: 16px;
+            margin-bottom: 16px;
+            border: 1px solid var(--input-border);
+            transition: var(--transition);
+        }
+
+        .result-item:hover {
+            border-color: var(--accent);
+        }
+
+        .result-header {
+            margin-bottom: 12px;
+        }
+
+        .result-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--accent);
+            text-decoration: none;
+            margin-bottom: 4px;
+            display: block;
+        }
+
+        .result-title:hover {
+            text-decoration: underline;
+        }
+
+        .result-meta {
+            font-size: 12px;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        .result-snippet {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 13px;
+            line-height: 1.4;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            padding: 12px;
+        }
+
+        /* control tab rendering width inside the pre/code snippet so tabs align predictably */
+        .result-snippet pre code,
+        .result-snippet code {
+            -moz-tab-size: 4;
+            -o-tab-size: 4;
+            tab-size: 4;
+        }
+
+        .result-snippet .line-number {
+            color: var(--muted);
+            margin-right: 12px;
+            user-select: none;
+            min-width: 40px;
+            text-align: right;
+            display: inline-block;
+            padding-right: 8px;
+        }
+
+        /* layout each snippet line as a row: line-number | code */
+        .result-snippet .line {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+
+        .result-snippet .line code.tokenized,
+        .result-snippet .line code {
+            display: block;
+            white-space: pre;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 13px;
+            line-height: 1.4;
+            overflow-x: auto;
+            flex: 1 1 auto;
+        }
+
+        .result-snippet .snippet-inner {
+            padding: 4px 6px;
+        }
+
+        .result-snippet .line.separator {
+            color: var(--muted);
+            font-style: italic;
+            text-align: center;
+            background: transparent;
+            border-left: none;
+            margin-left: 0;
+            padding-left: 0;
+        }
+
+        .no-results {
+            text-align: center;
+            color: var(--muted);
+            padding: 40px;
+            font-size: 16px;
+        }
+
+        .search-stats {
+            text-align: center;
+            color: var(--muted);
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .theme-toggle-container {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+        }
+
+        /* Syntax highlighting overrides for dark theme */
+        :root {
+            --prism-bg: var(--input-bg);
+            --prism-text: var(--text);
+            --prism-comment: #6a737d;
+            --prism-keyword: #f97583;
+            --prism-string: #9ecbff;
+            --prism-number: #79b8ff;
+            --prism-function: #b392f0;
+            --prism-variable: #ffab70;
+        }
+
+        .light-mode {
+            --prism-comment: #6a737d;
+            --prism-keyword: #d73a49;
+            --prism-string: #032f62;
+            --prism-number: #005cc5;
+            --prism-function: #6f42c1;
+            --prism-variable: #e36209;
+        }
+
+        .result-snippet code[class*="language-"] {
+            background: transparent;
+            color: var(--prism-text);
+        }
+
+        .result-snippet .token.comment {
+            color: var(--prism-comment);
+        }
+
+        .result-snippet .token.keyword {
+            color: var(--prism-keyword);
+        }
+
+        .result-snippet .token.string {
+            color: var(--prism-string);
+        }
+
+        .result-snippet .token.number {
+            color: var(--prism-number);
+        }
+
+        .result-snippet .token.function {
+            color: var(--prism-function);
+        }
+
+        .result-snippet .token.variable {
+            color: var(--prism-variable);
+        }
+    </style>
+    <script src="/static/common/theme.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+</head>
+
+<body>
+    <div class="theme-toggle-container">
+        <button id="theme-toggle" class="theme-toggle">
+            <span class="icon">🌙</span>
+            <span class="label">Dark</span>
+        </button>
+    </div>
+
+    <div class="container">
+        <h1>Distributed search</h1>
+
+        <div class="card search-form">
+            <form id="searchForm">
+                <label>Repo (supports *):
+                    <input type="text" name="repo" value="*" />
+                </label>
+                <label>Query:
+                    <input type="text" name="q" placeholder="search terms" />
+                </label>
+                <label>Branches (comma-separated, default *):
+                    <input type="text" name="branches" value="*" style="width:200px" />
+                </label>
+                <label>Context lines:
+                    <select name="context_lines">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="5" selected>5</option>
+                        <option value="10">10</option>
+                        <option value="20">20</option>
+                    </select>
+                </label>
+                <button type="submit">Search</button>
+            </form>
+        </div>
+
+        <div class="results">
+            <h2>Results</h2>
+            <div id="search-stats" class="search-stats" style="display: none;"></div>
+            <div id="results-container"></div>
+            <div id="no-results" class="no-results" style="display: none;">
+                No results found. Try adjusting your search terms.
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('searchForm');
+        const resultsContainer = document.getElementById('results-container');
+        const searchStats = document.getElementById('search-stats');
+        const noResults = document.getElementById('no-results');
+
+        // Language detection based on file extension
+        function detectLanguage(filename) {
+            const ext = filename.split('.').pop().toLowerCase();
+            const langMap = {
+                'rs': 'rust',
+                'py': 'python',
+                'js': 'javascript',
+                'ts': 'typescript',
+                'go': 'go',
+                'java': 'java',
+                'cpp': 'cpp',
+                'c': 'c',
+                'h': 'c',
+                'hpp': 'cpp',
+                'cs': 'csharp',
+                'php': 'php',
+                'rb': 'ruby',
+                'sh': 'bash',
+                'yml': 'yaml',
+                'yaml': 'yaml',
+                'json': 'json',
+                'xml': 'xml',
+                'html': 'html',
+                'css': 'css',
+                'md': 'markdown'
+            };
+            return langMap[ext] || '';
+        }
+
+        // Simple result formatter: show backend snippet raw inside a pre/code block
+        // This preserves whitespace and most closely matches the earlier rendering
+        function formatResult(result) {
+            const repo = result.repo || 'unknown';
+            const path = result.path || '';
+            const symbol = result.symbol || '';
+            const snippet = result.snippet || '';
+            const nodeId = result.node_id || '';
+
+            const fileUrl = `file://${repo}/${path}`;
+            let title = path;
+            if (symbol) title += ` (${symbol})`;
+            const language = detectLanguage(path);
+
+            const codeContent = snippet && snippet !== 'null' ? escapeHtml(snippet) : null;
+
+            return `
+                <div class="result-item">
+                    <div class="result-header">
+                        <a href="${fileUrl}" class="result-title" target="_blank">${escapeHtml(title)}</a>
+                        <div class="result-meta">Repository: ${escapeHtml(repo)} ${nodeId ? `• Node: ${nodeId}` : ''}</div>
+                    </div>
+                    ${codeContent ? `
+                        <div class="result-snippet">
+                            <pre><code class="language-${language}">${codeContent}</code></pre>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        // HTML escape utility
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fd = new FormData(form);
+            const params = new URLSearchParams();
+            for (const [k, v] of fd.entries()) if (v) params.append(k, v);
+
+            // Show loading state
+            resultsContainer.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--muted);">Searching...</div>';
+            searchStats.style.display = 'none';
+            noResults.style.display = 'none';
+
+            try {
+                const resp = await fetch('/search?' + params.toString());
+                const json = await resp.json();
+
+                if (json.results && json.results.length > 0) {
+                    // Format and display results
+                    const formattedResults = json.results.map(formatResult).join('');
+                    resultsContainer.innerHTML = formattedResults;
+
+                    // Show search stats
+                    const resultCount = json.results.length;
+                    searchStats.textContent = `Found ${resultCount} result${resultCount === 1 ? '' : 's'}`;
+                    searchStats.style.display = 'block';
+                    noResults.style.display = 'none';
+
+                    // Apply syntax highlighting
+                    setTimeout(() => {
+                        Prism.highlightAll();
+                    }, 100);
+                } else {
+                    // No results
+                    resultsContainer.innerHTML = '';
+                    searchStats.style.display = 'none';
+                    noResults.style.display = 'block';
+                }
+            } catch (err) {
+                resultsContainer.innerHTML = `<div style="color: var(--danger); padding: 20px; text-align: center;">Error: ${err.toString()}</div>`;
+                searchStats.style.display = 'none';
+                noResults.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+
+</html>

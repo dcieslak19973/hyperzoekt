@@ -1,6 +1,7 @@
 use crate::lease_manager::{LeaseManager, RemoteRepo};
 use crate::NodeConfig;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,8 @@ pub struct Node<I: Indexer> {
     lease_mgr: LeaseManager,
     repos: Arc<parking_lot::RwLock<Vec<RemoteRepo>>>,
     indexer: Arc<I>,
+    // track repos that have been indexed once when index_once is enabled
+    seen_once: Arc<parking_lot::RwLock<HashSet<String>>>,
 }
 
 impl<I: Indexer> Node<I> {
@@ -31,6 +34,7 @@ impl<I: Indexer> Node<I> {
             lease_mgr,
             repos: Arc::new(parking_lot::RwLock::new(Vec::new())),
             indexer: Arc::new(indexer),
+            seen_once: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         }
     }
 
@@ -64,6 +68,84 @@ impl<I: Indexer> Node<I> {
             tracing::info!(repo=%name, branch=%branch, "registering branch-specific RemoteRepo");
             self.add_remote(rr);
         }
+        // If reindexing is disabled, perform a single initial pass for local repos so
+        // developers still get an index on startup, but skip periodic re-index cycles.
+        if !self.config.enable_reindex {
+            let repos = self.repos.read().clone();
+            for repo in repos {
+                // Only index local paths during the initial pass
+                let git_url = repo.git_url.clone();
+                let is_local =
+                    PathBuf::from(&git_url).is_absolute() || git_url.starts_with("file://");
+                if !is_local {
+                    continue;
+                }
+
+                // Honor index_once: skip if already seen
+                if self.config.index_once {
+                    let key = format!("{}|{}", repo.name, repo.branch.clone().unwrap_or_default());
+                    if self.seen_once.read().contains(&key) {
+                        tracing::debug!(repo=%repo.name, branch=?repo.branch, "index_once: already indexed (initial pass), skipping");
+                        continue;
+                    }
+                }
+
+                tracing::info!(repo = %repo.name, "initial local index (reindex disabled)");
+                // Log ownership/permission bits for debugging prior to indexing.
+                log_path_permissions(&repo.git_url);
+
+                let repo_for_index = repo.clone();
+                let indexer = self.indexer.clone();
+
+                let index_started = std::time::Instant::now();
+                let index_result = match tokio::task::spawn_blocking(move || {
+                    indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow::anyhow!(e.to_string())),
+                };
+
+                match index_result {
+                    Ok(index) => {
+                        tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed (initial)");
+                        let dur = index_started.elapsed();
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let dur_ms = dur.as_millis() as i64;
+                        let mem_est = index.total_scanned_bytes() as i64;
+                        tracing::debug!(repo=%repo.name, "about to set branch meta (local, initial). repo-level meta writes are disabled");
+                        if let Some(branch) = &repo.branch {
+                            let _ = self
+                                .lease_mgr
+                                .set_branch_meta(
+                                    &repo.name,
+                                    branch,
+                                    now_ms,
+                                    dur_ms,
+                                    mem_est,
+                                    &self.config.id,
+                                )
+                                .await;
+                        } else {
+                            tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
+                        }
+                        if self.config.index_once {
+                            let key = format!(
+                                "{}|{}",
+                                repo.name,
+                                repo.branch.clone().unwrap_or_default()
+                            );
+                            self.seen_once.write().insert(key);
+                            tracing::info!(repo=%repo.name, "index_once: marked as indexed (initial)");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo = %repo.name, error = %e, "failed to index (initial)");
+                    }
+                }
+            }
+        }
         while start.elapsed() < duration {
             // Periodically update endpoint if indexer
             if self.config.node_type == crate::NodeType::Indexer && self.config.endpoint.is_some() {
@@ -74,6 +156,14 @@ impl<I: Indexer> Node<I> {
             }
             let repos = self.repos.read().clone();
             for repo in repos {
+                // If index_once is enabled and we've already indexed this repo, skip it
+                if self.config.index_once {
+                    let key = format!("{}|{}", repo.name, repo.branch.clone().unwrap_or_default());
+                    if self.seen_once.read().contains(&key) {
+                        tracing::debug!(repo=%repo.name, branch=?repo.branch, "index_once: already indexed, skipping");
+                        continue;
+                    }
+                }
                 // If the repo git_url points to a local path (absolute path or file://) we skip
                 // the lease acquisition and index directly. This makes local dev workflows fast
                 // and avoids requiring Redis/leases for local repos.
@@ -83,6 +173,10 @@ impl<I: Indexer> Node<I> {
 
                 if is_local {
                     tracing::info!(repo = %repo.name, "local repo, indexing without lease");
+                    if !self.config.enable_reindex {
+                        tracing::info!(repo=%repo.name, "reindexing disabled by config; skipping local index");
+                        continue;
+                    }
                     let repo_for_index = repo.clone();
                     let indexer = self.indexer.clone();
 
@@ -124,6 +218,15 @@ impl<I: Indexer> Node<I> {
                             } else {
                                 tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
                             }
+                            if self.config.index_once {
+                                let key = format!(
+                                    "{}|{}",
+                                    repo.name,
+                                    repo.branch.clone().unwrap_or_default()
+                                );
+                                self.seen_once.write().insert(key);
+                                tracing::info!(repo=%repo.name, "index_once: marked as indexed");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(repo = %repo.name, error = %e, "failed to index");
@@ -135,6 +238,11 @@ impl<I: Indexer> Node<I> {
                 // For remote (non-local) repos, also log path metadata before attempting to acquire a lease
                 // so permission/ownership issues are visible in logs.
                 log_path_permissions(&git_url);
+
+                if !self.config.enable_reindex {
+                    tracing::debug!(repo=%repo.name, "reindexing disabled; skipping remote index attempt");
+                    continue;
+                }
 
                 if self
                     .lease_mgr
@@ -204,6 +312,15 @@ impl<I: Indexer> Node<I> {
                                     .await;
                             } else {
                                 tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
+                            }
+                            if self.config.index_once {
+                                let key = format!(
+                                    "{}|{}",
+                                    repo.name,
+                                    repo.branch.clone().unwrap_or_default()
+                                );
+                                self.seen_once.write().insert(key);
+                                tracing::info!(repo=%repo.name, "index_once: marked as indexed");
                             }
                         }
                         Err(e) => {

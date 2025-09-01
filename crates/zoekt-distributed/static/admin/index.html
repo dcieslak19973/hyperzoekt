@@ -5,120 +5,62 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>zoekt-distributed admin</title>
+    <link rel="stylesheet" href="/static/common/styles.css">
     <style>
-        :root {
-            --bg: #0f1724;
-            /* dark base */
-            --panel: #0b1220;
-            --surface: #0f1724;
-            --muted: #94a3b8;
-            --text: #e6eef6;
-            --accent: #0ea5a4;
-            --danger: #ef4444;
-            --input-bg: #0b1220;
-            --input-border: #23303b;
-        }
-
-        .light-mode {
-            --bg: #f7fafc;
-            --panel: #ffffff;
-            --surface: #f7fafc;
-            --muted: #64748b;
-            --text: #0f172a;
-            --accent: #0ea5a4;
-            --danger: #ef4444;
-            --input-bg: #ffffff;
-            --input-border: #cbd5e1;
-        }
-
-        body {
-            font-family: Inter, Arial, Helvetica, sans-serif;
-            margin: 24px;
-            background: var(--bg);
-            color: var(--text);
-            transition: background-color .28s ease, color .28s ease;
-            font-size: 14px;
-        }
-
-        .container {
-            max-width: 960px;
-            margin: 0 auto
-        }
-
+        /* Admin-specific styles */
         nav {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 12px 0
-        }
-
-        .card {
-            background: var(--panel);
-            border-radius: 8px;
-            padding: 16px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-            transition: background-color .28s ease, box-shadow .28s ease;
+            padding: 12px 0;
+            margin-bottom: 16px;
         }
 
         table {
             border-collapse: collapse;
-            width: 100%
+            width: 100%;
+            margin-top: 16px;
         }
 
         th,
         td {
-            border: 1px solid #e6eef6;
+            border: 1px solid var(--input-border);
             padding: 10px;
-            text-align: left
+            text-align: left;
         }
 
-        /* numeric columns right aligned */
+        /* Numeric columns right aligned */
         td.numeric,
         th.numeric {
             text-align: right;
             font-variant-numeric: tabular-nums;
         }
 
-        /* small tooltip style for raw bytes */
+        /* Small tooltip style for raw bytes */
         td.memory[title] {
             position: relative;
         }
 
         th {
-            background: rgba(255, 255, 255, 0.02)
+            background: rgba(255, 255, 255, 0.02);
         }
 
-        /* clickable sortable header hint */
+        /* Clickable sortable header hint */
         th.sortable {
-            cursor: pointer
+            cursor: pointer;
         }
 
         th .sort-indicator {
             font-size: 0.8em;
-            opacity: 0.8
+            opacity: 0.8;
         }
 
-        .muted {
-            color: var(--muted);
-            font-size: 0.9rem
-        }
-
-        input[type=text],
-        input[type=url] {
-            padding: 8px;
-            border: 1px solid var(--input-border);
-            border-radius: 4px;
-            background: var(--input-bg);
-            color: var(--text);
-            transition: background-color .28s ease, border-color .28s ease, color .28s ease;
-        }
-
-        /* create form: put inputs on one line */
+        /* Create form: put inputs on one line */
         #create-form {
             display: flex;
             gap: 8px;
             align-items: center;
-            flex-wrap: wrap
+            flex-wrap: wrap;
         }
 
         #create-form label {
@@ -130,65 +72,35 @@
         }
 
         #create-form input[name="name"] {
-            width: 120px
+            width: 120px;
         }
 
         #create-form input[name="url"] {
             flex: 1;
-            min-width: 180px
+            min-width: 180px;
         }
 
         #create-form input[name="frequency"] {
-            width: 60px
+            width: 60px;
         }
 
         #create-form input[name="branches"] {
-            width: 140px
-        }
-
-        button {
-            background: #0ea5a4;
-            color: white;
-            border: none;
-            padding: 8px 12px;
-            border-radius: 6px;
-            cursor: pointer
+            width: 140px;
         }
 
         a.button {
             background: var(--danger);
             color: white;
             padding: 6px 10px;
-            border-radius: 6px;
-            text-decoration: none
-        }
-
-        /* theme toggle */
-        .theme-toggle {
-            background: transparent;
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            color: var(--text);
-            padding: 6px 10px;
-            border-radius: 6px;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .theme-toggle .icon {
-            font-size: 1.0em
-        }
-
-        .theme-toggle .label {
-            font-weight: 600
+            border-radius: var(--border-radius);
+            text-decoration: none;
         }
 
         form.inline {
-            display: inline
+            display: inline;
         }
 
-        /* branch details subrow */
+        /* Branch details subrow */
         tr.branch-row td {
             background: rgba(255, 255, 255, 0.02);
             padding: 12px;
@@ -204,7 +116,7 @@
             user-select: none;
         }
 
-        /* tab button visuals: higher contrast and clear active state */
+        /* Tab button visuals: higher contrast and clear active state */
         .tab-button {
             background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 60%);
             border: 1px solid rgba(255, 255, 255, 0.04);
@@ -246,11 +158,20 @@
             border: 1px solid rgba(255, 255, 255, 0.04);
         }
 
-        /* reduce visual noise for inactive tabs */
+        /* Reduce visual noise for inactive tabs */
         .tab-button[aria-pressed="false"] {
             opacity: 0.92;
         }
+
+        .spacer {
+            height: 16px;
+        }
+
+        .export-btn {
+            margin-left: 6px;
+        }
     </style>
+    <script src="/static/common/theme.js"></script>
     <script src="/static/admin.js" defer></script>
 </head>
 
@@ -258,8 +179,10 @@
     <div class="container">
         <nav>
             <div><strong>zoekt-distributed admin</strong></div>
-            <div style="display:flex;gap:10px;align-items:center"><button id="theme-toggle" class="theme-toggle">Toggle
-                    theme</button>
+            <div style="display:flex;gap:10px;align-items:center"> <button id="theme-toggle" class="theme-toggle">
+                    <span class="icon">🌙</span>
+                    <span class="label">Dark</span>
+                </button>
                 <button id="export-csv" title="Export repositories as CSV" style="margin-left:6px">Export CSV</button>
                 <div class="muted">Signed in as {{ADMIN_USER}} · <a href="/logout" class="button">Logout</a></div>
             </div>

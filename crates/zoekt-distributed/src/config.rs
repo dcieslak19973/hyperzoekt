@@ -30,6 +30,10 @@ pub struct NodeConfig {
     pub poll_interval: Duration,
     pub node_type: NodeType,
     pub endpoint: Option<String>,
+    /// If false, the node will not run indexing work (useful for disabling reindexing in dev)
+    pub enable_reindex: bool,
+    /// If true, index each registered repo once and then skip further re-index attempts
+    pub index_once: bool,
 }
 
 impl Default for NodeConfig {
@@ -76,6 +80,14 @@ impl Default for NodeConfig {
             poll_interval,
             node_type,
             endpoint,
+            enable_reindex: std::env::var("ZOEKTD_ENABLE_REINDEX")
+                .ok()
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(true),
+            index_once: std::env::var("ZOEKTD_INDEX_ONCE")
+                .ok()
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(false),
         }
     }
 }
@@ -200,6 +212,8 @@ pub struct MergeOpts {
     pub cli_lease_ttl_seconds: Option<u64>,
     pub cli_poll_interval_seconds: Option<u64>,
     pub cli_endpoint: Option<String>,
+    pub cli_enable_reindex: Option<bool>,
+    pub cli_index_once: Option<bool>,
 }
 
 /// Load and merge NodeConfig from: defaults <- config file <- env vars <- CLI
@@ -240,6 +254,16 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
     if let Ok(e) = std::env::var("ZOEKTD_ENDPOINT") {
         base.endpoint = Some(e);
     }
+    if let Ok(v) = std::env::var("ZOEKTD_ENABLE_REINDEX") {
+        if let Ok(b) = v.parse::<bool>() {
+            base.enable_reindex = b;
+        }
+    }
+    if let Ok(v) = std::env::var("ZOEKTD_INDEX_ONCE") {
+        if let Ok(b) = v.parse::<bool>() {
+            base.index_once = b;
+        }
+    }
 
     // CLI overrides everything
     if let Some(id) = opts.cli_id {
@@ -253,6 +277,12 @@ pub fn load_node_config(mut base: NodeConfig, opts: MergeOpts) -> Result<NodeCon
     }
     if let Some(e) = opts.cli_endpoint {
         base.endpoint = Some(e);
+    }
+    if let Some(b) = opts.cli_enable_reindex {
+        base.enable_reindex = b;
+    }
+    if let Some(b) = opts.cli_index_once {
+        base.index_once = b;
     }
 
     // NodeType may still be set by the caller
@@ -290,6 +320,8 @@ mod tests {
             poll_interval: Duration::from_secs(5),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
 
         // create a temp file with config
@@ -313,6 +345,8 @@ poll_interval_seconds = 3
             cli_lease_ttl_seconds: Some(33),
             cli_poll_interval_seconds: Some(5),
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         };
 
         let got = load_node_config(base, opts).expect("load");
@@ -342,6 +376,8 @@ poll_interval_seconds = 3
             poll_interval: Duration::from_secs(5),
             node_type: NodeType::Indexer,
             endpoint: None,
+            enable_reindex: true,
+            index_once: false,
         };
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let toml = r#"
@@ -363,6 +399,8 @@ poll_interval_seconds = 2
             cli_lease_ttl_seconds: None,
             cli_poll_interval_seconds: None,
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         };
         let got = load_node_config(base, opts).expect("load");
         // env should override file for id
@@ -406,6 +444,8 @@ poll_interval_seconds = 1
             cli_lease_ttl_seconds: Some(99),
             cli_poll_interval_seconds: Some(7),
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         };
 
         let got = load_node_config(base, opts).expect("load");
@@ -448,6 +488,8 @@ poll_interval_seconds = 6
             cli_lease_ttl_seconds: None,
             cli_poll_interval_seconds: None,
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         };
 
         let got = load_node_config(base, opts).expect("load");

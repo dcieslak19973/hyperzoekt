@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 clap = { version = "4", features = ["derive"] }
 toml = "0.7"
 axum = { version = "0.7", features = ["multipart"] }
-tower-http = { version = "0.5", features = ["auth"] }
+tower-http = { version = "0.5", features = ["auth", "fs"] }
 htmlescape = "0.3"
 rand = "0.8"
 hmac = "0.12"
@@ -36,9 +36,6 @@ urlencoding = "2.1"
 name = "dzr-http-search"
 path = "src/bin/dzr-http-search.rs"
 
-[[bin]]
-name = "dzr-mcp-search"
-path = "src/bin/dzr-mcp-search.rs"
 
 [[bin]]
 name = "dzr-indexer"

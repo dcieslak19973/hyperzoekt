@@ -1,46 +1,19 @@
 document.addEventListener('DOMContentLoaded', function () {
-    // Theme: default to dark, allow user to switch to light
-    const THEME_KEY = 'dzr_theme';
-    function applyTheme(theme) {
-        if (theme === 'light') document.documentElement.classList.add('light-mode');
-        else document.documentElement.classList.remove('light-mode');
-    }
-    const saved = localStorage.getItem(THEME_KEY) || 'dark';
-    applyTheme(saved);
-    // wire up all theme toggle buttons (nav + login)
-    // Show the target theme (what will happen when the user clicks)
-    function setToggleAppearance(btn, theme) {
-        const icon = btn.querySelector('.icon');
-        const label = btn.querySelector('.label');
-        if (!icon || !label) return;
-        if (theme === 'light') {
-            // currently light -> clicking will switch to dark (target)
-            icon.textContent = '🌙';
-            label.textContent = 'Dark mode';
-        } else {
-            // currently dark -> clicking will switch to light (target)
-            icon.textContent = '☀️';
-            label.textContent = 'Light mode';
-        }
-    }
-    const toggles = Array.from(document.querySelectorAll('.theme-toggle'));
-    toggles.forEach(btn => {
-        // ensure markup
-        if (!btn.querySelector('.icon')) {
-            const ic = document.createElement('span'); ic.className = 'icon'; ic.textContent = '🌙';
-            const lb = document.createElement('span'); lb.className = 'label'; lb.textContent = 'Dark';
-            btn.textContent = ''; btn.appendChild(ic); btn.appendChild(document.createTextNode(' ')); btn.appendChild(lb);
-        }
-        setToggleAppearance(btn, saved);
-        btn.addEventListener('click', function () {
-            const now = document.documentElement.classList.contains('light-mode') ? 'dark' : 'light';
-            applyTheme(now);
-            localStorage.setItem(THEME_KEY, now);
-            toggles.forEach(t => setToggleAppearance(t, now));
-            // small visual pulse
-            document.documentElement.animate([{ opacity: 0.98 }, { opacity: 1 }], { duration: 220, easing: 'ease' });
-        });
-    });
+    // Theme switching is now handled by /static/common/theme.js
+
+    // Use common utilities
+    const escapeHtml = window.ZoektCommon?.escapeHtml || function (s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": "&#39;" }[c]; }); };
+    const humanReadableBytes = window.ZoektCommon?.humanReadableBytes || function (bytes) {
+        if (bytes < 0 || Number.isNaN(bytes)) return 'N/A';
+        const KB = 1024;
+        if (bytes < KB) return bytes + ' B';
+        let v = bytes / KB;
+        if (v < KB) return v.toFixed(1) + ' KB';
+        v = v / KB;
+        if (v < KB) return v.toFixed(1) + ' MB';
+        v = v / KB;
+        return v.toFixed(2) + ' GB';
+    };
     const createForm = document.getElementById('create-form');
     const repoTableBody = document.getElementById('repo-table-body');
     const exportBtn = document.getElementById('export-csv');
@@ -73,8 +46,6 @@ document.addEventListener('DOMContentLoaded', function () {
         tr.innerHTML = `<td><span class="expander">▶</span>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
         return tr;
     }
-
-    function escapeHtml(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": "&#39;" }[c]; }); }
 
     if (createForm) {
         createForm.addEventListener('submit', function (e) {
@@ -291,18 +262,6 @@ document.addEventListener('DOMContentLoaded', function () {
         expanderEl.textContent = '▼';
     }
 
-    // Client-side human readable bytes formatting (matching server)
-    function humanReadableBytes(bytes) {
-        if (bytes < 0 || Number.isNaN(bytes)) return 'N/A';
-        const KB = 1024;
-        if (bytes < KB) return bytes + ' B';
-        let v = bytes / KB;
-        if (v < KB) return v.toFixed(1) + ' KB';
-        v = v / KB;
-        if (v < KB) return v.toFixed(1) + ' MB';
-        v = v / KB;
-        return v.toFixed(2) + ' GB';
-    }
     // Table sorting: add click handlers to sortable headers to sort tbody rows
     (function enableTableSorting() {
         const table = document.querySelector('table');

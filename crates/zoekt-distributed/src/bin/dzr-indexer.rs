@@ -21,6 +21,8 @@ use zoekt_distributed::{
     InMemoryIndex, Indexer, LeaseManager, Node, NodeConfig, NodeType, RemoteRepo,
 };
 
+type RemoteList = std::sync::Arc<RwLock<Vec<RemoteRepo>>>;
+
 fn make_snippet(
     text: &str,
     _path: &str,
@@ -262,6 +264,15 @@ struct Opts {
     /// Address to listen on for HTTP search (env: ZOEKTD_BIND_ADDR)
     #[arg(long)]
     listen: Option<String>,
+    /// Disable periodic reindexing (useful for dev when you don't want frequent re-index)
+    #[arg(long)]
+    disable_reindex: bool,
+    /// Index each repo only once and then stop reindexing it.
+    /// When enabled, successfully indexed repos are recorded in-memory and
+    /// skipped on future polling cycles. Use `ZOEKTD_INDEX_ONCE=true` to set
+    /// this behavior via environment instead.
+    #[arg(long)]
+    index_once: bool,
 }
 
 /// Shared in-memory store for indexes keyed by the repo url/path string.
@@ -337,6 +348,8 @@ async fn main() -> Result<()> {
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
             cli_endpoint: opts.listen.as_ref().map(|addr| format!("http://{}", addr)), // Only override if explicitly provided
+            cli_enable_reindex: Some(!opts.disable_reindex),
+            cli_index_once: Some(opts.index_once),
         },
     )?;
 
@@ -344,6 +357,8 @@ async fn main() -> Result<()> {
     // shared store of indexes that the HTTP handler will read from
     let store: IndexStore = Arc::new(RwLock::new(HashMap::new()));
     let indexer = SimpleIndexer::new(store.clone());
+    // shared list of registered remotes for /status
+    let registered_repos: RemoteList = Arc::new(RwLock::new(Vec::new()));
     let node = Node::new(cfg, lease_mgr, indexer);
 
     // Collect remote URLs and optional names from CLI or env. Support multiple values.
@@ -380,6 +395,8 @@ async fn main() -> Result<()> {
             git_url: url,
             branch: Some("main".into()),
         };
+        // record in local registered list and register with the node
+        registered_repos.write().push(repo.clone());
         node.add_remote(repo.clone());
     }
 
@@ -393,93 +410,115 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route(
             "/search",
-            axum::routing::get(|Query(params): Query<SearchParams>, Extension(store): Extension<IndexStore>| async move {
+            axum::routing::get(|Query(params): Query<SearchParams>, Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>| async move {
                 tracing::info!(repo=%params.repo, q=%params.q, "received search request");
-                // clone the index Arc out of the store and capture the repo root (map key)
-                let idx_pair = {
-                    let map = store.read();
-                    // try exact match by key
-                    if let Some((k, v)) = map.get_key_value(&params.repo) {
-                        Some((k.clone(), v.clone()))
-                    } else {
-                        // fallback: try matching by basename or path suffix (so 'demo' matches '/tmp/demo')
-                        map.iter().find_map(|(k, v)| {
-                            if k == &params.repo
-                                || k.ends_with(&format!("/{}", params.repo))
-                                || Path::new(k)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .map(|s| s == params.repo)
-                                    .unwrap_or(false)
-                            {
-                                Some((k.clone(), v.clone()))
-                            } else {
-                                None
-                            }
-                        })
+                // Resolve repo name to git_url if it's a registered name
+                let mut resolved_repos = Vec::new();
+                if params.repo == "*" {
+                    // Wildcard search: search all indexed repos
+                    for repo in reg.read().iter() {
+                        resolved_repos.push(repo.git_url.clone());
                     }
-                };
-
-                if let Some((repo_root, idx)) = idx_pair {
-                    // Parse query plan
-                    let plan = match QueryPlan::parse(&params.q) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(repo=%params.repo, q=%params.q, error=%e, "query parse error");
-                            return (
-                                axum::http::StatusCode::BAD_REQUEST,
-                                Json(json!({"error": format!("parse error: {}", e)})),
-                            )
+                } else {
+                    // Single repo search
+                    let mut resolved_repo = params.repo.clone();
+                    for repo in reg.read().iter() {
+                        if repo.name == params.repo {
+                            resolved_repo = repo.git_url.clone();
+                            tracing::debug!(original=%params.repo, resolved=%resolved_repo, "resolved repo name to git_url");
+                            break;
+                        }
+                    }
+                    resolved_repos.push(resolved_repo);
+                }
+                                // Search across all resolved repos
+                let mut all_results = Vec::new();
+                for resolved_repo in resolved_repos {
+                    // clone the index Arc out of the store and capture the repo root (map key)
+                    let idx_pair = {
+                        let map = store.read();
+                        // try exact match by key
+                        if let Some((k, v)) = map.get_key_value(&resolved_repo) {
+                            Some((k.clone(), v.clone()))
+                        } else {
+                            // fallback: try matching by basename or path suffix (so 'demo' matches '/tmp/demo')
+                            map.iter().find_map(|(k, v)| {
+                                if k == &resolved_repo
+                                    || k.ends_with(&format!("/{}", resolved_repo))
+                                    || Path::new(k)
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .map(|s| s == resolved_repo)
+                                        .unwrap_or(false)
+                                {
+                                    Some((k.clone(), v.clone()))
+                                } else {
+                                    None
+                                }
+                            })
                         }
                     };
 
-                    // Run the query in a blocking task with timeout to avoid blocking the reactor.
-                    let idx_clone = idx.clone();
-                    let fut = tokio::task::spawn_blocking(move || {
-                        // Run the plan search and then try to enrich file results with
-                        // symbol information when available. We prefer any symbols
-                        // that were extracted at index time (meta.symbols). If a
-                        // document has no symbols in the index, we fall back to
-                        // extracting symbols from the file content on-the-fly.
-                        let s = Searcher::new(&idx_clone);
-                        let mut results = s.search_plan(&plan);
+                    if let Some((repo_root, idx)) = idx_pair {
+                        // Parse query plan
+                        let plan = match QueryPlan::parse(&params.q) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(repo=%resolved_repo, q=%params.q, error=%e, "query parse error");
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    Json(json!({"error": format!("parse error: {}", e)})),
+                                )
+                            }
+                        };
 
-                        // Only attempt enrichment if we have a pattern to match
-                        if let Some(pat) = &plan.pattern {
-                            for r in results.iter_mut() {
-                                // skip if already has symbol information
-                                if r.symbol.is_some() {
-                                    continue;
-                                }
-                                // guard: doc index within range
-                                if let Some(meta) = idx_clone.doc_meta(r.doc as usize) {
-                                    // try to obtain file text: prefer in-memory doc_contents
-                                    let mut text_opt: Option<String> = idx_clone.doc_content(r.doc as usize);
-                                    if text_opt.is_none() {
-                                        let full = idx_clone.repo_root().join(&meta.path);
-                                        text_opt = std::fs::read_to_string(&full).ok();
+                        // Run the query in a blocking task with timeout to avoid blocking the reactor.
+                        let idx_clone = idx.clone();
+                        let fut = tokio::task::spawn_blocking(move || {
+                            // Run the plan search and then try to enrich file results with
+                            // symbol information when available. We prefer any symbols
+                            // that were extracted at index time (meta.symbols). If a
+                            // document has no symbols in the index, we fall back to
+                            // extracting symbols from the file content on-the-fly.
+                            let s = Searcher::new(&idx_clone);
+                            let mut results = s.search_plan(&plan);
+
+                            // Only attempt enrichment if we have a pattern to match
+                            if let Some(pat) = &plan.pattern {
+                                for r in results.iter_mut() {
+                                    // skip if already has symbol information
+                                    if r.symbol.is_some() {
+                                        continue;
                                     }
-                                    if let Some(text) = text_opt {
-                                        // find first match position (byte offset)
-                                        let pos_opt: Option<u32> = if plan.regex {
-                                            let mut pat_s = pat.clone();
-                                            if !plan.case_sensitive && !pat_s.starts_with("(?i)") {
-                                                pat_s = format!("(?i){}", pat_s);
-                                            }
-                                            if let Ok(re) = Regex::new(&pat_s) {
-                                                re.find(&text).map(|m| m.start() as u32)
+                                    // guard: doc index within range
+                                    if let Some(meta) = idx_clone.doc_meta(r.doc as usize) {
+                                        // try to obtain file text: prefer in-memory doc_contents
+                                        let mut text_opt: Option<String> = idx_clone.doc_content(r.doc as usize);
+                                        if text_opt.is_none() {
+                                            let full = idx_clone.repo_root().join(&meta.path);
+                                            text_opt = std::fs::read_to_string(&full).ok();
+                                        }
+                                        if let Some(text) = text_opt {
+                                            // find first match position (byte offset)
+                                            let pos_opt: Option<u32> = if plan.regex {
+                                                let mut pat_s = pat.clone();
+                                                if !plan.case_sensitive && !pat_s.starts_with("(?i)") {
+                                                    pat_s = format!("(?i){}", pat_s);
+                                                }
+                                                if let Ok(re) = Regex::new(&pat_s) {
+                                                    re.find(&text).map(|m| m.start() as u32)
+                                                } else {
+                                                    None
+                                                }
+                                            } else if plan.case_sensitive {
+                                                text.find(pat).map(|p| p as u32)
                                             } else {
-                                                None
-                                            }
-                                        } else if plan.case_sensitive {
-                                            text.find(pat).map(|p| p as u32)
-                                        } else {
-                                            text.to_lowercase()
-                                                .find(&pat.to_lowercase())
-                                                .map(|p| p as u32)
-                                        };
+                                                text.to_lowercase()
+                                                    .find(&pat.to_lowercase())
+                                                    .map(|p| p as u32)
+                                            };
 
-                                        if let Some(pos) = pos_opt {
+                                            if let Some(pos) = pos_opt {
                                                 // prefer indexed symbols if present
                                                 let mut chosen: Option<zoekt_rs::types::Symbol> = None;
                                                 for sym in &meta.symbols {
@@ -537,84 +576,103 @@ async fn main() -> Result<()> {
                                                     r.symbol = Some(sym.name.clone());
                                                     r.symbol_loc = Some(sym.clone());
                                                 }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        results
-                    });
+                            results
+                        });
 
-                    // 5s timeout for demo
-                    match timeout(Duration::from_secs(5), fut).await {
-                        Ok(join_res) => match join_res {
-                            Ok(results) => {
-                                // cap results to first 100
-                                let cap = 100usize;
-                                let context = params.context_lines.unwrap_or(2);
-                                let out: Vec<_> = results
-                                    .into_iter()
-                                    .take(cap)
-                                    .map(|mut r| {
-                                        // try to build a snippet: prefer in-memory contents if present
-                                        // Try to read file from disk under repo root. We don't access
-                                        // in-memory doc_contents here to avoid touching private APIs.
-                                        // We don't have the repo root here; attempt to read path as-is
-                                        // join repo_root with relative path so we read the correct file
-                                        let full_path = Path::new(&repo_root).join(&r.path);
-                                        match std::fs::read_to_string(&full_path) {
-                                            Ok(text) => {
-                                                let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &params.q);
-                                                if snippet.is_some() {
-                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
-                                                } else {
-                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                        // 5s timeout for demo
+                        match timeout(Duration::from_secs(5), fut).await {
+                            Ok(join_res) => match join_res {
+                                Ok(results) => {
+                                    // cap results to first 100 per repo
+                                    let context = params.context_lines.unwrap_or(2);
+                                    let repo_results: Vec<_> = results
+                                        .into_iter()
+                                        .take(100)
+                                        .map(|mut r| {
+                                            // try to build a snippet: prefer in-memory contents if present
+                                            // Try to read file from disk under repo root. We don't access
+                                            // in-memory doc_contents here to avoid touching private APIs.
+                                            // We don't have the repo root here; attempt to read path as-is
+                                            // join repo_root with relative path so we read the correct file
+                                            let full_path = Path::new(&repo_root).join(&r.path);
+                                            match std::fs::read_to_string(&full_path) {
+                                                Ok(text) => {
+                                                    let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &params.q);
+                                                    if snippet.is_some() {
+                                                        tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
+                                                    } else {
+                                                        tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                                                    }
+                                                    // Fallback: if no symbol from enrichment, use from snippet
+                                                    if r.symbol_loc.is_none() && snippet_symbol.is_some() {
+                                                        r.symbol_loc = snippet_symbol.clone();
+                                                        r.symbol = snippet_symbol.map(|s| s.name);
+                                                    }
+                                                    json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo})
                                                 }
-                                                // Fallback: if no symbol from enrichment, use from snippet
-                                                if r.symbol_loc.is_none() && snippet_symbol.is_some() {
-                                                    r.symbol_loc = snippet_symbol.clone();
-                                                    r.symbol = snippet_symbol.map(|s| s.name);
+                                                Err(e) => {
+                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, error=%e, "failed to read file for snippet");
+                                                    json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo})
                                                 }
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet})
                                             }
-                                            Err(e) => {
-                                                tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, error=%e, "failed to read file for snippet");
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null})
-                                            }
-                                        }
-                                    })
-                                    .collect();
-                                tracing::info!(repo=%params.repo, results=%out.len(), "search completed");
-                                (axum::http::StatusCode::OK, Json(json!({"results": out})))
-                            }
-                            Err(e) => (
-                                {
-                                    tracing::error!(repo=%params.repo, error=%e, "search task failed");
-                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
-                                },
-                                Json(json!({"error": format!("search task failed: {}", e)})),
-                            ),
-                        },
-                        Err(_) => (
-                            {
-                                tracing::warn!(repo=%params.repo, q=%params.q, "search timed out");
-                                axum::http::StatusCode::REQUEST_TIMEOUT
+                                        })
+                                        .collect();
+                                    all_results.extend(repo_results);
+                                }
+                                Err(e) => {
+                                    tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
+                                    return (
+                                        {
+                                            tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
+                                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                        },
+                                        Json(json!({"error": format!("search task failed: {}", e)})),
+                                    );
+                                }
                             },
-                            Json(json!({"error": "search timed out"})),
-                        ),
+                            Err(_) => {
+                                tracing::warn!(repo=%resolved_repo, q=%params.q, "search timed out");
+                                return (
+                                    {
+                                        tracing::warn!(repo=%resolved_repo, q=%params.q, "search timed out");
+                                        axum::http::StatusCode::REQUEST_TIMEOUT
+                                    },
+                                    Json(json!({"error": "search timed out"})),
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(repo=%resolved_repo, "repo not found in index store");
+                        // For wildcard searches, we don't fail if a repo isn't found, just skip it
+                        if params.repo != "*" {
+                            return (
+                                axum::http::StatusCode::NOT_FOUND,
+                                Json(json!({"error": "repo not found"})),
+                            );
+                        }
                     }
-                } else {
-                    tracing::warn!(repo=%params.repo, "repo not found in index store");
-                    (
-                        axum::http::StatusCode::NOT_FOUND,
-                        Json(json!({"error": "repo not found"})),
-                    )
                 }
+
+                // Sort results by score (highest first) and limit total results
+                all_results.sort_by(|a, b| {
+                    let score_a = a.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    let score_b = b.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let final_results = all_results.into_iter().take(100).collect::<Vec<_>>();
+
+                tracing::info!(repo=%params.repo, total_results=%final_results.len(), "search completed");
+                (axum::http::StatusCode::OK, Json(json!({"results": final_results})))
             }),
         )
         .route(
             "/search",
-            axum::routing::post(|Extension(store): Extension<IndexStore>, ReqJson(body): ReqJson<serde_json::Value>| async move {
+            axum::routing::post(|Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>, ReqJson(body): ReqJson<serde_json::Value>| async move {
                 // Accept either {"repo":..., "q":..., ...} or {"data": {"repo":..., "q":...}}
                 let inner = if let Some(d) = body.get("data") { d.clone() } else { body.clone() };
                 let params: SearchParams = match serde_json::from_value(inner) {
@@ -626,6 +684,16 @@ async fn main() -> Result<()> {
                 };
                 tracing::info!(repo=%params.repo, q=%params.q, "received POST search request");
 
+                // Resolve repo name to git_url if it's a registered name
+                let mut resolved_repo = params.repo.clone();
+                for repo in reg.read().iter() {
+                    if repo.name == params.repo {
+                        resolved_repo = repo.git_url.clone();
+                        tracing::debug!(original=%params.repo, resolved=%resolved_repo, "resolved repo name to git_url");
+                        break;
+                    }
+                }
+
                 // clone the index Arc and repo root key out of the store without holding
                 // non-Send guards across await. We capture the store key (repo_root)
                 // so we can join relative result paths against the repo root when
@@ -633,17 +701,17 @@ async fn main() -> Result<()> {
                 let idx_pair = {
                     let map = store.read();
                     // try exact match by key
-                    if let Some((k, v)) = map.get_key_value(&params.repo) {
+                    if let Some((k, v)) = map.get_key_value(&resolved_repo) {
                         Some((k.clone(), v.clone()))
                     } else {
                         // fallback: try matching by basename or path suffix
                         map.iter().find_map(|(k, v)| {
-                            if k == &params.repo
-                                || k.ends_with(&format!("/{}", params.repo))
+                            if k == &resolved_repo
+                                || k.ends_with(&format!("/{}", resolved_repo))
                                 || Path::new(k)
                                     .file_name()
                                     .and_then(|s| s.to_str())
-                                    .map(|s| s == params.repo)
+                                    .map(|s| s == resolved_repo)
                                     .unwrap_or(false)
                             {
                                 Some((k.clone(), v.clone()))
@@ -786,11 +854,11 @@ async fn main() -> Result<()> {
                                                     r.symbol_loc = snippet_symbol.clone();
                                                     r.symbol = snippet_symbol.map(|s| s.name);
                                                 }
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet})
+                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo})
                                             }
                                             Err(e) => {
                                                 tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, error=%e, "failed to read file for snippet");
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null})
+                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo})
                                             }
                                         }
                                     })
@@ -816,12 +884,50 @@ async fn main() -> Result<()> {
         )
         .route(
             "/status",
-            axum::routing::get(|| async move {
-                // the handler closes over nothing; we'll read the store via Extension below
-                (axum::http::StatusCode::OK, Json(json!({"status": "ok"})))
+            axum::routing::get(|Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>| async move {
+                let repos = reg.read().clone();
+                let mut out = Vec::new();
+                for repo in repos {
+                    // try to find a matching index in the store
+                    let idx_pair = {
+                        let map = store.read();
+                        if let Some((k, v)) = map.get_key_value(&repo.git_url) {
+                            Some((k.clone(), v.clone()))
+                        } else {
+                            map.iter().find_map(|(k, v)| {
+                                if k == &repo.git_url || k.ends_with(&format!("/{}", repo.git_url)) || std::path::Path::new(k)
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s == repo.git_url)
+                                    .unwrap_or(false)
+                                {
+                                    Some((k.clone(), v.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                    };
+
+                    let (indexed, docs) = if let Some((_k, idx)) = idx_pair {
+                        (true, Some(idx.doc_count()))
+                    } else {
+                        (false, None)
+                    };
+
+                    out.push(json!({
+                        "name": repo.name,
+                        "git_url": repo.git_url,
+                        "branch": repo.branch,
+                        "indexed": indexed,
+                        "docs": docs,
+                    }));
+                }
+                (axum::http::StatusCode::OK, Json(json!({"status": "ok", "repos": out})))
             }),
         )
-    .layer(Extension(store));
+    .layer(Extension(store))
+    .layer(Extension(registered_repos));
 
     // determine bind address from CLI flag, env var, or default
     let bind_addr = opts

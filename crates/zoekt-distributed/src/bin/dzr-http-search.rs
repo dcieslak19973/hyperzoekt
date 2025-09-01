@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
+use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 use zoekt_distributed::{LeaseManager, NodeConfig, NodeType};
@@ -33,6 +34,8 @@ struct SearchParams {
     q: String,
     /// number of context lines to include before/after the match (optional)
     context_lines: Option<usize>,
+    /// optional branches selector (e.g. "*" or "main,dev")
+    branches: Option<String>,
 }
 
 #[tokio::main]
@@ -54,6 +57,8 @@ async fn main() -> Result<()> {
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
             cli_endpoint: None,
+            cli_enable_reindex: None,
+            cli_index_once: None,
         },
     )?;
 
@@ -68,6 +73,8 @@ async fn main() -> Result<()> {
     tracing::info!(binding = %bind_addr, "starting distributed http search server");
 
     let app = axum::Router::new()
+        .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
+        .nest_service("/", ServeDir::new("crates/zoekt-distributed/static/search"))
         .route(
             "/search",
             axum::routing::get(|Query(params): Query<SearchParams>| async move {
@@ -89,11 +96,14 @@ async fn main() -> Result<()> {
                     let client = client.clone();
                     let params = params.clone();
                     let task = tokio::spawn(async move {
-                        let url = format!("{}/search?repo={}&q={}&context_lines={}",
+                        let branches = params.branches.clone().unwrap_or_else(|| "*".to_string());
+                        let url = format!(
+                            "{}/search?repo={}&q={}&context_lines={}&branches={}",
                             endpoint,
                             urlencoding::encode(&params.repo),
                             urlencoding::encode(&params.q),
-                            params.context_lines.unwrap_or(2)
+                            params.context_lines.unwrap_or(5),
+                            urlencoding::encode(&branches),
                         );
                         match timeout(Duration::from_secs(10), client.get(&url).send()).await {
                             Ok(Ok(resp)) if resp.status().is_success() => {
