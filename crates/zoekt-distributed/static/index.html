@@ -187,6 +187,22 @@
         form.inline {
             display: inline
         }
+
+        /* branch details subrow */
+        tr.branch-row td {
+            background: rgba(255, 255, 255, 0.02);
+            padding: 12px;
+        }
+
+        .expander {
+            display: inline-block;
+            width: 18px;
+            text-align: center;
+            cursor: pointer;
+            margin-right: 6px;
+            color: var(--muted);
+            user-select: none;
+        }
     </style>
     <script src="/static/admin.js" defer></script>
 </head>
@@ -211,10 +227,6 @@
                         <th class="sortable" data-type="text">URL</th>
                         <th class="sortable" data-type="text">Branches</th>
                         <th class="sortable numeric" data-type="number">Frequency (min)</th>
-                        <th class="sortable" data-type="date">Last indexed</th>
-                        <th class="sortable numeric" data-type="number">Last duration (ms)</th>
-                        <th class="sortable numeric" data-type="number">Memory (bytes)</th>
-                        <th class="sortable" data-type="text">Leased node</th>
                         <th>Actions</th>
                     </tr>
                 </thead>

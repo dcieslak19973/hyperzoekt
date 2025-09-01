@@ -46,6 +46,7 @@ mod tests {
             name: "r1".into(),
             // Use a non-local URL so the node attempts to acquire a lease in tests.
             git_url: "https://example.com/fake-repo.git".into(),
+            branch: Some("main".into()),
         };
         node.add_remote(repo.clone());
         node.run_for(Duration::from_millis(50)).await?;
@@ -82,6 +83,7 @@ mod tests {
         let repo = RemoteRepo {
             name: "r-meta".into(),
             git_url: "/tmp/fake-repo-meta".into(),
+            branch: Some("main".into()),
         };
         indexer_node.add_remote(repo.clone());
         // Run the node for a short duration to trigger indexing
@@ -103,15 +105,17 @@ mod tests {
             Err(_) => panic!("timed out waiting for meta message after 5 seconds"),
         };
         assert_eq!(rec.0, "r-meta");
+        // branch should be present and match
+        assert_eq!(rec.1, "main");
         // last_indexed should be close to now (within 10s)
         let now_ms = chrono::Utc::now().timestamp_millis();
-        assert!(rec.1 <= now_ms && rec.1 > now_ms - 10000);
+        assert!(rec.2 <= now_ms && rec.2 > now_ms - 10000);
         // duration should be positive
-        assert!(rec.2 > 0);
+        assert!(rec.3 > 0);
         // memory estimate should be non-negative
-        assert!(rec.3 >= 0);
+        assert!(rec.4 >= 0);
         // leased node should match config id
-        assert_eq!(rec.4, "test-node-meta");
+        assert_eq!(rec.5, "test-node-meta");
 
         tracing::info!("TEST END: node_records_repo_meta_on_index");
         Ok(())
@@ -133,6 +137,7 @@ mod tests {
             name: "r-contend".into(),
             // Use a non-local URL so nodes contend for a Redis-backed lease in this test
             git_url: "https://example.com/fake-repo-contend.git".into(),
+            branch: Some("main".into()),
         };
 
         // Two fake indexers that count how many times they were invoked (i.e. wins)
@@ -691,4 +696,42 @@ mod tests {
 
         // EnvGuard will automatically clean up when it goes out of scope
     }
+}
+
+#[tokio::test]
+async fn branch_scoped_leases_are_independent() {
+    let lease = LeaseManager::new().await;
+    let repo_base = RemoteRepo {
+        name: "r-branch-test".into(),
+        git_url: "https://example.com/branch-repo.git".into(),
+        branch: Some("main".into()),
+    };
+
+    let repo_a = RemoteRepo {
+        name: repo_base.name.clone(),
+        git_url: repo_base.git_url.clone(),
+        branch: Some("main".into()),
+    };
+    let repo_b = RemoteRepo {
+        name: repo_base.name.clone(),
+        git_url: repo_base.git_url.clone(),
+        branch: Some("dev".into()),
+    };
+
+    // Two different holders should be able to acquire different branch leases independently
+    let a_ok = lease
+        .try_acquire(&repo_a, "node-a".into(), std::time::Duration::from_secs(2))
+        .await;
+    let b_ok = lease
+        .try_acquire(&repo_b, "node-b".into(), std::time::Duration::from_secs(2))
+        .await;
+
+    assert!(a_ok, "expected node-a to acquire main branch lease");
+    assert!(b_ok, "expected node-b to acquire dev branch lease");
+
+    // Confirm leases are held by respective nodes
+    let la = lease.get_lease(&repo_a).await.expect("lease a exists");
+    let lb = lease.get_lease(&repo_b).await.expect("lease b exists");
+    assert_eq!(la.holder, "node-a");
+    assert_eq!(lb.holder, "node-b");
 }

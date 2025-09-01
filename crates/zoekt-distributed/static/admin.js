@@ -56,17 +56,16 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     } catch (e) { /* ignore parse errors */ }
 
-    function makeRow(name, url, csrf, freq, lastIndexed, lastDurMs, leased, branches) {
+    function makeRow(name, url, csrf, freq, branches, branchDetails) {
         const tr = document.createElement('tr');
         // ensure a stable key on the row so client-side diffs can match server-rendered rows
         tr.dataset.name = name;
-        // lastDurMs maps to fifth column, memory (formatted) will be sixth, leased seventh, branches eighth
-        const memRaw = (lastDurMs && typeof lastDurMs === 'object' && lastDurMs.memory_bytes !== undefined) ? String(lastDurMs.memory_bytes) : '';
-        const memDisplay = (lastDurMs && typeof lastDurMs === 'object' && lastDurMs.memory_display) ? String(lastDurMs.memory_display) : '';
-        // Fallback when server supplied scalar values for last_duration or memory
-        const lastDurVal = (typeof lastDurMs === 'number' || typeof lastDurMs === 'string') ? lastDurMs : '';
+        // attach branch details JSON for later use by the expander
+        if (branchDetails) tr.dataset.branchDetails = JSON.stringify(branchDetails);
         const branchesVal = (typeof branches === 'string') ? branches : '';
-        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td>${escapeHtml(String(lastIndexed || ''))}</td><td>${escapeHtml(String(lastDurVal || ''))}</td><td class="numeric memory" data-bytes="${escapeHtml(memRaw)}" title="${escapeHtml(memRaw)}">${escapeHtml(memDisplay || '')}</td><td>${escapeHtml(String(leased || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
+        // add an expander cell at the start
+        // columns: name, url, branches, frequency, actions
+        tr.innerHTML = `<td><span class="expander">▶</span>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
         return tr;
     }
 
@@ -109,7 +108,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 // append row (guard in case table body missing)
                 if (repoTableBody) {
                     const branches = formData.get('branches') || 'main';
-                    repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, data.last_indexed, data.last_duration_ms, data.leased_node, branches));
+                    // server response does not include branch details for a freshly created repo
+                    repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, branches));
                     // reapply current sort if any
                     applyCurrentSort();
                 }
@@ -227,20 +227,58 @@ document.addEventListener('DOMContentLoaded', function () {
                 }).catch(err => alert(err));
             }
         });
-        // After initial page load, format any existing memory cells (server-rendered)
-        (function formatMemoryCells() {
-            const cells = Array.from(document.querySelectorAll('td.memory'));
-            cells.forEach(c => {
-                const raw = c.getAttribute('data-bytes');
-                if (raw && raw !== '') {
-                    const n = Number(raw);
-                    if (!Number.isNaN(n)) {
-                        c.textContent = humanReadableBytes(n);
-                        c.setAttribute('title', raw);
-                    }
-                }
+        // No initial memory cell formatting needed: runtime columns moved to branch-details.
+        // Add click handler for expand/collapse
+        repoTableBody.addEventListener('click', function (e) {
+            const exp = e.target.closest('.expander');
+            if (!exp) return;
+            const tr = exp.closest('tr');
+            if (!tr) return;
+            toggleBranchRow(tr, exp);
+        });
+    }
+
+    function toggleBranchRow(tr, expanderEl) {
+        const next = tr.nextElementSibling;
+        // if next is a branch-row for this repo, remove it (collapse)
+        if (next && next.classList && next.classList.contains('branch-row')) {
+            next.remove();
+            expanderEl.textContent = '▶';
+            return;
+        }
+        // otherwise build and insert the branch details row
+        const raw = tr.dataset.branchDetails;
+        let details = null;
+        if (raw) {
+            try { details = JSON.parse(raw); } catch (e) { details = null; }
+        }
+        const br = document.createElement('tr');
+        br.className = 'branch-row';
+        const td = document.createElement('td');
+        td.colSpan = tr.children.length;
+        if (!details || !Array.isArray(details) || details.length === 0) {
+            td.innerHTML = '<em class="muted">No branch details available</em>';
+        } else {
+            // build a small table showing branch details
+            const tbl = document.createElement('table');
+            tbl.style.width = '100%';
+            tbl.style.borderCollapse = 'collapse';
+            const h = document.createElement('thead');
+            h.innerHTML = '<tr><th>Branch</th><th>Last indexed</th><th class="numeric">Duration (ms)</th><th class="numeric">Memory</th><th>Leased node</th></tr>';
+            tbl.appendChild(h);
+            const bbody = document.createElement('tbody');
+            details.forEach(d => {
+                const r = document.createElement('tr');
+                const mem = (d.memory_display) ? d.memory_display : (d.memory_bytes ? humanReadableBytes(Number(d.memory_bytes)) : '');
+                r.innerHTML = `<td>${escapeHtml(d.branch || '')}</td><td>${escapeHtml(d.last_indexed || '')}</td><td class="numeric">${escapeHtml(String(d.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(mem)}</td><td>${escapeHtml(d.leased_node || '')}</td>`;
+                bbody.appendChild(r);
             });
-        })();
+            tbl.appendChild(bbody);
+            td.appendChild(tbl);
+        }
+        br.appendChild(td);
+        tr.parentNode.insertBefore(br, tr.nextSibling);
+        expanderEl.textContent = '▼';
     }
 
     // Client-side human readable bytes formatting (matching server)
@@ -391,14 +429,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 // update fields if changed
                 const row = incoming.get(name);
                 seen.add(name);
-                // cells: 0=name,1=url,2=branches,3=freq,4=lastIndexed,5=lastDuration,6=memory,7=leased,8=actions
+                // cells: 0=name,1=url,2=branches,3=freq,4=actions
                 const urlCell = tr.children[1];
                 const branchesCell = tr.children[2];
                 const freqCell = tr.children[3];
-                const lastIndexedCell = tr.children[4];
-                const lastDurCell = tr.children[5];
-                const memCell = tr.children[6];
-                const leasedCell = tr.children[7];
 
                 if (urlCell && row.url !== undefined && urlCell.textContent !== String(row.url)) urlCell.textContent = String(row.url);
                 if (branchesCell) {
@@ -409,32 +443,19 @@ document.addEventListener('DOMContentLoaded', function () {
                     const want = row.frequency == null ? '' : String(row.frequency);
                     if (freqCell.textContent !== want) freqCell.textContent = want;
                 }
-                if (lastIndexedCell) {
-                    const want = row.last_indexed == null ? '' : String(row.last_indexed);
-                    if (lastIndexedCell.textContent !== want) lastIndexedCell.textContent = want;
-                }
-                if (lastDurCell) {
-                    const want = row.last_duration_ms == null ? '' : String(row.last_duration_ms);
-                    if (lastDurCell.textContent !== want) lastDurCell.textContent = want;
-                }
-                if (memCell) {
-                    const raw = row.memory_bytes == null ? '' : String(row.memory_bytes);
-                    const display = row.memory_display == null ? (row.memory_bytes == null ? '' : humanReadableBytes(Number(row.memory_bytes))) : String(row.memory_display);
-                    if (memCell.getAttribute('data-bytes') !== raw) memCell.setAttribute('data-bytes', raw);
-                    if (memCell.textContent !== display) memCell.textContent = display;
-                    if (raw) memCell.setAttribute('title', raw); else memCell.removeAttribute('title');
-                }
-                if (leasedCell) {
-                    const want = row.leased_node == null ? '' : String(row.leased_node);
-                    if (leasedCell.textContent !== want) leasedCell.textContent = want;
+                // update branch-details dataset on the row so the expander shows fresh data
+                if (row.branch_details) {
+                    try { tr.dataset.branchDetails = JSON.stringify(row.branch_details); } catch (e) { /* ignore */ }
+                } else {
+                    // remove attribute when no details
+                    if (tr.dataset && tr.dataset.branchDetails) delete tr.dataset.branchDetails;
                 }
             }
 
             // add any new rows at the end
             for (const [name, row] of incoming) {
                 if (seen.has(name)) continue;
-                const memObj = { memory_bytes: row.memory_bytes, memory_display: row.memory_display };
-                const newRow = makeRow(row.name, row.url, document.querySelector('input[name="csrf"]').value || '', row.frequency, row.last_indexed, memObj, row.leased_node, row.branches);
+                const newRow = makeRow(row.name, row.url, document.querySelector('input[name="csrf"]').value || '', row.frequency, row.branches, row.branch_details);
                 // if a sort is active, insert in sorted position; otherwise append
                 if (tableSortState.idx >= 0) {
                     // find first existing row that should come after newRow

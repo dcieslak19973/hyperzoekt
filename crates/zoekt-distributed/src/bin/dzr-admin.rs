@@ -176,57 +176,16 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                 let safe_name = htmlescape::encode_minimal(&name);
                 // fetch meta JSON from zoekt:repo_meta
                 let mut freq = "".to_string();
-                let mut last_indexed = "".to_string();
-                let mut last_duration_ms = "".to_string();
-                let mut memory_bytes = "".to_string();
-                let mut memory_bytes_raw = "".to_string();
-                let mut leased = "".to_string();
                 let mut branches = "".to_string();
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                        // repo_meta now stores only administrative settings: frequency and the
+                        // original branch pattern. Runtime fields (last_indexed, duration,
+                        // memory, leased_node) are stored per-branch in
+                        // `zoekt:repo_branch_meta` and are shown in the expandable branch
+                        // details. Only read frequency and branches here.
                         if let Some(f) = v.get("frequency") {
                             freq = f.to_string();
-                        }
-                        if let Some(li) = v.get("last_indexed") {
-                            if !li.is_null() {
-                                // last_indexed stored as epoch milliseconds -> format RFC3339
-                                if let Some(n) = li.as_i64() {
-                                    let dt: DateTime<Utc> = Utc
-                                        .timestamp_millis_opt(n)
-                                        .single()
-                                        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
-                                    last_indexed = dt.to_rfc3339();
-                                } else if let Some(s) = li.as_str() {
-                                    // fallback if stored as string
-                                    last_indexed = s.to_string();
-                                } else {
-                                    last_indexed = li.to_string();
-                                }
-                            }
-                        }
-                        if let Some(ld) = v.get("last_duration_ms") {
-                            if !ld.is_null() {
-                                last_duration_ms = ld.to_string();
-                            }
-                        }
-                        if let Some(mb) = v.get("memory_bytes") {
-                            if !mb.is_null() {
-                                // Try to extract as integer; record raw value and compute a human-friendly display
-                                if let Some(n) = mb.as_i64() {
-                                    memory_bytes_raw = n.to_string();
-                                    memory_bytes = human_readable_bytes(n);
-                                } else if let Some(s) = mb.as_str() {
-                                    memory_bytes_raw = s.to_string();
-                                    memory_bytes = s.to_string();
-                                } else {
-                                    memory_bytes = mb.to_string();
-                                }
-                            }
-                        }
-                        if let Some(n) = v.get("leased_node") {
-                            if !n.is_null() {
-                                leased = n.to_string();
-                            }
                         }
                         if let Some(b) = v.get("branches") {
                             if !b.is_null() {
@@ -239,18 +198,111 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                         }
                     }
                 }
+                // Gather branch-level details for display as structured JSON so the client can
+                // render an expandable subtable. We'll collect an array of objects with
+                // branch, last_indexed (RFC3339 or string), last_duration_ms, memory_bytes,
+                // memory_display and leased_node.
+                let mut branch_objs: Vec<serde_json::Value> = Vec::new();
+                if let Ok(entry_map) = pool.hgetall("zoekt:repo_branch_meta").await {
+                    for (field, json_val) in entry_map {
+                        if field.starts_with(&format!("{}|", name)) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_val) {
+                                if let Some((_, branch)) = field.split_once('|') {
+                                    let mut obj = serde_json::Map::new();
+                                    obj.insert(
+                                        "branch".to_string(),
+                                        serde_json::Value::String(branch.to_string()),
+                                    );
+                                    // last_indexed: normalize epoch millis -> RFC3339 when possible
+                                    if let Some(li) = v.get("last_indexed") {
+                                        if let Some(n) = li.as_i64() {
+                                            let dt: DateTime<Utc> = Utc
+                                                .timestamp_millis_opt(n)
+                                                .single()
+                                                .unwrap_or_else(|| {
+                                                    Utc.timestamp_opt(0, 0).unwrap()
+                                                });
+                                            obj.insert(
+                                                "last_indexed".to_string(),
+                                                serde_json::Value::String(dt.to_rfc3339()),
+                                            );
+                                        } else if let Some(s) = li.as_str() {
+                                            obj.insert(
+                                                "last_indexed".to_string(),
+                                                serde_json::Value::String(s.to_string()),
+                                            );
+                                        }
+                                    }
+                                    if let Some(ld) = v.get("last_duration_ms") {
+                                        if let Some(n) = ld.as_i64() {
+                                            obj.insert(
+                                                "last_duration_ms".to_string(),
+                                                serde_json::Value::Number(
+                                                    serde_json::Number::from(n),
+                                                ),
+                                            );
+                                        } else if let Some(s) = ld.as_str() {
+                                            if let Ok(n) = s.parse::<i64>() {
+                                                obj.insert(
+                                                    "last_duration_ms".to_string(),
+                                                    serde_json::Value::Number(
+                                                        serde_json::Number::from(n),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(mb) = v.get("memory_bytes") {
+                                        if let Some(n) = mb.as_i64() {
+                                            obj.insert(
+                                                "memory_bytes".to_string(),
+                                                serde_json::Value::Number(
+                                                    serde_json::Number::from(n),
+                                                ),
+                                            );
+                                            obj.insert(
+                                                "memory_display".to_string(),
+                                                serde_json::Value::String(human_readable_bytes(n)),
+                                            );
+                                        } else if let Some(s) = mb.as_str() {
+                                            obj.insert(
+                                                "memory_display".to_string(),
+                                                serde_json::Value::String(s.to_string()),
+                                            );
+                                        }
+                                    }
+                                    if let Some(n) = v.get("leased_node") {
+                                        if !n.is_null() {
+                                            if let Some(s) = n.as_str() {
+                                                obj.insert(
+                                                    "leased_node".to_string(),
+                                                    serde_json::Value::String(s.to_string()),
+                                                );
+                                            } else {
+                                                obj.insert("leased_node".to_string(), n.clone());
+                                            }
+                                        }
+                                    }
+                                    branch_objs.push(serde_json::Value::Object(obj));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let branch_json =
+                    serde_json::to_string(&branch_objs).unwrap_or_else(|_| "[]".to_string());
+                let branch_json_escaped = htmlescape::encode_minimal(&branch_json);
+
+                // Row columns: Name (with expander), URL, Branches, Frequency, Actions
                 rows.push_str(&format!(
-                    "<tr data-name=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"numeric memory\" data-bytes=\"{}\">{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
+                    "<tr data-name=\"{}\" data-branch-details=\"{}\"><td><span class=\"expander\">▶</span>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
                     safe_name,
+                    branch_json_escaped,
                     htmlescape::encode_minimal(&name),
                     htmlescape::encode_minimal(&url),
                     htmlescape::encode_minimal(&branches),
                     htmlescape::encode_minimal(&freq),
-                    htmlescape::encode_minimal(&last_indexed),
-                    htmlescape::encode_minimal(&last_duration_ms),
-                    htmlescape::encode_minimal(&memory_bytes_raw),
-                    htmlescape::encode_minimal(&memory_bytes),
-                    htmlescape::encode_minimal(&leased),
                     htmlescape::encode_minimal(&name),
                     htmlescape::encode_minimal(&csrf_token),
                 ));
@@ -621,14 +673,13 @@ async fn create_inner(
                     return resp;
                 }
                 // otherwise success (res == 0)
-                // store repo meta
+                // store repo meta (administrative fields only). Runtime/status fields
+                // like last_indexed/last_duration_ms/memory_bytes/leased_node are
+                // maintained per-branch in `zoekt:repo_branch_meta` and should not be
+                // written here.
                 let meta_key = "zoekt:repo_meta".to_string();
                 let mut meta = json!({
                     "frequency": form.frequency,
-                    "last_indexed": null,
-                    "last_duration_ms": null,
-                    "memory_bytes": null,
-                    "leased_node": null,
                 });
                 let branches_str = branches.join(",");
                 meta["branches"] = json!(branches_str);
@@ -639,6 +690,13 @@ async fn create_inner(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Html("<h1>Internal Server Error</h1>".to_string()),
                     ));
+                }
+                // Write expanded branch-level entries into zoekt:repo_branches so indexers can lease per-branch
+                let branch_map_key = "zoekt:repo_branches";
+                for b in branches.iter() {
+                    let field = format!("{}|{}", form.name, b);
+                    // store the repo URL as the value; consumers can parse field to get repo name + branch
+                    let _ = pool.hset(branch_map_key, &field, &form.url).await;
                 }
             }
             Err(e) => {
@@ -797,6 +855,18 @@ async fn delete_inner(
                 // otherwise success (res == 0)
                 // remove repo meta as well
                 let _ = pool.hdel("zoekt:repo_meta", &form.name).await;
+                // remove per-branch entries for this repo from zoekt:repo_branches
+                if let Ok(entries) = pool.hgetall("zoekt:repo_branches").await {
+                    let mut to_delete: Vec<String> = Vec::new();
+                    for (field, _val) in entries {
+                        if field.starts_with(&format!("{}|", form.name)) {
+                            to_delete.push(field);
+                        }
+                    }
+                    for f in to_delete {
+                        let _ = pool.hdel("zoekt:repo_branches", &f).await;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"delete_redis_error");
@@ -881,12 +951,6 @@ struct RepoInfo {
     url: String,
     frequency: Option<u64>,
     branches: Option<String>,
-    // RFC3339 string when available
-    last_indexed: Option<String>,
-    last_duration_ms: Option<i64>,
-    memory_bytes: Option<i64>,
-    memory_display: Option<String>,
-    leased_node: Option<String>,
 }
 
 async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
@@ -895,11 +959,6 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
         if let Ok(entries) = pool.hgetall("zoekt:repos").await {
             for (name, url) in entries {
                 let mut frequency: Option<u64> = None;
-                let mut last_indexed: Option<String> = None;
-                let mut last_duration_ms: Option<i64> = None;
-                let mut memory_bytes: Option<i64> = None;
-                let mut memory_display: Option<String> = None;
-                let mut leased_node: Option<String> = None;
                 let mut branches: Option<String> = None;
 
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
@@ -907,48 +966,9 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                         if let Some(f) = v.get("frequency") {
                             if let Some(n) = f.as_u64() {
                                 frequency = Some(n);
-                            }
-                        }
-                        if let Some(li) = v.get("last_indexed") {
-                            if !li.is_null() {
-                                if let Some(n) = li.as_i64() {
-                                    let dt: DateTime<Utc> = Utc
-                                        .timestamp_millis_opt(n)
-                                        .single()
-                                        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
-                                    last_indexed = Some(dt.to_rfc3339());
-                                } else if let Some(s) = li.as_str() {
-                                    last_indexed = Some(s.to_string());
-                                }
-                            }
-                        }
-                        if let Some(ld) = v.get("last_duration_ms") {
-                            if !ld.is_null() {
-                                if let Some(n) = ld.as_i64() {
-                                    last_duration_ms = Some(n);
-                                }
-                            }
-                        }
-                        if let Some(mb) = v.get("memory_bytes") {
-                            if !mb.is_null() {
-                                if let Some(n) = mb.as_i64() {
-                                    memory_bytes = Some(n);
-                                    memory_display = Some(human_readable_bytes(n));
-                                } else if let Some(s) = mb.as_str() {
-                                    // if stored string, try parse
-                                    if let Ok(n) = s.parse::<i64>() {
-                                        memory_bytes = Some(n);
-                                        memory_display = Some(human_readable_bytes(n));
-                                    } else {
-                                        memory_display = Some(s.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(n) = v.get("leased_node") {
-                            if !n.is_null() {
-                                if let Some(s) = n.as_str() {
-                                    leased_node = Some(s.to_string());
+                            } else if let Some(s) = f.as_str() {
+                                if let Ok(n) = s.parse::<u64>() {
+                                    frequency = Some(n);
                                 }
                             }
                         }
@@ -956,6 +976,8 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                             if !b.is_null() {
                                 if let Some(s) = b.as_str() {
                                     branches = Some(s.to_string());
+                                } else {
+                                    branches = Some(b.to_string());
                                 }
                             }
                         }
@@ -967,11 +989,6 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                     url: url.clone(),
                     frequency,
                     branches,
-                    last_indexed,
-                    last_duration_ms,
-                    memory_bytes,
-                    memory_display,
-                    leased_node,
                 });
             }
         }
@@ -1229,10 +1246,6 @@ async fn bulk_import_inner(
                         let meta_key = "zoekt:repo_meta".to_string();
                         let mut meta = json!({
                             "frequency": frequency.unwrap_or(60),
-                            "last_indexed": null,
-                            "last_duration_ms": null,
-                            "memory_bytes": null,
-                            "leased_node": null,
                         });
 
                         let branches_value = if let Some(branches) = &branches {
@@ -1269,6 +1282,20 @@ async fn bulk_import_inner(
                                 e
                             ));
                         } else {
+                            // write branch-level entries: expand stored pattern and write entries to zoekt:repo_branches
+                            let branches_pattern = branches_value.clone();
+                            match expand_branch_patterns(&url, &branches_pattern).await {
+                                Ok(expanded) => {
+                                    let branch_map_key = "zoekt:repo_branches";
+                                    for b in expanded.iter() {
+                                        let field = format!("{}|{}", name, b);
+                                        let _ = pool.hset(branch_map_key, &field, &url).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(request_id=%req_id, line=%line_num, error=?e, "failed to expand branches during bulk import");
+                                }
+                            }
                             created.push(name.clone());
                         }
                     }
@@ -1392,63 +1419,19 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
     }
 
     let mut csv = String::new();
-    csv.push_str(
-        "name,url,branches,frequency,last_indexed,last_duration_ms,memory_bytes,leased_node\n",
-    );
+    csv.push_str("name,url,branches,frequency,branch_details\n");
     if let Some(pool) = &state.redis_pool {
         if let Ok(entries) = pool.hgetall("zoekt:repos").await {
             for (name, url) in entries {
                 let mut frequency = String::new();
-                let mut last_indexed = String::new();
-                let mut last_duration_ms = String::new();
-                let mut memory_bytes = String::new();
-                let mut leased_node = String::new();
                 let mut branches = String::new();
 
                 if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                        // Only read administrative fields from repo_meta. Runtime/status
+                        // fields are stored per-branch in `zoekt:repo_branch_meta`.
                         if let Some(f) = v.get("frequency") {
                             frequency = f.to_string();
-                        }
-                        if let Some(li) = v.get("last_indexed") {
-                            if !li.is_null() {
-                                if let Some(n) = li.as_i64() {
-                                    let dt: DateTime<Utc> = Utc
-                                        .timestamp_millis_opt(n)
-                                        .single()
-                                        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
-                                    last_indexed = dt.to_rfc3339();
-                                } else if let Some(s) = li.as_str() {
-                                    last_indexed = s.to_string();
-                                } else {
-                                    last_indexed = li.to_string();
-                                }
-                            }
-                        }
-                        if let Some(ld) = v.get("last_duration_ms") {
-                            if !ld.is_null() {
-                                last_duration_ms = ld.to_string();
-                            }
-                        }
-                        if let Some(mb) = v.get("memory_bytes") {
-                            if !mb.is_null() {
-                                if let Some(n) = mb.as_i64() {
-                                    memory_bytes = n.to_string();
-                                } else if let Some(s) = mb.as_str() {
-                                    memory_bytes = s.to_string();
-                                } else {
-                                    memory_bytes = mb.to_string();
-                                }
-                            }
-                        }
-                        if let Some(n) = v.get("leased_node") {
-                            if !n.is_null() {
-                                if let Some(s) = n.as_str() {
-                                    leased_node = s.to_string();
-                                } else {
-                                    leased_node = n.to_string();
-                                }
-                            }
                         }
                         if let Some(b) = v.get("branches") {
                             if !b.is_null() {
@@ -1462,16 +1445,38 @@ async fn export_csv(state: Extension<AppState>, headers: HeaderMap) -> axum::res
                     }
                 }
 
+                // collect branch-level meta summary
+                let mut branch_details: Vec<String> = Vec::new();
+                if let Ok(entries_b) = pool.hgetall("zoekt:repo_branch_meta").await {
+                    for (field, val) in entries_b {
+                        if field.starts_with(&format!("{}|", name)) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&val) {
+                                if let Some((_, branch)) = field.split_once('|') {
+                                    let last_indexed_b = v
+                                        .get("last_indexed")
+                                        .map(|x| x.to_string())
+                                        .unwrap_or_default();
+                                    let dur_b = v
+                                        .get("last_duration_ms")
+                                        .map(|x| x.to_string())
+                                        .unwrap_or_default();
+                                    branch_details.push(format!(
+                                        "{}:last_indexed={} dur_ms={}",
+                                        branch, last_indexed_b, dur_b
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{}\n",
                     esc(&name),
                     esc(&url),
                     esc(&branches),
                     esc(&frequency),
-                    esc(&last_indexed),
-                    esc(&last_duration_ms),
-                    esc(&memory_bytes),
-                    esc(&leased_node)
+                    esc(&branch_details.join("; ")),
                 ));
             }
         }

@@ -112,18 +112,27 @@ async fn redis_repo_meta_contains_memory_bytes() {
     // ensure clean state
     let _: () = conn.hdel("zoekt:repo_meta", &test_name).await.unwrap_or(());
 
-    // call LeaseManager to persist meta including memory_bytes
+    // call LeaseManager to persist branch-scoped meta including memory_bytes
     let lease = LeaseManager::new().await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let dur_ms = 123i64;
     let mem_bytes = 12345i64;
+    // write branch meta under field "<repo>|<branch>"
     lease
-        .set_repo_meta(&test_name, now_ms, dur_ms, mem_bytes, "node-int-test")
+        .set_branch_meta(
+            &test_name,
+            "main",
+            now_ms,
+            dur_ms,
+            mem_bytes,
+            "node-int-test",
+        )
         .await;
 
-    // read back the stored JSON and assert memory_bytes present
-    let got: Option<String> = conn.hget("zoekt:repo_meta", &test_name).await.unwrap();
-    assert!(got.is_some(), "expected repo_meta to be present");
+    // read back the stored JSON from zoekt:repo_branch_meta
+    let field = format!("{}|{}", &test_name, "main");
+    let got: Option<String> = conn.hget("zoekt:repo_branch_meta", &field).await.unwrap();
+    assert!(got.is_some(), "expected repo_branch_meta to be present");
     let s = got.unwrap();
     let v: Value = serde_json::from_str(&s).expect("stored meta should be valid json");
     let m = v
@@ -133,6 +142,9 @@ async fn redis_repo_meta_contains_memory_bytes() {
     assert_eq!(m, mem_bytes);
 
     // cleanup
-    let _: () = conn.hdel("zoekt:repo_meta", &test_name).await.unwrap_or(());
+    let _: () = conn
+        .hdel("zoekt:repo_branch_meta", &field)
+        .await
+        .unwrap_or(());
     tracing::info!("TEST END: redis_repo_meta_contains_memory_bytes");
 }

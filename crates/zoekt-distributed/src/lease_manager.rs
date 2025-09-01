@@ -11,14 +11,15 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 // Type aliases to reduce clippy type-complexity warnings around the meta sender.
-// MetaMsg: (name, last_indexed_ms, last_duration_ms, memory_bytes, leased_node)
-type MetaMsg = (String, i64, i64, i64, String);
+// MetaMsg: (name, branch, last_indexed_ms, last_duration_ms, memory_bytes, leased_node)
+type MetaMsg = (String, String, i64, i64, i64, String);
 type MetaSender = Sender<MetaMsg>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RemoteRepo {
     pub name: String,
     pub git_url: String,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,46 +56,28 @@ impl LeaseManager {
         }
     }
 
-    /// Set or update repo metadata in the `zoekt:repo_meta` hash. This will merge
-    /// with any existing JSON blob and set last_indexed, last_duration_ms and leased_node.
-    pub async fn set_repo_meta(
+    // NOTE: repo-level metadata writes were removed in favor of branch-scoped metadata.
+    // The previous `set_repo_meta` helper has been intentionally removed. Tests and
+    // runtime code should use `set_branch_meta(repo, branch, ...)` which stores data
+    // in the `zoekt:repo_branch_meta` hash under the field "<repo>|<branch>".
+
+    /// Set or update branch-specific metadata in the `zoekt:repo_branch_meta` hash.
+    /// Field is stored as "<repo>|<branch>" and value is a JSON blob similar to repo_meta
+    pub async fn set_branch_meta(
         &self,
-        name: &str,
+        repo: &str,
+        branch: &str,
         last_indexed_ms: i64,
         last_duration_ms: i64,
         memory_bytes: i64,
         leased_node: &str,
     ) {
-        // call test hook if present (non-blocking)
-        // clone the optional sender out of the lock so we don't hold the RwLock guard across an await
-        let maybe_tx: Option<MetaSender> = {
-            let guard = self.meta_sender.read();
-            guard.clone()
-        };
-        if let Some(tx) = maybe_tx {
-            let name_s = name.to_string();
-            let leased_s = leased_node.to_string();
-            tracing::debug!(repo=%name_s, "sending repo meta to test hook");
-            // best-effort send; do not fail if receiver gone
-            match tx
-                .send((
-                    name_s.clone(),
-                    last_indexed_ms,
-                    last_duration_ms,
-                    memory_bytes,
-                    leased_s.clone(),
-                ))
-                .await
-            {
-                Ok(_) => tracing::debug!(repo=%name_s, "meta hook send succeeded"),
-                Err(e) => tracing::warn!(repo=%name_s, error=%e, "meta hook send failed"),
-            }
-        }
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
-                let key = "zoekt:repo_meta";
+                let key = "zoekt:repo_branch_meta";
+                let field = format!("{}|{}", repo, branch);
                 // Fetch existing meta if present
-                let existing: Option<String> = conn.hget(key, name).await.ok().flatten();
+                let existing: Option<String> = conn.hget(key, &field).await.ok().flatten();
                 let mut v = if let Some(s) = existing {
                     serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
                 } else {
@@ -107,10 +90,34 @@ impl LeaseManager {
                 // Persist back (ignore errors)
                 let _ = deadpool_redis::redis::cmd("HSET")
                     .arg(key)
-                    .arg(name)
+                    .arg(field)
                     .arg(v.to_string())
                     .query_async::<i32>(&mut conn)
                     .await;
+                // Attempt to notify any registered test hook with the updated meta
+                if let Some(sender) = &*self.meta_sender.read() {
+                    // best-effort, do not block on failure
+                    let _ = sender.try_send((
+                        repo.to_string(),
+                        branch.to_string(),
+                        last_indexed_ms,
+                        last_duration_ms,
+                        memory_bytes,
+                        leased_node.to_string(),
+                    ));
+                }
+            }
+        } else {
+            // When not using Redis (tests), still notify the meta sender if present
+            if let Some(sender) = &*self.meta_sender.read() {
+                let _ = sender.try_send((
+                    repo.to_string(),
+                    branch.to_string(),
+                    last_indexed_ms,
+                    last_duration_ms,
+                    memory_bytes,
+                    leased_node.to_string(),
+                ));
             }
         }
     }
@@ -169,8 +176,32 @@ impl LeaseManager {
         result
     }
 
+    /// Get all repo branch entries from the `zoekt:repo_branches` hash.
+    /// Returns a vector of (repo_name, branch, url).
+    pub async fn get_repo_branches(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:repo_branches";
+                let all: RedisResult<HashMap<String, String>> = conn.hgetall(key).await;
+                if let Ok(map) = all {
+                    for (field, url) in map {
+                        // field format: "<repo_name>|<branch>"
+                        if let Some((name, branch)) = field.split_once('|') {
+                            out.push((name.to_string(), branch.to_string(), url));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn repo_key(repo: &RemoteRepo) -> String {
-        base64::engine::general_purpose::URL_SAFE.encode(format!("{}|{}", repo.name, repo.git_url))
+        // include branch when present so leases can be scoped to specific branches
+        let branch_part = repo.branch.as_deref().unwrap_or("");
+        base64::engine::general_purpose::URL_SAFE
+            .encode(format!("{}|{}|{}", repo.name, repo.git_url, branch_part))
     }
 
     /// Try to acquire a lease. Prefer Redis (atomic SET NX EX). Fall back to an in-memory

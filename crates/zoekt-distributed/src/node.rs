@@ -51,6 +51,19 @@ impl<I: Indexer> Node<I> {
                     .await;
             }
         }
+        // Load branch-specific work units from Redis (if configured) and register them.
+        // This allows admin to expand branch wildcards into concrete RemoteRepo entries
+        // stored in `zoekt:repo_branches`.
+        let branch_entries = self.lease_mgr.get_repo_branches().await;
+        for (name, branch, url) in branch_entries {
+            let rr = RemoteRepo {
+                name: name.clone(),
+                git_url: url.clone(),
+                branch: Some(branch.clone()),
+            };
+            tracing::info!(repo=%name, branch=%branch, "registering branch-specific RemoteRepo");
+            self.add_remote(rr);
+        }
         while start.elapsed() < duration {
             // Periodically update endpoint if indexer
             if self.config.node_type == crate::NodeType::Indexer && self.config.endpoint.is_some() {
@@ -94,12 +107,23 @@ impl<I: Indexer> Node<I> {
                             let now_ms = chrono::Utc::now().timestamp_millis();
                             let dur_ms = dur.as_millis() as i64;
                             let mem_est = index.total_scanned_bytes() as i64;
-                            // best-effort: persist meta (no lease holder semantics for local)
-                            tracing::debug!(repo=%repo.name, "about to set repo meta (local)");
-                            let _ = self
-                                .lease_mgr
-                                .set_repo_meta(&repo.name, now_ms, dur_ms, mem_est, &self.config.id)
-                                .await;
+                            // best-effort: persist meta. We only write branch-specific meta now.
+                            tracing::debug!(repo=%repo.name, "about to set branch meta (local). repo-level meta writes are disabled");
+                            if let Some(branch) = &repo.branch {
+                                let _ = self
+                                    .lease_mgr
+                                    .set_branch_meta(
+                                        &repo.name,
+                                        branch,
+                                        now_ms,
+                                        dur_ms,
+                                        mem_est,
+                                        &self.config.id,
+                                    )
+                                    .await;
+                            } else {
+                                tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(repo = %repo.name, error = %e, "failed to index");
@@ -163,13 +187,24 @@ impl<I: Indexer> Node<I> {
                             let dur = index_started.elapsed();
                             let now_ms = chrono::Utc::now().timestamp_millis();
                             let dur_ms = dur.as_millis() as i64;
-                            // best-effort: persist meta
+                            // best-effort: persist meta. We only write branch-specific meta now.
                             let mem_est = index.total_scanned_bytes() as i64;
-                            tracing::debug!(repo=%repo.name, "about to set repo meta (remote)");
-                            let _ = self
-                                .lease_mgr
-                                .set_repo_meta(&repo.name, now_ms, dur_ms, mem_est, &self.config.id)
-                                .await;
+                            tracing::debug!(repo=%repo.name, "about to set branch meta (remote). repo-level meta writes are disabled");
+                            if let Some(branch) = &repo.branch {
+                                let _ = self
+                                    .lease_mgr
+                                    .set_branch_meta(
+                                        &repo.name,
+                                        branch,
+                                        now_ms,
+                                        dur_ms,
+                                        mem_est,
+                                        &self.config.id,
+                                    )
+                                    .await;
+                            } else {
+                                tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(repo = %repo.name, error = %e, "failed to index");

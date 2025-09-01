@@ -375,7 +375,11 @@ async fn main() -> Result<()> {
         };
 
         tracing::info!(remote = %name, url = %url, "registering remote repo");
-        let repo = RemoteRepo { name, git_url: url };
+        let repo = RemoteRepo {
+            name,
+            git_url: url,
+            branch: Some("main".into()),
+        };
         node.add_remote(repo.clone());
     }
 
