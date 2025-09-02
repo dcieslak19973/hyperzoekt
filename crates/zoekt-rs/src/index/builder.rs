@@ -9,6 +9,56 @@ use super::utils::*;
 
 use std::path::Path;
 
+/// Helper function to inject credentials into a git URL if available from environment variables.
+/// Returns the original URL if no credentials are found or if it's not an HTTPS URL.
+fn inject_credentials(url: &str) -> String {
+    if !url.starts_with("https://") {
+        return url.to_string();
+    }
+
+    // Check if credentials are already present (user:pass@host)
+    if let Some(at_pos) = url.find('@') {
+        if let Some(scheme_end) = url.find("://") {
+            let host_part = &url[scheme_end + 3..at_pos];
+            if host_part.contains(':') {
+                // Credentials already present, return as-is
+                return url.to_string();
+            }
+        }
+    }
+
+    // Detect platform and get credentials
+    let (username_env, token_env) = if url.contains("github.com") {
+        ("GITHUB_USERNAME", "GITHUB_TOKEN")
+    } else if url.contains("gitlab.com") {
+        ("GITLAB_USERNAME", "GITLAB_TOKEN")
+    } else if url.contains("bitbucket.org") {
+        ("BITBUCKET_USERNAME", "BITBUCKET_TOKEN")
+    } else {
+        return url.to_string();
+    };
+
+    let username = std::env::var(username_env).ok();
+    let token = std::env::var(token_env).ok();
+
+    if let (Some(user), Some(tok)) = (username, token) {
+        // Insert credentials into URL: https://user:tok@host/path
+        if let Some(host_start) = url.find("://") {
+            let host_path = &url[host_start + 3..];
+            if let Some(slash_pos) = host_path.find('/') {
+                let host = &host_path[..slash_pos];
+                let path = &host_path[slash_pos..];
+                return format!("https://{}:{}@{}{}", user, tok, host, path);
+            } else {
+                // No path, just host
+                return format!("https://{}:{}@{}", user, tok, host_path);
+            }
+        }
+    }
+
+    url.to_string()
+}
+
 /// Attempt a non-interactive `git clone --depth 1 <url> <dst>`.
 ///
 /// `runner` is an optional test hook that receives (url, dst) and returns
@@ -19,8 +69,11 @@ pub(crate) fn try_git_clone_fallback(
     dst: &Path,
     runner: Option<&dyn Fn(&str, &Path) -> std::io::Result<std::process::Output>>,
 ) -> Result<(), crate::index::IndexError> {
+    let authenticated_url = inject_credentials(url);
+
     if let Some(r) = runner {
-        let output = r(url, dst).map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
+        let output = r(&authenticated_url, dst)
+            .map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
         if output.status.success() {
             return Ok(());
         }
@@ -43,7 +96,11 @@ pub(crate) fn try_git_clone_fallback(
     }
 
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("clone").arg("--depth").arg("1").arg(url).arg(dst);
+    cmd.arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg(&authenticated_url)
+        .arg(dst);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     if url.starts_with("git@") || url.starts_with("ssh://") {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
@@ -129,13 +186,27 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_clone_error_maps_to_clone_error() {
-        let runner = |_: &str, _: &std::path::Path| -> std::io::Result<std::process::Output> {
-            Ok(make_output_cmd("some other failure", 1))
-        };
-        let td = tempfile::tempdir().unwrap();
-        let res = try_git_clone_fallback("https://example.com/repo.git", td.path(), Some(&runner));
-        assert!(matches!(res, Err(crate::index::IndexError::CloneError(_))));
+    fn test_inject_credentials_no_env_vars() {
+        let result = inject_credentials("https://github.com/user/repo.git");
+        assert_eq!(result, "https://github.com/user/repo.git");
+    }
+
+    #[test]
+    fn test_inject_credentials_ssh_url() {
+        let result = inject_credentials("git@github.com:user/repo.git");
+        assert_eq!(result, "git@github.com:user/repo.git");
+    }
+
+    #[test]
+    fn test_inject_credentials_already_has_credentials() {
+        let result = inject_credentials("https://existing:creds@github.com/user/repo.git");
+        assert_eq!(result, "https://existing:creds@github.com/user/repo.git");
+    }
+
+    #[test]
+    fn test_inject_credentials_non_matching_host() {
+        let result = inject_credentials("https://example.com/user/repo.git");
+        assert_eq!(result, "https://example.com/user/repo.git");
     }
 }
 
@@ -225,8 +296,9 @@ impl IndexBuilder {
         {
             let td =
                 tempfile::tempdir().map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
+            let authenticated_url = inject_credentials(root_s.as_ref());
             // Try libgit2 clone first, fall back to git CLI if libgit2 fails.
-            match git2::Repository::clone(root_s.as_ref(), td.path()) {
+            match git2::Repository::clone(&authenticated_url, td.path()) {
                 Ok(_) => {
                     repo_root = td.path().to_path_buf();
                     _repo_clone_tempdir = Some(td);

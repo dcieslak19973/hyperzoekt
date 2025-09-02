@@ -65,12 +65,18 @@ If `REDIS_URL` doesn't contain authentication credentials, the system will autom
 - `ZOEKTD_ENABLE_REINDEX`: Enable/disable reindexing (default: true)
 - `ZOEKTD_INDEX_ONCE`: Index each repo once and skip further re-index attempts (default: false)
 
-### Kubernetes Service Discovery
-- `ZOEKTD_SERVICE_NAME`: Kubernetes service name for auto-discovery
-- `ZOEKTD_SERVICE_PORT`: Kubernetes service port
-- `ZOEKTD_SERVICE_PROTOCOL`: Protocol for service endpoints (default: http)
-- `POD_NAME`: Pod name for StatefulSet endpoint discovery
-- `POD_NAMESPACE`: Pod namespace (default: default)
+### Git Repository Authentication
+For indexing private repositories from GitHub, GitLab, or Bitbucket, set the following environment variables:
+
+- `GITHUB_USERNAME` and `GITHUB_TOKEN`: For GitHub repositories
+- `GITLAB_USERNAME` and `GITLAB_TOKEN`: For GitLab repositories  
+- `BITBUCKET_USERNAME` and `BITBUCKET_TOKEN`: For Bitbucket repositories
+
+When both username and token are provided for a platform, the indexer will automatically inject credentials into HTTPS URLs for authentication. For example:
+- Original: `https://github.com/user/repo.git`
+- With auth: `https://username:token@github.com/user/repo.git`
+
+SSH URLs (starting with `git@` or `ssh://`) are not modified and rely on SSH key authentication.
 
 License
 -------
