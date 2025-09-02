@@ -1,0 +1,42 @@
+# Use Rust image for building
+FROM rust:latest AS builder
+
+# Install required dependencies
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Disable sccache to avoid compilation issues
+ENV RUSTC_WRAPPER=
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the entire workspace
+COPY . .
+
+# Build the zoekt-distributed binaries
+RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search
+
+# Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
+FROM debian:trixie-slim
+
+# Install ca-certificates for HTTPS requests
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the built binaries from the builder stage
+COPY --from=builder /app/target/release/dzr-admin /app/
+COPY --from=builder /app/target/release/dzr-http-search /app/
+COPY --from=builder /app/target/release/dzr-indexer /app/
+COPY --from=builder /app/target/release/dzr-mcp-search /app/
+
+# Copy configuration and static files
+COPY --from=builder /app/crates/zoekt-distributed/config.toml /app/
+COPY --from=builder /app/crates/zoekt-distributed/static /app/static/
+
+# Default command (can be overridden)
+CMD ["/app/dzr-http-search"]

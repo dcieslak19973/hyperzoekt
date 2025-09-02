@@ -128,15 +128,23 @@ and the Search UI to work together.
 
 1. Run the Indexer:
 ```bash
-cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3001 --remote-url /workspaces/hyperzoekt --disable-reindex
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3001 --remote-url /workspaces/hyperzoekt --disable-reindex
+```
+OR
+```bash
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3002
 ```
 2. Run the Admin UI:
 ```bash
-cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 ZOEKT_ADMIN_USERNAME=admin ZOEKT_ADMIN_PASSWORD=password cargo run --bin dzr-admin -- --bind 127.0.0.1:7878
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 ZOEKT_ADMIN_USERNAME=admin ZOEKT_ADMIN_PASSWORD=password cargo run --bin dzr-admin -- --bind 127.0.0.1:7878
 ```
 3. Run the Search UI:
 ```bash
-cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-http-search -- --listen 127.0.0.1:8080
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-http-search -- --listen 127.0.0.1:8080
+```
+3. Run the MCP UI:
+```bash
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-mcp-search -- --listen 127.0.0.1:8081
 ```
 
 License

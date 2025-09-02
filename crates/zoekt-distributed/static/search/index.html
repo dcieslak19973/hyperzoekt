@@ -11,20 +11,37 @@
         body {
             font-family: system-ui, -apple-system, Roboto, Arial;
             padding: 20px;
+            background: var(--bg);
+            color: var(--text);
         }
 
         .search-form {
             max-width: 600px;
             margin: 0 auto 20px;
+            background: var(--panel);
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            padding: 20px;
         }
 
         .search-form label {
             margin-bottom: 8px;
+            color: var(--text);
         }
 
         .search-form input[type=text] {
             width: 100%;
             margin-bottom: 10px;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            color: var(--text);
+            padding: 8px;
+        }
+
+        .search-form input[type=text]:focus {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
         }
 
         .search-form select {
@@ -39,6 +56,17 @@
 
         .search-form button {
             width: 100%;
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px;
+            border-radius: var(--border-radius);
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .search-form button:hover {
+            background: #0891a2;
         }
 
         .results {
@@ -90,6 +118,7 @@
             border: 1px solid var(--input-border);
             border-radius: var(--border-radius);
             padding: 12px;
+            color: var(--text);
         }
 
         /* control tab rendering width inside the pre/code snippet so tabs align predictably */
@@ -162,8 +191,45 @@
             right: 20px;
         }
 
+        .theme-toggle {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--text);
+            padding: 6px 10px;
+            border-radius: var(--border-radius);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            transition: var(--transition);
+        }
+
+        .theme-toggle:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .theme-toggle .icon {
+            font-size: 1.0em;
+        }
+
+        .theme-toggle .label {
+            font-weight: 600;
+        }
+
         /* Syntax highlighting overrides for dark theme */
         :root {
+            --bg: #0f1724;
+            --panel: #0b1220;
+            --surface: #0f1724;
+            --muted: #94a3b8;
+            --text: #e6eef6;
+            --accent: #0ea5a4;
+            --danger: #ef4444;
+            --input-bg: #0b1220;
+            --input-border: #23303b;
+            --border-radius: 6px;
+            --shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+            --transition: background-color .28s ease, color .28s ease, border-color .28s ease;
             --prism-bg: var(--input-bg);
             --prism-text: var(--text);
             --prism-comment: #6a737d;
@@ -175,6 +241,15 @@
         }
 
         .light-mode {
+            --bg: #f7fafc;
+            --panel: #ffffff;
+            --surface: #f7fafc;
+            --muted: #64748b;
+            --text: #0f172a;
+            --accent: #0ea5a4;
+            --danger: #ef4444;
+            --input-bg: #ffffff;
+            --input-border: #cbd5e1;
             --prism-comment: #6a737d;
             --prism-keyword: #d73a49;
             --prism-string: #032f62;
@@ -224,7 +299,7 @@
     <div class="theme-toggle-container">
         <button id="theme-toggle" class="theme-toggle">
             <span class="icon">🌙</span>
-            <span class="label">Dark</span>
+            <span class="label">Dark mode</span>
         </button>
     </div>
 

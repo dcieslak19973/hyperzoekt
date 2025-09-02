@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::Json,
+    response::{Html, Json},
     routing::get,
     Router,
 };
@@ -15,6 +15,11 @@ use zoekt_distributed::{
     distributed_search::{DistributedSearchService, DistributedSearchTool},
     LeaseManager, NodeConfig, NodeType,
 };
+
+// Embed static templates and assets so the binary can serve them directly.
+const SEARCH_INDEX_TEMPLATE: &str = include_str!("../../static/search/index.html");
+const COMMON_STYLES: &str = include_str!("../../static/common/styles.css");
+const COMMON_THEME_JS: &str = include_str!("../../static/common/theme.js");
 
 #[derive(Deserialize, Debug)]
 struct SearchQuery {
@@ -95,6 +100,18 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
+async fn search_ui_handler() -> Html<&'static str> {
+    Html(SEARCH_INDEX_TEMPLATE)
+}
+
+async fn styles_handler() -> &'static str {
+    COMMON_STYLES
+}
+
+async fn theme_js_handler() -> &'static str {
+    COMMON_THEME_JS
+}
+
 #[derive(Parser)]
 struct Opts {
     #[arg(long)]
@@ -142,6 +159,9 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/search", get(search_handler))
         .route("/health", get(health_handler))
+        .route("/", get(search_ui_handler))
+        .route("/static/common/styles.css", get(styles_handler))
+        .route("/static/common/theme.js", get(theme_js_handler))
         .with_state(search_service);
 
     // Determine bind address

@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7676:7676"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7676
+    command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676", "--remote-url", "/tmp/repos", "--disable-reindex"]
+    depends_on:
+      - redis
+    volumes:
+      - ../:/tmp/repos:ro
+
+  admin:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7878:7878"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ZOEKT_ADMIN_USERNAME=admin
+      - ZOEKT_ADMIN_PASSWORD=password
+    command: ["/app/dzr-admin", "--bind", "0.0.0.0:7878"]
+    depends_on:
+      - redis
+
+  search:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ZOEKTD_BIND_ADDR=0.0.0.0:8080
+    command: ["/app/dzr-http-search", "--listen", "0.0.0.0:8080"]
+    depends_on:
+      - redis
+
+  mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7979:7979"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7979
+    command: ["/app/dzr-mcp-search", "--listen", "0.0.0.0:7979"]
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:

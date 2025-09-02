@@ -76,6 +76,8 @@ struct CreateRepoWithFreq {
 const INDEX_TEMPLATE: &str = include_str!("../../static/admin/index.html");
 const LOGIN_TEMPLATE: &str = include_str!("../../static/admin/login.html");
 const ADMIN_JS: &str = include_str!("../../static/admin/admin.js");
+const COMMON_STYLES: &str = include_str!("../../static/common/styles.css");
+const COMMON_THEME_JS: &str = include_str!("../../static/common/theme.js");
 
 // Reuse shared web helper functions from the crate for common HTTP helpers.
 use web_utils::{
@@ -943,6 +945,24 @@ async fn serve_admin_js() -> impl IntoResponse {
     resp
 }
 
+async fn serve_common_styles() -> impl IntoResponse {
+    let mut resp = (StatusCode::OK, COMMON_STYLES).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    resp
+}
+
+async fn serve_common_theme_js() -> impl IntoResponse {
+    let mut resp = (StatusCode::OK, COMMON_THEME_JS).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    resp
+}
+
 #[derive(Serialize)]
 struct RepoInfo {
     name: String,
@@ -1134,6 +1154,8 @@ fn make_app(state: AppState) -> Router {
         )
         .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
         .route("/static/admin.js", get(serve_admin_js))
+        .route("/static/common/styles.css", get(serve_common_styles))
+        .route("/static/common/theme.js", get(serve_common_theme_js))
         .route("/export.csv", get(export_csv))
         .layer(axum::Extension(state))
 }

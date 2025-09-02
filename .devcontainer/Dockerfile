@@ -19,25 +19,28 @@ RUN apt-get update \
   mold \
   locales \
   redis-server \
+  docker.io \
+  net-tools \
+  iproute2 \
   && rm -rf /var/lib/apt/lists/*
 
 # Register mold/ld.lld as alternatives for /usr/bin/ld so they can be used as the system linker
 RUN if [ -x /usr/bin/mold ]; then \
-      update-alternatives --install /usr/bin/ld ld /usr/bin/mold 60 || true; \
-    fi; \
-    if [ -x /usr/bin/ld.lld ]; then \
-      update-alternatives --install /usr/bin/ld ld /usr/bin/ld.lld 40 || true; \
-    fi
+  update-alternatives --install /usr/bin/ld ld /usr/bin/mold 60 || true; \
+  fi; \
+  if [ -x /usr/bin/ld.lld ]; then \
+  update-alternatives --install /usr/bin/ld ld /usr/bin/ld.lld 40 || true; \
+  fi
 
 # Install GitHub CLI (gh) using the official GitHub CLI apt repository
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
+  | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/*
 
 # Create workspace dir
 WORKDIR /workspaces/hyperzoekt
@@ -50,7 +53,8 @@ ARG USER_GID=$USER_UID
 RUN groupadd --gid ${USER_GID} ${USERNAME} || true \
   && useradd --uid ${USER_UID} --gid ${USER_GID} -m ${USERNAME} || true \
   && apt-get update && apt-get install -y sudo || true \
-  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} || true
+  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} || true \
+  && usermod -aG docker ${USERNAME} || true
 
 # Install sccache system-wide so it's available regardless of sudo contexts and PATH changes
 RUN set -eux; \
@@ -71,6 +75,7 @@ ENV PATH="/home/${USERNAME}/.cargo/bin:/usr/local/bin:${PATH}"
 # the result is baked into the image rather than done at runtime.
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
+ENV LC_ALL=C.UTF-8
 
 # Generate the en_US.UTF-8 locale during image build so the locale is
 # available to all processes without requiring runtime setup.
