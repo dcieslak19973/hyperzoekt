@@ -29,21 +29,29 @@ async-trait = "0.1"
 sha2 = "0.10"
 regex = "1"
 surrealdb = { version = "=2.3.1", features = ["kv-mem"] }
+async-stream = "0.3"
+futures = "0.3"
+tokio-stream = "0.1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 urlencoding = "2.1"
+hyper = "1.0"
+ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http", "oauth"] }
+
+[[bin]]
+name = "dzr-admin"
+path = "src/bin/dzr-admin.rs"
 
 [[bin]]
 name = "dzr-http-search"
 path = "src/bin/dzr-http-search.rs"
-
 
 [[bin]]
 name = "dzr-indexer"
 path = "src/bin/dzr-indexer.rs"
 
 [[bin]]
-name = "dzr-admin"
-path = "src/bin/dzr-admin.rs"
+name = "dzr-mcp-search"
+path = "src/bin/dzr-mcp-search.rs"
 
 [dev-dependencies]
 # use the zoekt-rs test helpers to make small repo indexes

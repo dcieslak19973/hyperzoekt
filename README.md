@@ -78,6 +78,48 @@ When both username and token are provided for a platform, the indexer will autom
 
 SSH URLs (starting with `git@` or `ssh://`) are not modified and rely on SSH key authentication.
 
+### MCP Server Authentication
+The MCP (Model Context Protocol) server supports Git authentication through HTTP headers. When using MCP clients to perform distributed searches, you can provide Git credentials as HTTP headers:
+
+**Supported Headers:**
+- `X-GitHub-Username` and `X-GitHub-Token`: GitHub credentials
+- `X-GitLab-Username` and `X-GitLab-Token`: GitLab credentials  
+- `X-BitBucket-Username` and `X-BitBucket-Token`: Bitbucket credentials
+
+**Example HTTP Request with Headers:**
+```http
+POST /mcp HTTP/1.1
+Content-Type: application/json
+X-GitHub-Username: your-github-username
+X-GitHub-Token: your-github-personal-access-token
+X-GitLab-Username: your-gitlab-username
+X-GitLab-Token: your-gitlab-access-token
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "distributed_search",
+    "arguments": {
+      "regex": "function.*search"
+    }
+  }
+}
+```
+
+**Using the Header Wrapper Script:**
+For easier deployment, use the provided wrapper script that extracts headers and sets environment variables:
+
+```bash
+# Start MCP server with header extraction
+./scripts/mcp-header-wrapper.sh cargo run --bin dzr-mcp-search -- --listen 127.0.0.1:8080
+```
+
+When deployed behind a reverse proxy (like nginx or Apache), the proxy can extract the `X-*` headers and set them as `HTTP_X_*` environment variables that the wrapper script will detect.
+
+These headers allow the search system to access private repositories and avoid rate limits when searching across multiple Git hosting services. The credentials are extracted from the HTTP headers and used for authentication with the respective Git services.
+
 Running the full system locally
 -------------------
 

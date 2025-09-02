@@ -6,6 +6,7 @@
 //! - Keep the API small so tests can plug a fake indexer easily
 
 pub mod config;
+pub mod distributed_search;
 pub mod lease_manager;
 pub mod node;
 pub mod redis_adapter;

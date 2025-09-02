@@ -1,17 +1,99 @@
 use anyhow::Result;
-use axum::extract::Query;
-use axum::http::StatusCode;
-use axum::response::Json;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Json,
+    routing::get,
+    Router,
+};
 use clap::Parser;
 use reqwest::Client;
-use serde::Deserialize;
-use serde_json::json;
-use std::time::Duration;
-use tokio::time::timeout;
-use tower_http::services::ServeDir;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
+use zoekt_distributed::{
+    distributed_search::{DistributedSearchService, DistributedSearchTool},
+    LeaseManager, NodeConfig, NodeType,
+};
 
-use zoekt_distributed::{LeaseManager, NodeConfig, NodeType};
+#[derive(Deserialize, Debug)]
+struct SearchQuery {
+    /// Regex pattern to search for (required)
+    q: String,
+    /// Path patterns to include (optional, supports glob patterns like "src/**/*.rs")
+    include: Option<String>,
+    /// Path patterns to exclude (optional, supports glob patterns like "target/**")
+    exclude: Option<String>,
+    /// Repository to search in (optional, searches all if not specified)
+    repo: Option<String>,
+    /// Maximum number of results to return (optional, default 100)
+    max_results: Option<usize>,
+    /// Number of context lines around matches (optional, default 2)
+    context: Option<usize>,
+    /// Case sensitive search (optional, default false)
+    case: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct SearchResponse {
+    results: Vec<serde_json::Value>,
+    summary: String,
+    total_results: usize,
+}
+
+async fn search_handler(
+    State(search_service): State<DistributedSearchService>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, StatusCode> {
+    tracing::info!("HTTP search request: {:?}", query);
+
+    let params = DistributedSearchTool {
+        regex: query.q,
+        include: query.include,
+        exclude: query.exclude,
+        repo: query.repo,
+        max_results: query.max_results,
+        context: query.context,
+        case_sensitive: query.case,
+        github_username: None,
+        github_token: None,
+        gitlab_username: None,
+        gitlab_token: None,
+        bitbucket_username: None,
+        bitbucket_token: None,
+    };
+
+    match search_service.execute_distributed_search_json(params).await {
+        Ok(results) => {
+            let total_results = results.len().saturating_sub(1); // Subtract 1 for summary
+            let summary = if let Some(first) = results.first() {
+                first
+                    .get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("Search completed")
+                    .to_string()
+            } else {
+                "No results found".to_string()
+            };
+
+            let response = SearchResponse {
+                results,
+                summary,
+                total_results,
+            };
+
+            Ok(Json(response))
+        }
+        Err(e) => {
+            tracing::error!("Search failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn health_handler() -> &'static str {
+    "OK"
+}
 
 #[derive(Parser)]
 struct Opts {
@@ -26,16 +108,6 @@ struct Opts {
     /// Address to listen on for HTTP search (env: ZOEKTD_BIND_ADDR)
     #[arg(long)]
     listen: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct SearchParams {
-    repo: String,
-    q: String,
-    /// number of context lines to include before/after the match (optional)
-    context_lines: Option<usize>,
-    /// optional branches selector (e.g. "*" or "main,dev")
-    branches: Option<String>,
 }
 
 #[tokio::main]
@@ -64,114 +136,28 @@ async fn main() -> Result<()> {
 
     let lease_mgr = LeaseManager::new().await;
     let client = Client::new();
+    let search_service = DistributedSearchService::new(lease_mgr, client);
 
-    // determine bind address from CLI flag, env var, or default
+    // Build the application with routes
+    let app = Router::new()
+        .route("/search", get(search_handler))
+        .route("/health", get(health_handler))
+        .with_state(search_service);
+
+    // Determine bind address
     let bind_addr = opts
         .listen
         .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:8080".into());
-    tracing::info!(binding = %bind_addr, "starting distributed http search server");
 
-    let app = axum::Router::new()
-        .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
-        .nest_service("/", ServeDir::new("crates/zoekt-distributed/static/search"))
-        .route(
-            "/search",
-            axum::routing::get(|Query(params): Query<SearchParams>| async move {
-                tracing::info!(repo=%params.repo, q=%params.q, "received distributed search request");
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
 
-                // Get all indexer endpoints
-                let endpoints = lease_mgr.get_indexer_endpoints().await;
-                if endpoints.is_empty() {
-                    tracing::warn!("no indexer endpoints found");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error": "no indexers available"})),
-                    );
-                }
+    tracing::info!("Starting HTTP search server on {}", addr);
 
-                // Query all indexers in parallel
-                let mut tasks = Vec::new();
-                for (node_id, endpoint) in endpoints {
-                    let client = client.clone();
-                    let params = params.clone();
-                    let task = tokio::spawn(async move {
-                        let branches = params.branches.clone().unwrap_or_else(|| "*".to_string());
-                        let url = format!(
-                            "{}/search?repo={}&q={}&context_lines={}&branches={}",
-                            endpoint,
-                            urlencoding::encode(&params.repo),
-                            urlencoding::encode(&params.q),
-                            params.context_lines.unwrap_or(5),
-                            urlencoding::encode(&branches),
-                        );
-                        match timeout(Duration::from_secs(10), client.get(&url).send()).await {
-                            Ok(Ok(resp)) if resp.status().is_success() => {
-                                match resp.json::<serde_json::Value>().await {
-                                    Ok(json) => Some((node_id, json)),
-                                    Err(e) => {
-                                        tracing::warn!(node_id=%node_id, error=%e, "failed to parse response");
-                                        None
-                                    }
-                                }
-                            }
-                            Ok(Ok(resp)) => {
-                                tracing::warn!(node_id=%node_id, status=%resp.status(), "search request failed");
-                                None
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(node_id=%node_id, error=%e, "search request error");
-                                None
-                            }
-                            Err(_) => {
-                                tracing::warn!(node_id=%node_id, "search request timed out");
-                                None
-                            }
-                        }
-                    });
-                    tasks.push(task);
-                }
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
-                // Collect results
-                let mut all_results = Vec::new();
-                for task in tasks {
-                    if let Ok(Some((node_id, json))) = task.await {
-                        if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
-                            for result in results {
-                                let mut result = result.clone();
-                                // Add node_id to the result
-                                if let Some(obj) = result.as_object_mut() {
-                                    obj.insert("node_id".to_string(), json!(node_id));
-                                }
-                                all_results.push(result);
-                            }
-                        }
-                    }
-                }
-
-                // Sort results by score (highest first)
-                all_results.sort_by(|a, b| {
-                    let score_a = a.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    let score_b = b.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                tracing::info!(repo=%params.repo, total_results=%all_results.len(), "distributed search completed");
-                (StatusCode::OK, Json(json!({"results": all_results})))
-            }),
-        )
-        .route(
-            "/status",
-            axum::routing::get(|| async move {
-                (StatusCode::OK, Json(json!({"status": "ok"})))
-            }),
-        );
-
-    let addr: std::net::SocketAddr = bind_addr.parse().expect("invalid bind address");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let server = axum::serve(listener, app);
-
-    // run server until interrupted
-    server.await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(())
 }
