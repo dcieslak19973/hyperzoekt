@@ -19,6 +19,10 @@ pub struct RemoteRepo {
     pub name: String,
     pub git_url: String,
     pub branch: Option<String>,
+    pub visibility: zoekt_rs::types::RepoVisibility,
+    pub owner: Option<String>,
+    pub allowed_users: Vec<String>,
+    pub last_commit_sha: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +40,8 @@ pub struct LeaseManager {
     inner: Arc<RwLock<HashMap<RemoteRepo, Lease>>>,
     // optional test hook to observe repo meta writes (name, last_indexed_ms, last_duration_ms, leased_node)
     meta_sender: Arc<RwLock<Option<MetaSender>>>,
+    // SurrealDB store for repository metadata and permissions
+    surreal_store: Option<Arc<crate::surreal_repo_store::SurrealRepoStore>>,
 }
 
 impl LeaseManager {
@@ -45,10 +51,51 @@ impl LeaseManager {
         // Use the shared Redis pool creation function with authentication support
         let redis_pool = crate::redis_adapter::create_redis_pool();
 
+        // Initialize SurrealDB store for repository metadata
+        let surreal_store = match Self::init_surreal_store().await {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize SurrealDB store: {}", e);
+                None
+            }
+        };
+
         Self {
             redis_pool,
             inner: Arc::new(RwLock::new(HashMap::new())),
             meta_sender: Arc::new(RwLock::new(None)),
+            surreal_store,
+        }
+    }
+
+    async fn init_surreal_store() -> anyhow::Result<crate::surreal_repo_store::SurrealRepoStore> {
+        let surreal_url = std::env::var("SURREALDB_URL").ok();
+        let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
+        let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
+        let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
+        let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
+
+        // Check if we have all required environment variables for remote connection
+        let use_remote =
+            surreal_url.is_some() && surreal_username.is_some() && surreal_password.is_some();
+
+        if use_remote {
+            tracing::info!("Connecting to remote SurrealDB instance");
+            crate::surreal_repo_store::SurrealRepoStore::new_remote(
+                surreal_url.unwrap(),
+                surreal_username.unwrap(),
+                surreal_password.unwrap(),
+                surreal_ns,
+                surreal_db,
+            )
+            .await
+        } else {
+            if surreal_url.is_some() || surreal_username.is_some() || surreal_password.is_some() {
+                tracing::warn!("Incomplete SurrealDB configuration. Missing SURREALDB_URL, SURREALDB_USERNAME, or SURREALDB_PASSWORD. Falling back to in-memory instance.");
+            } else {
+                tracing::info!("No SurrealDB configuration found, using in-memory instance");
+            }
+            crate::surreal_repo_store::SurrealRepoStore::new_in_memory(surreal_ns, surreal_db).await
         }
     }
 
@@ -319,5 +366,51 @@ impl LeaseManager {
         let res = guard.get(&repo).cloned();
         drop(guard);
         res
+    }
+
+    /// Check if a user can access a repository based on its visibility settings
+    pub async fn can_user_access_repo(&self, git_url: &str, user_id: Option<&str>) -> bool {
+        if let Some(store) = &self.surreal_store {
+            match store.can_user_access_repo(git_url, user_id).await {
+                Ok(can_access) => can_access,
+                Err(e) => {
+                    tracing::warn!("Failed to check repo access for {}: {}", git_url, e);
+                    true // Default to allowing access on error
+                }
+            }
+        } else {
+            true // If no SurrealDB store, allow access
+        }
+    }
+
+    /// Update repository metadata in SurrealDB
+    pub async fn update_repo_metadata(&self, repo: &RemoteRepo, last_commit_sha: Option<String>) {
+        if let Some(store) = &self.surreal_store {
+            let metadata = crate::surreal_repo_store::RepoMetadata {
+                id: format!("repo:{}", repo.git_url.replace("/", "_").replace(":", "_")),
+                name: repo.name.clone(),
+                git_url: repo.git_url.clone(),
+                branch: repo.branch.clone(),
+                visibility: repo.visibility.clone(),
+                owner: repo.owner.clone(),
+                allowed_users: repo.allowed_users.clone(),
+                last_commit_sha,
+                last_indexed_at: Some(chrono::Utc::now()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            if let Err(e) = store.upsert_repo_metadata(metadata).await {
+                tracing::warn!("Failed to update repo metadata for {}: {}", repo.git_url, e);
+            }
+        }
+    }
+
+    /// Check if indexing should be skipped for a repository
+    /// Always returns false to ensure permissions are reevaluated every time
+    pub async fn should_skip_indexing(&self, _git_url: &str, _current_sha: &str) -> bool {
+        // As requested by the user, we never skip indexing based on SHA alone
+        // This ensures permissions are always reevaluated
+        false
     }
 }

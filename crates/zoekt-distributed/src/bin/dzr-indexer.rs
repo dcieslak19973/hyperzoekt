@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::extract::Json as ReqJson;
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use axum::Extension;
 use clap::Parser;
@@ -235,6 +235,31 @@ fn extract_symbols_local(content: &str, ext: &str) -> Vec<zoekt_rs::types::Symbo
     out
 }
 
+// Extract user ID from request headers
+// Supports JWT tokens in Authorization header or user ID in X-User-ID header
+fn extract_user_id(headers: &HeaderMap) -> Option<String> {
+    // Try Authorization header first (Bearer token)
+    if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                // Remove "Bearer " prefix
+                // For now, we'll use the token as-is. In production, you'd validate the JWT
+                // and extract the user ID from the claims
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    // Fallback to X-User-ID header
+    if let Some(user_header) = headers.get("x-user-id") {
+        if let Ok(user_str) = user_header.to_str() {
+            return Some(user_str.to_string());
+        }
+    }
+
+    None
+}
+
 #[derive(Parser)]
 struct Opts {
     /// Path to a TOML config file (optional)
@@ -359,7 +384,7 @@ async fn main() -> Result<()> {
     let indexer = SimpleIndexer::new(store.clone());
     // shared list of registered remotes for /status
     let registered_repos: RemoteList = Arc::new(RwLock::new(Vec::new()));
-    let node = Node::new(cfg, lease_mgr, indexer);
+    let node = Node::new(cfg, lease_mgr.clone(), indexer);
 
     // Collect remote URLs and optional names from CLI or env. Support multiple values.
     let mut urls: Vec<String> = opts.remote_url.clone();
@@ -394,10 +419,17 @@ async fn main() -> Result<()> {
             name,
             git_url: url,
             branch: Some("main".into()),
+            visibility: zoekt_rs::types::RepoVisibility::Public, // Default to public
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         };
         // record in local registered list and register with the node
         registered_repos.write().push(repo.clone());
         node.add_remote(repo.clone());
+
+        // Update repository metadata in SurrealDB
+        lease_mgr.update_repo_metadata(&repo, None).await;
     }
 
     // spawn the node loop in the background (indexing/lease loop)
@@ -410,25 +442,46 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route(
             "/search",
-            axum::routing::get(|Query(params): Query<SearchParams>, Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>| async move {
+            axum::routing::get(|Query(params): Query<SearchParams>, Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>, Extension(lease_mgr): Extension<LeaseManager>, headers: HeaderMap| async move {
                 tracing::info!(repo=%params.repo, q=%params.q, "received search request");
+
+                // Extract user ID from headers
+                let user_id_binding = extract_user_id(&headers);
+                let user_id = user_id_binding.as_deref();
+
                 // Resolve repo name to git_url if it's a registered name
                 let mut resolved_repos = Vec::new();
+                let registered_repos_list = reg.read().clone(); // Clone the list to avoid holding lock across await
                 if params.repo == "*" {
                     // Wildcard search: search all indexed repos
-                    for repo in reg.read().iter() {
-                        resolved_repos.push(repo.git_url.clone());
+                    for repo in &registered_repos_list {
+                        // Check permissions for each repo
+                        if lease_mgr.can_user_access_repo(&repo.git_url, user_id).await {
+                            resolved_repos.push(repo.git_url.clone());
+                        } else {
+                            tracing::debug!(repo=%repo.git_url, "access denied for user");
+                        }
                     }
                 } else {
                     // Single repo search
                     let mut resolved_repo = params.repo.clone();
-                    for repo in reg.read().iter() {
+                    for repo in &registered_repos_list {
                         if repo.name == params.repo {
                             resolved_repo = repo.git_url.clone();
                             tracing::debug!(original=%params.repo, resolved=%resolved_repo, "resolved repo name to git_url");
                             break;
                         }
                     }
+
+                    // Check permissions for the resolved repo
+                    if !lease_mgr.can_user_access_repo(&resolved_repo, user_id).await {
+                        tracing::warn!(repo=%resolved_repo, "access denied for user");
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            Json(json!({"error": "access denied"})),
+                        );
+                    }
+
                     resolved_repos.push(resolved_repo);
                 }
                                 // Search across all resolved repos
@@ -672,7 +725,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/search",
-            axum::routing::post(|Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>, ReqJson(body): ReqJson<serde_json::Value>| async move {
+            axum::routing::post(|Extension(store): Extension<IndexStore>, Extension(reg): Extension<RemoteList>, Extension(lease_mgr): Extension<LeaseManager>, headers: HeaderMap, ReqJson(body): ReqJson<serde_json::Value>| async move {
                 // Accept either {"repo":..., "q":..., ...} or {"data": {"repo":..., "q":...}}
                 let inner = if let Some(d) = body.get("data") { d.clone() } else { body.clone() };
                 let params: SearchParams = match serde_json::from_value(inner) {
@@ -684,14 +737,28 @@ async fn main() -> Result<()> {
                 };
                 tracing::info!(repo=%params.repo, q=%params.q, "received POST search request");
 
+                // Extract user ID from headers
+                let user_id_binding = extract_user_id(&headers);
+                let user_id = user_id_binding.as_deref();
+
                 // Resolve repo name to git_url if it's a registered name
                 let mut resolved_repo = params.repo.clone();
-                for repo in reg.read().iter() {
+                let registered_repos_list = reg.read().clone(); // Clone the list to avoid holding lock across await
+                for repo in &registered_repos_list {
                     if repo.name == params.repo {
                         resolved_repo = repo.git_url.clone();
                         tracing::debug!(original=%params.repo, resolved=%resolved_repo, "resolved repo name to git_url");
                         break;
                     }
+                }
+
+                // Check permissions for the resolved repo
+                if !lease_mgr.can_user_access_repo(&resolved_repo, user_id).await {
+                    tracing::warn!(repo=%resolved_repo, "access denied for user");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": "access denied"})),
+                    );
                 }
 
                 // clone the index Arc and repo root key out of the store without holding
@@ -927,7 +994,8 @@ async fn main() -> Result<()> {
             }),
         )
     .layer(Extension(store))
-    .layer(Extension(registered_repos));
+    .layer(Extension(registered_repos))
+    .layer(Extension(lease_mgr));
 
     // determine bind address from CLI flag, env var, or default
     let bind_addr = opts

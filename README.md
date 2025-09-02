@@ -78,6 +78,25 @@ When both username and token are provided for a platform, the indexer will autom
 
 SSH URLs (starting with `git@` or `ssh://`) are not modified and rely on SSH key authentication.
 
+Running the full system locally
+-------------------
+
+In generaly, you'll need a REDIs instance running for the Admin UI, the Indexer,
+and the Search UI to work together.
+
+1. Run the Indexer:
+```bash
+cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3001 --remote-url /workspaces/hyperzoekt --disable-reindex
+```
+2. Run the Admin UI:
+```bash
+cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 ZOEKT_ADMIN_USERNAME=admin ZOEKT_ADMIN_PASSWORD=password cargo run --bin dzr-admin -- --bind 127.0.0.1:7878
+```
+3. Run the Search UI:
+```bash
+cd /workspaces/hyperzoekt && REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-http-search -- --listen 127.0.0.1:8080
+```
+
 License
 -------
 This repository is licensed under the Apache License, Version 2.0. See the `LICENSE` and `NOTICE` files for details.

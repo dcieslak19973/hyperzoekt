@@ -90,11 +90,19 @@ async fn branch_level_leasing_integration() {
         name: repo_name.clone(),
         git_url: url.clone(),
         branch: Some("main".into()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: vec![],
+        last_commit_sha: None,
     };
     let rr_dev = RemoteRepo {
         name: repo_name.clone(),
         git_url: url.clone(),
         branch: Some("dev".into()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: vec![],
+        last_commit_sha: None,
     };
 
     let l_main = lease

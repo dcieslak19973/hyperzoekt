@@ -364,6 +364,10 @@ impl IndexBuilder {
             name,
             root: repo_root.clone(),
             branches: repo_branches.clone(),
+            visibility: crate::types::RepoVisibility::Public, // Default to public for indexing
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         };
 
         let mut pending: Vec<PendingFile> = Vec::new();

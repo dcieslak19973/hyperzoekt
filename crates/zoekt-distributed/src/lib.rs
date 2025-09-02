@@ -9,6 +9,7 @@ pub mod config;
 pub mod lease_manager;
 pub mod node;
 pub mod redis_adapter;
+pub mod surreal_repo_store;
 pub mod test_utils;
 pub mod web_utils;
 
@@ -49,6 +50,10 @@ mod tests {
             // Use a non-local URL so the node attempts to acquire a lease in tests.
             git_url: "https://example.com/fake-repo.git".into(),
             branch: Some("main".into()),
+            visibility: zoekt_rs::types::RepoVisibility::Public,
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         };
         node.add_remote(repo.clone());
         node.run_for(Duration::from_millis(50)).await?;
@@ -88,6 +93,10 @@ mod tests {
             name: "r-meta".into(),
             git_url: "/tmp/fake-repo-meta".into(),
             branch: Some("main".into()),
+            visibility: zoekt_rs::types::RepoVisibility::Public,
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         };
         indexer_node.add_remote(repo.clone());
         // Run the node for a short duration to trigger indexing
@@ -142,6 +151,10 @@ mod tests {
             // Use a non-local URL so nodes contend for a Redis-backed lease in this test
             git_url: "https://example.com/fake-repo-contend.git".into(),
             branch: Some("main".into()),
+            visibility: zoekt_rs::types::RepoVisibility::Public,
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         };
 
         // Two fake indexers that count how many times they were invoked (i.e. wins)
@@ -713,17 +726,29 @@ async fn branch_scoped_leases_are_independent() {
         name: "r-branch-test".into(),
         git_url: "https://example.com/branch-repo.git".into(),
         branch: Some("main".into()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: Vec::new(),
+        last_commit_sha: None,
     };
 
     let repo_a = RemoteRepo {
         name: repo_base.name.clone(),
         git_url: repo_base.git_url.clone(),
         branch: Some("main".into()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: Vec::new(),
+        last_commit_sha: None,
     };
     let repo_b = RemoteRepo {
         name: repo_base.name.clone(),
         git_url: repo_base.git_url.clone(),
         branch: Some("dev".into()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: Vec::new(),
+        last_commit_sha: None,
     };
 
     // Two different holders should be able to acquire different branch leases independently

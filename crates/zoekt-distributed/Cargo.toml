@@ -28,8 +28,8 @@ hmac = "0.12"
 async-trait = "0.1"
 sha2 = "0.10"
 regex = "1"
+surrealdb = { version = "=2.3.1", features = ["kv-mem"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-http-body = "1.0"
 urlencoding = "2.1"
 
 [[bin]]
@@ -52,5 +52,4 @@ tempfile = "3"
 serial_test = "2"
 http = "0.2"
 tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 

@@ -2,11 +2,22 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum RepoVisibility {
+    Public,                  // Anyone can search
+    Private,                 // Only authenticated users can search
+    Restricted(Vec<String>), // Only specific users/groups can search
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RepoMeta {
     pub name: String,
     pub root: PathBuf,
     // For future multi-branch support; for now, single-repo indexing will default to ["HEAD"].
     pub branches: Vec<String>,
+    pub visibility: RepoVisibility,
+    pub owner: Option<String>,
+    pub allowed_users: Vec<String>,
+    pub last_commit_sha: Option<String>,
 }
 
 /// A discovered symbol inside a document.

@@ -111,6 +111,10 @@ pub fn make_index_with_trigrams(
             name: repo_name.to_string(),
             root: std::path::PathBuf::from("/tmp"),
             branches,
+            visibility: crate::types::RepoVisibility::Public, // Default to public for tests
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
         },
         docs,
         terms: std::collections::HashMap::new(),

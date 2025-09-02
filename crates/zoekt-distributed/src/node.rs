@@ -64,6 +64,10 @@ impl<I: Indexer> Node<I> {
                 name: name.clone(),
                 git_url: url.clone(),
                 branch: Some(branch.clone()),
+                visibility: zoekt_rs::types::RepoVisibility::Public, // Default to public
+                owner: None,
+                allowed_users: Vec::new(),
+                last_commit_sha: None,
             };
             tracing::info!(repo=%name, branch=%branch, "registering branch-specific RemoteRepo");
             self.add_remote(rr);
@@ -156,6 +160,17 @@ impl<I: Indexer> Node<I> {
             }
             let repos = self.repos.read().clone();
             for repo in repos {
+                // Check if we should skip indexing based on permissions (always check permissions)
+                if !self.lease_mgr.should_skip_indexing(&repo.git_url, "").await {
+                    // Get current commit SHA for tracking
+                    let current_sha = get_current_commit_sha(&repo.git_url).await;
+
+                    // Update repository metadata in SurrealDB
+                    self.lease_mgr
+                        .update_repo_metadata(&repo, current_sha)
+                        .await;
+                }
+
                 // If index_once is enabled and we've already indexed this repo, skip it
                 if self.config.index_once {
                     let key = format!("{}|{}", repo.name, repo.branch.clone().unwrap_or_default());
@@ -368,4 +383,36 @@ pub(crate) fn looks_like_remote_git_url(path: &str) -> bool {
         || path.starts_with("https://")
         || path.starts_with("git@")
         || path.starts_with("ssh://")
+}
+
+/// Get the current commit SHA for a repository
+async fn get_current_commit_sha(git_url: &str) -> Option<String> {
+    // For local repos, try to get the HEAD commit SHA
+    if std::path::Path::new(git_url).is_absolute() || git_url.starts_with("file://") {
+        let repo_path = if git_url.starts_with("file://") {
+            git_url.strip_prefix("file://").unwrap_or(git_url)
+        } else {
+            git_url
+        };
+
+        match std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Some(sha)
+            }
+            _ => {
+                tracing::debug!(repo=%git_url, "failed to get commit SHA for local repo");
+                None
+            }
+        }
+    } else {
+        // For remote repos, we could implement fetching the latest commit
+        // but for now, we'll return None and let the indexer handle it
+        tracing::debug!(repo=%git_url, "remote repo SHA detection not implemented yet");
+        None
+    }
 }
