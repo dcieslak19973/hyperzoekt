@@ -315,22 +315,77 @@ impl SimpleIndexer {
 
 impl Indexer for SimpleIndexer {
     fn index_repo(&self, repo_path: PathBuf) -> Result<InMemoryIndex> {
+        let repo_path_str = repo_path.to_string_lossy().to_string();
+
+        // Check if this is a git URL that needs to be cloned
+        let is_git_url = repo_path_str.starts_with("http://")
+            || repo_path_str.starts_with("https://")
+            || repo_path_str.starts_with("git@")
+            || repo_path_str.starts_with("ssh://");
+
+        let actual_repo_path = if is_git_url {
+            // For git URLs, clone to a temporary directory
+            let temp_dir = std::env::temp_dir().join(format!(
+                "hyperzoekt-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            ));
+
+            tracing::info!(url=%repo_path_str, temp_dir=%temp_dir.display(), "cloning remote repository");
+
+            // Clone the repository
+            let clone_result = std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--depth",
+                    "1",
+                    &repo_path_str,
+                    &temp_dir.to_string_lossy(),
+                ])
+                .output();
+
+            match clone_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(url=%repo_path_str, "successfully cloned repository");
+                    temp_dir
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(anyhow::anyhow!("Failed to clone repository: {}", stderr));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to run git clone: {}", e));
+                }
+            }
+        } else {
+            // For local paths, use as-is
+            repo_path
+        };
+
         // Ensure directory exists; do not attempt to create files. Indexer will only read
         // existing readable files to avoid write attempts that can fail under restricted perms.
-        if !repo_path.exists() {
-            std::fs::create_dir_all(&repo_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !actual_repo_path.exists() {
+            std::fs::create_dir_all(&actual_repo_path)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
 
-        tracing::info!(path=%repo_path.display(), "starting index build");
+        tracing::info!(path=%actual_repo_path.display(), "starting index build");
         // Build a real in-memory index for the repo dir using the IndexBuilder
         // Explicitly enable symbol extraction at index time.
-        let builder = zoekt_rs::IndexBuilder::new(repo_path.clone()).enable_symbols(true);
+        let builder = zoekt_rs::IndexBuilder::new(actual_repo_path.clone()).enable_symbols(true);
         let idx = builder
             .build()
             .map_err(|e| anyhow::anyhow!(format!("index build error: {}", e)))?;
 
-        // store the built index under the repo_path string so search handlers can find it
-        let key = repo_path.to_string_lossy().into_owned();
+        // Store the built index under the original repo URL/path string so search handlers can find it
+        // For git URLs, use the original URL as the key; for local paths, use the path
+        let key = if is_git_url {
+            repo_path_str
+        } else {
+            actual_repo_path.to_string_lossy().into_owned()
+        };
         self.store.write().insert(key.clone(), idx.clone());
         tracing::info!(repo=%key, "index build complete and stored");
         Ok(idx)
@@ -391,9 +446,9 @@ async fn main() -> Result<()> {
     if urls.is_empty() {
         if let Ok(s) = std::env::var("REMOTE_REPO_URL") {
             urls.push(s);
-        } else {
-            urls.push("/tmp/demo".into());
         }
+        // Don't add default demo repo when no remote URLs are configured
+        // The indexer will still pick up repos from Redis via get_repo_branches()
     }
 
     // remote_name may be provided multiple times; if not present, try env or use basename/demo
@@ -437,6 +492,24 @@ async fn main() -> Result<()> {
         // run for a long time for demo/dev; in production this would be indefinite
         let _ = node.run_for(Duration::from_secs(60 * 60)).await;
     });
+
+    // After spawning the node, also register repositories from Redis with the search handlers
+    // The node loop above will have loaded repos from Redis, so we need to get them and add to registered_repos
+    let redis_repos = lease_mgr.get_repo_branches().await;
+    for (name, branch, url) in redis_repos {
+        let repo = RemoteRepo {
+            name: name.clone(),
+            git_url: url.clone(),
+            branch: Some(branch.clone()),
+            visibility: zoekt_rs::types::RepoVisibility::Public, // Default to public
+            owner: None,
+            allowed_users: Vec::new(),
+            last_commit_sha: None,
+        };
+        // Add to the registered repos list used by search handlers
+        registered_repos.write().push(repo.clone());
+        tracing::info!(repo=%name, branch=%branch, url=%url, "registered Redis repo with search handlers");
+    }
 
     // start a small HTTP server to answer search requests against the in-memory indexes
     let app = axum::Router::new()
@@ -490,12 +563,15 @@ async fn main() -> Result<()> {
                     // clone the index Arc out of the store and capture the repo root (map key)
                     let idx_pair = {
                         let map = store.read();
+                        tracing::debug!(resolved_repo=%resolved_repo, available_keys=?map.keys().collect::<Vec<_>>(), "searching for repo in index store");
+
                         // try exact match by key
                         if let Some((k, v)) = map.get_key_value(&resolved_repo) {
+                            tracing::debug!(resolved_repo=%resolved_repo, matched_key=%k, "found exact match in index store");
                             Some((k.clone(), v.clone()))
                         } else {
                             // fallback: try matching by basename or path suffix (so 'demo' matches '/tmp/demo')
-                            map.iter().find_map(|(k, v)| {
+                            let fallback_match = map.iter().find_map(|(k, v)| {
                                 if k == &resolved_repo
                                     || k.ends_with(&format!("/{}", resolved_repo))
                                     || Path::new(k)
@@ -504,15 +580,20 @@ async fn main() -> Result<()> {
                                         .map(|s| s == resolved_repo)
                                         .unwrap_or(false)
                                 {
+                                    tracing::debug!(resolved_repo=%resolved_repo, matched_key=%k, "found fallback match in index store");
                                     Some((k.clone(), v.clone()))
                                 } else {
                                     None
                                 }
-                            })
+                            });
+                            if fallback_match.is_none() {
+                                tracing::debug!(resolved_repo=%resolved_repo, "no match found in index store");
+                            }
+                            fallback_match
                         }
                     };
 
-                    if let Some((repo_root, idx)) = idx_pair {
+                    if let Some((_, idx)) = idx_pair {
                         // Parse query plan
                         let plan = match QueryPlan::parse(&params.q) {
                             Ok(p) => p,
@@ -525,9 +606,12 @@ async fn main() -> Result<()> {
                             }
                         };
 
-                        // Run the query in a blocking task with timeout to avoid blocking the reactor.
                         let idx_clone = idx.clone();
-                        let fut = tokio::task::spawn_blocking(move || {
+                        let actual_repo_root = idx.repo_root(); // Use the actual repo root from index metadata
+                        let resolved_repo_clone = resolved_repo.clone();
+                        let query_clone = params.q.clone();
+                        let context_lines_clone = params.context_lines;
+                        let _fut = tokio::task::spawn_blocking(move || {
                             // Run the plan search and then try to enrich file results with
                             // symbol information when available. We prefer any symbols
                             // that were extracted at index time (meta.symbols). If a
@@ -634,69 +718,56 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            results
+
+                            // Generate snippets here inside the blocking task
+                            let context = context_lines_clone.unwrap_or(2);
+                            let repo_results: Vec<_> = results
+                                .into_iter()
+                                .take(100)
+                                .map(|mut r| {
+                                    // try to build a snippet: prefer in-memory contents if present
+                                    // Try to read file from disk under repo root. We don't access
+                                    // in-memory doc_contents here to avoid touching private APIs.
+                                    // We don't have the repo root here; attempt to read path as-is
+                                    // join repo_root with relative path so we read the correct file
+                                    let full_path = Path::new(&actual_repo_root).join(&r.path);
+                                    let text_opt = idx_clone.doc_content(r.doc as usize)
+                                        .or_else(|| std::fs::read_to_string(&full_path).ok());
+                                    match text_opt {
+                                        Some(text) => {
+                                            let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &query_clone);
+                                            if snippet.is_some() {
+                                                tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
+                                            } else {
+                                                tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                                            }
+                                            // Fallback: if no symbol from enrichment, use from snippet
+                                            if r.symbol_loc.is_none() && snippet_symbol.is_some() {
+                                                r.symbol_loc = snippet_symbol.clone();
+                                                r.symbol = snippet_symbol.map(|s| s.name);
+                                            }
+                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo_clone})
+                                        }
+                                        None => {
+                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
+                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo_clone})
+                                        }
+                                    }
+                                })
+                                .collect();
+                            repo_results
                         });
 
-                        // 5s timeout for demo
-                        match timeout(Duration::from_secs(5), fut).await {
-                            Ok(join_res) => match join_res {
-                                Ok(results) => {
-                                    // cap results to first 100 per repo
-                                    let context = params.context_lines.unwrap_or(2);
-                                    let repo_results: Vec<_> = results
-                                        .into_iter()
-                                        .take(100)
-                                        .map(|mut r| {
-                                            // try to build a snippet: prefer in-memory contents if present
-                                            // Try to read file from disk under repo root. We don't access
-                                            // in-memory doc_contents here to avoid touching private APIs.
-                                            // We don't have the repo root here; attempt to read path as-is
-                                            // join repo_root with relative path so we read the correct file
-                                            let full_path = Path::new(&repo_root).join(&r.path);
-                                            match std::fs::read_to_string(&full_path) {
-                                                Ok(text) => {
-                                                    let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &params.q);
-                                                    if snippet.is_some() {
-                                                        tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
-                                                    } else {
-                                                        tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
-                                                    }
-                                                    // Fallback: if no symbol from enrichment, use from snippet
-                                                    if r.symbol_loc.is_none() && snippet_symbol.is_some() {
-                                                        r.symbol_loc = snippet_symbol.clone();
-                                                        r.symbol = snippet_symbol.map(|s| s.name);
-                                                    }
-                                                    json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo})
-                                                }
-                                                Err(e) => {
-                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, error=%e, "failed to read file for snippet");
-                                                    json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo})
-                                                }
-                                            }
-                                        })
-                                        .collect();
-                                    all_results.extend(repo_results);
-                                }
-                                Err(e) => {
-                                    tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
-                                    return (
-                                        {
-                                            tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
-                                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-                                        },
-                                        Json(json!({"error": format!("search task failed: {}", e)})),
-                                    );
-                                }
-                            },
+                        // Wait for the search task to complete and collect results
+                        match tokio::time::timeout(std::time::Duration::from_secs(30), _fut).await {
+                            Ok(Ok(repo_results)) => {
+                                all_results.extend(repo_results);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
+                            }
                             Err(_) => {
                                 tracing::warn!(repo=%resolved_repo, q=%params.q, "search timed out");
-                                return (
-                                    {
-                                        tracing::warn!(repo=%resolved_repo, q=%params.q, "search timed out");
-                                        axum::http::StatusCode::REQUEST_TIMEOUT
-                                    },
-                                    Json(json!({"error": "search timed out"})),
-                                );
                             }
                         }
                     } else {
@@ -712,7 +783,7 @@ async fn main() -> Result<()> {
                 }
 
                 // Sort results by score (highest first) and limit total results
-                all_results.sort_by(|a, b| {
+                all_results.sort_by(|a: &serde_json::Value, b: &serde_json::Value| {
                     let score_a = a.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
                     let score_b = b.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
                     score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -767,12 +838,15 @@ async fn main() -> Result<()> {
                 // reading files for snippets (same behavior as GET /search).
                 let idx_pair = {
                     let map = store.read();
+                    tracing::debug!(resolved_repo=%resolved_repo, available_keys=?map.keys().collect::<Vec<_>>(), "POST search: searching for repo in index store");
+
                     // try exact match by key
                     if let Some((k, v)) = map.get_key_value(&resolved_repo) {
+                        tracing::debug!(resolved_repo=%resolved_repo, matched_key=%k, "POST search: found exact match in index store");
                         Some((k.clone(), v.clone()))
                     } else {
                         // fallback: try matching by basename or path suffix
-                        map.iter().find_map(|(k, v)| {
+                        let fallback_match = map.iter().find_map(|(k, v)| {
                             if k == &resolved_repo
                                 || k.ends_with(&format!("/{}", resolved_repo))
                                 || Path::new(k)
@@ -781,15 +855,20 @@ async fn main() -> Result<()> {
                                     .map(|s| s == resolved_repo)
                                     .unwrap_or(false)
                             {
+                                tracing::debug!(resolved_repo=%resolved_repo, matched_key=%k, "POST search: found fallback match in index store");
                                 Some((k.clone(), v.clone()))
                             } else {
                                 None
                             }
-                        })
+                        });
+                        if fallback_match.is_none() {
+                            tracing::debug!(resolved_repo=%resolved_repo, "POST search: no match found in index store");
+                        }
+                        fallback_match
                     }
                 };
 
-                if let Some((repo_root, idx)) = idx_pair {
+                if let Some((_, idx)) = idx_pair {
                     let plan = match QueryPlan::parse(&params.q) {
                         Ok(p) => p,
                         Err(e) => {
@@ -799,6 +878,10 @@ async fn main() -> Result<()> {
                     };
 
                     let idx_clone = idx.clone();
+                    let actual_repo_root = idx.repo_root(); // Use the actual repo root from index metadata
+                    let resolved_repo_clone = resolved_repo.clone();
+                    let query_clone = params.q.clone();
+                    let context_lines_clone = params.context_lines;
                     let fut = tokio::task::spawn_blocking(move || {
                         // Same enrichment as the GET handler: attach symbol metadata
                         // to results when possible by scanning content and using
@@ -893,43 +976,47 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        results
+
+                        // Generate snippets here inside the blocking task
+                        let cap = 100usize;
+                        let context = context_lines_clone.unwrap_or(2);
+                        let out: Vec<_> = results
+                            .into_iter()
+                            .take(cap)
+                            .map(|mut r| {
+                                // join the repo root key with the relative path to read the
+                                // correct file on disk for snippet generation
+                                let full_path = Path::new(&actual_repo_root).join(&r.path);
+                                let text_opt = idx_clone.doc_content(r.doc as usize)
+                                    .or_else(|| std::fs::read_to_string(&full_path).ok());
+                                match text_opt {
+                                    Some(text) => {
+                                        let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &query_clone);
+                                        if snippet.is_some() {
+                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
+                                        } else {
+                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                                        }
+                                        // Fallback: if no symbol from enrichment, use from snippet
+                                        if r.symbol_loc.is_none() && snippet_symbol.is_some() {
+                                            r.symbol_loc = snippet_symbol.clone();
+                                            r.symbol = snippet_symbol.map(|s| s.name);
+                                        }
+                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo_clone})
+                                    }
+                                    None => {
+                                        tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
+                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo_clone})
+                                    }
+                                }
+                            })
+                            .collect();
+                        out
                     });
 
                     match timeout(Duration::from_secs(5), fut).await {
                         Ok(join_res) => match join_res {
-                            Ok(results) => {
-                                let cap = 100usize;
-                                let context = params.context_lines.unwrap_or(2);
-                                let out: Vec<_> = results
-                                    .into_iter()
-                                    .take(cap)
-                                    .map(|mut r| {
-                                        // join the repo root key with the relative path to read the
-                                        // correct file on disk for snippet generation
-                                        let full_path = Path::new(&repo_root).join(&r.path);
-                                        match std::fs::read_to_string(&full_path) {
-                                            Ok(text) => {
-                                                let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &params.q);
-                                                if snippet.is_some() {
-                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
-                                                } else {
-                                                    tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
-                                                }
-                                                // Fallback: if no symbol from enrichment, use from snippet
-                                                if r.symbol_loc.is_none() && snippet_symbol.is_some() {
-                                                    r.symbol_loc = snippet_symbol.clone();
-                                                    r.symbol = snippet_symbol.map(|s| s.name);
-                                                }
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo})
-                                            }
-                                            Err(e) => {
-                                                tracing::info!(repo=%repo_root, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, error=%e, "failed to read file for snippet");
-                                                json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo})
-                                            }
-                                        }
-                                    })
-                                    .collect();
+                            Ok(out) => {
                                 tracing::info!(repo=%params.repo, results=%out.len(), "POST search completed");
                                 (StatusCode::OK, Json(json!({"results": out})))
                             }

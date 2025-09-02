@@ -14,6 +14,19 @@ document.addEventListener('DOMContentLoaded', function () {
         v = v / KB;
         return v.toFixed(2) + ' GB';
     };
+
+    // Helper function to format UTC timestamp to local time
+    function formatTimestamp(utcTimestamp) {
+        if (!utcTimestamp) return '';
+        try {
+            // Parse UTC timestamp (ISO format: 2025-09-02T14:44:00.000Z)
+            const date = new Date(utcTimestamp);
+            if (isNaN(date.getTime())) return utcTimestamp; // fallback to original if parsing fails
+            return date.toLocaleString();
+        } catch (e) {
+            return utcTimestamp; // fallback to original on error
+        }
+    }
     const createForm = document.getElementById('create-form');
     const repoTableBody = document.getElementById('repo-table-body');
     const exportBtn = document.getElementById('export-csv');
@@ -254,7 +267,8 @@ document.addEventListener('DOMContentLoaded', function () {
             details.forEach(d => {
                 const r = document.createElement('tr');
                 const mem = (d.memory_display) ? d.memory_display : (d.memory_bytes ? humanReadableBytes(Number(d.memory_bytes)) : '');
-                r.innerHTML = `<td>${escapeHtml(d.branch || '')}</td><td>${escapeHtml(d.last_indexed || '')}</td><td class="numeric">${escapeHtml(String(d.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(mem)}</td><td>${escapeHtml(d.leased_node || '')}</td>`;
+                const formattedTime = formatTimestamp(d.last_indexed);
+                r.innerHTML = `<td>${escapeHtml(d.branch || '')}</td><td>${escapeHtml(formattedTime)}</td><td class="numeric">${escapeHtml(String(d.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(mem)}</td><td>${escapeHtml(d.leased_node || '')}</td>`;
                 bbody.appendChild(r);
             });
             tbl.appendChild(bbody);
@@ -356,7 +370,8 @@ document.addEventListener('DOMContentLoaded', function () {
         branchTableBody.innerHTML = '';
         for (const br of branchRows) {
             const tr = document.createElement('tr');
-            tr.innerHTML = `<td>${escapeHtml(br.repo)}</td><td>${escapeHtml(br.branch)}</td><td>${escapeHtml(br.last_indexed)}</td><td class="numeric">${escapeHtml(String(br.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(br.memory_display || '')}</td><td>${escapeHtml(br.leased_node || '')}</td>`;
+            const formattedTime = formatTimestamp(br.last_indexed);
+            tr.innerHTML = `<td>${escapeHtml(br.repo)}</td><td>${escapeHtml(br.branch)}</td><td>${escapeHtml(formattedTime)}</td><td class="numeric">${escapeHtml(String(br.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(br.memory_display || '')}</td><td>${escapeHtml(br.leased_node || '')}</td>`;
             // attach data-bytes on memory cell to help numeric sorting
             const memCell = tr.children[4];
             if (memCell && br.memory_bytes) memCell.setAttribute('data-bytes', String(br.memory_bytes));
@@ -381,8 +396,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     // Format last heartbeat
                     let heartbeatDisplay = 'Never';
                     if (indexer.last_heartbeat) {
-                        const date = new Date(indexer.last_heartbeat);
-                        heartbeatDisplay = date.toLocaleString();
+                        heartbeatDisplay = new Date(indexer.last_heartbeat).toLocaleString();
                     }
 
                     // Status styling
@@ -396,7 +410,10 @@ document.addEventListener('DOMContentLoaded', function () {
                         statusClass = 'style="color: #ef4444;"'; // red
                     }
 
-                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td ${statusClass}>${escapeHtml(statusText)}</td>`;
+                    // Get CSRF token from the create form
+                    const csrfToken = document.querySelector('input[name="csrf"]').value || '';
+
+                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td ${statusClass}>${escapeHtml(statusText)}</td><td><form class="delete-indexer-form" data-node-id="${escapeHtml(indexer.node_id)}"><input type="hidden" name="node_id" value="${escapeHtml(indexer.node_id)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"/><button type="submit" style="background: var(--danger); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Delete</button></form></td>`;
                     indexerTableBody.appendChild(tr);
                 }
                 // apply saved sort state if the indexers table header supports it
@@ -404,8 +421,53 @@ document.addEventListener('DOMContentLoaded', function () {
             })
             .catch(e => {
                 console.warn('Failed to fetch indexers:', e);
-                indexerTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--muted);">Failed to load indexer data</td></tr>';
+                indexerTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--muted);">Failed to load indexer data</td></tr>';
             });
+    }
+
+    // Add event listener for delete indexer forms
+    if (indexerTableBody) {
+        indexerTableBody.addEventListener('submit', function (e) {
+            const f = e.target;
+            if (f && f.classList && f.classList.contains('delete-indexer-form')) {
+                e.preventDefault();
+                const nodeId = f.dataset.nodeId || '';
+                if (!confirm(`Delete indexer '${nodeId}'? This will also release all leases held by this indexer.`)) return;
+                const formData = new URLSearchParams(new FormData(f));
+                fetch('/delete-indexer', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'same-origin',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
+                    }
+                }).then(r => {
+                    if (r.ok) return r.json();
+                    // Try to parse JSON error body
+                    return r.json().then(j => {
+                        let msg = 'Delete indexer failed';
+                        if (j && j.error) {
+                            msg = `Delete indexer failed: ${j.error}`;
+                        } else {
+                            msg = `Delete indexer failed: ${r.status} ${r.statusText}`;
+                        }
+                        throw new Error(msg);
+                    }).catch(() => {
+                        throw new Error(`Delete indexer failed: ${r.status} ${r.statusText}`);
+                    });
+                }).then(data => {
+                    // remove row
+                    const row = f.closest('tr'); if (row) { row.remove(); }
+                    // Show success message
+                    let msg = `Indexer '${nodeId}' deleted successfully!`;
+                    if (data.leases_released && data.leases_released > 0) {
+                        msg += ` ${data.leases_released} lease(s) were released.`;
+                    }
+                    alert(msg);
+                }).catch(err => alert(err && err.message ? err.message : String(err)));
+            }
+        });
     }
 
     // tab switching

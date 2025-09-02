@@ -28,8 +28,6 @@ use web_utils::SessionEntry;
 use anyhow::Result;
 use base64::Engine;
 
-use tracing_subscriber::fmt::time::UtcTime;
-
 use zoekt_distributed::{load_node_config, MergeOpts, NodeConfig, NodeType};
 
 #[derive(Parser)]
@@ -969,6 +967,7 @@ struct RepoInfo {
     url: String,
     frequency: Option<u64>,
     branches: Option<String>,
+    branch_details: Vec<serde_json::Value>,
 }
 
 async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
@@ -1002,11 +1001,103 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                     }
                 }
 
+                // Gather branch-level details for the API response
+                let mut branch_details: Vec<serde_json::Value> = Vec::new();
+                if let Ok(entry_map) = pool.hgetall("zoekt:repo_branch_meta").await {
+                    for (field, json_val) in entry_map {
+                        if field.starts_with(&format!("{}|", name)) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_val) {
+                                if let Some((_, branch)) = field.split_once('|') {
+                                    let mut obj = serde_json::Map::new();
+                                    obj.insert(
+                                        "branch".to_string(),
+                                        serde_json::Value::String(branch.to_string()),
+                                    );
+                                    // last_indexed: keep in UTC format for client-side timezone conversion
+                                    if let Some(li) = v.get("last_indexed") {
+                                        if let Some(n) = li.as_i64() {
+                                            let dt: DateTime<Utc> = Utc
+                                                .timestamp_millis_opt(n)
+                                                .single()
+                                                .unwrap_or_else(|| {
+                                                    Utc.timestamp_opt(0, 0).unwrap()
+                                                });
+                                            obj.insert(
+                                                "last_indexed".to_string(),
+                                                serde_json::Value::String(
+                                                    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                                                ),
+                                            );
+                                        } else if let Some(s) = li.as_str() {
+                                            obj.insert(
+                                                "last_indexed".to_string(),
+                                                serde_json::Value::String(s.to_string()),
+                                            );
+                                        }
+                                    }
+                                    if let Some(ld) = v.get("last_duration_ms") {
+                                        if let Some(n) = ld.as_i64() {
+                                            obj.insert(
+                                                "last_duration_ms".to_string(),
+                                                serde_json::Value::Number(
+                                                    serde_json::Number::from(n),
+                                                ),
+                                            );
+                                        } else if let Some(s) = ld.as_str() {
+                                            if let Ok(n) = s.parse::<i64>() {
+                                                obj.insert(
+                                                    "last_duration_ms".to_string(),
+                                                    serde_json::Value::Number(
+                                                        serde_json::Number::from(n),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(mb) = v.get("memory_bytes") {
+                                        if let Some(n) = mb.as_i64() {
+                                            obj.insert(
+                                                "memory_bytes".to_string(),
+                                                serde_json::Value::Number(
+                                                    serde_json::Number::from(n),
+                                                ),
+                                            );
+                                            obj.insert(
+                                                "memory_display".to_string(),
+                                                serde_json::Value::String(human_readable_bytes(n)),
+                                            );
+                                        } else if let Some(s) = mb.as_str() {
+                                            obj.insert(
+                                                "memory_display".to_string(),
+                                                serde_json::Value::String(s.to_string()),
+                                            );
+                                        }
+                                    }
+                                    if let Some(n) = v.get("leased_node") {
+                                        if !n.is_null() {
+                                            if let Some(s) = n.as_str() {
+                                                obj.insert(
+                                                    "leased_node".to_string(),
+                                                    serde_json::Value::String(s.to_string()),
+                                                );
+                                            } else {
+                                                obj.insert("leased_node".to_string(), n.clone());
+                                            }
+                                        }
+                                    }
+                                    branch_details.push(serde_json::Value::Object(obj));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 out.push(RepoInfo {
                     name: name.clone(),
                     url: url.clone(),
                     frequency,
                     branches,
+                    branch_details,
                 });
             }
         }
@@ -1060,6 +1151,207 @@ async fn api_indexers(state: Extension<AppState>) -> impl IntoResponse {
         }
     }
     Json(out)
+}
+
+#[derive(Deserialize)]
+struct DeleteIndexerForm {
+    node_id: String,
+    csrf: String,
+}
+
+async fn delete_indexer_inner(
+    state: Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteIndexerForm>,
+) -> impl IntoResponse {
+    let req_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(gen_token);
+    tracing::info!(request_id=%req_id, node_id=%form.node_id, "delete_indexer: incoming");
+
+    // Authentication check
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let has_session = if let Some(sid) = &sid_opt {
+        let map = state.sessions.read();
+        map.get(sid)
+            .map(|(_tok, exp, _u)| Instant::now() < *exp)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_basic && !has_session {
+        tracing::warn!(request_id=%req_id, outcome=%"delete_indexer_unauthorized");
+        if wants_json(&headers) {
+            let body = json!({"error": "unauthorized"});
+            let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        return into_boxed_response(Redirect::to("/login"));
+    }
+
+    // Validate CSRF if we have a session
+    if let Some(sid) = sid_opt {
+        let map = state.sessions.read();
+        if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
+            tracing::warn!(request_id=%req_id, outcome=%"delete_indexer_forbidden_csrf_mismatch");
+            if wants_json(&headers) {
+                let body = json!({"error": "csrf_mismatch"});
+                let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::FORBIDDEN,
+                Html("<h1>Forbidden</h1>".to_string()),
+            ));
+        }
+    }
+
+    if let Some(pool) = &state.redis_pool {
+        // Check if indexer exists
+        let exists: bool = pool
+            .hget("zoekt:indexers", &form.node_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            tracing::warn!(request_id=%req_id, node_id=%form.node_id, outcome=%"delete_indexer_not_found");
+            if wants_json(&headers) {
+                let body = json!({"error": "indexer_not_found"});
+                let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::NOT_FOUND,
+                Html("<h1>Indexer not found</h1>".to_string()),
+            ));
+        }
+
+        // Delete the indexer from zoekt:indexers
+        let delete_result = pool.hdel("zoekt:indexers", &form.node_id).await;
+        if delete_result.is_err() {
+            tracing::error!(request_id=%req_id, node_id=%form.node_id, error=?delete_result.err(), "Failed to delete indexer");
+            if wants_json(&headers) {
+                let body = json!({"error": "delete_failed"});
+                let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<h1>Failed to delete indexer</h1>".to_string()),
+            ));
+        }
+
+        // Clean up leases held by this indexer
+        let mut leases_released = 0;
+        if let Ok(branch_meta_entries) = pool.hgetall("zoekt:repo_branch_meta").await {
+            for (field, meta_json) in branch_meta_entries {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                    if let Some(leased_node) = v.get("leased_node").and_then(|n| n.as_str()) {
+                        if leased_node == form.node_id {
+                            // This branch is leased by the indexer we're deleting
+                            // Parse the field to get repo and branch names
+                            if let Some((repo_name, branch)) = field.split_once('|') {
+                                // Create a lease key to release
+                                let lease_key = format!(
+                                    "lease:{}",
+                                    base64::engine::general_purpose::URL_SAFE
+                                        .encode(format!("{}||{}", repo_name, ""))
+                                );
+                                // Try to delete the lease key if it exists
+                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+
+                                // Also try with the branch-specific key format
+                                let lease_key_with_branch = format!(
+                                    "lease:{}",
+                                    base64::engine::general_purpose::URL_SAFE
+                                        .encode(format!("{}||{}", repo_name, branch))
+                                );
+                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key_with_branch], &[]).await;
+
+                                leases_released += 1;
+
+                                // Clear the leased_node from the branch metadata
+                                let mut updated_meta = v.clone();
+                                updated_meta["leased_node"] = serde_json::Value::Null;
+                                let _ = pool
+                                    .hset(
+                                        "zoekt:repo_branch_meta",
+                                        &field,
+                                        &updated_meta.to_string(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            request_id=%req_id,
+            node_id=%form.node_id,
+            leases_released=%leases_released,
+            outcome=%"delete_indexer_success"
+        );
+
+        if wants_json(&headers) {
+            let body = json!({
+                "success": true,
+                "node_id": form.node_id,
+                "leases_released": leases_released
+            });
+            let mut resp = into_boxed_response((StatusCode::OK, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+
+        // For HTML response, redirect back to index
+        let mut resp = into_boxed_response(Redirect::to("/"));
+        resp.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+            HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        resp
+    } else {
+        tracing::error!(request_id=%req_id, "No Redis connection available");
+        if wants_json(&headers) {
+            let body = json!({"error": "no_redis_connection"});
+            let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        into_boxed_response((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html("<h1>No Redis connection</h1>".to_string()),
+        ))
+    }
 }
 
 async fn login_post(
@@ -1144,6 +1436,12 @@ fn make_app(state: AppState) -> Router {
             "/delete",
             post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteForm>| async move {
                 delete_inner(state, headers, Form(form)).await
+            }),
+        )
+        .route(
+            "/delete-indexer",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteIndexerForm>| async move {
+                delete_indexer_inner(state, headers, Form(form)).await
             }),
         )
         .route(
@@ -1589,15 +1887,11 @@ async fn session_sweeper(state: AppState) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Emit structured JSON logs for easier aggregation. Honor RUST_LOG via EnvFilter.
+    // Emit structured logs for easier aggregation. Honor RUST_LOG via EnvFilter.
     // include pid in logs via field when needed; avoid unused variable warning
     let _pid = std::process::id();
-    tracing_subscriber::fmt()
-        .with_timer(UtcTime::rfc_3339())
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let opts = Opts::parse();
 
     let _cfg = load_node_config(

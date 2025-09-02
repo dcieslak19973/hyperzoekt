@@ -410,9 +410,37 @@ async fn get_current_commit_sha(git_url: &str) -> Option<String> {
             }
         }
     } else {
-        // For remote repos, we could implement fetching the latest commit
-        // but for now, we'll return None and let the indexer handle it
-        tracing::debug!(repo=%git_url, "remote repo SHA detection not implemented yet");
-        None
+        // For remote repos, use git ls-remote to get the HEAD commit SHA
+        match tokio::process::Command::new("git")
+            .args(["ls-remote", git_url, "HEAD"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                // git ls-remote output format: <sha>\t<ref>
+                // We want the SHA from the first line
+                if let Some(first_line) = output_str.lines().next() {
+                    if let Some(sha) = first_line.split('\t').next() {
+                        let sha = sha.trim().to_string();
+                        if !sha.is_empty() {
+                            tracing::debug!(repo=%git_url, sha=%sha, "got remote commit SHA");
+                            return Some(sha);
+                        }
+                    }
+                }
+                tracing::debug!(repo=%git_url, "failed to parse SHA from git ls-remote output");
+                None
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(repo=%git_url, status=%output.status, stderr=%stderr, "git ls-remote failed");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(repo=%git_url, error=%e, "failed to run git ls-remote");
+                None
+            }
+        }
     }
 }
