@@ -1370,39 +1370,43 @@ async fn delete_indexer_inner(
 
         // Clean up leases held by this indexer
         let mut leases_released = 0;
-        if let Ok(branch_meta_entries) = pool.hgetall("zoekt:repo_branch_meta").await {
-            for (field, meta_json) in branch_meta_entries {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
-                    if let Some(leased_node) = v.get("leased_node").and_then(|n| n.as_str()) {
-                        if leased_node == form.node_id {
-                            // This branch is leased by the indexer we're deleting
-                            // Parse the field to get repo and branch names
-                            if let Some((repo_name, branch)) = field.split_once('|') {
-                                // Get the git_url for this repository branch
-                                let branch_field = format!("{}|{}", repo_name, branch);
-                                if let Ok(Some(git_url)) =
-                                    pool.hget("zoekt:repo_branches", &branch_field).await
-                                {
-                                    // Create a lease key using the correct format
-                                    let lease_key = base64::engine::general_purpose::URL_SAFE
-                                        .encode(format!("{}|{}|{}", repo_name, git_url, branch));
+        if let Ok(branch_entries) = pool.hgetall("zoekt:repo_branches").await {
+            for (field, git_url) in branch_entries {
+                // Parse the field to get repo and branch names
+                if let Some((repo_name, branch)) = field.split_once('|') {
+                    // Construct the lease key using the same format as lease_manager.rs
+                    let lease_key = base64::engine::general_purpose::URL_SAFE
+                        .encode(format!("{}|{}|{}", repo_name, git_url, branch));
 
-                                    // Try to delete the lease key if it exists
-                                    let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+                    // Check if this lease key exists and is held by the indexer being deleted
+                    if let Ok(Some(holder)) = pool.get(&lease_key).await {
+                        if holder == form.node_id {
+                            // This lease is held by the indexer we're deleting - release it
+                            let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+                            if delete_result.is_ok() {
+                                leases_released += 1;
+                                tracing::info!(
+                                    request_id=%req_id,
+                                    node_id=%form.node_id,
+                                    repo=%repo_name,
+                                    branch=%branch,
+                                    "released lease during indexer deletion"
+                                );
+                            }
+                        }
+                    }
 
-                                    leases_released += 1;
-
-                                    // Clear the leased_node from the branch metadata
-                                    let mut updated_meta = v.clone();
-                                    updated_meta["leased_node"] = serde_json::Value::Null;
-                                    let _ = pool
-                                        .hset(
-                                            "zoekt:repo_branch_meta",
-                                            &field,
-                                            &updated_meta.to_string(),
-                                        )
-                                        .await;
-                                }
+                    // Also clean up any leased_node field in metadata for backwards compatibility
+                    let meta_field = format!("{}|{}", repo_name, branch);
+                    if let Ok(Some(meta_json)) =
+                        pool.hget("zoekt:repo_branch_meta", &meta_field).await
+                    {
+                        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                            if v.get("leased_node").is_some() {
+                                v["leased_node"] = serde_json::Value::Null;
+                                let _ = pool
+                                    .hset("zoekt:repo_branch_meta", &meta_field, &v.to_string())
+                                    .await;
                             }
                         }
                     }
