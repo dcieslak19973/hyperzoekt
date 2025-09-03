@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Regex analysis approximations to derive trigram sets for prefiltering.
 //! This is a simplified version of Zoekt's regex/syntax analysis.
 
@@ -373,7 +389,7 @@ mod tests {
     fn regex_literal_prefilter() {
         let pf = prefilter_from_regex("fooBar");
         match pf {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             _ => panic!("expected conj"),
         }
     }
@@ -383,14 +399,14 @@ mod tests {
         // patterns with clear literal runs
         let p = prefilter_from_regex("\\bint\\s+main\\b");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => panic!("expected conj for int main"),
         }
 
         let p = prefilter_from_regex("foo|bar");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => panic!("expected conj or disjunction for foo|bar"),
         }
@@ -409,7 +425,7 @@ mod tests {
         // common word-boundary searches
         let p = prefilter_from_regex("\\bthe\\b");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             Prefilter::Disj(d) => assert!(d.iter().any(|v| !v.is_empty())),
             Prefilter::None => (),
         }
@@ -419,7 +435,7 @@ mod tests {
 
         let p = prefilter_from_regex("foo{3}bar");
         match p {
-            Prefilter::Conj(v) => assert!(v.len() >= 1),
+            Prefilter::Conj(v) => assert!(!v.is_empty()),
             _ => panic!("expected conj for foo{{3}}bar"),
         }
     }

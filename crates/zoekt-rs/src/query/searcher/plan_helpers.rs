@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::query::helpers::intersect_sorted;
 use crate::QueryPlan;
 use crate::RepoDocId;
@@ -228,29 +244,25 @@ mod tests {
     fn repo_matches_substring_glob_regex_and_branch() {
         let mut plan = crate::QueryPlan::default();
         plan.repos.push("owner/repo".to_string());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repos.clear();
         plan.repo_globs.push("owner/*".to_string());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repo_globs.clear();
         plan.repo_regexes
             .push(regex::Regex::new("^owner/.*$").unwrap());
-        assert!(repo_matches("owner/repo", &vec!["HEAD".to_string()], &plan));
+        assert!(repo_matches("owner/repo", &["HEAD".to_string()], &plan));
 
         plan.repo_regexes.clear();
         plan.branches.push("feature".to_string());
         // repo has only HEAD
-        assert!(!repo_matches(
-            "owner/repo",
-            &vec!["HEAD".to_string()],
-            &plan
-        ));
+        assert!(!repo_matches("owner/repo", &["HEAD".to_string()], &plan));
         // when branches include feature it's ok
         assert!(repo_matches(
             "owner/repo",
-            &vec!["HEAD".to_string(), "feature".to_string()],
+            &["HEAD".to_string(), "feature".to_string()],
             &plan
         ));
     }

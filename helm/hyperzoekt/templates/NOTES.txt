@@ -1,0 +1,43 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named {{ .Release.Name }}.
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+{{- range .paths }}
+Access the {{ .service.name }} service at: http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $.Values.ingress.hosts | first | get "host" }}{{ .path }}
+{{- end }}
+{{- end }}
+{{- else }}
+To access the services, you can use port-forwarding:
+
+# Admin UI
+kubectl port-forward svc/{{ include "hyperzoekt.fullname" . }}-admin {{ .Values.admin.service.port }}:{{ .Values.admin.service.port }}
+# Access at: http://localhost:{{ .Values.admin.service.port }}
+
+# Search API
+kubectl port-forward svc/{{ include "hyperzoekt.fullname" . }}-search {{ .Values.search.service.port }}:{{ .Values.search.service.port }}
+# Access at: http://localhost:{{ .Values.search.service.port }}
+
+# MCP Server
+kubectl port-forward svc/{{ include "hyperzoekt.fullname" . }}-mcp {{ .Values.mcp.service.port }}:{{ .Values.mcp.service.port }}
+# Access at: http://localhost:{{ .Values.mcp.service.port }}
+{{- end }}
+
+{{- if .Values.redis.enabled }}
+Redis is deployed and available at: {{ include "hyperzoekt.redisUrl" . }}
+{{- else }}
+Using external Redis at: {{ .Values.redis.external.host }}:{{ .Values.redis.external.port }}
+{{- end }}
+
+{{- if .Values.surrealdb.enabled }}
+SurrealDB is deployed and available at: {{ include "hyperzoekt.surrealUrl" . }}
+{{- else }}
+Using external SurrealDB at: {{ .Values.surrealdb.external.url }}
+{{- end }}
+
+{{- if .Values.indexer.autoscaling.enabled }}
+Indexer autoscaling is enabled with {{ .Values.indexer.autoscaling.minReplicas }}-{{ .Values.indexer.autoscaling.maxReplicas }} replicas based on memory usage.
+{{- end }}
+
+For more information, visit: https://github.com/dcieslak19973/hyperzoekt

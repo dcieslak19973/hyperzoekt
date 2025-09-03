@@ -1,0 +1,46 @@
+# Rust build artifacts
+target/
+.cargo/
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Development files
+.devcontainer/
+.githooks/
+
+# Documentation
+doc/
+*.md
+!README.md
+
+# Test data
+test_repos/
+test_repos.csv
+.bench_results/
+.tmp/
+.tmp_experiments/
+
+# Cache and temp files
+.sccache/
+.data/
+.upstream/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker
+docker/
+docker-compose.yml

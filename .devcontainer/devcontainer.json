@@ -8,7 +8,8 @@
     "vscode": {
       "extensions": [
         "rust-lang.rust-analyzer",
-        "ms-vscode.cpptools"
+        "ms-vscode.cpptools",
+        "ms-kubernetes-tools.vscode-helm"
       ],
       "settings": {
         "terminal.integrated.defaultProfile.linux": "bash",
@@ -29,28 +30,21 @@
   // For macOS/Linux run the container from a user with SSH_AGENT running so
   // the `SSH_AUTH_SOCK` env var is available to the Remote - Containers process.
   "mounts": [
-    // SSH mounts are disabled by default to avoid creating an empty bind "source"
-    // which causes Docker to fail with: "invalid mount config for type 'bind': field Source must not be empty".
-    // If you want SSH agent forwarding, enable one of these options and then
-    // uncomment the corresponding line(s) below:
-    //  - Ensure SSH_AUTH_SOCK is set in the environment that launches VS Code / the devcontainer CLI
-    //  - Or set WSL_SSH_PATH to the host .ssh path (example in the top comments)
-    // Example (uncomment when ready):
-    // "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent/socket,type=bind,consistency=cached",
-    // "source=${localEnv:WSL_SSH_PATH},target=/home/vscode/.ssh,type=bind,consistency=cached"
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
   "postCreateCommand": "bash .devcontainer/scripts/setup_devcontainer.sh",
   "postStartCommand": "bash .devcontainer/scripts/start_devcontainer.sh",
   // If you want SSH agent forwarding, configure it in your environment or use the
   // "ssh-agent" devcontainer feature instead of binding SSH_AUTH_SOCK directly.
   "remoteEnv": {
-    // inside the container point to the mounted agent socket
-    "SSH_AUTH_SOCK": "/ssh-agent/socket",
+    // SSH agent is provided by the ssh-agent feature; do not hardcode SSH_AUTH_SOCK here
     "SCCACHE_DIR": "/workspaces/hyperzoekt/.sccache",
     "CARGO_HOME": "/home/vscode/.cargo",
     "CARGO_TARGET_DIR": "/tmp/hyperzoekt-target",
     "RUSTUP_HOME": "/home/vscode/.rustup",
-    "PATH": "/usr/local/bin:/home/vscode/.cargo/bin:/usr/bin:/bin:${PATH}"
+    "PATH": "/usr/local/bin:/home/vscode/.cargo/bin:/usr/bin:/bin:${PATH}",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "C.UTF-8"
   },
   "remoteUser": "vscode"
 }

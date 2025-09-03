@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::index::RepoDocId;
 use regex::Regex;
 
@@ -68,6 +84,7 @@ pub(crate) fn search_plan(
                     path: inner.repo.name.clone(),
                     symbol: None,
                     symbol_loc: None,
+                    score: 1.0,
                 }]
             }
         }
@@ -95,6 +112,7 @@ pub(crate) fn search_plan(
                                                 path: meta.path.display().to_string(),
                                                 symbol: Some(sym.name.clone()),
                                                 symbol_loc: Some(sym.clone()),
+                                                score: 2.0, // Higher score for symbol matches
                                             });
                                         }
                                     }
@@ -117,6 +135,7 @@ pub(crate) fn search_plan(
                                             path: meta.path.display().to_string(),
                                             symbol: Some(sym.name.clone()),
                                             symbol_loc: Some(sym.clone()),
+                                            score: 2.0, // Higher score for symbol matches
                                         });
                                     }
                                 }
@@ -143,6 +162,7 @@ pub(crate) fn search_plan(
                                             path: meta.path.display().to_string(),
                                             symbol: Some(sym.name.clone()),
                                             symbol_loc: Some(sym.clone()),
+                                            score: 2.0, // Higher score for symbol matches
                                         });
                                     }
                                 }
@@ -165,6 +185,7 @@ pub(crate) fn search_plan(
                                         path: meta.path.display().to_string(),
                                         symbol: Some(sym.name.clone()),
                                         symbol_loc: Some(sym.clone()),
+                                        score: 2.0, // Higher score for symbol matches
                                     });
                                 }
                             }
@@ -176,6 +197,7 @@ pub(crate) fn search_plan(
                                 path: meta.path.display().to_string(),
                                 symbol: Some(sym.name.clone()),
                                 symbol_loc: Some(sym.clone()),
+                                score: 2.0, // Higher score for symbol matches
                             });
                         }
                     }
@@ -192,6 +214,7 @@ pub(crate) fn search_plan(
                     path: meta.path.display().to_string(),
                     symbol: None,
                     symbol_loc: None,
+                    score: 1.0, // Lower score for file matches
                 })
             })
             .collect(),
@@ -215,6 +238,10 @@ mod tests {
                 name: repo_name.to_string(),
                 root: std::path::PathBuf::from("/tmp"),
                 branches,
+                visibility: crate::types::RepoVisibility::Public,
+                owner: None,
+                allowed_users: vec![],
+                last_commit_sha: None,
             },
             docs,
             terms: std::collections::HashMap::new(),
@@ -239,7 +266,7 @@ mod tests {
         let mut plan = QueryPlan::default();
         plan.repo_globs.push("owner/*".to_string());
         let res = search_plan(&s, &plan);
-        assert!(res.is_empty() == false);
+        assert!(!res.is_empty());
     }
 
     #[test]

@@ -1,0 +1,11 @@
+# Default configuration for zoekt-distributed
+# Edit this file and load values at runtime if you wire a config loader.
+
+# Node identity
+id = "node-1"
+
+# Lease TTL in seconds (default 2.5 minutes)
+lease_ttl_seconds = 150
+
+# How often the node polls known remotes
+poll_interval_seconds = 5

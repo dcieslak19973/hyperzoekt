@@ -1,0 +1,126 @@
+{{- if .Values.indexer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-indexer
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+  {{- with .Values.indexer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.indexer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: indexer
+  template:
+    metadata:
+      labels:
+        {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: indexer
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "hyperzoekt.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: indexer
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ .Values.indexer.image.registry }}/{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}
+          imagePullPolicy: {{ .Values.indexer.image.pullPolicy }}
+          command:
+            - /app/dzr-indexer
+            - --listen
+            - 0.0.0.0:7676
+          env:
+            - name: REDIS_URL
+              value: {{ include "hyperzoekt.redisUrl" . | quote }}
+            - name: SURREALDB_URL
+              value: {{ include "hyperzoekt.surrealUrl" . | quote }}
+            - name: SURREALDB_USERNAME
+              value: {{ .Values.surrealdb.external.username | default "root" | quote }}
+            - name: SURREALDB_PASSWORD
+              value: {{ .Values.surrealdb.external.password | default "root" | quote }}
+            - name: SURREAL_NS
+              value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
+            - name: SURREAL_DB
+              value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
+            {{- with .Values.indexer.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.indexer.extraEnvVars }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.indexer.resources | nindent 12 }}
+          {{- if .Values.indexer.hostRepoPath }}
+          volumeMounts:
+            - name: host-repo
+              mountPath: /tmp/repos
+              readOnly: true
+      {{- end }}
+      {{- with .Values.indexer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.indexer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.indexer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.indexer.hostRepoPath }}
+      volumes:
+        - name: host-repo
+          hostPath:
+            path: {{ .Values.indexer.hostRepoPath }}
+            type: Directory
+      {{- end }}
+{{- end }}
+---
+{{- if and .Values.indexer.enabled .Values.indexer.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-indexer-hpa
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+  {{- with .Values.indexer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "hyperzoekt.fullname" . }}-indexer
+  minReplicas: {{ .Values.indexer.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.indexer.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.indexer.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.indexer.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.indexer.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.indexer.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+{{- end }}

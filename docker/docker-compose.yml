@@ -1,0 +1,97 @@
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  surrealdb:
+    image: surrealdb/surrealdb:v2.3.1
+    ports:
+      - "8000:8000"
+    command: start --bind 0.0.0.0:8000 --user root --pass root memory
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    user: "1000:1000"
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7676:7676"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7676
+    command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676"]
+    depends_on:
+      - redis
+      - surrealdb
+    volumes:
+      - ../:/tmp/repos:ro
+
+  admin:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7878:7878"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+      - ZOEKT_ADMIN_USERNAME=admin
+      - ZOEKT_ADMIN_PASSWORD=password
+    command: ["/app/dzr-admin", "--bind", "0.0.0.0:7878"]
+    depends_on:
+      - redis
+      - surrealdb
+
+  search:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+      - ZOEKTD_BIND_ADDR=0.0.0.0:8080
+    command: ["/app/dzr-http-search", "--listen", "0.0.0.0:8080"]
+    depends_on:
+      - redis
+      - surrealdb
+
+  mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7979:7979"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7979
+    command: ["/app/dzr-mcp-search", "--listen", "0.0.0.0:7979"]
+    depends_on:
+      - redis
+      - surrealdb

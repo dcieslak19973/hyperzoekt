@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::types::{DocumentMeta, RepoMeta};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -69,5 +85,23 @@ impl InMemoryIndex {
     pub fn total_scanned_bytes(&self) -> u64 {
         let inner = self.inner.read();
         inner.docs.iter().map(|d| d.size).sum()
+    }
+
+    /// Public accessor to retrieve a cloned DocumentMeta for a given doc index.
+    pub fn doc_meta(&self, doc_idx: usize) -> Option<crate::types::DocumentMeta> {
+        let inner = self.inner.read();
+        inner.docs.get(doc_idx).cloned()
+    }
+
+    /// Public accessor to retrieve in-memory doc content for a given doc index, if present.
+    pub fn doc_content(&self, doc_idx: usize) -> Option<String> {
+        let inner = self.inner.read();
+        inner.doc_contents.get(doc_idx).and_then(|o| o.clone())
+    }
+
+    /// Public accessor to retrieve the repo root path for this index.
+    pub fn repo_root(&self) -> std::path::PathBuf {
+        let inner = self.inner.read();
+        inner.repo.root.clone()
     }
 }
