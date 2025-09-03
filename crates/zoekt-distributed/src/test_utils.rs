@@ -94,6 +94,15 @@ impl Indexer for FakeIndexer {
         let idx = zoekt_rs::test_helpers::make_index_with_trigrams(vec![], "fake", vec![], None);
         Ok(idx)
     }
+
+    fn remove_index(&self, _repo_key: &str) {
+        // No-op for fake indexer
+    }
+
+    fn get_indexed_repos(&self) -> Vec<String> {
+        // Fake indexer doesn't track repos
+        Vec::new()
+    }
 }
 
 impl Default for FakeIndexer {
@@ -122,5 +131,14 @@ impl Indexer for SleepIndexer {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let idx = zoekt_rs::test_helpers::make_index_with_trigrams(vec![], "fake", vec![], None);
         Ok(idx)
+    }
+
+    fn remove_index(&self, _repo_key: &str) {
+        // No-op for sleep indexer
+    }
+
+    fn get_indexed_repos(&self) -> Vec<String> {
+        // Sleep indexer doesn't track repos
+        Vec::new()
     }
 }

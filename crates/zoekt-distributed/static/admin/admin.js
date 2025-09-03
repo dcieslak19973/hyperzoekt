@@ -22,7 +22,8 @@ document.addEventListener('DOMContentLoaded', function () {
             // Parse UTC timestamp (ISO format: 2025-09-02T14:44:00.000Z)
             const date = new Date(utcTimestamp);
             if (isNaN(date.getTime())) return utcTimestamp; // fallback to original if parsing fails
-            return date.toLocaleString();
+            // Format without comma between date and time
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
         } catch (e) {
             return utcTimestamp; // fallback to original on error
         }
@@ -399,7 +400,8 @@ document.addEventListener('DOMContentLoaded', function () {
                     // Format expiry time
                     let expiryDisplay = 'Unknown';
                     if (lease.expires) {
-                        expiryDisplay = new Date(lease.expires).toLocaleString();
+                        const date = new Date(lease.expires);
+                        expiryDisplay = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
                     }
 
                     // Get CSRF token from the create form
@@ -414,6 +416,40 @@ document.addEventListener('DOMContentLoaded', function () {
             .catch(e => {
                 console.warn('Failed to fetch leases:', e);
                 leaseTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--muted);">Failed to load lease data</td></tr>';
+            });
+    }
+
+    // Indexers tab handling: fetch and display indexer nodes
+    function refreshIndexersTable() {
+        if (!indexerTableBody) return;
+
+        fetch('/api/indexers', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                // clear and repopulate
+                indexerTableBody.innerHTML = '';
+                for (const indexer of data) {
+                    const tr = document.createElement('tr');
+
+                    // Format last heartbeat time
+                    let heartbeatDisplay = 'Never';
+                    if (indexer.last_heartbeat) {
+                        const date = new Date(indexer.last_heartbeat);
+                        heartbeatDisplay = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+                    }
+
+                    // Get CSRF token from the create form
+                    const csrfToken = document.querySelector('input[name="csrf"]').value || '';
+
+                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td>${escapeHtml(indexer.status)}</td><td><form class="delete-indexer-form" data-node-id="${escapeHtml(indexer.node_id)}"><input type="hidden" name="node_id" value="${escapeHtml(indexer.node_id)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"/><button type="submit" style="background: var(--danger); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Delete</button></form></td>`;
+                    indexerTableBody.appendChild(tr);
+                }
+                // apply saved sort state if the indexers table header supports it
+                if (window.applyCurrentSort) window.applyCurrentSort();
+            })
+            .catch(e => {
+                console.warn('Failed to fetch indexers:', e);
+                indexerTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--muted);">Failed to load indexer data</td></tr>';
             });
     }
 
@@ -454,6 +490,48 @@ document.addEventListener('DOMContentLoaded', function () {
                     const row = f.closest('tr'); if (row) { row.remove(); }
                     // Show success message
                     alert(`Lease for repository '${repo}' branch '${branch}' deleted successfully!`);
+                }).catch(err => alert(err && err.message ? err.message : String(err)));
+            }
+        });
+    }
+
+    // Add event listener for delete indexer forms
+    if (indexerTableBody) {
+        indexerTableBody.addEventListener('submit', function (e) {
+            const f = e.target;
+            if (f && f.classList && f.classList.contains('delete-indexer-form')) {
+                e.preventDefault();
+                const nodeId = f.dataset.nodeId || '';
+                if (!confirm(`Delete indexer '${nodeId}'? This will also release all leases held by this indexer.`)) return;
+                const formData = new URLSearchParams(new FormData(f));
+                fetch('/delete-indexer', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'same-origin',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
+                    }
+                }).then(r => {
+                    if (r.ok) return r.json();
+                    // Try to parse JSON error body
+                    return r.json().then(j => {
+                        let msg = 'Delete indexer failed';
+                        if (j && j.error) {
+                            msg = `Delete indexer failed: ${j.error}`;
+                        } else {
+                            msg = `Delete indexer failed: ${r.status} ${r.statusText}`;
+                        }
+                        throw new Error(msg);
+                    }).catch(() => {
+                        throw new Error(`Delete indexer failed: ${r.status} ${r.statusText}`);
+                    });
+                }).then(data => {
+                    // remove row
+                    const row = f.closest('tr'); if (row) { row.remove(); }
+                    // Show success message
+                    const leasesReleased = data.leases_released || 0;
+                    alert(`Indexer '${nodeId}' deleted successfully! ${leasesReleased} lease(s) were released.`);
                 }).catch(err => alert(err && err.message ? err.message : String(err)));
             }
         });

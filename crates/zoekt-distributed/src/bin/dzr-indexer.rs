@@ -404,6 +404,19 @@ impl Indexer for SimpleIndexer {
         tracing::info!(repo=%key, "index build complete and stored");
         Ok(idx)
     }
+
+    fn remove_index(&self, repo_key: &str) {
+        let removed = self.store.write().remove(repo_key);
+        if removed.is_some() {
+            tracing::info!(repo=%repo_key, "removed index from memory");
+        } else {
+            tracing::debug!(repo=%repo_key, "index not found in memory, nothing to remove");
+        }
+    }
+
+    fn get_indexed_repos(&self) -> Vec<String> {
+        self.store.read().keys().cloned().collect()
+    }
 }
 
 #[derive(Deserialize)]

@@ -86,8 +86,15 @@ pub trait DynRedis: Send + Sync {
     async fn ping(&self) -> anyhow::Result<()>;
     async fn hgetall(&self, key: &str) -> anyhow::Result<Vec<(String, String)>>;
     async fn eval_i32(&self, script: &str, keys: &[&str], args: &[&str]) -> anyhow::Result<i32>;
+    async fn eval_vec_string(
+        &self,
+        script: &str,
+        keys: &[&str],
+        args: &[&str],
+    ) -> anyhow::Result<Vec<String>>;
     async fn hset(&self, key: &str, field: &str, value: &str) -> anyhow::Result<()>;
     async fn hget(&self, key: &str, field: &str) -> anyhow::Result<Option<String>>;
+    async fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
     async fn hdel(&self, key: &str, field: &str) -> anyhow::Result<bool>;
 }
 
@@ -144,6 +151,32 @@ impl DynRedis for RealRedis {
         Ok(v)
     }
 
+    async fn eval_vec_string(
+        &self,
+        script: &str,
+        keys: &[&str],
+        args: &[&str],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let mut cmd = deadpool_redis::redis::cmd("EVAL");
+        cmd.arg(script).arg(keys.len());
+        for k in keys {
+            cmd.arg(k);
+        }
+        for a in args {
+            cmd.arg(a);
+        }
+        let v: Vec<String> = cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(v)
+    }
+
     async fn hset(&self, key: &str, field: &str, value: &str) -> anyhow::Result<()> {
         let mut conn = self
             .pool
@@ -165,6 +198,19 @@ impl DynRedis for RealRedis {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let v: Option<String> = conn
             .hget(key, field)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(v)
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let v: Option<String> = conn
+            .get(key)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(v)

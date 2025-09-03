@@ -1203,35 +1203,46 @@ async fn api_indexers(state: Extension<AppState>) -> impl IntoResponse {
 async fn api_leases(state: Extension<AppState>) -> impl IntoResponse {
     let mut out: Vec<LeaseInfo> = Vec::new();
     if let Some(pool) = &state.redis_pool {
-        if let Ok(entries) = pool.hgetall("zoekt:repo_branch_meta").await {
-            for (field, meta_json) in entries {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
-                    if let Some(leased_node) = v.get("leased_node").and_then(|n| n.as_str()) {
-                        // Parse the field to get repo and branch names
-                        if let Some((repo_name, branch)) = field.split_once('|') {
-                            // Check if the lease key exists in Redis to get expiry info
-                            let lease_key = format!(
-                                "lease:{}",
-                                base64::engine::general_purpose::URL_SAFE
-                                    .encode(format!("{}||{}", repo_name, branch))
-                            );
+        // Get all keys from Redis - lease keys are base64-encoded strings
+        if let Ok(all_keys) = pool
+            .eval_vec_string("return redis.call('keys', '*')", &[], &[])
+            .await
+        {
+            for key in all_keys {
+                // Try to decode the key as base64 to see if it's a lease key
+                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE.decode(&key) {
+                    if let Ok(decoded_str) = String::from_utf8(decoded) {
+                        // Parse the decoded string: format is "repo_name|git_url|branch_name"
+                        let parts: Vec<&str> = decoded_str.split('|').collect();
+                        if parts.len() >= 3 {
+                            let repo_name = parts[0];
+                            let branch_name = parts[2];
 
-                            let expires = if let Ok(exists) = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return 1 else return 0 end", &[&lease_key], &[]).await {
-                                if exists == 1 {
-                                    "Active".to_string()
-                                } else {
-                                    "Expired".to_string()
-                                }
-                            } else {
-                                "Unknown".to_string()
-                            };
+                            // Get the holder from Redis
+                            let holder_result = pool.get(&key).await;
 
-                            out.push(LeaseInfo {
-                                repository: repo_name.to_string(),
-                                branch: branch.to_string(),
-                                holder: leased_node.to_string(),
-                                expires,
-                            });
+                            if let Ok(Some(holder)) = holder_result {
+                                // Get TTL for expiry information
+                                let ttl_result = pool
+                                    .eval_i32("return redis.call('ttl', KEYS[1])", &[&key], &[])
+                                    .await;
+
+                                let expires = match ttl_result {
+                                    Ok(ttl) if ttl > 0 => {
+                                        let expiry_time = chrono::Utc::now()
+                                            + chrono::Duration::seconds(ttl as i64);
+                                        expiry_time.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                                    }
+                                    _ => "Unknown".to_string(),
+                                };
+
+                                out.push(LeaseInfo {
+                                    repository: repo_name.to_string(),
+                                    branch: branch_name.to_string(),
+                                    holder,
+                                    expires,
+                                });
+                            }
                         }
                     }
                 }
@@ -1367,35 +1378,31 @@ async fn delete_indexer_inner(
                             // This branch is leased by the indexer we're deleting
                             // Parse the field to get repo and branch names
                             if let Some((repo_name, branch)) = field.split_once('|') {
-                                // Create a lease key to release
-                                let lease_key = format!(
-                                    "lease:{}",
-                                    base64::engine::general_purpose::URL_SAFE
-                                        .encode(format!("{}||{}", repo_name, ""))
-                                );
-                                // Try to delete the lease key if it exists
-                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+                                // Get the git_url for this repository branch
+                                let branch_field = format!("{}|{}", repo_name, branch);
+                                if let Ok(Some(git_url)) =
+                                    pool.hget("zoekt:repo_branches", &branch_field).await
+                                {
+                                    // Create a lease key using the correct format
+                                    let lease_key = base64::engine::general_purpose::URL_SAFE
+                                        .encode(format!("{}|{}|{}", repo_name, git_url, branch));
 
-                                // Also try with the branch-specific key format
-                                let lease_key_with_branch = format!(
-                                    "lease:{}",
-                                    base64::engine::general_purpose::URL_SAFE
-                                        .encode(format!("{}||{}", repo_name, branch))
-                                );
-                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key_with_branch], &[]).await;
+                                    // Try to delete the lease key if it exists
+                                    let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
 
-                                leases_released += 1;
+                                    leases_released += 1;
 
-                                // Clear the leased_node from the branch metadata
-                                let mut updated_meta = v.clone();
-                                updated_meta["leased_node"] = serde_json::Value::Null;
-                                let _ = pool
-                                    .hset(
-                                        "zoekt:repo_branch_meta",
-                                        &field,
-                                        &updated_meta.to_string(),
-                                    )
-                                    .await;
+                                    // Clear the leased_node from the branch metadata
+                                    let mut updated_meta = v.clone();
+                                    updated_meta["leased_node"] = serde_json::Value::Null;
+                                    let _ = pool
+                                        .hset(
+                                            "zoekt:repo_branch_meta",
+                                            &field,
+                                            &updated_meta.to_string(),
+                                        )
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -1534,12 +1541,38 @@ async fn delete_lease_inner(
             ));
         }
 
-        // Delete the lease key
-        let lease_key = format!(
-            "lease:{}",
-            base64::engine::general_purpose::URL_SAFE
-                .encode(format!("{}||{}", form.repository, form.branch))
-        );
+        // Get the git_url for this repository branch to construct the correct lease key
+        let git_url: Option<String> = pool
+            .hget("zoekt:repo_branches", &field)
+            .await
+            .ok()
+            .flatten();
+
+        let git_url = match git_url {
+            Some(url) => url,
+            None => {
+                tracing::error!(request_id=%req_id, repository=%form.repository, branch=%form.branch, "Could not find git_url for repository branch");
+                if wants_json(&headers) {
+                    let body = json!({"error": "repository_not_found"});
+                    let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
+                    resp.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        HeaderValue::from_str(&req_id)
+                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                    return resp;
+                }
+                return into_boxed_response((
+                    StatusCode::NOT_FOUND,
+                    Html("<h1>Repository not found</h1>".to_string()),
+                ));
+            }
+        };
+
+        // Construct the lease key using the same format as lease_manager.rs
+        let lease_key = base64::engine::general_purpose::URL_SAFE
+            .encode(format!("{}|{}|{}", form.repository, git_url, form.branch));
+
         let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
 
         if delete_result.is_err() {
@@ -2307,11 +2340,25 @@ mod tests {
             Ok(lock.take().unwrap_or(0))
         }
 
+        async fn eval_vec_string(
+            &self,
+            _script: &str,
+            _keys: &[&str],
+            _args: &[&str],
+        ) -> anyhow::Result<Vec<String>> {
+            // For mock, return empty vec for lease keys
+            Ok(vec![])
+        }
+
         async fn hset(&self, _key: &str, _field: &str, _value: &str) -> anyhow::Result<()> {
             Ok(())
         }
 
         async fn hget(&self, _key: &str, _field: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
 

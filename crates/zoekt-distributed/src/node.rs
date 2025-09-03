@@ -28,6 +28,12 @@ pub trait Indexer: Send + Sync + 'static {
     /// Build/index the repo at `repo_path` and return some index handle. For the prototype,
     /// we return an `InMemoryIndex` from `zoekt_rs`.
     fn index_repo(&self, repo_path: PathBuf) -> Result<InMemoryIndex>;
+
+    /// Remove an index from memory by repo URL/path key
+    fn remove_index(&self, repo_key: &str);
+
+    /// Get all repo keys currently in memory
+    fn get_indexed_repos(&self) -> Vec<String>;
 }
 
 /// Simple Node that periodically tries to acquire leases for known remote repos and then
@@ -56,13 +62,94 @@ impl<I: Indexer> Node<I> {
         self.repos.write().push(repo);
     }
 
+    /// Perform heartbeat maintenance tasks for indexers
+    async fn perform_heartbeat_maintenance(&self) {
+        tracing::debug!(node_id=%self.config.id, "performing heartbeat maintenance");
+
+        // 1. Check for branches in memory whose parent repos no longer exist
+        let indexed_repos = self.indexer.get_indexed_repos();
+        tracing::debug!(node_id=%self.config.id, indexed_repos_count=%indexed_repos.len(), "checking for stale indexes");
+
+        for repo_key in &indexed_repos {
+            // Try to determine repo name and branch from the key
+            // The key format could be a URL or path, we need to find matching registered repos
+            let registered_branches = self.lease_mgr.get_repo_branches().await;
+
+            // Check if this repo key matches any registered branch
+            let mut found_registered = false;
+            for (_repo_name, _branch, url) in &registered_branches {
+                // Check if the repo_key matches the URL or is a path that corresponds to it
+                if repo_key == url || repo_key.contains(url) || url.contains(repo_key) {
+                    found_registered = true;
+                    break;
+                }
+            }
+
+            if !found_registered {
+                tracing::info!(node_id=%self.config.id, repo=%repo_key, "removing index for unregistered repo");
+                self.indexer.remove_index(repo_key);
+            }
+        }
+
+        // 2. Check for unleased branches that we can bid on
+        let unleased_branches = self.lease_mgr.get_unleased_branches().await;
+        tracing::debug!(node_id=%self.config.id, unleased_branches_count=%unleased_branches.len(), "checking for available leases");
+
+        // Track how many pending bids we have
+        let mut pending_bids = 0;
+
+        for (repo_name, branch, url) in unleased_branches {
+            // Check if we already have a pending bid for this repo
+            let repo = RemoteRepo {
+                name: repo_name.clone(),
+                git_url: url.clone(),
+                branch: Some(branch.clone()),
+                visibility: zoekt_rs::types::RepoVisibility::Public,
+                owner: None,
+                allowed_users: Vec::new(),
+                last_commit_sha: None,
+            };
+
+            // Check if we already hold this lease
+            if let Some(holder) = self.lease_mgr.get_current_lease_holder(&repo).await {
+                if holder == self.config.id {
+                    tracing::debug!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "already hold lease, skipping bid");
+                    continue;
+                }
+            }
+
+            // Only bid if we don't have too many pending bids
+            if pending_bids >= 1 {
+                tracing::debug!(node_id=%self.config.id, "maximum pending bids reached, skipping additional bids");
+                break;
+            }
+
+            // Try to acquire the lease
+            if self
+                .lease_mgr
+                .try_acquire(&repo, self.config.id.clone(), self.config.lease_ttl)
+                .await
+            {
+                tracing::info!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "acquired lease during heartbeat");
+                pending_bids += 1;
+
+                // Add to our repos list so it gets processed in the main loop
+                self.add_remote(repo);
+            } else {
+                tracing::debug!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "failed to acquire lease during heartbeat");
+            }
+        }
+
+        tracing::debug!(node_id=%self.config.id, pending_bids=%pending_bids, "heartbeat maintenance complete");
+    }
+
     /// Run the node loop for `duration`. Async version for use in async apps/tests.
     pub async fn run_for(&self, duration: Duration) -> Result<()> {
         let start = std::time::Instant::now();
         // If this is an indexer with an endpoint, register it
         if self.config.node_type == crate::NodeType::Indexer {
             if let Some(ref endpoint) = self.config.endpoint {
-                tracing::info!(node_id = %self.config.id, endpoint = %endpoint, "registering indexer endpoint");
+                tracing::info!(node_id = %self.config.id, endpoint = %endpoint, "registering indexer endpoint on startup");
                 let _ = self
                     .lease_mgr
                     .set_indexer_endpoint(&self.config.id, endpoint)
@@ -154,16 +241,23 @@ impl<I: Indexer> Node<I> {
                     Err(e) => {
                         tracing::warn!(repo = %repo.name, error = %e, "failed to index (initial)");
                     }
-                }
+                };
             }
         }
         while start.elapsed() < duration {
             // Periodically update endpoint if indexer
             if self.config.node_type == crate::NodeType::Indexer && self.config.endpoint.is_some() {
+                tracing::debug!(node_id=%self.config.id, "sending indexer heartbeat");
+
                 let _ = self
                     .lease_mgr
                     .set_indexer_endpoint(&self.config.id, self.config.endpoint.as_ref().unwrap())
                     .await;
+
+                // Perform heartbeat maintenance tasks
+                self.perform_heartbeat_maintenance().await;
+
+                tracing::debug!(node_id=%self.config.id, "heartbeat cycle completed");
             }
             let repos = self.repos.read().clone();
             for repo in repos {

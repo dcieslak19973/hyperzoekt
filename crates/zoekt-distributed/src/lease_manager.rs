@@ -189,25 +189,49 @@ impl LeaseManager {
     /// with any existing JSON blob and set the endpoint and last_heartbeat.
     pub async fn set_indexer_endpoint(&self, node_id: &str, endpoint: &str) {
         if let Some(pool) = &self.redis_pool {
-            if let Ok(mut conn) = pool.get().await {
-                let key = "zoekt:indexers";
-                // Fetch existing meta if present
-                let existing: Option<String> = conn.hget(key, node_id).await.ok().flatten();
-                let mut v = if let Some(s) = existing {
-                    serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
-                } else {
-                    json!({})
-                };
-                v["endpoint"] = json!(endpoint);
-                v["last_heartbeat"] = json!(chrono::Utc::now().timestamp_millis());
-                // Persist back (ignore errors)
-                let _ = deadpool_redis::redis::cmd("HSET")
-                    .arg(key)
-                    .arg(node_id)
-                    .arg(v.to_string())
-                    .query_async::<i32>(&mut conn)
-                    .await;
+            match pool.get().await {
+                Ok(mut conn) => {
+                    let key = "zoekt:indexers";
+                    let timestamp = chrono::Utc::now().timestamp_millis();
+
+                    // Fetch existing meta if present
+                    let existing: Option<String> = conn.hget(key, node_id).await.ok().flatten();
+                    let mut v = if let Some(s) = existing {
+                        serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
+                    } else {
+                        json!({})
+                    };
+
+                    let was_new = v.get("endpoint").is_none();
+                    v["endpoint"] = json!(endpoint);
+                    v["last_heartbeat"] = json!(timestamp);
+
+                    // Persist back
+                    match deadpool_redis::redis::cmd("HSET")
+                        .arg(key)
+                        .arg(node_id)
+                        .arg(v.to_string())
+                        .query_async::<i32>(&mut conn)
+                        .await
+                    {
+                        Ok(_) => {
+                            if was_new {
+                                tracing::info!(node_id=%node_id, endpoint=%endpoint, "indexer endpoint registered");
+                            } else {
+                                tracing::debug!(node_id=%node_id, endpoint=%endpoint, timestamp=%timestamp, "indexer heartbeat sent");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(node_id=%node_id, endpoint=%endpoint, error=%e, "failed to update indexer endpoint");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(node_id=%node_id, endpoint=%endpoint, error=%e, "failed to get Redis connection for heartbeat");
+                }
             }
+        } else {
+            tracing::debug!(node_id=%node_id, endpoint=%endpoint, "skipping heartbeat: no Redis connection");
         }
     }
 
@@ -233,6 +257,54 @@ impl LeaseManager {
         result
     }
 
+    /// Get all indexer endpoints with their last heartbeat information.
+    /// Returns a map of node_id to (endpoint, last_heartbeat_timestamp).
+    pub async fn get_indexer_endpoints_with_heartbeat(&self) -> HashMap<String, (String, i64)> {
+        let mut result = HashMap::new();
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:indexers";
+                let all: RedisResult<HashMap<String, String>> = conn.hgetall(key).await;
+                if let Ok(map) = all {
+                    for (node_id, json_str) in map {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                            if let (Some(endpoint), Some(last_heartbeat)) = (
+                                v.get("endpoint").and_then(|e| e.as_str()),
+                                v.get("last_heartbeat").and_then(|h| h.as_i64()),
+                            ) {
+                                result.insert(node_id, (endpoint.to_string(), last_heartbeat));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Check if an indexer is healthy based on its last heartbeat.
+    /// Returns true if the indexer has sent a heartbeat within the specified timeout.
+    pub async fn is_indexer_healthy(&self, node_id: &str, max_age_seconds: i64) -> bool {
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = "zoekt:indexers";
+                let existing: Option<String> = conn.hget(key, node_id).await.ok().flatten();
+                if let Some(json_str) = existing {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        if let Some(last_heartbeat) =
+                            v.get("last_heartbeat").and_then(|h| h.as_i64())
+                        {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let age_seconds = (now - last_heartbeat) / 1000;
+                            return age_seconds <= max_age_seconds;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Get all repo branch entries from the `zoekt:repo_branches` hash.
     /// Returns a vector of (repo_name, branch, url).
     pub async fn get_repo_branches(&self) -> Vec<(String, String, String)> {
@@ -252,6 +324,41 @@ impl LeaseManager {
             }
         }
         out
+    }
+
+    /// Get all unleased branches from the registered repo branches.
+    /// Returns a vector of (repo_name, branch, url) for branches that don't have active leases.
+    pub async fn get_unleased_branches(&self) -> Vec<(String, String, String)> {
+        let mut unleased = Vec::new();
+        let all_branches = self.get_repo_branches().await;
+
+        for (name, branch, url) in all_branches {
+            let repo = RemoteRepo {
+                name: name.clone(),
+                git_url: url.clone(),
+                branch: Some(branch.clone()),
+                visibility: zoekt_rs::types::RepoVisibility::Public, // Default visibility
+                owner: None,
+                allowed_users: Vec::new(),
+                last_commit_sha: None,
+            };
+
+            // Check if this branch has an active lease
+            if self.get_current_lease_holder(&repo).await.is_none() {
+                unleased.push((name, branch, url));
+            }
+        }
+
+        unleased
+    }
+
+    /// Check if a specific repo branch is still registered in the system.
+    /// Returns true if the branch exists in zoekt:repo_branches, false otherwise.
+    pub async fn is_repo_branch_registered(&self, repo_name: &str, branch: &str) -> bool {
+        let all_branches = self.get_repo_branches().await;
+        all_branches
+            .iter()
+            .any(|(name, br, _)| name == repo_name && br == branch)
     }
 
     fn repo_key(repo: &RemoteRepo) -> String {
