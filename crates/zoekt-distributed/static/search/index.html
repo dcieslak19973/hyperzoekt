@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8">
-    <title>dzr-http-search UI</title>
+    <title>Distributed Zoekt</title>
     <link rel="stylesheet" href="/static/common/styles.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
     <style>
@@ -67,6 +67,22 @@
 
         .search-form button:hover {
             background: #0891a2;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+        }
+
+        .form-row label {
+            flex: 1;
+            margin-bottom: 0;
+        }
+
+        .form-row label:last-child {
+            flex: 0 0 auto;
+            min-width: 120px;
         }
 
         .results {
@@ -412,28 +428,32 @@
     </div>
 
     <div class="container">
-        <h1>Distributed search</h1>
+        <h1>Distributed Zoekt</h1>
 
         <div class="card search-form">
             <form id="searchForm">
-                <label>Repo (supports *):
-                    <input type="text" name="repo" value="*" />
-                </label>
                 <label>Query:
                     <input type="text" name="q" placeholder="search terms" />
                 </label>
-                <label>Branches (comma-separated, default *):
-                    <input type="text" name="branches" value="*" style="width:200px" />
-                </label>
-                <label>Context lines:
-                    <select name="context_lines">
-                        <option value="1">1</option>
-                        <option value="2">2</option>
-                        <option value="5" selected>5</option>
-                        <option value="10">10</option>
-                        <option value="20">20</option>
-                    </select>
-                </label>
+
+                <div class="form-row">
+                    <label>Repo (supports *):
+                        <input type="text" name="repo" value="*" />
+                    </label>
+                    <label>Branches (comma-separated, default *):
+                        <input type="text" name="branches" value="*" />
+                    </label>
+                    <label>Context lines:
+                        <select name="context_lines">
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="5" selected>5</option>
+                            <option value="10">10</option>
+                            <option value="20">20</option>
+                        </select>
+                    </label>
+                </div>
+
                 <button type="submit">Search</button>
             </form>
         </div>
@@ -502,6 +522,56 @@
             return langMap[ext] || '';
         }
 
+        // Convert git URL to web URL for repository browsing
+        function gitUrlToWebUrl(gitUrl, path, branch = 'main') {
+            if (!gitUrl) return `file://${gitUrl}/${path}`;
+
+            // Handle HTTPS git URLs
+            if (gitUrl.startsWith('https://')) {
+                let webUrl = gitUrl;
+                if (webUrl.endsWith('.git')) {
+                    webUrl = webUrl.slice(0, -4);
+                }
+
+                // GitHub
+                if (webUrl.includes('github.com')) {
+                    return `${webUrl}/blob/${branch}/${path}`;
+                }
+                // GitLab
+                if (webUrl.includes('gitlab.com')) {
+                    return `${webUrl}/-/blob/${branch}/${path}`;
+                }
+                // Bitbucket
+                if (webUrl.includes('bitbucket.org')) {
+                    return `${webUrl}/src/${branch}/${path}`;
+                }
+                // Default: assume GitHub-like structure
+                return `${webUrl}/blob/${branch}/${path}`;
+            }
+
+            // Handle SSH git URLs (git@host:user/repo.git)
+            const sshMatch = gitUrl.match(/^git@([^:]+):(.+)\.git$/);
+            if (sshMatch) {
+                const host = sshMatch[1];
+                const repoPath = sshMatch[2];
+
+                if (host === 'github.com') {
+                    return `https://github.com/${repoPath}/blob/${branch}/${path}`;
+                }
+                if (host === 'gitlab.com') {
+                    return `https://gitlab.com/${repoPath}/-/blob/${branch}/${path}`;
+                }
+                if (host === 'bitbucket.org') {
+                    return `https://bitbucket.org/${repoPath}/src/${branch}/${path}`;
+                }
+                // Default: assume https with same host
+                return `https://${host}/${repoPath}/blob/${branch}/${path}`;
+            }
+
+            // Fallback to file URL for local paths
+            return `file://${gitUrl}/${path}`;
+        }
+
         // Simple result formatter: show backend snippet raw inside a pre/code block
         // This preserves whitespace and most closely matches the earlier rendering
         function formatResult(result) {
@@ -510,8 +580,9 @@
             const symbol = result.symbol || '';
             const snippet = result.snippet || '';
             const nodeId = result.node_id || '';
+            const branch = result.branch || 'main';
 
-            const fileUrl = `file://${repo}/${path}`;
+            const fileUrl = gitUrlToWebUrl(repo, path, branch);
             let title = path;
             if (symbol) title += ` (${symbol})`;
             const language = detectLanguage(path);
