@@ -484,6 +484,13 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:3000".into());
 
+    // Determine endpoint for registration: prefer ZOEKT_ENDPOINT env var, fallback to listen addr
+    let endpoint = if let Ok(e) = std::env::var("ZOEKT_ENDPOINT") {
+        Some(e)
+    } else {
+        opts.listen.as_ref().map(|addr| format!("http://{}", addr))
+    };
+
     let cfg = zoekt_distributed::load_node_config(
         NodeConfig {
             node_type: NodeType::Indexer,
@@ -495,7 +502,7 @@ async fn main() -> Result<()> {
             cli_id: opts.id,
             cli_lease_ttl_seconds: opts.lease_ttl_seconds,
             cli_poll_interval_seconds: opts.poll_interval_seconds,
-            cli_endpoint: opts.listen.as_ref().map(|addr| format!("http://{}", addr)), // Only override if explicitly provided
+            cli_endpoint: endpoint, // Only override if explicitly provided
             cli_enable_reindex: Some(!opts.disable_reindex),
             cli_index_once: Some(opts.index_once),
         },
@@ -505,9 +512,11 @@ async fn main() -> Result<()> {
     // shared store of indexes that the HTTP handler will read from
     let store: IndexStore = Arc::new(RwLock::new(HashMap::new()));
     let indexer = SimpleIndexer::new(store.clone());
-    // shared list of registered remotes for /status
-    let registered_repos: RemoteList = Arc::new(RwLock::new(Vec::new()));
+    // Create the node (it holds the authoritative list of registered repos)
     let node = Node::new(cfg, lease_mgr.clone(), indexer);
+    // Use the node's internal registered repos list for the HTTP handlers so
+    // runtime additions by the node are visible to /status and /search.
+    let registered_repos = node.registered_repos();
 
     // Collect remote URLs and optional names from CLI or env. Support multiple values.
     let mut urls: Vec<String> = opts.remote_url.clone();

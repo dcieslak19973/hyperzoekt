@@ -61,6 +61,12 @@ impl<I: Indexer> Node<I> {
         }
     }
 
+    /// Expose the internal registered repos list so external listeners (HTTP handlers)
+    /// can observe repos that the node dynamically registers at runtime.
+    pub fn registered_repos(&self) -> std::sync::Arc<parking_lot::RwLock<Vec<RemoteRepo>>> {
+        self.repos.clone()
+    }
+
     pub fn add_remote(&self, repo: RemoteRepo) {
         let mut repos = self.repos.write();
         // Check if this repo is already in the list
