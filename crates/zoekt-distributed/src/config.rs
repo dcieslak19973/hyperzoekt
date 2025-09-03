@@ -75,7 +75,7 @@ impl Default for NodeConfig {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(5));
+            .unwrap_or(Duration::from_secs(30));
 
         let node_type: NodeType = std::env::var("ZOEKTD_NODE_TYPE")
             .ok()

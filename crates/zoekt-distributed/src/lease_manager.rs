@@ -218,7 +218,23 @@ impl LeaseManager {
                             if was_new {
                                 tracing::info!(node_id=%node_id, endpoint=%endpoint, "indexer endpoint registered");
                             } else {
-                                tracing::debug!(node_id=%node_id, endpoint=%endpoint, timestamp=%timestamp, "indexer heartbeat sent");
+                                let heartbeat_age = if let Some(last_heartbeat) =
+                                    v.get("last_heartbeat").and_then(|h| h.as_i64())
+                                {
+                                    let now = chrono::Utc::now().timestamp_millis();
+                                    let age_seconds = (now - last_heartbeat) / 1000;
+                                    format!("{}s ago", age_seconds)
+                                } else {
+                                    "unknown".to_string()
+                                };
+                                tracing::info!(
+                                    node_id=%node_id,
+                                    endpoint=%endpoint,
+                                    timestamp=%timestamp,
+                                    last_heartbeat=%heartbeat_age,
+                                    "indexer heartbeat sent to Redis"
+                                );
+                                tracing::debug!(node_id=%node_id, endpoint=%endpoint, timestamp=%timestamp, "indexer heartbeat details");
                             }
                         }
                         Err(e) => {
@@ -378,7 +394,7 @@ impl LeaseManager {
 
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
-                let set_res: RedisResult<String> = redis::cmd("SET")
+                let set_res: RedisResult<Option<String>> = redis::cmd("SET")
                     .arg(key.clone())
                     .arg(holder.clone())
                     .arg("NX")
@@ -386,8 +402,15 @@ impl LeaseManager {
                     .arg(ttl_secs)
                     .query_async(&mut conn)
                     .await;
-                if let Ok(s) = set_res {
+                if let Ok(Some(s)) = set_res {
                     if s == "OK" {
+                        tracing::info!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder,
+                            ttl_secs=%ttl_secs,
+                            "lease acquired successfully"
+                        );
                         inner.write().insert(
                             repo.clone(),
                             Lease {
@@ -396,8 +419,39 @@ impl LeaseManager {
                             },
                         );
                         return true;
+                    } else {
+                        tracing::debug!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder,
+                            "lease acquisition failed: already held by another node"
+                        );
                     }
+                } else if let Ok(None) = set_res {
+                    // SET NX EX returned nil, meaning key already exists
+                    tracing::debug!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        holder=%holder,
+                        "lease acquisition failed: already held"
+                    );
+                } else {
+                    // Actual Redis error
+                    tracing::warn!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        holder=%holder,
+                        error=?set_res.as_ref().err(),
+                        "lease acquisition failed: Redis error"
+                    );
                 }
+            } else {
+                tracing::warn!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    holder=%holder,
+                    "lease acquisition failed: Redis connection error"
+                );
             }
             return false;
         }
@@ -407,9 +461,23 @@ impl LeaseManager {
         let now = Utc::now();
         if let Some(existing) = guard.get(repo) {
             if existing.until > now {
+                tracing::debug!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    holder=%holder,
+                    existing_holder=%existing.holder,
+                    "lease acquisition failed: already held (in-memory)"
+                );
                 return false;
             }
         }
+        tracing::info!(
+            repo=%repo.name,
+            branch=?repo.branch,
+            holder=%holder,
+            ttl_secs=%ttl_secs,
+            "lease acquired successfully (in-memory)"
+        );
         guard.insert(
             repo.clone(),
             Lease {
@@ -429,16 +497,65 @@ impl LeaseManager {
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
                 let script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
-                let _res: RedisResult<i32> = redis::cmd("EVAL")
+                let res: RedisResult<i32> = redis::cmd("EVAL")
                     .arg(script)
                     .arg(1)
                     .arg(key.clone())
                     .arg(holder_id.to_string())
                     .query_async(&mut conn)
                     .await;
+                match res {
+                    Ok(1) => {
+                        tracing::info!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            "lease released successfully"
+                        );
+                    }
+                    Ok(0) => {
+                        tracing::warn!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            "lease release failed: not held by this holder"
+                        );
+                    }
+                    Ok(code) => {
+                        tracing::warn!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            return_code=%code,
+                            "lease release: unexpected Redis script return code"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            error=%e,
+                            "lease release failed: Redis error"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    holder=%holder_id,
+                    "lease release failed: Redis connection error"
+                );
             }
             inner.write().remove(repo);
         } else {
+            tracing::info!(
+                repo=%repo.name,
+                branch=?repo.branch,
+                holder=%holder_id,
+                "lease released (in-memory)"
+            );
             inner.write().remove(repo);
         }
     }
@@ -457,15 +574,58 @@ impl LeaseManager {
                     .arg(script)
                     .arg(1)
                     .arg(key.clone())
-                    .arg(holder_id)
+                    .arg(holder_id.clone())
                     .arg(ttl_secs)
                     .query_async(&mut conn)
                     .await;
                 return match res {
-                    Ok(v) => v == 1,
-                    Err(_) => false,
+                    Ok(1) => {
+                        tracing::debug!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            ttl_secs=%ttl_secs,
+                            "lease renewed successfully"
+                        );
+                        true
+                    }
+                    Ok(0) => {
+                        tracing::warn!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            "lease renewal failed: not held by this holder"
+                        );
+                        false
+                    }
+                    Ok(code) => {
+                        tracing::warn!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            return_code=%code,
+                            "lease renewal: unexpected Redis script return code"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder_id,
+                            error=%e,
+                            "lease renewal failed: Redis error"
+                        );
+                        false
+                    }
                 };
             }
+            tracing::warn!(
+                repo=%repo.name,
+                branch=?repo.branch,
+                holder=%holder_id,
+                "lease renewal failed: Redis connection error"
+            );
             return false;
         }
 
@@ -473,9 +633,32 @@ impl LeaseManager {
         let mut guard = inner.write();
         if let Some(existing) = guard.get_mut(repo) {
             if existing.holder == holder_id {
+                let ttl_secs = ttl.as_secs() as usize;
                 existing.until = Utc::now() + chrono::Duration::from_std(ttl).unwrap();
+                tracing::debug!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    holder=%holder_id,
+                    ttl_secs=%ttl_secs,
+                    "lease renewed successfully (in-memory)"
+                );
                 return true;
+            } else {
+                tracing::warn!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    holder=%holder_id,
+                    existing_holder=%existing.holder,
+                    "lease renewal failed: held by different holder (in-memory)"
+                );
             }
+        } else {
+            tracing::warn!(
+                repo=%repo.name,
+                branch=?repo.branch,
+                holder=%holder_id,
+                "lease renewal failed: lease not found (in-memory)"
+            );
         }
         false
     }
@@ -564,10 +747,11 @@ impl LeaseManager {
     }
 
     /// Check if indexing should be skipped for a repository
-    /// Always returns false to ensure permissions are reevaluated every time
+    /// Note: SHA-based skipping is now handled at the Node level for remote repositories.
+    /// This method is kept for backwards compatibility and potential future use.
     pub async fn should_skip_indexing(&self, _git_url: &str, _current_sha: &str) -> bool {
-        // As requested by the user, we never skip indexing based on SHA alone
-        // This ensures permissions are always reevaluated
+        // SHA-based skipping is now handled at the Node level for remote repositories
+        // to avoid unnecessary lease acquisition when content hasn't changed.
         false
     }
 }

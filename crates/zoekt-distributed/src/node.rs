@@ -45,6 +45,8 @@ pub struct Node<I: Indexer> {
     indexer: Arc<I>,
     // track repos that have been indexed once when index_once is enabled
     seen_once: Arc<parking_lot::RwLock<HashSet<String>>>,
+    // track the last known commit SHA for remote repositories to avoid unnecessary re-indexing
+    last_known_sha: Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl<I: Indexer> Node<I> {
@@ -55,11 +57,77 @@ impl<I: Indexer> Node<I> {
             repos: Arc::new(parking_lot::RwLock::new(Vec::new())),
             indexer: Arc::new(indexer),
             seen_once: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            last_known_sha: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
     pub fn add_remote(&self, repo: RemoteRepo) {
-        self.repos.write().push(repo);
+        let mut repos = self.repos.write();
+        // Check if this repo is already in the list
+        let exists = repos.iter().any(|existing| {
+            existing.name == repo.name
+                && existing.git_url == repo.git_url
+                && existing.branch == repo.branch
+        });
+        if !exists {
+            repos.push(repo);
+        }
+    }
+
+    /// Check if a remote repository should be skipped based on SHA comparison
+    fn should_skip_remote_indexing(&self, repo: &RemoteRepo, current_sha: Option<&str>) -> bool {
+        if let Some(current_sha) = current_sha {
+            let repo_key = format!("{}|{}", repo.name, repo.branch.as_deref().unwrap_or(""));
+            let last_sha = self.last_known_sha.read().get(&repo_key).cloned();
+
+            if let Some(last_sha) = last_sha {
+                if last_sha == current_sha {
+                    tracing::info!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        sha=%current_sha,
+                        "skipping indexing: SHA unchanged"
+                    );
+                    return true;
+                } else {
+                    tracing::info!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        last_sha=%last_sha,
+                        current_sha=%current_sha,
+                        "SHA changed, will re-index"
+                    );
+                }
+            } else {
+                tracing::info!(
+                    repo=%repo.name,
+                    branch=?repo.branch,
+                    current_sha=%current_sha,
+                    "first time indexing repository"
+                );
+            }
+        } else {
+            tracing::warn!(
+                repo=%repo.name,
+                branch=?repo.branch,
+                "could not determine current SHA, will index anyway"
+            );
+        }
+        false
+    }
+
+    /// Update the last known SHA for a repository after successful indexing
+    fn update_last_known_sha(&self, repo: &RemoteRepo, sha: &str) {
+        let repo_key = format!("{}|{}", repo.name, repo.branch.as_deref().unwrap_or(""));
+        self.last_known_sha
+            .write()
+            .insert(repo_key, sha.to_string());
+        tracing::debug!(
+            repo=%repo.name,
+            branch=?repo.branch,
+            sha=%sha,
+            "updated last known SHA"
+        );
     }
 
     /// Perform heartbeat maintenance tasks for indexers
@@ -91,7 +159,39 @@ impl<I: Indexer> Node<I> {
             }
         }
 
-        // 2. Check for unleased branches that we can bid on
+        // 2. Renew existing leases held by this indexer
+        let registered_branches = self.lease_mgr.get_repo_branches().await;
+        tracing::debug!(node_id=%self.config.id, registered_branches_count=%registered_branches.len(), "renewing existing leases");
+
+        for (repo_name, branch, url) in &registered_branches {
+            let repo = RemoteRepo {
+                name: repo_name.clone(),
+                git_url: url.clone(),
+                branch: Some(branch.clone()),
+                visibility: zoekt_rs::types::RepoVisibility::Public,
+                owner: None,
+                allowed_users: Vec::new(),
+                last_commit_sha: None,
+            };
+
+            // Check if we hold this lease
+            if let Some(holder) = self.lease_mgr.get_current_lease_holder(&repo).await {
+                if holder == self.config.id {
+                    // We hold this lease, renew it
+                    if self
+                        .lease_mgr
+                        .renew(&repo, self.config.id.clone(), self.config.lease_ttl)
+                        .await
+                    {
+                        tracing::debug!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "renewed lease during heartbeat");
+                    } else {
+                        tracing::warn!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "failed to renew lease during heartbeat");
+                    }
+                }
+            }
+        }
+
+        // 3. Check for unleased branches that we can bid on
         let unleased_branches = self.lease_mgr.get_unleased_branches().await;
         tracing::debug!(node_id=%self.config.id, unleased_branches_count=%unleased_branches.len(), "checking for available leases");
 
@@ -131,6 +231,17 @@ impl<I: Indexer> Node<I> {
                 .await
             {
                 tracing::info!(node_id=%self.config.id, repo=%repo_name, branch=%branch, "acquired lease during heartbeat");
+
+                // Get current commit SHA for this remote repository
+                let current_sha = get_current_commit_sha(&repo.git_url).await;
+
+                // Check if we should skip indexing based on SHA
+                if self.should_skip_remote_indexing(&repo, current_sha.as_deref()) {
+                    // Release the lease since we're not going to index
+                    self.lease_mgr.release(&repo, &self.config.id).await;
+                    continue;
+                }
+
                 pending_bids += 1;
 
                 // Add to our repos list so it gets processed in the main loop
@@ -247,17 +358,22 @@ impl<I: Indexer> Node<I> {
         while start.elapsed() < duration {
             // Periodically update endpoint if indexer
             if self.config.node_type == crate::NodeType::Indexer && self.config.endpoint.is_some() {
-                tracing::debug!(node_id=%self.config.id, "sending indexer heartbeat");
+                let heartbeat_start = std::time::Instant::now();
+                tracing::info!(node_id=%self.config.id, endpoint=%self.config.endpoint.as_ref().unwrap(), "sending indexer heartbeat to Redis");
 
-                let _ = self
-                    .lease_mgr
+                self.lease_mgr
                     .set_indexer_endpoint(&self.config.id, self.config.endpoint.as_ref().unwrap())
                     .await;
 
                 // Perform heartbeat maintenance tasks
                 self.perform_heartbeat_maintenance().await;
 
-                tracing::debug!(node_id=%self.config.id, "heartbeat cycle completed");
+                let heartbeat_duration = heartbeat_start.elapsed();
+                tracing::info!(
+                    node_id=%self.config.id,
+                    duration_ms=%heartbeat_duration.as_millis(),
+                    "indexer heartbeat cycle completed"
+                );
             }
             let repos = self.repos.read().clone();
             for repo in repos {
@@ -359,6 +475,17 @@ impl<I: Indexer> Node<I> {
                     .await
                 {
                     tracing::info!(repo = %repo.name, "acquired lease, indexing");
+
+                    // Get current commit SHA for this remote repository
+                    let current_sha = get_current_commit_sha(&repo.git_url).await;
+
+                    // Check if we should skip indexing based on SHA
+                    if self.should_skip_remote_indexing(&repo, current_sha.as_deref()) {
+                        // Release the lease since we're not going to index
+                        self.lease_mgr.release(&repo, &self.config.id).await;
+                        continue;
+                    }
+
                     // Run indexing in a blocking task (indexer is synchronous). While indexing
                     // runs, periodically renew the lease so long-running indexing doesn't expire it.
                     let repo_for_index = repo.clone();
@@ -400,6 +527,12 @@ impl<I: Indexer> Node<I> {
                     match index_result {
                         Ok(index) => {
                             tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+
+                            // Update the last known SHA after successful indexing
+                            if let Some(ref sha) = current_sha {
+                                self.update_last_known_sha(&repo, sha);
+                            }
+
                             // compute duration and record meta in redis
                             let dur = index_started.elapsed();
                             let now_ms = chrono::Utc::now().timestamp_millis();
