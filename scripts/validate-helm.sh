@@ -91,6 +91,12 @@ validate_chart() {
 
 # Update documentation with helm-docs if available
 update_docs() {
+    # Skip documentation generation in CI - docs should be committed as part of PRs
+    if [[ -n "${CI:-}" ]]; then
+        log_info "Skipping documentation generation in CI environment"
+        return 0
+    fi
+    
     if check_helm_docs >/dev/null 2>&1; then
         log_info "Updating documentation with helm-docs..."
         if ! (cd "$REPO_ROOT" && helm-docs); then

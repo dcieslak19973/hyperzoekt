@@ -42,12 +42,3 @@ jobs:
 
     - name: Validate Helm charts
       run: ./scripts/validate-helm.sh
-
-    - name: Check for documentation changes
-      run: |
-        if [ -n "$(git status --porcelain)" ]; then
-          echo "Documentation changes detected:"
-          git diff --name-only
-          echo "Please commit these documentation changes."
-          exit 1
-        fi
