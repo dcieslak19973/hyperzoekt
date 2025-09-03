@@ -238,6 +238,13 @@
             --prism-number: #79b8ff;
             --prism-function: #b392f0;
             --prism-variable: #ffab70;
+            --prism-operator: #f97583;
+            --prism-boolean: #f97583;
+            --prism-class-name: #b392f0;
+            --prism-property: #ffab70;
+            --prism-tag: #f97583;
+            --prism-attr-name: #ffab70;
+            --prism-attr-value: #9ecbff;
         }
 
         .light-mode {
@@ -256,6 +263,13 @@
             --prism-number: #005cc5;
             --prism-function: #6f42c1;
             --prism-variable: #e36209;
+            --prism-operator: #d73a49;
+            --prism-boolean: #d73a49;
+            --prism-class-name: #6f42c1;
+            --prism-property: #e36209;
+            --prism-tag: #d73a49;
+            --prism-attr-name: #e36209;
+            --prism-attr-value: #032f62;
         }
 
         .result-snippet code[class*="language-"] {
@@ -286,13 +300,107 @@
         .result-snippet .token.variable {
             color: var(--prism-variable);
         }
+
+        .result-snippet .token.operator {
+            color: var(--prism-operator);
+        }
+
+        .result-snippet .token.punctuation {
+            color: var(--text);
+        }
+
+        .result-snippet .token.boolean {
+            color: var(--prism-boolean);
+        }
+
+        .result-snippet .token.class-name {
+            color: var(--prism-class-name);
+        }
+
+        .result-snippet .token.property {
+            color: var(--prism-property);
+        }
+
+        .result-snippet .token.tag {
+            color: var(--prism-tag);
+        }
+
+        .result-snippet .token.attr-name {
+            color: var(--prism-attr-name);
+        }
+
+        .result-snippet .token.attr-value {
+            color: var(--prism-attr-value);
+        }
     </style>
     <script src="/static/common/theme.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js"></script>
+    <script
+        src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup-templating.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-php.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-docker.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+    <script>
+        // Ensure Prism's C/C++ grammars are available and load them in order if missing.
+        (function ensurePrismCpp() {
+            function hasCpp() {
+                return window.Prism && Prism.languages && Prism.languages.cpp;
+            }
+
+            if (hasCpp()) {
+                console.debug('Prism: cpp grammar already present');
+                return;
+            }
+
+            console.debug('Prism: cpp grammar missing, attempting ordered load of clike -> c -> cpp');
+            const base = 'https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/';
+            const toLoad = ['prism-clike.min.js', 'prism-c.min.js', 'prism-cpp.min.js'];
+
+            function loadSequential(idx) {
+                if (idx >= toLoad.length) {
+                    // Give Prism a moment to register languages
+                    setTimeout(() => {
+                        if (hasCpp()) {
+                            console.debug('Prism: cpp grammar loaded successfully');
+                        } else {
+                            console.error('Prism: failed to load cpp grammar');
+                        }
+                    }, 50);
+                    return;
+                }
+                const s = document.createElement('script');
+                s.src = base + toLoad[idx];
+                s.async = false; // preserve execution order
+                s.onload = () => loadSequential(idx + 1);
+                s.onerror = () => {
+                    console.error('Prism: error loading', toLoad[idx]);
+                    loadSequential(idx + 1);
+                };
+                document.head.appendChild(s);
+            }
+
+            // If DOMContentLoaded already fired, start immediately; otherwise wait.
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => loadSequential(0));
+            } else {
+                loadSequential(0);
+            }
+        })();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-swift.min.js"></script>
 </head>
 
 <body>
@@ -364,13 +472,32 @@
                 'php': 'php',
                 'rb': 'ruby',
                 'sh': 'bash',
+                'bash': 'bash',
+                'zsh': 'bash',
+                'fish': 'bash',
+                'ps1': 'powershell',
+                'swift': 'swift',
                 'yml': 'yaml',
                 'yaml': 'yaml',
                 'json': 'json',
-                'xml': 'xml',
-                'html': 'html',
+                'xml': 'markup',
+                'html': 'markup',
+                'htm': 'markup',
+                'xhtml': 'markup',
                 'css': 'css',
-                'md': 'markdown'
+                'scss': 'css',
+                'sass': 'css',
+                'less': 'css',
+                'md': 'markdown',
+                'markdown': 'markdown',
+                'Dockerfile': 'dockerfile',
+                'dockerfile': 'dockerfile'
+                ,
+                // common C/C++ variants
+                'cc': 'cpp',
+                'cxx': 'cpp',
+                'hh': 'cpp',
+                'hxx': 'cpp'
             };
             return langMap[ext] || '';
         }
@@ -388,6 +515,8 @@
             let title = path;
             if (symbol) title += ` (${symbol})`;
             const language = detectLanguage(path);
+            // Debug: log detected language for this result (useful in browser console)
+            console.debug('detectLanguage:', path, '->', language);
 
             const codeContent = snippet && snippet !== 'null' ? escapeHtml(snippet) : null;
 
@@ -399,7 +528,7 @@
                     </div>
                     ${codeContent ? `
                         <div class="result-snippet">
-                            <pre><code class="language-${language}">${codeContent}</code></pre>
+                            <pre><code class="language-${language}${language === 'cpp' ? ' language-c' : ''}">${codeContent}</code></pre>
                         </div>
                     ` : ''}
                 </div>
