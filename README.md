@@ -118,7 +118,57 @@ For easier deployment, use the provided wrapper script that extracts headers and
 
 When deployed behind a reverse proxy (like nginx or Apache), the proxy can extract the `X-*` headers and set them as `HTTP_X_*` environment variables that the wrapper script will detect.
 
-These headers allow the search system to access private repositories and avoid rate limits when searching across multiple Git hosting services. The credentials are extracted from the HTTP headers and used for authentication with the respective Git services.
+### SurrealDB Configuration
+- `SURREALDB_URL`: SurrealDB WebSocket RPC URL (e.g., `ws://localhost:8000/rpc`)
+- `SURREALDB_USERNAME`: SurrealDB username (default: root)
+- `SURREALDB_PASSWORD`: SurrealDB password (default: root)
+- `SURREAL_NS`: SurrealDB namespace (default: zoekt)
+- `SURREAL_DB`: SurrealDB database name (default: repos)
+
+If these environment variables are not set, the system will fall back to using an in-memory SurrealDB instance for development and testing.
+
+Running with Docker Compose
+---------------------------
+
+The project includes a Docker Compose setup that runs all components with Redis and SurrealDB:
+
+1. **Start all services:**
+```bash
+cd docker && docker-compose up --build
+```
+
+This will start:
+- **Redis** on port 6379 (for distributed coordination)
+- **SurrealDB** on port 8000 (for repository metadata and permissions)
+- **Indexer** on port 7676 (for indexing repositories)
+- **Admin UI** on port 7878 (web interface for managing repositories)
+- **Search API** on port 8080 (HTTP search endpoint)
+- **MCP Server** on port 7979 (Model Context Protocol for AI assistants)
+
+2. **Access the services:**
+- Admin UI: http://localhost:7878 (username: `admin`, password: `password`)
+- Search API: http://localhost:8080
+- SurrealDB: ws://localhost:8000/rpc
+
+3. **Environment variables for Docker:**
+The Docker Compose file sets up the following environment variables for all services:
+```yaml
+environment:
+  - REDIS_URL=redis://redis:6379
+  - SURREALDB_URL=ws://surrealdb:8000/rpc
+  - SURREALDB_USERNAME=root
+  - SURREALDB_PASSWORD=root
+  - SURREAL_NS=zoekt
+  - SURREAL_DB=repos
+```
+
+4. **Adding repositories:**
+Use the Admin UI at http://localhost:7878 to add repositories for indexing.
+
+5. **Stop services:**
+```bash
+cd docker && docker-compose down
+```
 
 Running the full system locally
 -------------------

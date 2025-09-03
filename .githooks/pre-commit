@@ -4,6 +4,8 @@
 # (deny warnings) to block commits that still contain issues.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 echo "Running pre-commit: attempt auto-fixes (cargo fix, clippy --fix), format, then strict clippy"
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found in PATH; skipping pre-commit checks." >&2
@@ -49,6 +51,25 @@ if ! cargo clippy --workspace -- -D warnings; then
   echo "cargo clippy failed with warnings/errors. Please inspect and fix them locally." >&2
   echo "If autofix modified files, they have been staged for you; amend the commit after review." >&2
   exit 1
+fi
+
+# 6) Helm chart validation
+STAGED_HELM_FILES=$(git diff --name-only --staged | rg "^helm/" || true)
+if [ -n "$STAGED_HELM_FILES" ]; then
+  echo "Staged Helm files detected, running Helm chart validation..."
+
+  # Check if helm is available
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "helm not found in PATH; skipping Helm validation." >&2
+  else
+    # Run the dedicated Helm validation script
+    if ! "$REPO_ROOT/scripts/validate-helm.sh"; then
+      echo "Helm validation failed. Please fix the issues before committing." >&2
+      exit 1
+    fi
+  fi
+else
+  echo "No staged Helm files; skipping Helm validation"
 fi
 
 echo "pre-commit checks passed."

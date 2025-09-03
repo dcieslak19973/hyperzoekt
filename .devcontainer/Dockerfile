@@ -42,6 +42,24 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && apt-get install -y --no-install-recommends gh \
   && rm -rf /var/lib/apt/lists/*
 
+# Install Helm using the official Helm apt repository
+RUN curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | tee /usr/share/keyrings/helm.gpg > /dev/null \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" \
+  | tee /etc/apt/sources.list.d/helm-stable-debian.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends helm \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install kubeconform for Kubernetes schema validation
+RUN curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+  | tar xz -C /usr/local/bin kubeconform \
+  && chmod +x /usr/local/bin/kubeconform
+
+# Install helm-docs for generating Helm chart documentation
+RUN curl -L https://github.com/norwoodj/helm-docs/releases/latest/download/helm-docs_1.14.2_Linux_x86_64.tar.gz \
+  | tar xz -C /usr/local/bin helm-docs \
+  && chmod +x /usr/local/bin/helm-docs
+
 # Create workspace dir
 WORKDIR /workspaces/hyperzoekt
 
