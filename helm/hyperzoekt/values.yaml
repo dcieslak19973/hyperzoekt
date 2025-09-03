@@ -1,0 +1,292 @@
+# Default values for hyperzoekt.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global settings
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+
+# Redis configuration
+redis:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: redis
+    tag: "alpine"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 6379
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  persistence:
+    enabled: false
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # External Redis configuration (when redis.enabled=false)
+  external:
+    host: ""
+    port: 6379
+    password: ""
+
+# SurrealDB configuration
+surrealdb:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: surrealdb/surrealdb
+    tag: "v2.3.1"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  persistence:
+    enabled: false
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # External SurrealDB configuration (when surrealdb.enabled=false)
+  external:
+    url: ""
+    username: "root"
+    password: "root"
+    namespace: "zoekt"
+    database: "repos"
+
+# Indexer configuration
+indexer:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetMemoryUtilizationPercentage: 80
+    targetCPUUtilizationPercentage: 80
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:7676"
+    - name: ZOEKTD_ENABLE_REINDEX
+      value: "true"
+    - name: ZOEKTD_INDEX_ONCE
+      value: "false"
+  # Additional environment variables
+  extraEnvVars: []
+  # Mount host repository directory
+  hostRepoPath: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Admin UI configuration
+admin:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7878
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: admin.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKT_ADMIN_USERNAME
+      value: "admin"
+    - name: ZOEKT_ADMIN_PASSWORD
+      value: "password"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Search API configuration
+search:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 8080
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: search.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:8080"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# MCP Server configuration
+mcp:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7979
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: mcp.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:7979"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: hyperzoekt.local
+      paths:
+        - path: /admin
+          pathType: Prefix
+          service:
+            name: hyperzoekt-admin
+            port:
+              number: 7878
+        - path: /search
+          pathType: Prefix
+          service:
+            name: hyperzoekt-search
+            port:
+              number: 8080
+        - path: /mcp
+          pathType: Prefix
+          service:
+            name: hyperzoekt-mcp
+            port:
+              number: 7979
+  tls: []
+
+# Service account configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod security context
+podSecurityContext: {}
+  # fsGroup: 2000
+
+# Security context
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+# Node selector, tolerations, and affinity for all components
+nodeSelector: {}
+tolerations: []
+affinity: {}
