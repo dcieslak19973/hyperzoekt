@@ -4,18 +4,18 @@ services:
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   surrealdb:
-    image: surrealdb/surrealdb:v2.3.1
+    image: surrealdb/surrealdb:latest
     ports:
       - "8000:8000"
-    command: start --bind 0.0.0.0:8000 --user root --pass root memory
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    user: "1000:1000"
+    command: start --user root --pass root memory
+    restart: unless-stopped
 
   indexer:
     build:
@@ -25,6 +25,7 @@ services:
       - "7676:7676"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=ws://surrealdb:8000/rpc
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
@@ -33,10 +34,10 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:7676
     command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676"]
     depends_on:
-      - redis
-      - surrealdb
-    volumes:
-      - ../:/tmp/repos:ro
+      redis:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   admin:
     build:
@@ -46,6 +47,7 @@ services:
       - "7878:7878"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=ws://surrealdb:8000/rpc
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
@@ -55,8 +57,10 @@ services:
       - ZOEKT_ADMIN_PASSWORD=password
     command: ["/app/dzr-admin", "--bind", "0.0.0.0:7878"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   search:
     build:
@@ -66,6 +70,7 @@ services:
       - "8080:8080"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=ws://surrealdb:8000/rpc
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
@@ -74,8 +79,10 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:8080
     command: ["/app/dzr-http-search", "--listen", "0.0.0.0:8080"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   mcp:
     build:
@@ -85,6 +92,7 @@ services:
       - "7979:7979"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=ws://surrealdb:8000/rpc
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
@@ -93,5 +101,7 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:7979
     command: ["/app/dzr-mcp-search", "--listen", "0.0.0.0:7979"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started

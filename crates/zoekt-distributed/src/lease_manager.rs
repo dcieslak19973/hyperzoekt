@@ -120,6 +120,7 @@ impl LeaseManager {
 
     /// Set or update branch-specific metadata in the `zoekt:repo_branch_meta` hash.
     /// Field is stored as "<repo>|<branch>" and value is a JSON blob similar to repo_meta
+    /// Note: leased_node is no longer stored in metadata - use get_current_lease_holder instead
     pub async fn set_branch_meta(
         &self,
         repo: &str,
@@ -127,7 +128,6 @@ impl LeaseManager {
         last_indexed_ms: i64,
         last_duration_ms: i64,
         memory_bytes: i64,
-        leased_node: &str,
     ) {
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
@@ -143,7 +143,7 @@ impl LeaseManager {
                 v["last_indexed"] = json!(last_indexed_ms);
                 v["last_duration_ms"] = json!(last_duration_ms);
                 v["memory_bytes"] = json!(memory_bytes);
-                v["leased_node"] = json!(leased_node);
+                // Note: leased_node is no longer stored in metadata
                 // Persist back (ignore errors)
                 let _ = deadpool_redis::redis::cmd("HSET")
                     .arg(key)
@@ -160,7 +160,7 @@ impl LeaseManager {
                         last_indexed_ms,
                         last_duration_ms,
                         memory_bytes,
-                        leased_node.to_string(),
+                        "".to_string(), // leased_node no longer used
                     ));
                 }
             }
@@ -173,7 +173,7 @@ impl LeaseManager {
                     last_indexed_ms,
                     last_duration_ms,
                     memory_bytes,
-                    leased_node.to_string(),
+                    "".to_string(), // leased_node no longer used
                 ));
             }
         }
@@ -373,13 +373,49 @@ impl LeaseManager {
         false
     }
 
+    /// Get the current lease holder for a repository branch by checking Redis directly
+    pub async fn get_current_lease_holder(&self, repo: &RemoteRepo) -> Option<String> {
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = Self::repo_key(repo);
+                let result: RedisResult<String> = conn.get(&key).await;
+                result.ok()
+            } else {
+                None
+            }
+        } else {
+            // In-memory fallback
+            self.inner
+                .read()
+                .get(repo)
+                .map(|lease| lease.holder.clone())
+        }
+    }
+
+    /// Get the current lease for a repository branch
     pub async fn get_lease(&self, repo: &RemoteRepo) -> Option<Lease> {
-        let repo = repo.clone();
-        let inner = self.inner.clone();
-        let guard = inner.read();
-        let res = guard.get(&repo).cloned();
-        drop(guard);
-        res
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let key = Self::repo_key(repo);
+                let result: RedisResult<String> = conn.get(&key).await;
+                match result {
+                    Ok(holder) => {
+                        // For Redis-backed leases, we don't have the exact expiry time
+                        // but we know it's held by someone, so we return a lease with current time + some buffer
+                        Some(Lease {
+                            holder,
+                            until: Utc::now() + chrono::Duration::seconds(30), // Assume 30 second TTL for display
+                        })
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            // In-memory fallback
+            self.inner.read().get(repo).cloned()
+        }
     }
 
     /// Check if a user can access a repository based on its visibility settings
