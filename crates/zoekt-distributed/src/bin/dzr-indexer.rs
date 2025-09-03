@@ -330,6 +330,7 @@ impl SimpleIndexer {
 impl Indexer for SimpleIndexer {
     fn index_repo(&self, repo_path: PathBuf) -> Result<InMemoryIndex> {
         let repo_path_str = repo_path.to_string_lossy().to_string();
+        tracing::debug!(repo_path=%repo_path_str, "starting repository indexing");
 
         // Check if this is a git URL that needs to be cloned
         let is_git_url = repo_path_str.starts_with("http://")
@@ -338,39 +339,46 @@ impl Indexer for SimpleIndexer {
             || repo_path_str.starts_with("ssh://");
 
         let actual_repo_path = if is_git_url {
-            // For git URLs, clone to a temporary directory
-            let temp_dir = std::env::temp_dir().join(format!(
-                "hyperzoekt-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            ));
+            // Check if this git URL is the current repository
+            if is_current_repo_sync(&repo_path_str) {
+                tracing::info!(url=%repo_path_str, "detected current repository, using current directory");
+                std::env::current_dir()
+                    .map_err(|e| anyhow::anyhow!("Failed to get current directory: {}", e))?
+            } else {
+                // For git URLs, clone to a temporary directory
+                let temp_dir = std::env::temp_dir().join(format!(
+                    "hyperzoekt-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                ));
 
-            tracing::info!(url=%repo_path_str, temp_dir=%temp_dir.display(), "cloning remote repository");
+                tracing::info!(url=%repo_path_str, temp_dir=%temp_dir.display(), "cloning remote repository");
 
-            // Clone the repository
-            let clone_result = std::process::Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    &repo_path_str,
-                    &temp_dir.to_string_lossy(),
-                ])
-                .output();
+                // Clone the repository
+                let clone_result = std::process::Command::new("git")
+                    .args([
+                        "clone",
+                        "--depth",
+                        "1",
+                        &repo_path_str,
+                        &temp_dir.to_string_lossy(),
+                    ])
+                    .output();
 
-            match clone_result {
-                Ok(output) if output.status.success() => {
-                    tracing::info!(url=%repo_path_str, "successfully cloned repository");
-                    temp_dir
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(anyhow::anyhow!("Failed to clone repository: {}", stderr));
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to run git clone: {}", e));
+                match clone_result {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!(url=%repo_path_str, "successfully cloned repository");
+                        temp_dir
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(anyhow::anyhow!("Failed to clone repository: {}", stderr));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to run git clone: {}", e));
+                    }
                 }
             }
         } else {
@@ -402,6 +410,7 @@ impl Indexer for SimpleIndexer {
         };
         self.store.write().insert(key.clone(), idx.clone());
         tracing::info!(repo=%key, "index build complete and stored");
+        tracing::debug!(repo=%key, "repository indexing completed successfully");
         Ok(idx)
     }
 
@@ -417,6 +426,38 @@ impl Indexer for SimpleIndexer {
     fn get_indexed_repos(&self) -> Vec<String> {
         self.store.read().keys().cloned().collect()
     }
+}
+
+/// Synchronous version of is_current_repo for use in blocking indexer
+fn is_current_repo_sync(git_url: &str) -> bool {
+    // Try to get the remote URL of the current directory
+    match std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(".")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Normalize URLs by removing trailing .git and comparing
+            let normalized_git_url = git_url.trim_end_matches(".git");
+            let normalized_remote = remote_url.trim_end_matches(".git");
+            tracing::debug!(git_url=%git_url, remote_url=%remote_url, normalized_git_url=%normalized_git_url, normalized_remote=%normalized_remote, "checking if current repo");
+            if normalized_git_url == normalized_remote {
+                tracing::info!(git_url=%git_url, remote_url=%remote_url, "detected current repository, using current directory");
+                return true;
+            } else {
+                tracing::debug!(git_url=%git_url, remote_url=%remote_url, "not current repository");
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(git_url=%git_url, status=%output.status, stderr=%stderr, "git remote get-url failed");
+        }
+        Err(e) => {
+            tracing::debug!(git_url=%git_url, error=%e, "failed to run git remote get-url");
+        }
+    }
+    false
 }
 
 #[derive(Deserialize)]
@@ -514,14 +555,7 @@ async fn main() -> Result<()> {
         lease_mgr.update_repo_metadata(&repo, None).await;
     }
 
-    // spawn the node loop in the background (indexing/lease loop)
-    let node_handle = tokio::spawn(async move {
-        // run for a long time for demo/dev; in production this would be indefinite
-        let _ = node.run_for(Duration::from_secs(60 * 60)).await;
-    });
-
-    // After spawning the node, also register repositories from Redis with the search handlers
-    // The node loop above will have loaded repos from Redis, so we need to get them and add to registered_repos
+    // Before spawning the node, also register repositories from Redis
     let redis_repos = lease_mgr.get_repo_branches().await;
     for (name, branch, url) in redis_repos {
         let repo = RemoteRepo {
@@ -533,12 +567,19 @@ async fn main() -> Result<()> {
             allowed_users: Vec::new(),
             last_commit_sha: None,
         };
-        // Add to the registered repos list used by search handlers
+        // Add to the registered repos list and register with the node
         registered_repos.write().push(repo.clone());
-        tracing::info!(repo=%name, branch=%branch, url=%url, "registered Redis repo with search handlers");
+        node.add_remote(repo.clone());
+        // Update repository metadata in SurrealDB
+        lease_mgr.update_repo_metadata(&repo, None).await;
+        tracing::info!(repo=%name, branch=%branch, url=%url, "registered Redis repo with search handlers and node");
     }
 
-    // start a small HTTP server to answer search requests against the in-memory indexes
+    // spawn the node loop in the background (indexing/lease loop)
+    let node_handle = tokio::spawn(async move {
+        // run for a long time for demo/dev; in production this would be indefinite
+        let _ = node.run_for(Duration::from_secs(60 * 60)).await;
+    }); // start a small HTTP server to answer search requests against the in-memory indexes
     let app = axum::Router::new()
         .route(
             "/search",

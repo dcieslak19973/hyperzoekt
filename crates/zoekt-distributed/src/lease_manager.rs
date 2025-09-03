@@ -429,12 +429,42 @@ impl LeaseManager {
                     }
                 } else if let Ok(None) = set_res {
                     // SET NX EX returned nil, meaning key already exists
-                    tracing::debug!(
-                        repo=%repo.name,
-                        branch=?repo.branch,
-                        holder=%holder,
-                        "lease acquisition failed: already held"
-                    );
+                    // Check if we are already the holder
+                    let get_res: RedisResult<String> = conn.get(&key).await;
+                    if let Ok(existing_holder) = get_res {
+                        if existing_holder == holder {
+                            tracing::debug!(
+                                repo=%repo.name,
+                                branch=?repo.branch,
+                                holder=%holder,
+                                "lease already held by this node, proceeding"
+                            );
+                            // Update the in-memory cache
+                            inner.write().insert(
+                                repo.clone(),
+                                Lease {
+                                    holder: holder.clone(),
+                                    until: Utc::now() + chrono::Duration::seconds(ttl_secs as i64),
+                                },
+                            );
+                            return true;
+                        } else {
+                            tracing::debug!(
+                                repo=%repo.name,
+                                branch=?repo.branch,
+                                holder=%holder,
+                                existing_holder=%existing_holder,
+                                "lease acquisition failed: already held by another node"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            repo=%repo.name,
+                            branch=?repo.branch,
+                            holder=%holder,
+                            "lease acquisition failed: could not check existing holder"
+                        );
+                    }
                 } else {
                     // Actual Redis error
                     tracing::warn!(
@@ -461,14 +491,32 @@ impl LeaseManager {
         let now = Utc::now();
         if let Some(existing) = guard.get(repo) {
             if existing.until > now {
-                tracing::debug!(
-                    repo=%repo.name,
-                    branch=?repo.branch,
-                    holder=%holder,
-                    existing_holder=%existing.holder,
-                    "lease acquisition failed: already held (in-memory)"
-                );
-                return false;
+                if existing.holder == holder {
+                    tracing::debug!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        holder=%holder,
+                        "lease already held by this node (in-memory), proceeding"
+                    );
+                    // Update the expiry time
+                    guard.insert(
+                        repo.clone(),
+                        Lease {
+                            holder: holder.clone(),
+                            until: now + chrono::Duration::from_std(ttl).unwrap(),
+                        },
+                    );
+                    return true;
+                } else {
+                    tracing::debug!(
+                        repo=%repo.name,
+                        branch=?repo.branch,
+                        holder=%holder,
+                        existing_holder=%existing.holder,
+                        "lease acquisition failed: already held by another node (in-memory)"
+                    );
+                    return false;
+                }
             }
         }
         tracing::info!(
@@ -669,16 +717,29 @@ impl LeaseManager {
             if let Ok(mut conn) = pool.get().await {
                 let key = Self::repo_key(repo);
                 let result: RedisResult<String> = conn.get(&key).await;
-                result.ok()
+                match result {
+                    Ok(holder) => {
+                        tracing::debug!(repo=%repo.name, branch=?repo.branch, key=%key, holder=%holder, "get_current_lease_holder: found holder in Redis");
+                        Some(holder)
+                    }
+                    Err(e) => {
+                        tracing::debug!(repo=%repo.name, branch=?repo.branch, key=%key, error=%e, "get_current_lease_holder: Redis error");
+                        None
+                    }
+                }
             } else {
+                tracing::debug!(repo=%repo.name, branch=?repo.branch, "get_current_lease_holder: Redis connection error");
                 None
             }
         } else {
             // In-memory fallback
-            self.inner
+            let holder = self
+                .inner
                 .read()
                 .get(repo)
-                .map(|lease| lease.holder.clone())
+                .map(|lease| lease.holder.clone());
+            tracing::debug!(repo=%repo.name, branch=?repo.branch, holder=?holder, "get_current_lease_holder: in-memory fallback");
+            holder
         }
     }
 

@@ -291,8 +291,9 @@ impl<I: Indexer> Node<I> {
             for repo in repos {
                 // Only index local paths during the initial pass
                 let git_url = repo.git_url.clone();
-                let is_local =
-                    PathBuf::from(&git_url).is_absolute() || git_url.starts_with("file://");
+                let is_local = PathBuf::from(&git_url).is_absolute()
+                    || git_url.starts_with("file://")
+                    || is_current_repo(&git_url).await;
                 if !is_local {
                     continue;
                 }
@@ -400,8 +401,9 @@ impl<I: Indexer> Node<I> {
                 // the lease acquisition and index directly. This makes local dev workflows fast
                 // and avoids requiring Redis/leases for local repos.
                 let git_url = repo.git_url.clone();
-                let is_local =
-                    PathBuf::from(&git_url).is_absolute() || git_url.starts_with("file://");
+                let is_local = PathBuf::from(&git_url).is_absolute()
+                    || git_url.starts_with("file://")
+                    || is_current_repo(&git_url).await;
 
                 if is_local {
                     tracing::info!(repo = %repo.name, "local repo, indexing without lease");
@@ -467,6 +469,105 @@ impl<I: Indexer> Node<I> {
                 if !self.config.enable_reindex {
                     tracing::debug!(repo=%repo.name, "reindexing disabled; skipping remote index attempt");
                     continue;
+                }
+
+                // Check if we already hold this lease
+                let current_holder = self.lease_mgr.get_current_lease_holder(&repo).await;
+                tracing::debug!(node_id=%self.config.id, repo=%repo.name, branch=?repo.branch, current_holder=?current_holder, "checking current lease holder");
+                if let Some(holder) = current_holder {
+                    if holder == self.config.id {
+                        tracing::debug!(node_id=%self.config.id, repo=%repo.name, branch=?repo.branch, "already hold lease, proceeding with indexing");
+
+                        // Get current commit SHA for this remote repository
+                        let current_sha = get_current_commit_sha(&repo.git_url).await;
+
+                        // Check if we should skip indexing based on SHA
+                        if self.should_skip_remote_indexing(&repo, current_sha.as_deref()) {
+                            // Don't release the lease since we already hold it
+                            continue;
+                        }
+
+                        // Run indexing in a blocking task (indexer is synchronous). While indexing
+                        // runs, periodically renew the lease so long-running indexing doesn't expire it.
+                        let repo_for_index = repo.clone();
+                        let holder = self.config.id.clone();
+                        let lease_mgr = self.lease_mgr.clone();
+                        let indexer = self.indexer.clone();
+
+                        let index_started = std::time::Instant::now();
+                        let mut index_handle = tokio::task::spawn_blocking(move || {
+                            indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
+                        });
+
+                        // Renewal loop: wake up every (ttl/3) seconds to renew; stop when indexing completes.
+                        let renew_interval = std::cmp::max(1, self.config.lease_ttl.as_secs() / 3);
+                        let mut renew_tick =
+                            tokio::time::interval(tokio::time::Duration::from_secs(renew_interval));
+                        renew_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                        let mut indexing_done = false;
+                        let mut index_result = Err(anyhow::anyhow!("indexing not run"));
+
+                        while !indexing_done {
+                            tokio::select! {
+                                biased;
+                                _ = renew_tick.tick() => {
+                                    // try renew; if renewal fails we stop renewing (lease may be lost)
+                                    let _ = lease_mgr.renew(&repo, holder.clone(), self.config.lease_ttl).await;
+                                }
+                                res = &mut index_handle => {
+                                    indexing_done = true;
+                                    match res {
+                                        Ok(r) => index_result = r,
+                                        Err(e) => index_result = Err(anyhow::anyhow!(e.to_string())),
+                                    }
+                                }
+                            }
+                        }
+
+                        match index_result {
+                            Ok(index) => {
+                                tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+
+                                // Update the last known SHA after successful indexing
+                                if let Some(ref sha) = current_sha {
+                                    self.update_last_known_sha(&repo, sha);
+                                }
+
+                                // compute duration and record meta in redis
+                                let dur = index_started.elapsed();
+                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                let dur_ms = dur.as_millis() as i64;
+                                // best-effort: persist meta. We only write branch-specific meta now.
+                                let mem_est = index.total_scanned_bytes() as i64;
+                                tracing::debug!(repo=%repo.name, "about to set branch meta (remote). repo-level meta writes are disabled");
+                                if let Some(branch) = &repo.branch {
+                                    let _ = self
+                                        .lease_mgr
+                                        .set_branch_meta(
+                                            &repo.name, branch, now_ms, dur_ms, mem_est,
+                                        )
+                                        .await;
+                                } else {
+                                    tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
+                                }
+                                if self.config.index_once {
+                                    let key = format!(
+                                        "{}|{}",
+                                        repo.name,
+                                        repo.branch.clone().unwrap_or_default()
+                                    );
+                                    self.seen_once.write().insert(key);
+                                    tracing::info!(repo=%repo.name, "index_once: marked as indexed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(repo = %repo.name, error = %e, "failed to index");
+                                // Don't release the lease since we already held it
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 if self
@@ -563,6 +664,8 @@ impl<I: Indexer> Node<I> {
                             self.lease_mgr.release(&repo, &self.config.id).await;
                         }
                     }
+                } else {
+                    tracing::debug!(node_id=%self.config.id, repo=%repo.name, branch=?repo.branch, "lease acquisition failed, skipping indexing");
                 }
             }
             tokio::time::sleep(self.config.poll_interval).await;
@@ -603,6 +706,31 @@ pub(crate) fn looks_like_remote_git_url(path: &str) -> bool {
         || path.starts_with("https://")
         || path.starts_with("git@")
         || path.starts_with("ssh://")
+}
+
+/// Check if the given git_url matches the current repository's remote URL
+async fn is_current_repo(git_url: &str) -> bool {
+    // Try to get the remote URL of the current directory
+    match std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(".")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Normalize URLs by removing trailing .git and comparing
+            let normalized_git_url = git_url.trim_end_matches(".git");
+            let normalized_remote = remote_url.trim_end_matches(".git");
+            if normalized_git_url == normalized_remote {
+                tracing::debug!(git_url=%git_url, remote_url=%remote_url, "detected current repo, treating as local");
+                return true;
+            }
+        }
+        _ => {
+            // If we can't get the remote URL, assume it's not the current repo
+        }
+    }
+    false
 }
 
 /// Get the current commit SHA for a repository
