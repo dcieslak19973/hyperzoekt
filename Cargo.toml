@@ -3,8 +3,7 @@ members = [
 	"crates/hyperzoekt",
 	"crates/zoekt-rs",
 	"crates/zoekt-cli",
-	"crates/zoekt-bench",
-	"crates/zoekt-tools",
+	"crates/zoekt-distributed",
 ]
 
 # Use the edition-2021 dependency resolver semantics for workspace members.
@@ -15,3 +14,6 @@ opt-level = 0
 debug = true
 incremental = true
 codegen-units = 16
+ 
+
+

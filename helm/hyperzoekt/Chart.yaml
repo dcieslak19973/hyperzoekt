@@ -1,0 +1,17 @@
+apiVersion: v2
+name: hyperzoekt
+description: A Helm chart for deploying HyperZoekt distributed code search
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - code-search
+  - zoekt
+  - distributed
+  - search
+home: https://github.com/dcieslak19973/hyperzoekt
+sources:
+  - https://github.com/dcieslak19973/hyperzoekt
+maintainers:
+  - name: HyperZoekt Team
+    email: info@hyperzoekt.dev

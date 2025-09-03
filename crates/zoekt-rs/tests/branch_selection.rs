@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
@@ -112,17 +128,21 @@ fn test_branch_selection_with_git_archive() -> anyhow::Result<()> {
     let s = zoekt_rs::query::Searcher::new(&idx);
 
     // query branch main should match 'content on main'
-    let mut plan = QueryPlan::default();
-    plan.pattern = Some("content on main".to_string());
-    plan.branches = vec![initial_branch.clone()];
+    let plan = QueryPlan {
+        pattern: Some("content on main".to_string()),
+        branches: vec![initial_branch.clone()],
+        ..Default::default()
+    };
     let res = s.search_plan(&plan);
     assert_eq!(res.len(), 1);
     assert!(res[0].path.ends_with("file.txt"));
 
     // query branch feature should match 'content on feature'
-    let mut plan2 = QueryPlan::default();
-    plan2.pattern = Some("content on feature".to_string());
-    plan2.branches = vec!["feature".to_string()];
+    let plan2 = QueryPlan {
+        pattern: Some("content on feature".to_string()),
+        branches: vec!["feature".to_string()],
+        ..Default::default()
+    };
     let res2 = s.search_plan(&plan2);
     assert_eq!(res2.len(), 1);
     assert!(res2[0].path.ends_with("file.txt"));

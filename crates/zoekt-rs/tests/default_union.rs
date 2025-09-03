@@ -1,3 +1,19 @@
+// Copyright 2025 HyperZoekt Project
+// Derived from sourcegraph/zoekt (https://github.com/sourcegraph/zoekt)
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::fs::{self, File};
 use std::io::Write;
 use tempfile::tempdir;
@@ -24,8 +40,10 @@ fn test_default_unions_path_and_content() -> anyhow::Result<()> {
     let s = zoekt_rs::query::Searcher::new(&idx);
 
     // default (neither path-only nor content-only) should match both
-    let mut plan = QueryPlan::default();
-    plan.pattern = Some("needle".to_string());
+    let plan = QueryPlan {
+        pattern: Some("needle".to_string()),
+        ..Default::default()
+    };
     let res = s.search_plan(&plan);
     let paths: Vec<String> = res.into_iter().map(|r| r.path).collect();
     assert!(

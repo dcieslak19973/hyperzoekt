@@ -1,3 +1,16 @@
+// Copyright 2025 HyperZoekt Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 use hyperzoekt::repo_index::RepoIndexService;
 use surrealdb::engine::local::Mem;
 use surrealdb::Surreal;
@@ -63,7 +76,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                                 .and_then(|l| l.get(i))
                                 .cloned()
                                 .unwrap_or(0)
-                                .saturating_add(1) as u32;
+                                .saturating_add(1);
                             imports.push(ImportItem {
                                 path: target_file.path.clone(),
                                 line: line_no,
@@ -76,7 +89,7 @@ async fn watcher_db_ingest_flow() -> Result<(), Box<dyn std::error::Error>> {
                 for (m, lineno) in unres {
                     unresolved_imports.push(UnresolvedImport {
                         module: m.clone(),
-                        line: lineno.saturating_add(1) as u32,
+                        line: lineno.saturating_add(1),
                     });
                 }
             }
