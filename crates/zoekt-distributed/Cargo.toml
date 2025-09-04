@@ -5,35 +5,35 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-parking_lot = "0.12"
+parking_lot = "0.12.4"
 chrono = { version = "0.4", features = ["serde"] }
 # depend on the local workspace crate
 zoekt-rs = { path = "../zoekt-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
-deadpool-redis = "0.18"
+deadpool-redis = "0.22"
 base64 = "0.22"
 redis = { version = "0.27", features = ["script"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.7"
-axum = { version = "0.7", features = ["multipart"] }
-tower-http = { version = "0.5", features = ["auth", "fs"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower-http = { version = "0.6", features = ["auth", "fs"] }
 htmlescape = "0.3"
-rand = "0.8"
+rand = "0.9"
 hmac = "0.12"
 async-trait = "0.1"
 sha2 = "0.10"
 regex = "1"
-surrealdb = { version = "=2.3.1", features = ["kv-mem"] }
+surrealdb = { version = "2.3", features = ["kv-mem"] }
 async-stream = "0.3"
 futures = "0.3"
 tokio-stream = "0.1"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-urlencoding = "2.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+urlencoding = "2.1.3"
 hyper = "1.0"
 ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http", "oauth"] }
 
@@ -57,7 +57,8 @@ path = "src/bin/dzr-mcp-search.rs"
 # use the zoekt-rs test helpers to make small repo indexes
 proptest = "1"
 tempfile = "3"
-serial_test = "2"
-http = "0.2"
-tower = { version = "0.5", features = ["util"] }
+serial_test = "3"
+http = "1"
+tower = { version = "0.5.2", features = ["util"] }
+getrandom = "0.2"
 

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine;
+use getrandom::getrandom;
 use parking_lot::RwLock;
-use rand::RngCore;
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 use zoekt_distributed::LeaseManager;
@@ -26,7 +26,7 @@ type TestState = Arc<TestStateInner>;
 
 fn gen_token() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    getrandom(&mut b).expect("failed to get random bytes");
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
@@ -119,14 +119,7 @@ async fn redis_repo_meta_contains_memory_bytes() {
     let mem_bytes = 12345i64;
     // write branch meta under field "<repo>|<branch>"
     lease
-        .set_branch_meta(
-            &test_name,
-            "main",
-            now_ms,
-            dur_ms,
-            mem_bytes,
-            "node-int-test",
-        )
+        .set_branch_meta(&test_name, "main", now_ms, dur_ms, mem_bytes, "test-node")
         .await;
 
     // read back the stored JSON from zoekt:repo_branch_meta

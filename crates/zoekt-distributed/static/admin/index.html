@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>zoekt-distributed admin</title>
+    <title>Distributed Zoekt</title>
     <link rel="stylesheet" href="/static/common/styles.css">
     <style>
         /* Admin-specific styles */
@@ -181,7 +181,7 @@
 <body>
     <div class="container">
         <nav>
-            <div><strong>zoekt-distributed admin</strong></div>
+            <div><strong>Distributed Zoekt</strong></div>
             <div style="display:flex;gap:10px;align-items:center"> <button id="theme-toggle" class="theme-toggle">
                     <span class="icon">🌙</span>
                     <span class="label">Dark</span>
@@ -196,6 +196,7 @@
             <button id="tab-repos" class="tab-button" aria-pressed="true">Repositories</button>
             <button id="tab-branches" class="tab-button" aria-pressed="false">Branches</button>
             <button id="tab-indexers" class="tab-button" aria-pressed="false">Indexers</button>
+            <button id="tab-leases" class="tab-button" aria-pressed="false">Leases</button>
         </div>
 
         <div id="repos-tab" class="card">
@@ -250,6 +251,25 @@
                     </tr>
                 </thead>
                 <tbody id="indexer-table-body"></tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Leases tab (hidden by default) -->
+        <div id="leases-tab" class="card" style="display:none">
+            <h2>Active Leases</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Repository</th>
+                        <th class="sortable" data-type="text">Branch</th>
+                        <th class="sortable" data-type="text">Holder</th>
+                        <th class="sortable" data-type="date">Expires</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="lease-table-body"></tbody>
             </table>
         </div>
 
