@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine;
+use getrandom::getrandom;
 use parking_lot::RwLock;
-use rand::RngCore;
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 use zoekt_distributed::LeaseManager;
@@ -26,7 +26,7 @@ type TestState = Arc<TestStateInner>;
 
 fn gen_token() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    getrandom(&mut b).expect("failed to get random bytes");
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 

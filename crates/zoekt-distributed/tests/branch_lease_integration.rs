@@ -1,5 +1,5 @@
 use deadpool_redis::{redis::AsyncCommands, Config as RedisConfig};
-use rand::RngCore;
+use getrandom::getrandom;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -14,7 +14,7 @@ use zoekt_distributed::test_utils::FakeIndexer;
 
 fn gen_token() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    getrandom(&mut b).expect("failed to get random bytes");
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 

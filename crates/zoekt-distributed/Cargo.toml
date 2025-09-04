@@ -60,4 +60,5 @@ tempfile = "3"
 serial_test = "3"
 http = "1"
 tower = { version = "0.5.2", features = ["util"] }
+getrandom = "0.2"
 

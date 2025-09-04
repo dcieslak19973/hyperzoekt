@@ -22,12 +22,13 @@
 //! regex-based extractor.
 
 // std helpers kept intentionally minimal for this module
+use std::collections::HashSet;
 use tree_sitter::{Language, Node, Parser};
 // use the language bindings with short aliases to match other code in workspace
 use tree_sitter_c_sharp as ts_c_sharp;
 use tree_sitter_cpp as ts_cpp;
 use tree_sitter_go as ts_go;
-// note: java binding intentionally omitted in this build
+use tree_sitter_java as ts_java;
 use tree_sitter_javascript as ts_js;
 use tree_sitter_ocaml as ts_ocaml;
 use tree_sitter_python as ts_python;
@@ -43,13 +44,13 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
         "go" => ts_go::LANGUAGE.into(),
         "py" => ts_python::LANGUAGE.into(),
         "js" | "jsx" => ts_js::LANGUAGE.into(),
+        "java" => ts_java::LANGUAGE.into(),
         "ts" => ts_typescript::LANGUAGE_TYPESCRIPT.into(),
         "tsx" => ts_typescript::LANGUAGE_TSX.into(),
         "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => ts_cpp::LANGUAGE.into(),
         "cs" => ts_c_sharp::LANGUAGE.into(),
         "swift" => ts_swift::LANGUAGE.into(),
         "v" | "sv" => ts_verilog::LANGUAGE.into(),
-        // OCaml extensions
         "ml" | "mli" | "mll" => ts_ocaml::LANGUAGE_OCAML.into(),
         _ => return Vec::new(),
     };
@@ -130,6 +131,8 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
         let kind = n.kind();
 
         // Kinds that are likely to declare a named symbol across languages
+        // Include Swift-specific node kinds (protocol/extension/enum) so
+        // those top-level declarations are discovered by the extractor.
         const TOP_KINDS: &[&str] = &[
             "function_item",
             "function_definition",
@@ -139,6 +142,9 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
             "value_description",
             "value_spec",
             "type_declaration",
+            "interface_declaration",
+            "interface_definition",
+            "interface",
             "type_item",
             "module",
             "module_declaration",
@@ -148,14 +154,30 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
             "class_definition",
             "struct_item",
             "enum_item",
+            "trait_item",
+            "impl_item",
+            "enum_declaration",
             "method_declaration",
             "method_definition",
+            "protocol_declaration",
+            "protocol",
+            "extension_declaration",
+            "extension",
+            "macro_definition",
+            "macro_rules",
         ];
 
         let want = TOP_KINDS.contains(&kind)
             || kind == "module" // be permissive for module-like nodes
             || kind.starts_with("module")
             || kind.starts_with("class")
+            || kind.starts_with("interface")
+            || kind.starts_with("trait")
+            || kind.starts_with("impl")
+            || kind.starts_with("protocol")
+            || kind.starts_with("extension")
+            || kind.starts_with("enum")
+            || kind.starts_with("macro")
             || kind == "exception_definition";
 
         if want {
@@ -168,7 +190,14 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
                 } else {
                     find_identifier_descendant(n)
                 }
-            } else if kind.starts_with("class") {
+            } else if kind.starts_with("class")
+                || kind.starts_with("interface")
+                || kind.starts_with("protocol")
+                || kind.starts_with("extension")
+                || kind.starts_with("enum")
+                || kind.starts_with("trait")
+                || kind.starts_with("impl")
+            {
                 n.child_by_field_name("name")
                     .or_else(|| n.child_by_field_name("identifier"))
                     .or_else(|| find_identifier_descendant(n))
@@ -227,7 +256,38 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
     }
 
     visit(root, content, &mut out, ext);
-    out
+
+    // Deduplicate same-name/same-offset symbols which can appear when
+    // tree-sitter exposes multiple nested nodes for the same identifier.
+    let mut seen: HashSet<(String, Option<u32>)> = HashSet::new();
+    let mut unique: Vec<crate::types::Symbol> = Vec::new();
+    for s in out.into_iter() {
+        if seen.insert((s.name.clone(), s.start)) {
+            unique.push(s);
+        }
+    }
+    // If we didn't find anything, attempt a lightweight regex fallback for
+    // Verilog/SystemVerilog module declarations. This helps when tree-sitter
+    // grammars expose different node kinds for modules across versions.
+    if unique.is_empty() && (ext == "v" || ext == "sv") {
+        if let Ok(re) = regex::Regex::new(r"(?m)^\s*module\s+([A-Za-z_]\w*)") {
+            for cap in re.captures_iter(content) {
+                if let Some(m) = cap.get(1) {
+                    let name = m.as_str().to_string();
+                    let start = Some(m.start() as u32);
+                    if seen.insert((name.clone(), start)) {
+                        unique.push(crate::types::Symbol {
+                            name,
+                            start,
+                            line: Some(line_for_offset(content, m.start() as u32) as u32 + 1),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    unique
 }
 
 // local helper: compute 0-based line index for a byte offset
@@ -376,7 +436,7 @@ end
         assert!(!syms.is_empty());
 
         for name in ["M", "add", "x"].iter() {
-            let sym = find_symbol(&syms, name).expect(&format!("{} symbol", name));
+            let sym = find_symbol(&syms, name).unwrap_or_else(|| panic!("{} symbol", name));
             let start = sym.start.expect("start");
             let end = start as usize + name.len();
             assert_eq!(src.get(start as usize..end).unwrap(), *name);
@@ -428,5 +488,291 @@ module M : sig val m : int end
         let syms = extract_symbols_typesitter(&src, "mli");
         // Expect at least the module M to be present in the interface
         assert!(find_symbol(&syms, "M").is_some());
+    }
+
+    #[test]
+    fn java_fixture_symbol_extracted() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/java/Simple.java"
+        );
+        let src = std::fs::read_to_string(path).expect("read Simple.java");
+        let syms = extract_symbols_typesitter(&src, "java");
+        // Expect the class Foo to be present
+        assert!(find_symbol(&syms, "Foo").is_some());
+    }
+
+    #[test]
+    fn java_more_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/java/");
+
+        let cases = [
+            ("Interface.java", "ITest"),
+            ("Nested.java", "Outer"),
+            ("Types.java", "UsesEnum"),
+        ];
+
+        for (file, expect) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read java fixture");
+            let syms = extract_symbols_typesitter(&src, "java");
+            assert!(
+                find_symbol(&syms, expect).is_some(),
+                "expected {} in {}",
+                expect,
+                file
+            );
+        }
+    }
+
+    #[test]
+    fn python_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/python/");
+
+        let cases = [
+            ("simple_module.py", &["Foo", "free_func"] as &[_]),
+            ("nested_classes.py", &["Outer", "Inner"]),
+            ("annotations_and_defs.py", &["IFoo", "Concrete"]),
+            ("async_defs.py", &["fetch_data", "process", "AsyncWorker"]),
+            ("decorators.py", &["decorated_func", "WithDecorator"]),
+            ("module_assignments.py", &["CONSTANT", "WithConstants"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read python fixture");
+            let syms = extract_symbols_typesitter(&src, "py");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpp_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cpp/");
+
+        let cases = [
+            ("templates_simple.h", &["Holder", "T"] as &[_]),
+            ("functions_and_templates.cpp", &["T", "UsesTemplates"]),
+            ("template_specialization.cpp", &["Holder", "val"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read cpp fixture");
+            let syms = extract_symbols_typesitter(&src, "cpp");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verilog_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/verilog/");
+
+        let cases = [
+            ("simple_module.sv", &["simple"] as &[_]),
+            ("parameterized_mod.sv", &["fifo"]),
+            ("nested_modules.sv", &["top_mod", "inner_mod"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read verilog fixture");
+            let syms = extract_symbols_typesitter(&src, "sv");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn csharp_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/csharp/");
+
+        let cases = [
+            ("SimpleClass.cs", &["Foo"] as &[_]),
+            ("Interface.cs", &["ITest"]),
+            ("Generics.cs", &["GenericHolder", "Util"]),
+            ("NamespaceNested.cs", &["OuterClass", "InnerClass"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read csharp fixture");
+            let syms = extract_symbols_typesitter(&src, "cs");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go/");
+
+        let cases = [
+            ("simple.go", &["Server", "Start", "Add"] as &[_]),
+            ("generics.go", &["List", "Id"]),
+            ("nested.go", &["Outer", "Inner", "MakeInner"]),
+            ("advanced.go", &["node", "doIt", "helper", "startPrivate"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read go fixture");
+            let syms = extract_symbols_typesitter(&src, "go");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/javascript/");
+
+        let cases = [
+            ("simple.js", &["Foo", "util"] as &[_]),
+            ("async_and_exports.js", &["fetchData"]),
+            ("nested.js", &["doIt", "topFunc"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read js fixture");
+            let syms = extract_symbols_typesitter(&src, "js");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/typescript/");
+
+        let cases = [
+            ("simple.ts", &["Foo", "util"] as &[_]),
+            ("async_and_exports.ts", &["fetchData"]),
+            ("nested.ts", &["doIt", "topFunc"]),
+            ("interfaces.ts", &["IFoo", "ImplFoo"]),
+            ("generics.ts", &["Box", "id"]),
+            ("component.tsx", &["Component"]),
+            ("interfaces_generics.ts", &["IFoo", "ImplFoo"]),
+            ("declaration_merging.ts", &["M"]),
+            // ambient_module.d.ts provides types only and no runtime symbol
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read ts fixture");
+            let syms = extract_symbols_typesitter(&src, "ts");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    // temporary debug test removed
+
+    #[test]
+    fn swift_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swift/");
+
+        let cases = [
+            ("simple.swift", &["Foo", "topFunc"] as &[_]),
+            ("protocols.swift", &["PTest"]),
+            ("generics.swift", &["Box", "id"]),
+            ("extensions.swift", &["Person", "salute", "extStatic"]),
+            ("enums.swift", &["Direction", "Result"]),
+            ("conformance.swift", &["Drawable", "Circle", "Shape"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read swift fixture");
+            let syms = extract_symbols_typesitter(&src, "swift");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rust_fixtures_extract_symbols() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rust/");
+
+        let cases = [
+            (
+                "extensions.rs",
+                &["Person", "greet", "salute", "ext_static"] as &[_],
+            ),
+            ("enums.rs", &["Direction", "Result"]),
+            ("traits.rs", &["Drawable", "Circle", "Shape"]),
+            ("associated_types.rs", &["IteratorLike", "MyIter"]),
+            ("generics_where.rs", &["Wrapper", "uses_wrapper"]),
+            ("macros.rs", &["make_struct", "AutoGen"]),
+            ("proc_macros.rs", &["attr_macro", "derive_something"]),
+            // We can't rely on macro expansion; expect the macro name and a real wrapper
+            ("macro_funcs.rs", &["make_fn", "wrapper"]),
+            ("nested_where.rs", &["Complex"]),
+        ];
+
+        for (file, expects) in cases.iter() {
+            let path = format!("{}{}", base, file);
+            let src = std::fs::read_to_string(&path).expect("read rust fixture");
+            let syms = extract_symbols_typesitter(&src, "rs");
+            for name in expects.iter() {
+                assert!(
+                    find_symbol(&syms, name).is_some(),
+                    "expected {} in {}",
+                    name,
+                    file
+                );
+            }
+        }
     }
 }
