@@ -9,6 +9,20 @@ members = [
 # Use the edition-2021 dependency resolver semantics for workspace members.
 resolver = "2"
 
+# Force newer versions of dependencies to reduce duplicates
+[workspace.dependencies]
+# Force thiserror v2 everywhere
+thiserror = "2"
+# Force newer versions of dependencies that still use thiserror v1
+affinitypool = "0.3"
+async-graphql = "7"
+miette = "7"
+rustls = "0.23"
+storekey = "0.5"
+sysinfo = "0.33"
+tokio-tungstenite = "0.23"
+webpki-roots = "0.26"
+
 [profile.dev]
 opt-level = 0
 debug = true

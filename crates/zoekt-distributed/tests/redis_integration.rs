@@ -119,7 +119,7 @@ async fn redis_repo_meta_contains_memory_bytes() {
     let mem_bytes = 12345i64;
     // write branch meta under field "<repo>|<branch>"
     lease
-        .set_branch_meta(&test_name, "main", now_ms, dur_ms, mem_bytes)
+        .set_branch_meta(&test_name, "main", now_ms, dur_ms, mem_bytes, "test-node")
         .await;
 
     // read back the stored JSON from zoekt:repo_branch_meta

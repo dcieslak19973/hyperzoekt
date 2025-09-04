@@ -128,6 +128,7 @@ impl LeaseManager {
         last_indexed_ms: i64,
         last_duration_ms: i64,
         memory_bytes: i64,
+        node_id: &str,
     ) {
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
@@ -160,7 +161,7 @@ impl LeaseManager {
                         last_indexed_ms,
                         last_duration_ms,
                         memory_bytes,
-                        "".to_string(), // leased_node no longer used
+                        node_id.to_string(),
                     ));
                 }
             }
@@ -173,7 +174,7 @@ impl LeaseManager {
                     last_indexed_ms,
                     last_duration_ms,
                     memory_bytes,
-                    "".to_string(), // leased_node no longer used
+                    node_id.to_string(),
                 ));
             }
         }

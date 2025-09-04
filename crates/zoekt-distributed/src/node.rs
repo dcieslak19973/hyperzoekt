@@ -341,7 +341,14 @@ impl<I: Indexer> Node<I> {
                         if let Some(branch) = &repo.branch {
                             let _ = self
                                 .lease_mgr
-                                .set_branch_meta(&repo.name, branch, now_ms, dur_ms, mem_est)
+                                .set_branch_meta(
+                                    &repo.name,
+                                    branch,
+                                    now_ms,
+                                    dur_ms,
+                                    mem_est,
+                                    &self.config.id,
+                                )
                                 .await;
                         } else {
                             tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
@@ -446,7 +453,14 @@ impl<I: Indexer> Node<I> {
                             if let Some(branch) = &repo.branch {
                                 let _ = self
                                     .lease_mgr
-                                    .set_branch_meta(&repo.name, branch, now_ms, dur_ms, mem_est)
+                                    .set_branch_meta(
+                                        &repo.name,
+                                        branch,
+                                        now_ms,
+                                        dur_ms,
+                                        mem_est,
+                                        &self.config.id,
+                                    )
                                     .await;
                             } else {
                                 tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");
@@ -551,7 +565,12 @@ impl<I: Indexer> Node<I> {
                                     let _ = self
                                         .lease_mgr
                                         .set_branch_meta(
-                                            &repo.name, branch, now_ms, dur_ms, mem_est,
+                                            &repo.name,
+                                            branch,
+                                            now_ms,
+                                            dur_ms,
+                                            mem_est,
+                                            &self.config.id,
                                         )
                                         .await;
                                 } else {
@@ -650,7 +669,14 @@ impl<I: Indexer> Node<I> {
                             if let Some(branch) = &repo.branch {
                                 let _ = self
                                     .lease_mgr
-                                    .set_branch_meta(&repo.name, branch, now_ms, dur_ms, mem_est)
+                                    .set_branch_meta(
+                                        &repo.name,
+                                        branch,
+                                        now_ms,
+                                        dur_ms,
+                                        mem_est,
+                                        &self.config.id,
+                                    )
                                     .await;
                             } else {
                                 tracing::debug!(repo=%repo.name, "skipping repo-level meta write for legacy/unspecified branch");

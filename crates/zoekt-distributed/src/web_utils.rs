@@ -187,7 +187,7 @@ pub fn wants_json(headers: &HeaderMap) -> bool {
 /// Generate a random token (base64-encoded 16 bytes).
 pub fn gen_token() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
