@@ -816,4 +816,28 @@ impl LeaseManager {
         // to avoid unnecessary lease acquisition when content hasn't changed.
         false
     }
+
+    /// Publish a repo event to Redis pub/sub if Redis is available.
+    /// Event types: "indexing_started", "indexing_finished"
+    pub async fn publish_repo_event(&self, event_type: &str, repo: &RemoteRepo, node_id: &str) {
+        if let Some(pool) = &self.redis_pool {
+            if let Ok(mut conn) = pool.get().await {
+                let event = json!({
+                    "event": event_type,
+                    "repo_name": repo.name,
+                    "git_url": repo.git_url,
+                    "branch": repo.branch,
+                    "node_id": node_id,
+                    "timestamp": chrono::Utc::now().timestamp_millis()
+                });
+                let channel = "zoekt:repo_events";
+                let _: RedisResult<()> = conn.publish(channel, event.to_string()).await;
+                tracing::debug!(event_type=%event_type, repo=%repo.name, branch=?repo.branch, "published repo event to Redis pub/sub");
+            } else {
+                tracing::debug!("failed to get Redis connection for publishing repo event");
+            }
+        } else {
+            tracing::debug!("no Redis pool available for publishing repo event");
+        }
+    }
 }
