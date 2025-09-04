@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use anyhow::Result;
+use rand;
 use std::fs;
 use std::time::Duration;
 
@@ -55,13 +56,16 @@ impl Default for NodeConfig {
         // Read configuration from environment variables when present. Useful for k8s.
         // Env vars:
         // - ZOEKTD_NODE_ID
+        // - POD_NAME (Kubernetes pod name, used as default if ZOEKTD_NODE_ID not set)
         // - ZOEKTD_LEASE_TTL_SECONDS
         // - ZOEKTD_POLL_INTERVAL_SECONDS
         // - ZOEKTD_ENDPOINT (manual override)
         // - ZOEKTD_SERVICE_NAME (for k8s service discovery)
         // - ZOEKTD_SERVICE_PORT (for k8s service discovery)
         // - ZOEKTD_SERVICE_PROTOCOL (http/https, defaults to http)
-        let id = std::env::var("ZOEKTD_NODE_ID").unwrap_or_else(|_| "node-1".into());
+        let id = std::env::var("ZOEKTD_NODE_ID")
+            .or_else(|_| std::env::var("POD_NAME"))
+            .unwrap_or_else(|_| format!("node-{}", rand::random::<u64>()));
         let lease_ttl = std::env::var("ZOEKTD_LEASE_TTL_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -71,7 +75,7 @@ impl Default for NodeConfig {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(5));
+            .unwrap_or(Duration::from_secs(30));
 
         let node_type: NodeType = std::env::var("ZOEKTD_NODE_TYPE")
             .ok()

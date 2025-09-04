@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8">
-    <title>dzr-http-search UI</title>
+    <title>Distributed Zoekt</title>
     <link rel="stylesheet" href="/static/common/styles.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
     <style>
@@ -67,6 +67,22 @@
 
         .search-form button:hover {
             background: #0891a2;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+        }
+
+        .form-row label {
+            flex: 1;
+            margin-bottom: 0;
+        }
+
+        .form-row label:last-child {
+            flex: 0 0 auto;
+            min-width: 120px;
         }
 
         .results {
@@ -238,6 +254,13 @@
             --prism-number: #79b8ff;
             --prism-function: #b392f0;
             --prism-variable: #ffab70;
+            --prism-operator: #f97583;
+            --prism-boolean: #f97583;
+            --prism-class-name: #b392f0;
+            --prism-property: #ffab70;
+            --prism-tag: #f97583;
+            --prism-attr-name: #ffab70;
+            --prism-attr-value: #9ecbff;
         }
 
         .light-mode {
@@ -256,6 +279,13 @@
             --prism-number: #005cc5;
             --prism-function: #6f42c1;
             --prism-variable: #e36209;
+            --prism-operator: #d73a49;
+            --prism-boolean: #d73a49;
+            --prism-class-name: #6f42c1;
+            --prism-property: #e36209;
+            --prism-tag: #d73a49;
+            --prism-attr-name: #e36209;
+            --prism-attr-value: #032f62;
         }
 
         .result-snippet code[class*="language-"] {
@@ -286,13 +316,107 @@
         .result-snippet .token.variable {
             color: var(--prism-variable);
         }
+
+        .result-snippet .token.operator {
+            color: var(--prism-operator);
+        }
+
+        .result-snippet .token.punctuation {
+            color: var(--text);
+        }
+
+        .result-snippet .token.boolean {
+            color: var(--prism-boolean);
+        }
+
+        .result-snippet .token.class-name {
+            color: var(--prism-class-name);
+        }
+
+        .result-snippet .token.property {
+            color: var(--prism-property);
+        }
+
+        .result-snippet .token.tag {
+            color: var(--prism-tag);
+        }
+
+        .result-snippet .token.attr-name {
+            color: var(--prism-attr-name);
+        }
+
+        .result-snippet .token.attr-value {
+            color: var(--prism-attr-value);
+        }
     </style>
     <script src="/static/common/theme.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js"></script>
+    <script
+        src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup-templating.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-php.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-docker.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+    <script>
+        // Ensure Prism's C/C++ grammars are available and load them in order if missing.
+        (function ensurePrismCpp() {
+            function hasCpp() {
+                return window.Prism && Prism.languages && Prism.languages.cpp;
+            }
+
+            if (hasCpp()) {
+                console.debug('Prism: cpp grammar already present');
+                return;
+            }
+
+            console.debug('Prism: cpp grammar missing, attempting ordered load of clike -> c -> cpp');
+            const base = 'https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/';
+            const toLoad = ['prism-clike.min.js', 'prism-c.min.js', 'prism-cpp.min.js'];
+
+            function loadSequential(idx) {
+                if (idx >= toLoad.length) {
+                    // Give Prism a moment to register languages
+                    setTimeout(() => {
+                        if (hasCpp()) {
+                            console.debug('Prism: cpp grammar loaded successfully');
+                        } else {
+                            console.error('Prism: failed to load cpp grammar');
+                        }
+                    }, 50);
+                    return;
+                }
+                const s = document.createElement('script');
+                s.src = base + toLoad[idx];
+                s.async = false; // preserve execution order
+                s.onload = () => loadSequential(idx + 1);
+                s.onerror = () => {
+                    console.error('Prism: error loading', toLoad[idx]);
+                    loadSequential(idx + 1);
+                };
+                document.head.appendChild(s);
+            }
+
+            // If DOMContentLoaded already fired, start immediately; otherwise wait.
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => loadSequential(0));
+            } else {
+                loadSequential(0);
+            }
+        })();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-swift.min.js"></script>
 </head>
 
 <body>
@@ -304,28 +428,32 @@
     </div>
 
     <div class="container">
-        <h1>Distributed search</h1>
+        <h1>Distributed Zoekt</h1>
 
         <div class="card search-form">
             <form id="searchForm">
-                <label>Repo (supports *):
-                    <input type="text" name="repo" value="*" />
-                </label>
                 <label>Query:
                     <input type="text" name="q" placeholder="search terms" />
                 </label>
-                <label>Branches (comma-separated, default *):
-                    <input type="text" name="branches" value="*" style="width:200px" />
-                </label>
-                <label>Context lines:
-                    <select name="context_lines">
-                        <option value="1">1</option>
-                        <option value="2">2</option>
-                        <option value="5" selected>5</option>
-                        <option value="10">10</option>
-                        <option value="20">20</option>
-                    </select>
-                </label>
+
+                <div class="form-row">
+                    <label>Repo (supports *):
+                        <input type="text" name="repo" value="*" />
+                    </label>
+                    <label>Branches (comma-separated, default *):
+                        <input type="text" name="branches" value="*" />
+                    </label>
+                    <label>Context lines:
+                        <select name="context_lines">
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="5" selected>5</option>
+                            <option value="10">10</option>
+                            <option value="20">20</option>
+                        </select>
+                    </label>
+                </div>
+
                 <button type="submit">Search</button>
             </form>
         </div>
@@ -364,15 +492,84 @@
                 'php': 'php',
                 'rb': 'ruby',
                 'sh': 'bash',
+                'bash': 'bash',
+                'zsh': 'bash',
+                'fish': 'bash',
+                'ps1': 'powershell',
+                'swift': 'swift',
                 'yml': 'yaml',
                 'yaml': 'yaml',
                 'json': 'json',
-                'xml': 'xml',
-                'html': 'html',
+                'xml': 'markup',
+                'html': 'markup',
+                'htm': 'markup',
+                'xhtml': 'markup',
                 'css': 'css',
-                'md': 'markdown'
+                'scss': 'css',
+                'sass': 'css',
+                'less': 'css',
+                'md': 'markdown',
+                'markdown': 'markdown',
+                'Dockerfile': 'dockerfile',
+                'dockerfile': 'dockerfile'
+                ,
+                // common C/C++ variants
+                'cc': 'cpp',
+                'cxx': 'cpp',
+                'hh': 'cpp',
+                'hxx': 'cpp'
             };
             return langMap[ext] || '';
+        }
+
+        // Convert git URL to web URL for repository browsing
+        function gitUrlToWebUrl(gitUrl, path, branch = 'main') {
+            if (!gitUrl) return `file://${gitUrl}/${path}`;
+
+            // Handle HTTPS git URLs
+            if (gitUrl.startsWith('https://')) {
+                let webUrl = gitUrl;
+                if (webUrl.endsWith('.git')) {
+                    webUrl = webUrl.slice(0, -4);
+                }
+
+                // GitHub
+                if (webUrl.includes('github.com')) {
+                    return `${webUrl}/blob/${branch}/${path}`;
+                }
+                // GitLab
+                if (webUrl.includes('gitlab.com')) {
+                    return `${webUrl}/-/blob/${branch}/${path}`;
+                }
+                // Bitbucket
+                if (webUrl.includes('bitbucket.org')) {
+                    return `${webUrl}/src/${branch}/${path}`;
+                }
+                // Default: assume GitHub-like structure
+                return `${webUrl}/blob/${branch}/${path}`;
+            }
+
+            // Handle SSH git URLs (git@host:user/repo.git)
+            const sshMatch = gitUrl.match(/^git@([^:]+):(.+)\.git$/);
+            if (sshMatch) {
+                const host = sshMatch[1];
+                const repoPath = sshMatch[2];
+
+                if (host === 'github.com') {
+                    return `https://github.com/${repoPath}/blob/${branch}/${path}`;
+                }
+                if (host === 'gitlab.com') {
+                    return `https://gitlab.com/${repoPath}/-/blob/${branch}/${path}`;
+                }
+                if (host === 'bitbucket.org') {
+                    return `https://bitbucket.org/${repoPath}/src/${branch}/${path}`;
+                }
+                // Default: assume https with same host
+                return `https://${host}/${repoPath}/blob/${branch}/${path}`;
+            }
+
+            // Fallback to file URL for local paths
+            return `file://${gitUrl}/${path}`;
         }
 
         // Simple result formatter: show backend snippet raw inside a pre/code block
@@ -383,11 +580,14 @@
             const symbol = result.symbol || '';
             const snippet = result.snippet || '';
             const nodeId = result.node_id || '';
+            const branch = result.branch || 'main';
 
-            const fileUrl = `file://${repo}/${path}`;
+            const fileUrl = gitUrlToWebUrl(repo, path, branch);
             let title = path;
             if (symbol) title += ` (${symbol})`;
             const language = detectLanguage(path);
+            // Debug: log detected language for this result (useful in browser console)
+            console.debug('detectLanguage:', path, '->', language);
 
             const codeContent = snippet && snippet !== 'null' ? escapeHtml(snippet) : null;
 
@@ -399,7 +599,7 @@
                     </div>
                     ${codeContent ? `
                         <div class="result-snippet">
-                            <pre><code class="language-${language}">${codeContent}</code></pre>
+                            <pre><code class="language-${language}${language === 'cpp' ? ' language-c' : ''}">${codeContent}</code></pre>
                         </div>
                     ` : ''}
                 </div>

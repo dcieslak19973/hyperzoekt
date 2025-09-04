@@ -42,7 +42,10 @@ use web_utils::SessionEntry;
 use anyhow::Result;
 use base64::Engine;
 
-use zoekt_distributed::{load_node_config, MergeOpts, NodeConfig, NodeType};
+use zoekt_distributed::{
+    lease_manager::{LeaseManager, RemoteRepo},
+    load_node_config, MergeOpts, NodeConfig, NodeType,
+};
 
 #[derive(Parser)]
 struct Opts {
@@ -68,6 +71,8 @@ struct AppStateInner {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     // HMAC key for signing session ids (optional—if empty, unsigned cookies accepted)
     session_hmac_key: Option<Vec<u8>>,
+    // Lease manager for fetching current lease status
+    lease_manager: Arc<LeaseManager>,
 }
 
 type AppState = Arc<AppStateInner>;
@@ -283,17 +288,25 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                                             );
                                         }
                                     }
-                                    if let Some(n) = v.get("leased_node") {
-                                        if !n.is_null() {
-                                            if let Some(s) = n.as_str() {
-                                                obj.insert(
-                                                    "leased_node".to_string(),
-                                                    serde_json::Value::String(s.to_string()),
-                                                );
-                                            } else {
-                                                obj.insert("leased_node".to_string(), n.clone());
-                                            }
-                                        }
+                                    // Get current lease holder from Redis lease keys for real-time accuracy
+                                    let remote_repo = RemoteRepo {
+                                        name: name.clone(),
+                                        git_url: url.clone(),
+                                        branch: Some(branch.to_string()),
+                                        visibility: zoekt_rs::types::RepoVisibility::Public,
+                                        owner: None,
+                                        allowed_users: Vec::new(),
+                                        last_commit_sha: None,
+                                    };
+                                    if let Some(current_holder) = state
+                                        .lease_manager
+                                        .get_current_lease_holder(&remote_repo)
+                                        .await
+                                    {
+                                        obj.insert(
+                                            "leased_node".to_string(),
+                                            serde_json::Value::String(current_holder),
+                                        );
                                     }
                                     branch_objs.push(serde_json::Value::Object(obj));
                                 }
@@ -1087,17 +1100,29 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                                             );
                                         }
                                     }
-                                    if let Some(n) = v.get("leased_node") {
-                                        if !n.is_null() {
-                                            if let Some(s) = n.as_str() {
-                                                obj.insert(
-                                                    "leased_node".to_string(),
-                                                    serde_json::Value::String(s.to_string()),
-                                                );
-                                            } else {
-                                                obj.insert("leased_node".to_string(), n.clone());
-                                            }
-                                        }
+                                    // Get current lease holder from Redis instead of stale metadata
+                                    let current_lease_holder = if let Some(_pool) =
+                                        &state.redis_pool
+                                    {
+                                        let repo = RemoteRepo {
+                                            name: name.clone(),
+                                            git_url: url.clone(),
+                                            branch: Some(branch.to_string()),
+                                            visibility: zoekt_rs::types::RepoVisibility::Public,
+                                            owner: None,
+                                            allowed_users: Vec::new(),
+                                            last_commit_sha: None,
+                                        };
+                                        state.lease_manager.get_current_lease_holder(&repo).await
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(lease_holder) = current_lease_holder {
+                                        obj.insert(
+                                            "leased_node".to_string(),
+                                            serde_json::Value::String(lease_holder),
+                                        );
                                     }
                                     branch_details.push(serde_json::Value::Object(obj));
                                 }
@@ -1125,6 +1150,14 @@ struct IndexerInfo {
     endpoint: String,
     last_heartbeat: Option<i64>,
     status: String,
+}
+
+#[derive(Serialize)]
+struct LeaseInfo {
+    repository: String,
+    branch: String,
+    holder: String,
+    expires: String,
 }
 
 async fn api_indexers(state: Extension<AppState>) -> impl IntoResponse {
@@ -1167,9 +1200,68 @@ async fn api_indexers(state: Extension<AppState>) -> impl IntoResponse {
     Json(out)
 }
 
+async fn api_leases(state: Extension<AppState>) -> impl IntoResponse {
+    let mut out: Vec<LeaseInfo> = Vec::new();
+    if let Some(pool) = &state.redis_pool {
+        // Get all keys from Redis - lease keys are base64-encoded strings
+        if let Ok(all_keys) = pool
+            .eval_vec_string("return redis.call('keys', '*')", &[], &[])
+            .await
+        {
+            for key in all_keys {
+                // Try to decode the key as base64 to see if it's a lease key
+                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE.decode(&key) {
+                    if let Ok(decoded_str) = String::from_utf8(decoded) {
+                        // Parse the decoded string: format is "repo_name|git_url|branch_name"
+                        let parts: Vec<&str> = decoded_str.split('|').collect();
+                        if parts.len() >= 3 {
+                            let repo_name = parts[0];
+                            let branch_name = parts[2];
+
+                            // Get the holder from Redis
+                            let holder_result = pool.get(&key).await;
+
+                            if let Ok(Some(holder)) = holder_result {
+                                // Get TTL for expiry information
+                                let ttl_result = pool
+                                    .eval_i32("return redis.call('ttl', KEYS[1])", &[&key], &[])
+                                    .await;
+
+                                let expires = match ttl_result {
+                                    Ok(ttl) if ttl > 0 => {
+                                        let expiry_time = chrono::Utc::now()
+                                            + chrono::Duration::seconds(ttl as i64);
+                                        expiry_time.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                                    }
+                                    _ => "Unknown".to_string(),
+                                };
+
+                                out.push(LeaseInfo {
+                                    repository: repo_name.to_string(),
+                                    branch: branch_name.to_string(),
+                                    holder,
+                                    expires,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Json(out)
+}
+
 #[derive(Deserialize)]
 struct DeleteIndexerForm {
     node_id: String,
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteLeaseForm {
+    repository: String,
+    branch: String,
     csrf: String,
 }
 
@@ -1278,42 +1370,42 @@ async fn delete_indexer_inner(
 
         // Clean up leases held by this indexer
         let mut leases_released = 0;
-        if let Ok(branch_meta_entries) = pool.hgetall("zoekt:repo_branch_meta").await {
-            for (field, meta_json) in branch_meta_entries {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
-                    if let Some(leased_node) = v.get("leased_node").and_then(|n| n.as_str()) {
-                        if leased_node == form.node_id {
-                            // This branch is leased by the indexer we're deleting
-                            // Parse the field to get repo and branch names
-                            if let Some((repo_name, branch)) = field.split_once('|') {
-                                // Create a lease key to release
-                                let lease_key = format!(
-                                    "lease:{}",
-                                    base64::engine::general_purpose::URL_SAFE
-                                        .encode(format!("{}||{}", repo_name, ""))
-                                );
-                                // Try to delete the lease key if it exists
-                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+        if let Ok(branch_entries) = pool.hgetall("zoekt:repo_branches").await {
+            for (field, git_url) in branch_entries {
+                // Parse the field to get repo and branch names
+                if let Some((repo_name, branch)) = field.split_once('|') {
+                    // Construct the lease key using the same format as lease_manager.rs
+                    let lease_key = base64::engine::general_purpose::URL_SAFE
+                        .encode(format!("{}|{}|{}", repo_name, git_url, branch));
 
-                                // Also try with the branch-specific key format
-                                let lease_key_with_branch = format!(
-                                    "lease:{}",
-                                    base64::engine::general_purpose::URL_SAFE
-                                        .encode(format!("{}||{}", repo_name, branch))
-                                );
-                                let _ = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key_with_branch], &[]).await;
-
+                    // Check if this lease key exists and is held by the indexer being deleted
+                    if let Ok(Some(holder)) = pool.get(&lease_key).await {
+                        if holder == form.node_id {
+                            // This lease is held by the indexer we're deleting - release it
+                            let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+                            if delete_result.is_ok() {
                                 leases_released += 1;
+                                tracing::info!(
+                                    request_id=%req_id,
+                                    node_id=%form.node_id,
+                                    repo=%repo_name,
+                                    branch=%branch,
+                                    "released lease during indexer deletion"
+                                );
+                            }
+                        }
+                    }
 
-                                // Clear the leased_node from the branch metadata
-                                let mut updated_meta = v.clone();
-                                updated_meta["leased_node"] = serde_json::Value::Null;
+                    // Also clean up any leased_node field in metadata for backwards compatibility
+                    let meta_field = format!("{}|{}", repo_name, branch);
+                    if let Ok(Some(meta_json)) =
+                        pool.hget("zoekt:repo_branch_meta", &meta_field).await
+                    {
+                        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                            if v.get("leased_node").is_some() {
+                                v["leased_node"] = serde_json::Value::Null;
                                 let _ = pool
-                                    .hset(
-                                        "zoekt:repo_branch_meta",
-                                        &field,
-                                        &updated_meta.to_string(),
-                                    )
+                                    .hset("zoekt:repo_branch_meta", &meta_field, &v.to_string())
                                     .await;
                             }
                         }
@@ -1334,6 +1426,198 @@ async fn delete_indexer_inner(
                 "success": true,
                 "node_id": form.node_id,
                 "leases_released": leases_released
+            });
+            let mut resp = into_boxed_response((StatusCode::OK, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+
+        // For HTML response, redirect back to index
+        let mut resp = into_boxed_response(Redirect::to("/"));
+        resp.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+            HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        resp
+    } else {
+        tracing::error!(request_id=%req_id, "No Redis connection available");
+        if wants_json(&headers) {
+            let body = json!({"error": "no_redis_connection"});
+            let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        into_boxed_response((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html("<h1>No Redis connection</h1>".to_string()),
+        ))
+    }
+}
+
+async fn delete_lease_inner(
+    state: Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteLeaseForm>,
+) -> impl IntoResponse {
+    let req_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(gen_token);
+    tracing::info!(request_id=%req_id, repository=%form.repository, branch=%form.branch, "delete_lease: incoming");
+
+    // Authentication check
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let has_session = if let Some(sid) = &sid_opt {
+        let map = state.sessions.read();
+        map.get(sid)
+            .map(|(_tok, exp, _u)| Instant::now() < *exp)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_basic && !has_session {
+        tracing::warn!(request_id=%req_id, outcome=%"delete_lease_unauthorized");
+        if wants_json(&headers) {
+            let body = json!({"error": "unauthorized"});
+            let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
+        }
+        return into_boxed_response(Redirect::to("/login"));
+    }
+
+    // Validate CSRF if we have a session
+    if let Some(sid) = sid_opt {
+        let map = state.sessions.read();
+        if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
+            tracing::warn!(request_id=%req_id, outcome=%"delete_lease_forbidden_csrf_mismatch");
+            if wants_json(&headers) {
+                let body = json!({"error": "csrf_mismatch"});
+                let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::FORBIDDEN,
+                Html("<h1>Forbidden</h1>".to_string()),
+            ));
+        }
+    }
+
+    if let Some(pool) = &state.redis_pool {
+        // Check if the lease exists by looking up the branch metadata
+        let field = format!("{}|{}", form.repository, form.branch);
+        let exists: bool = pool
+            .hget("zoekt:repo_branch_meta", &field)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            tracing::warn!(request_id=%req_id, repository=%form.repository, branch=%form.branch, outcome=%"delete_lease_not_found");
+            if wants_json(&headers) {
+                let body = json!({"error": "lease_not_found"});
+                let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::NOT_FOUND,
+                Html("<h1>Lease not found</h1>".to_string()),
+            ));
+        }
+
+        // Get the git_url for this repository branch to construct the correct lease key
+        let git_url: Option<String> = pool
+            .hget("zoekt:repo_branches", &field)
+            .await
+            .ok()
+            .flatten();
+
+        let git_url = match git_url {
+            Some(url) => url,
+            None => {
+                tracing::error!(request_id=%req_id, repository=%form.repository, branch=%form.branch, "Could not find git_url for repository branch");
+                if wants_json(&headers) {
+                    let body = json!({"error": "repository_not_found"});
+                    let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
+                    resp.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        HeaderValue::from_str(&req_id)
+                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                    );
+                    return resp;
+                }
+                return into_boxed_response((
+                    StatusCode::NOT_FOUND,
+                    Html("<h1>Repository not found</h1>".to_string()),
+                ));
+            }
+        };
+
+        // Construct the lease key using the same format as lease_manager.rs
+        let lease_key = base64::engine::general_purpose::URL_SAFE
+            .encode(format!("{}|{}|{}", form.repository, git_url, form.branch));
+
+        let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
+
+        if delete_result.is_err() {
+            tracing::error!(request_id=%req_id, repository=%form.repository, branch=%form.branch, error=?delete_result.err(), "Failed to delete lease");
+            if wants_json(&headers) {
+                let body = json!({"error": "delete_failed"});
+                let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-request-id"),
+                    HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+                );
+                return resp;
+            }
+            return into_boxed_response((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<h1>Failed to delete lease</h1>".to_string()),
+            ));
+        }
+
+        // Clear the leased_node from the branch metadata
+        if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_branch_meta", &field).await {
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
+                v["leased_node"] = serde_json::Value::Null;
+                let _ = pool
+                    .hset("zoekt:repo_branch_meta", &field, &v.to_string())
+                    .await;
+            }
+        }
+
+        tracing::info!(
+            request_id=%req_id,
+            repository=%form.repository,
+            branch=%form.branch,
+            outcome=%"delete_lease_success"
+        );
+
+        if wants_json(&headers) {
+            let body = json!({
+                "success": true,
+                "repository": form.repository,
+                "branch": form.branch
             });
             let mut resp = into_boxed_response((StatusCode::OK, Json(body)));
             resp.headers_mut().insert(
@@ -1437,6 +1721,7 @@ fn make_app(state: AppState) -> Router {
         .route("/", get(index))
         .route("/api/repos", get(api_repos))
         .route("/api/indexers", get(api_indexers))
+        .route("/api/leases", get(api_leases))
         .route("/login", get(login_get))
         .route("/login", post(login_post))
         .route("/logout", get(logout))
@@ -1456,6 +1741,12 @@ fn make_app(state: AppState) -> Router {
             "/delete-indexer",
             post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteIndexerForm>| async move {
                 delete_indexer_inner(state, headers, Form(form)).await
+            }),
+        )
+        .route(
+            "/delete-lease",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteLeaseForm>| async move {
+                delete_lease_inner(state, headers, Form(form)).await
             }),
         )
         .route(
@@ -1928,6 +2219,9 @@ async fn main() -> Result<()> {
     let redis_pool = zoekt_distributed::redis_adapter::create_redis_pool()
         .map(|p| std::sync::Arc::new(RealRedis { pool: p }) as std::sync::Arc<dyn DynRedis>);
 
+    // Create lease manager
+    let lease_manager = Arc::new(LeaseManager::new().await);
+
     // Admin credentials from env (user requested ZOEKT_ADMIN_{USERNAME,PASSWORD})
     let admin_user = std::env::var("ZOEKT_ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
     let admin_pass = std::env::var("ZOEKT_ADMIN_PASSWORD").unwrap_or_else(|_| "password".into());
@@ -1943,6 +2237,7 @@ async fn main() -> Result<()> {
         admin_pass: admin_pass.clone(),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         session_hmac_key,
+        lease_manager,
     });
 
     let app = make_app(state.clone());
@@ -1982,6 +2277,7 @@ async fn login_create_delete_flow_inprocess() {
         admin_pass: "pass1".into(),
         sessions: sessions.clone(),
         session_hmac_key: None,
+        lease_manager: Arc::new(LeaseManager::new().await),
     });
     let app1 = make_app(state.clone());
 
@@ -2048,11 +2344,25 @@ mod tests {
             Ok(lock.take().unwrap_or(0))
         }
 
+        async fn eval_vec_string(
+            &self,
+            _script: &str,
+            _keys: &[&str],
+            _args: &[&str],
+        ) -> anyhow::Result<Vec<String>> {
+            // For mock, return empty vec for lease keys
+            Ok(vec![])
+        }
+
         async fn hset(&self, _key: &str, _field: &str, _value: &str) -> anyhow::Result<()> {
             Ok(())
         }
 
         async fn hget(&self, _key: &str, _field: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
 
@@ -2078,6 +2388,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
         let req = Request::builder().uri("/").body(Body::empty()).unwrap();
@@ -2103,6 +2414,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
 
@@ -2138,6 +2450,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
         let req = Request::builder()
@@ -2172,6 +2485,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
         let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
@@ -2208,6 +2522,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
 
@@ -2247,6 +2562,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
 
@@ -2276,6 +2592,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state.clone());
 
@@ -2324,6 +2641,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state.clone());
 
@@ -2363,6 +2681,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state.clone());
 
@@ -2451,6 +2770,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
 
@@ -2490,6 +2810,7 @@ mod tests {
             admin_pass: "pass1".into(),
             sessions: sessions.clone(),
             session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
         });
         let app = make_app(state);
 

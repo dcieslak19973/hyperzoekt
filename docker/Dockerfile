@@ -22,8 +22,8 @@ RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexe
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
 
-# Install ca-certificates for HTTPS requests
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install ca-certificates for HTTPS requests and git for repository operations
+RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
 WORKDIR /app

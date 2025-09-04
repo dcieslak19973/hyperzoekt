@@ -22,7 +22,8 @@ document.addEventListener('DOMContentLoaded', function () {
             // Parse UTC timestamp (ISO format: 2025-09-02T14:44:00.000Z)
             const date = new Date(utcTimestamp);
             if (isNaN(date.getTime())) return utcTimestamp; // fallback to original if parsing fails
-            return date.toLocaleString();
+            // Format without comma between date and time
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
         } catch (e) {
             return utcTimestamp; // fallback to original on error
         }
@@ -38,6 +39,9 @@ document.addEventListener('DOMContentLoaded', function () {
     const tabIndexersBtn = document.getElementById('tab-indexers');
     const indexersTab = document.getElementById('indexers-tab');
     const indexerTableBody = document.getElementById('indexer-table-body');
+    const tabLeasesBtn = document.getElementById('tab-leases');
+    const leasesTab = document.getElementById('leases-tab');
+    const leaseTableBody = document.getElementById('lease-table-body');
     // remember current sort state so dynamic updates can reapply it
     const TABLE_SORT_KEY = 'dzr_table_sort';
     // Load saved sort state from localStorage if present
@@ -381,7 +385,41 @@ document.addEventListener('DOMContentLoaded', function () {
         if (window.applyCurrentSort) window.applyCurrentSort();
     }
 
-    // Indexers tab handling: fetch and display indexer status
+    // Leases tab handling: fetch and display active leases
+    function refreshLeasesTable() {
+        if (!leaseTableBody) return;
+
+        fetch('/api/leases', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                // clear and repopulate
+                leaseTableBody.innerHTML = '';
+                for (const lease of data) {
+                    const tr = document.createElement('tr');
+
+                    // Format expiry time
+                    let expiryDisplay = 'Unknown';
+                    if (lease.expires) {
+                        const date = new Date(lease.expires);
+                        expiryDisplay = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+                    }
+
+                    // Get CSRF token from the create form
+                    const csrfToken = document.querySelector('input[name="csrf"]').value || '';
+
+                    tr.innerHTML = `<td>${escapeHtml(lease.repository)}</td><td>${escapeHtml(lease.branch)}</td><td>${escapeHtml(lease.holder)}</td><td>${escapeHtml(expiryDisplay)}</td><td><form class="delete-lease-form" data-repo="${escapeHtml(lease.repository)}" data-branch="${escapeHtml(lease.branch)}"><input type="hidden" name="repository" value="${escapeHtml(lease.repository)}"/><input type="hidden" name="branch" value="${escapeHtml(lease.branch)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"/><button type="submit" style="background: var(--danger); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Delete</button></form></td>`;
+                    leaseTableBody.appendChild(tr);
+                }
+                // apply saved sort state if the leases table header supports it
+                if (window.applyCurrentSort) window.applyCurrentSort();
+            })
+            .catch(e => {
+                console.warn('Failed to fetch leases:', e);
+                leaseTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--muted);">Failed to load lease data</td></tr>';
+            });
+    }
+
+    // Indexers tab handling: fetch and display indexer nodes
     function refreshIndexersTable() {
         if (!indexerTableBody) return;
 
@@ -393,27 +431,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 for (const indexer of data) {
                     const tr = document.createElement('tr');
 
-                    // Format last heartbeat
+                    // Format last heartbeat time
                     let heartbeatDisplay = 'Never';
                     if (indexer.last_heartbeat) {
-                        heartbeatDisplay = new Date(indexer.last_heartbeat).toLocaleString();
-                    }
-
-                    // Status styling
-                    let statusClass = '';
-                    let statusText = indexer.status;
-                    if (indexer.status === 'online') {
-                        statusClass = 'style="color: #10b981;"'; // green
-                    } else if (indexer.status === 'stale') {
-                        statusClass = 'style="color: #f59e0b;"'; // amber
-                    } else if (indexer.status === 'offline') {
-                        statusClass = 'style="color: #ef4444;"'; // red
+                        const date = new Date(indexer.last_heartbeat);
+                        heartbeatDisplay = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
                     }
 
                     // Get CSRF token from the create form
                     const csrfToken = document.querySelector('input[name="csrf"]').value || '';
 
-                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td ${statusClass}>${escapeHtml(statusText)}</td><td><form class="delete-indexer-form" data-node-id="${escapeHtml(indexer.node_id)}"><input type="hidden" name="node_id" value="${escapeHtml(indexer.node_id)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"/><button type="submit" style="background: var(--danger); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Delete</button></form></td>`;
+                    tr.innerHTML = `<td>${escapeHtml(indexer.node_id)}</td><td>${escapeHtml(indexer.endpoint)}</td><td>${escapeHtml(heartbeatDisplay)}</td><td>${escapeHtml(indexer.status)}</td><td><form class="delete-indexer-form" data-node-id="${escapeHtml(indexer.node_id)}"><input type="hidden" name="node_id" value="${escapeHtml(indexer.node_id)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"/><button type="submit" style="background: var(--danger); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Delete</button></form></td>`;
                     indexerTableBody.appendChild(tr);
                 }
                 // apply saved sort state if the indexers table header supports it
@@ -423,6 +451,48 @@ document.addEventListener('DOMContentLoaded', function () {
                 console.warn('Failed to fetch indexers:', e);
                 indexerTableBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--muted);">Failed to load indexer data</td></tr>';
             });
+    }
+
+    // Add event listener for delete lease forms
+    if (leaseTableBody) {
+        leaseTableBody.addEventListener('submit', function (e) {
+            const f = e.target;
+            if (f && f.classList && f.classList.contains('delete-lease-form')) {
+                e.preventDefault();
+                const repo = f.dataset.repo || '';
+                const branch = f.dataset.branch || '';
+                if (!confirm(`Delete lease for repository '${repo}' branch '${branch}'?`)) return;
+                const formData = new URLSearchParams(new FormData(f));
+                fetch('/delete-lease', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'same-origin',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
+                    }
+                }).then(r => {
+                    if (r.ok) return r.json();
+                    // Try to parse JSON error body
+                    return r.json().then(j => {
+                        let msg = 'Delete lease failed';
+                        if (j && j.error) {
+                            msg = `Delete lease failed: ${j.error}`;
+                        } else {
+                            msg = `Delete lease failed: ${r.status} ${r.statusText}`;
+                        }
+                        throw new Error(msg);
+                    }).catch(() => {
+                        throw new Error(`Delete lease failed: ${r.status} ${r.statusText}`);
+                    });
+                }).then(data => {
+                    // remove row
+                    const row = f.closest('tr'); if (row) { row.remove(); }
+                    // Show success message
+                    alert(`Lease for repository '${repo}' branch '${branch}' deleted successfully!`);
+                }).catch(err => alert(err && err.message ? err.message : String(err)));
+            }
+        });
     }
 
     // Add event listener for delete indexer forms
@@ -460,29 +530,29 @@ document.addEventListener('DOMContentLoaded', function () {
                     // remove row
                     const row = f.closest('tr'); if (row) { row.remove(); }
                     // Show success message
-                    let msg = `Indexer '${nodeId}' deleted successfully!`;
-                    if (data.leases_released && data.leases_released > 0) {
-                        msg += ` ${data.leases_released} lease(s) were released.`;
-                    }
-                    alert(msg);
+                    const leasesReleased = data.leases_released || 0;
+                    alert(`Indexer '${nodeId}' deleted successfully! ${leasesReleased} lease(s) were released.`);
                 }).catch(err => alert(err && err.message ? err.message : String(err)));
             }
         });
     }
 
     // tab switching
-    if (tabReposBtn && tabBranchesBtn && tabIndexersBtn && reposTab && branchesTab && indexersTab) {
+    if (tabReposBtn && tabBranchesBtn && tabIndexersBtn && tabLeasesBtn && reposTab && branchesTab && indexersTab && leasesTab) {
         tabReposBtn.addEventListener('click', () => {
             reposTab.style.display = '';
             branchesTab.style.display = 'none';
             indexersTab.style.display = 'none';
+            leasesTab.style.display = 'none';
             tabReposBtn.setAttribute('aria-pressed', 'true');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
             tabIndexersBtn.setAttribute('aria-pressed', 'false');
+            tabLeasesBtn.setAttribute('aria-pressed', 'false');
             // visual tab styling
             reposTab.classList.add('tabbed');
             branchesTab.classList.remove('tabbed');
             indexersTab.classList.remove('tabbed');
+            leasesTab.classList.remove('tabbed');
             // show add/import cards
             showAddImport(true);
         });
@@ -490,13 +560,16 @@ document.addEventListener('DOMContentLoaded', function () {
             reposTab.style.display = 'none';
             branchesTab.style.display = '';
             indexersTab.style.display = 'none';
+            leasesTab.style.display = 'none';
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'true');
             tabIndexersBtn.setAttribute('aria-pressed', 'false');
+            tabLeasesBtn.setAttribute('aria-pressed', 'false');
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.add('tabbed');
             indexersTab.classList.remove('tabbed');
+            leasesTab.classList.remove('tabbed');
             // hide add/import cards when viewing branches
             showAddImport(false);
             refreshBranchesTable();
@@ -505,16 +578,37 @@ document.addEventListener('DOMContentLoaded', function () {
             reposTab.style.display = 'none';
             branchesTab.style.display = 'none';
             indexersTab.style.display = '';
+            leasesTab.style.display = 'none';
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
             tabIndexersBtn.setAttribute('aria-pressed', 'true');
+            tabLeasesBtn.setAttribute('aria-pressed', 'false');
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.remove('tabbed');
             indexersTab.classList.add('tabbed');
+            leasesTab.classList.remove('tabbed');
             // hide add/import cards when viewing indexers
             showAddImport(false);
             refreshIndexersTable();
+        });
+        tabLeasesBtn.addEventListener('click', () => {
+            reposTab.style.display = 'none';
+            branchesTab.style.display = 'none';
+            indexersTab.style.display = 'none';
+            leasesTab.style.display = '';
+            tabReposBtn.setAttribute('aria-pressed', 'false');
+            tabBranchesBtn.setAttribute('aria-pressed', 'false');
+            tabIndexersBtn.setAttribute('aria-pressed', 'false');
+            tabLeasesBtn.setAttribute('aria-pressed', 'true');
+            // visual tab styling
+            reposTab.classList.remove('tabbed');
+            branchesTab.classList.remove('tabbed');
+            indexersTab.classList.remove('tabbed');
+            leasesTab.classList.add('tabbed');
+            // hide add/import cards when viewing leases
+            showAddImport(false);
+            refreshLeasesTable();
         });
     }
 
@@ -662,6 +756,11 @@ document.addEventListener('DOMContentLoaded', function () {
                 // Also refresh indexers table if it's visible
                 if (indexersTab && indexersTab.style.display !== 'none') {
                     refreshIndexersTable();
+                }
+
+                // Also refresh leases table if it's visible
+                if (leasesTab && leasesTab.style.display !== 'none') {
+                    refreshLeasesTable();
                 }
             } catch (e) { console.warn('poll error', e); }
         }

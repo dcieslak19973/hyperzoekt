@@ -4,18 +4,20 @@ services:
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   surrealdb:
-    image: surrealdb/surrealdb:v2.3.1
+    image: surrealdb/surrealdb:latest
     ports:
       - "8000:8000"
-    command: start --bind 0.0.0.0:8000 --user root --pass root memory
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    user: "1000:1000"
+    command: start --user root --pass root memory
+    restart: unless-stopped
+  # Note: no in-container healthcheck because the surrealdb image may not include curl/wget.
+  # An external prober service below performs the HTTP health check instead.
 
   indexer:
     build:
@@ -25,18 +27,19 @@ services:
       - "7676:7676"
     environment:
       - REDIS_URL=redis://redis:6379
-      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:7676
+      - ZOEKT_ENDPOINT=http://indexer:7676
     command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676"]
     depends_on:
-      - redis
-      - surrealdb
-    volumes:
-      - ../:/tmp/repos:ro
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
 
   admin:
     build:
@@ -46,7 +49,8 @@ services:
       - "7878:7878"
     environment:
       - REDIS_URL=redis://redis:6379
-      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
@@ -55,8 +59,10 @@ services:
       - ZOEKT_ADMIN_PASSWORD=password
     command: ["/app/dzr-admin", "--bind", "0.0.0.0:7878"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
 
   search:
     build:
@@ -66,7 +72,7 @@ services:
       - "8080:8080"
     environment:
       - REDIS_URL=redis://redis:6379
-      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
@@ -74,8 +80,10 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:8080
     command: ["/app/dzr-http-search", "--listen", "0.0.0.0:8080"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
 
   mcp:
     build:
@@ -85,7 +93,7 @@ services:
       - "7979:7979"
     environment:
       - REDIS_URL=redis://redis:6379
-      - SURREALDB_URL=ws://surrealdb:8000/rpc
+      - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
@@ -93,5 +101,20 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:7979
     command: ["/app/dzr-mcp-search", "--listen", "0.0.0.0:7979"]
     depends_on:
-      - redis
-      - surrealdb
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  surrealdb-prober:
+    image: curlimages/curl:8.3.0
+    command: ["tail", "-f", "/dev/null"]
+    depends_on:
+      surrealdb:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://surrealdb:8000/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
