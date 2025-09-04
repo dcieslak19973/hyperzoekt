@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::repo_index::indexer::payload::EntityPayload;
 use anyhow::Result;
-use hyperzoekt::repo_index::indexer::payload::EntityPayload;
 use log::{error, info, trace, warn};
 // use serde_json; // use fully-qualified path where needed
 use std::sync::mpsc::{sync_channel, SyncSender};

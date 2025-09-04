@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::index;
-use hyperzoekt::repo_index::indexer::payload::EntityPayload;
+use crate::repo_index::indexer::payload::EntityPayload;
 use log::{info, warn};
 use notify::Watcher;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode};

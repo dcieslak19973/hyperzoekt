@@ -17,11 +17,12 @@ use log::{error, info, warn};
 use serde_json::json;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-mod db_writer;
-mod index;
-mod watcher;
+use hyperzoekt::db_writer;
+use hyperzoekt::event_consumer;
+use hyperzoekt::watcher;
 
 use hyperzoekt::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
 use sha2::Digest;
@@ -43,10 +44,6 @@ struct Args {
     incremental: bool,
     #[arg(long)]
     debug: bool,
-    #[arg(long)]
-    mcp_stdio: bool,
-    #[arg(long)]
-    mcp_http: bool,
     #[arg(long)]
     stream_once: bool,
 }
@@ -92,8 +89,20 @@ impl AppConfig {
     }
 }
 
-fn main() -> Result<(), anyhow::Error> {
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
+
+    // If HYPERZOEKT_LOG_FILE is set, redirect stderr to that file for logging
+    if let Ok(log_file_path) = std::env::var("HYPERZOEKT_LOG_FILE") {
+        let log_file = File::create(&log_file_path).expect("Failed to create log file");
+        let fd = log_file.as_raw_fd();
+        unsafe {
+            libc::dup2(fd, libc::STDERR_FILENO);
+        }
+        // Keep the file open until the end, but dup2 duplicates the fd
+    }
+
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::Builder::from_env(env).init();
     let (app_cfg, cfg_path) = AppConfig::load(args.config.as_ref())?;
@@ -130,11 +139,6 @@ fn main() -> Result<(), anyhow::Error> {
         "Index build finished (files_indexed={} entities_indexed={})",
         stats.files_indexed, stats.entities_indexed
     );
-
-    // MCP delegation (not used in tests)
-    if args.mcp_stdio || args.mcp_http {
-        return hyperzoekt::mcp::run_mcp(svc, args.mcp_stdio, args.mcp_http);
-    }
 
     // Debug / incremental JSONL output
     let is_incremental = args.incremental || app_cfg.incremental.unwrap_or(false);
@@ -370,11 +374,18 @@ fn main() -> Result<(), anyhow::Error> {
         }
         drop(tx);
         match db_join.join() {
-            Ok(Ok(())) => println!("Streaming import finished (stream-once)"),
+            Ok(Ok(())) => {
+                println!("Streaming import finished (stream-once)");
+            }
             Ok(Err(e)) => error!("DB task failed: {}", e),
             Err(e) => error!("DB thread panicked: {:?}", e),
         }
         return Ok(());
+    }
+
+    // Start the event consumer system for zoekt-distributed integration
+    if let Err(e) = event_consumer::start_event_system().await {
+        warn!("Failed to start event system: {}", e);
     }
 
     // Otherwise start watcher (blocking)
@@ -383,7 +394,9 @@ fn main() -> Result<(), anyhow::Error> {
 
     // If watcher exits, ensure DB thread finishes
     match db_join.join() {
-        Ok(Ok(())) => println!("Streaming import finished"),
+        Ok(Ok(())) => {
+            println!("Streaming import finished");
+        }
         Ok(Err(e)) => error!("DB task failed: {}", e),
         Err(e) => error!("DB thread panicked: {:?}", e),
     }

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use hyperzoekt::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
-use hyperzoekt::repo_index::indexer::{EntityKind, RepoIndexOptions, RepoIndexStats};
-use hyperzoekt::repo_index::RepoIndexService;
+use crate::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
+use crate::repo_index::indexer::{EntityKind, RepoIndexOptions, RepoIndexStats};
+use crate::repo_index::RepoIndexService;
 use sha2::Digest;
 use std::path::Path;
 
