@@ -586,8 +586,8 @@ async fn main() -> Result<()> {
 
     // spawn the node loop in the background (indexing/lease loop)
     let node_handle = tokio::spawn(async move {
-        // run for a long time for demo/dev; in production this would be indefinite
-        let _ = node.run_for(Duration::from_secs(60 * 60)).await;
+        // run indefinitely for production
+        let _ = node.run_for(Duration::from_secs(u64::MAX)).await;
     }); // start a small HTTP server to answer search requests against the in-memory indexes
     let app = axum::Router::new()
         .route(

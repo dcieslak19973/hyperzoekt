@@ -35,6 +35,7 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:7676
       - ZOEKT_ENDPOINT=http://indexer:7676
     command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
