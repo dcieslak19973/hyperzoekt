@@ -29,7 +29,6 @@ env_logger = "0.11"
 # SurrealDB client for importer/streaming integration. This is a core dependency.
 surrealdb = { version = "2.3", features = ["kv-mem", "protocol-ws", "protocol-http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-notify = "8.2"
 toml = "0.7"
 sha2 = "0.10"
 signal-hook = "0.3.18"

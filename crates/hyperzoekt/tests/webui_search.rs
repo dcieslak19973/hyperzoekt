@@ -22,7 +22,9 @@ use surrealdb::Surreal;
 
 enum SurrealConnection {
     Local(Surreal<surrealdb::engine::local::Db>),
+    #[allow(dead_code)]
     RemoteHttp(Surreal<surrealdb::engine::remote::http::Client>),
+    #[allow(dead_code)]
     RemoteWs(Surreal<surrealdb::engine::remote::ws::Client>),
 }
 
@@ -30,7 +32,9 @@ impl Clone for SurrealConnection {
     fn clone(&self) -> Self {
         match self {
             SurrealConnection::Local(db) => SurrealConnection::Local(db.clone()),
+            #[allow(unreachable_patterns)]
             SurrealConnection::RemoteHttp(db) => SurrealConnection::RemoteHttp(db.clone()),
+            #[allow(unreachable_patterns)]
             SurrealConnection::RemoteWs(db) => SurrealConnection::RemoteWs(db.clone()),
         }
     }
@@ -40,7 +44,9 @@ impl SurrealConnection {
     async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
         match self {
             SurrealConnection::Local(db) => db.query(sql).await,
+            #[allow(unreachable_patterns)]
             SurrealConnection::RemoteHttp(db) => db.query(sql).await,
+            #[allow(unreachable_patterns)]
             SurrealConnection::RemoteWs(db) => db.query(sql).await,
         }
     }
@@ -65,31 +71,38 @@ impl TestDatabase {
         query: &str,
         repo_filter: Option<&str>,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        // Escape single quotes in the query for SQL safety
-        let escaped_query = query.replace("'", "\\'");
+        let query_lower = query.to_lowercase();
 
-        let mut sql_query = format!(
-            r#"
-            SELECT * FROM entity
-            WHERE (string::matches(string::lowercase(name), '{}')
-                   OR string::matches(string::lowercase(signature), '{}')
-                   OR string::matches(string::lowercase(file), '{}'))
-        "#,
-            escaped_query.to_lowercase(),
-            escaped_query.to_lowercase(),
-            escaped_query.to_lowercase()
-        );
+        // Access the underlying Surreal instance for parameterized queries
+        let db = match &*self.db {
+            SurrealConnection::Local(db) => db,
+            _ => panic!("Test database should always use local connection"),
+        };
 
-        if let Some(repo) = repo_filter {
-            sql_query.push_str(&format!(
-                " AND string::starts_with(file, '{}')",
-                repo.replace("'", "\\'")
-            ));
-        }
+        let query_builder = if let Some(repo) = repo_filter {
+            let sql = r#"
+                SELECT * FROM entity
+                WHERE (string::matches(string::lowercase(name), $query)
+                       OR string::matches(string::lowercase(signature), $query)
+                       OR string::matches(string::lowercase(file), $query))
+                AND string::starts_with(file, $repo)
+                ORDER BY rank DESC LIMIT 100
+            "#;
+            db.query(sql)
+                .bind(("query", query_lower.clone()))
+                .bind(("repo", repo.to_string()))
+        } else {
+            let sql = r#"
+                SELECT * FROM entity
+                WHERE (string::matches(string::lowercase(name), $query)
+                       OR string::matches(string::lowercase(signature), $query)
+                       OR string::matches(string::lowercase(file), $query))
+                ORDER BY rank DESC LIMIT 100
+            "#;
+            db.query(sql).bind(("query", query_lower))
+        };
 
-        sql_query.push_str(" ORDER BY rank DESC LIMIT 100");
-
-        let mut response = self.db.query(&sql_query).await?;
+        let mut response = query_builder.await?;
         let entities: Vec<EntityPayload> = response.take(0)?;
 
         Ok(entities)

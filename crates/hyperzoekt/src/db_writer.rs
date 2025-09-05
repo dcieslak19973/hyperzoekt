@@ -107,8 +107,15 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
                         }
                         SurrealConnection::RemoteWs(connection)
                     } else if url.starts_with("http://") || url.starts_with("https://") {
-                        // HTTP connection to SurrealDB - extract host and port
-                        let url_str = url.trim_start_matches("http://").trim_start_matches("https://");
+                        // HTTP connection to SurrealDB - extract host and port using proper URL parsing
+                        let url_str = if let Some(stripped) = url.strip_prefix("https://") {
+                            stripped
+                        } else if let Some(stripped) = url.strip_prefix("http://") {
+                            stripped
+                        } else {
+                            // This should never happen due to the condition above, but handle gracefully
+                            url.as_str()
+                        };
                         info!("Connecting to SurrealDB via HTTP: {} (parsed from {})", url_str, url);
                         let connection = Surreal::new::<Http>(url_str).await?;
                         // Authenticate if credentials are provided

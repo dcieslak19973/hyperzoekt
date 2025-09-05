@@ -23,4 +23,4 @@ pub use repo_index::RepoIndexService;
 pub mod db_writer;
 pub mod event_consumer;
 pub mod index;
-pub mod watcher;
+pub mod utils;

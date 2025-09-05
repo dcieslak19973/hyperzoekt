@@ -19,7 +19,6 @@ use crate::repo_index::RepoIndexService;
 use deadpool_redis::redis::{AsyncCommands, Client};
 use deadpool_redis::{Config as RedisConfig, Pool};
 use log;
-use sha2::Digest;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -455,13 +454,15 @@ impl EventProcessor {
                             });
                             let commit = std::env::var("SURREAL_COMMIT")
                                 .unwrap_or_else(|_| "unknown-commit".into());
-                            let key = format!(
-                                "{}|{}|{}|{}|{}|{}|{}",
-                                project, repo, branch, commit, file.path, ent.name, ent.signature
+                            let stable_id = crate::utils::generate_stable_id(
+                                &project,
+                                &repo,
+                                &branch,
+                                &commit,
+                                &file.path,
+                                &ent.name,
+                                &ent.signature,
                             );
-                            let mut hasher = sha2::Sha256::new();
-                            hasher.update(key.as_bytes());
-                            let stable_id = format!("{:x}", hasher.finalize());
 
                             EntityPayload {
                                 file: file.path.clone(),
@@ -588,10 +589,21 @@ impl EventProcessor {
 
     /// Clone a repository to a temporary directory
     async fn clone_repository(event: &RepoEvent) -> Result<PathBuf, anyhow::Error> {
+        // Sanitize repo name to prevent path traversal attacks
+        let sanitized_repo_name = event
+            .repo_name
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect::<String>();
+
         // Create a temporary directory for the clone
         let temp_dir = std::env::temp_dir().join("hyperzoekt-clones").join(format!(
             "{}-{}",
-            event.repo_name,
+            sanitized_repo_name,
             Uuid::new_v4()
         ));
 
@@ -607,7 +619,7 @@ impl EventProcessor {
 
         log::info!(
             "Cloning {} from {} to {}",
-            event.repo_name,
+            sanitized_repo_name,
             event.git_url,
             temp_dir.display()
         );
@@ -658,7 +670,7 @@ impl EventProcessor {
 
         log::info!(
             "Successfully cloned {} to {}",
-            event.repo_name,
+            sanitized_repo_name,
             temp_dir.display()
         );
         Ok(temp_dir)
@@ -708,5 +720,34 @@ mod tests {
         let e: RepoEvent = serde_json::from_str(json).expect("deserialize");
         assert_eq!(e.event_type, "indexing_finished");
         assert_eq!(e.repo_name, "r");
+    }
+
+    #[test]
+    fn repo_name_sanitization() {
+        // Test that dangerous characters are sanitized
+        let test_cases = vec![
+            ("../../../etc/passwd", ".._.._.._etc_passwd"),
+            ("repo/with/slashes", "repo_with_slashes"),
+            ("repo\\with\\backslashes", "repo_with_backslashes"),
+            ("repo:with:colons", "repo_with_colons"),
+            ("repo*with*asterisks", "repo_with_asterisks"),
+            ("repo?with?questions", "repo_with_questions"),
+            ("repo\"with\"quotes", "repo_with_quotes"),
+            ("repo<with>brackets", "repo_with_brackets"),
+            ("repo|with|pipes", "repo_with_pipes"),
+            ("normal-repo", "normal-repo"),
+        ];
+
+        for (input, expected) in test_cases {
+            let sanitized = input
+                .chars()
+                .map(|c| match c {
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                    c if c.is_control() => '_',
+                    c => c,
+                })
+                .collect::<String>();
+            assert_eq!(sanitized, expected, "Failed to sanitize: {}", input);
+        }
     }
 }

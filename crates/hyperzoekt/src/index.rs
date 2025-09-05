@@ -15,7 +15,6 @@
 use crate::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
 use crate::repo_index::indexer::{EntityKind, RepoIndexOptions, RepoIndexStats};
 use crate::repo_index::RepoIndexService;
-use sha2::Digest;
 use std::path::Path;
 
 pub fn index_single_file(
@@ -88,13 +87,15 @@ pub fn index_single_file(
         });
         let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| "local-branch".into());
         let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "local-commit".into());
-        let key = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            project, repo, branch, commit, file.path, ent.name, ent.signature
+        let stable_id = crate::utils::generate_stable_id(
+            &project,
+            &repo,
+            &branch,
+            &commit,
+            &file.path,
+            &ent.name,
+            &ent.signature,
         );
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(key.as_bytes());
-        let stable_id = format!("{:x}", hasher.finalize());
 
         payloads.push(EntityPayload {
             file: file.path.clone(),

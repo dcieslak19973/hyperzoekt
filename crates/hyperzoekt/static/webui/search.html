@@ -90,8 +90,10 @@
         const repoName = pathParts[0];
         const fileName = pathParts.slice(1).join('/');
 
-        // Create GitHub URL
-        const githubUrl = `https://github.com/${repoName}/${fileName}`;
+        // Create GitHub URL with proper URL encoding to prevent XSS
+        const encodedRepoName = encodeURIComponent(repoName);
+        const encodedFileName = encodeURIComponent(fileName);
+        const githubUrl = `https://github.com/${encodedRepoName}/${encodedFileName}`;
         const urlWithLine = startLine ? `${githubUrl}#L${startLine}` : githubUrl;
 
         // Return HTML link
@@ -135,7 +137,7 @@
                     <a href="/entity/${entity.stable_id}" style="color: #333; text-decoration: none;">
                         ${entity.name}
                     </a>
-                    <span class="badge">${entity.kind}</span>
+                    <span class="badge badge-${getKindClass(entity.kind)}">${entity.kind}</span>
                     <span class="badge ${getLanguageClass(entity.language)}">${entity.language}</span>
                 </div>
                 <div class="entity-meta">

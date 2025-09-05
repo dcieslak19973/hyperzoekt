@@ -37,7 +37,7 @@ services:
       - ZOEKTD_BIND_ADDR=0.0.0.0:7676
       - ZOEKT_ENDPOINT=http://zoekt-indexer:7676
     command: ["/app/dzr-indexer", "--host", "0.0.0.0", "--port", "7676"]
-    # restart: unless-stopped
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -61,6 +61,7 @@ services:
       - ZOEKT_ADMIN_USERNAME=admin
       - ZOEKT_ADMIN_PASSWORD=password
     command: ["/app/dzr-admin", "--host", "0.0.0.0", "--port", "7878"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -83,6 +84,7 @@ services:
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:8080
     command: ["/app/dzr-http-search", "--host", "0.0.0.0", "--port", "8080"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -105,6 +107,7 @@ services:
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:7979
     command: ["/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "7979"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -126,7 +129,7 @@ services:
       - SURREAL_NS=zoekt
       - SURREAL_DB=repos
     command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7677"]
-    # restart: unless-stopped
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy

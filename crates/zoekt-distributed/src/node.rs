@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use zoekt_rs::InMemoryIndex;
 
@@ -748,12 +749,26 @@ impl<I: Indexer> Node<I> {
 
 /// Check if repo events should be emitted based on DISTRIBUTED_ZOEKT_REPO_EVENTS env var.
 /// Returns true if the var is set to a truthy value (1, yes, true, case insensitive).
+static SHOULD_EMIT_REPO_EVENTS: OnceLock<bool> = OnceLock::new();
+
 pub fn should_emit_repo_events() -> bool {
-    if let Ok(val) = std::env::var("DISTRIBUTED_ZOEKT_REPO_EVENTS") {
-        let val_lower = val.to_lowercase();
-        matches!(val_lower.as_str(), "1" | "yes" | "true")
+    if cfg!(test) {
+        // Don't cache in tests to allow env var changes
+        if let Ok(val) = std::env::var("DISTRIBUTED_ZOEKT_REPO_EVENTS") {
+            let val_lower = val.to_lowercase();
+            matches!(val_lower.as_str(), "1" | "yes" | "true")
+        } else {
+            false
+        }
     } else {
-        false
+        *SHOULD_EMIT_REPO_EVENTS.get_or_init(|| {
+            if let Ok(val) = std::env::var("DISTRIBUTED_ZOEKT_REPO_EVENTS") {
+                let val_lower = val.to_lowercase();
+                matches!(val_lower.as_str(), "1" | "yes" | "true")
+            } else {
+                false
+            }
+        })
     }
 }
 

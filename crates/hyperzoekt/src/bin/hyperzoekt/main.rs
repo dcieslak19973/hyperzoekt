@@ -22,10 +22,8 @@ use std::path::PathBuf;
 
 use hyperzoekt::db_writer;
 use hyperzoekt::event_consumer;
-use hyperzoekt::watcher;
 
 use hyperzoekt::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
-use sha2::Digest;
 
 use hyperzoekt::repo_index::indexer::{EntityKind, RepoIndexOptions};
 use hyperzoekt::repo_index::RepoIndexService;
@@ -54,11 +52,6 @@ struct AppConfig {
     out: Option<PathBuf>,
     incremental: Option<bool>,
     debug: Option<bool>,
-    channel_capacity: Option<usize>,
-    debounce_ms: Option<u64>,
-    batch_capacity: Option<usize>,
-    batch_timeout_ms: Option<u64>,
-    max_retries: Option<usize>,
 }
 
 impl AppConfig {
@@ -77,11 +70,6 @@ impl AppConfig {
                     out: None,
                     incremental: None,
                     debug: None,
-                    channel_capacity: None,
-                    debounce_ms: None,
-                    batch_capacity: None,
-                    batch_timeout_ms: None,
-                    max_retries: None,
                 },
                 cfg_path,
             ))
@@ -294,13 +282,15 @@ async fn main() -> Result<(), anyhow::Error> {
             });
             let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| "local-branch".into());
             let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "local-commit".into());
-            let key = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                project, repo, branch, commit, file.path, ent.name, ent.signature
+            let stable_id = hyperzoekt::utils::generate_stable_id(
+                &project,
+                &repo,
+                &branch,
+                &commit,
+                &file.path,
+                &ent.name,
+                &ent.signature,
             );
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(key.as_bytes());
-            let stable_id = format!("{:x}", hasher.finalize());
 
             EntityPayload {
                 file: file.path.clone(),
@@ -322,16 +312,11 @@ async fn main() -> Result<(), anyhow::Error> {
         .collect();
 
     // Start DB writer thread
-    let channel_capacity = app_cfg.channel_capacity.unwrap_or(100usize);
-    let batch_capacity = app_cfg.batch_capacity;
-    let batch_timeout_ms = app_cfg.batch_timeout_ms;
-    let max_retries = app_cfg.max_retries;
-
     let db_cfg = db_writer::DbWriterConfig {
-        channel_capacity,
-        batch_capacity,
-        batch_timeout_ms,
-        max_retries,
+        channel_capacity: 100,
+        batch_capacity: None,
+        batch_timeout_ms: None,
+        max_retries: None,
         surreal_url,
         surreal_username: std::env::var("SURREALDB_USERNAME").ok(),
         surreal_password: std::env::var("SURREALDB_PASSWORD").ok(),
@@ -390,18 +375,8 @@ async fn main() -> Result<(), anyhow::Error> {
         warn!("Failed to start event system: {}", e);
     }
 
-    // Otherwise start watcher (blocking)
-    let debounce_ms = app_cfg.debounce_ms.unwrap_or(200u64);
-    watcher::run_watcher(effective_root.clone(), debounce_ms, tx)?;
-
-    // If watcher exits, ensure DB thread finishes
-    match db_join.join() {
-        Ok(Ok(())) => {
-            println!("Streaming import finished");
-        }
-        Ok(Err(e)) => error!("DB task failed: {}", e),
-        Err(e) => error!("DB thread panicked: {:?}", e),
-    }
-
+    // Wait for event system to run (this will run indefinitely)
+    // The event system handles all indexing now
+    std::future::pending::<()>().await;
     Ok(())
 }
