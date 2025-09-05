@@ -57,10 +57,12 @@ struct Opts {
     lease_ttl_seconds: Option<u64>,
     #[arg(long)]
     poll_interval_seconds: Option<u64>,
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    #[arg(long, default_value_t = 7878)]
-    port: u16,
+    /// Address to listen on
+    #[arg(long)]
+    host: Option<String>,
+    /// Port to listen on
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 struct AppStateInner {
@@ -1757,7 +1759,7 @@ fn make_app(state: AppState) -> Router {
                 bulk_import_inner(state, headers, multipart).await
             }),
         )
-        .nest_service("/static/common", tower_http::services::ServeDir::new("../../static/common"))
+        .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
         .route("/static/admin.js", get(serve_admin_js))
         .route("/static/common/styles.css", get(serve_common_styles))
         .route("/static/common/theme.js", get(serve_common_theme_js))
@@ -2248,7 +2250,22 @@ async fn main() -> Result<()> {
     let sweeper_state = state.clone();
     tokio::spawn(async move { session_sweeper(sweeper_state).await });
 
-    let addr: SocketAddr = format!("{}:{}", opts.host, opts.port).parse()?;
+    // determine bind address from CLI flags, env var, or default
+    let host = opts
+        .host
+        .clone()
+        .or_else(|| std::env::var("ZOEKTD_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = opts
+        .port
+        .or_else(|| {
+            std::env::var("ZOEKTD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(7878);
+
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     tracing::info!("admin UI listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

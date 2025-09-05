@@ -242,6 +242,7 @@ mod tests {
                 owner: None,
                 allowed_users: vec![],
                 last_commit_sha: None,
+                original_url: None,
             },
             docs,
             terms: std::collections::HashMap::new(),

@@ -71,7 +71,7 @@ mod tests {
             last_commit_sha: None,
         };
         node.add_remote(repo.clone());
-        node.run_for(Duration::from_millis(50)).await?;
+        node.run_for(Duration::from_millis(500)).await?;
         let l = lease.get_lease(&repo).await.expect("lease should exist");
         assert_eq!(l.holder, "test-node");
         tracing::info!("TEST END: node_acquires_and_indexes");

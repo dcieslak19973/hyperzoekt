@@ -698,6 +698,7 @@ async fn main() -> Result<()> {
 
                         let idx_clone = idx.clone();
                         let actual_repo_root = idx.repo_root(); // Use the actual repo root from index metadata
+                        let original_url = idx.original_url(); // Get the original repository URL if available
                         let resolved_repo_clone = resolved_repo.clone();
                         let query_clone = params.q.clone();
                         let context_lines_clone = params.context_lines;
@@ -707,6 +708,10 @@ async fn main() -> Result<()> {
                             .and_then(|r| r.branch.clone())
                             .unwrap_or_else(|| "main".to_string());
                         let branch_clone = branch.clone();
+                        // Use original URL if available, otherwise use resolved repo
+                        let repo_for_results = original_url.clone().unwrap_or_else(|| resolved_repo_clone.clone());
+                        // Use original URL for logging if available
+                        let repo_for_logging = original_url.clone().unwrap_or_else(|| resolved_repo_clone.clone());
                         let _fut = tokio::task::spawn_blocking(move || {
                             // Run the plan search and then try to enrich file results with
                             // symbol information when available. We prefer any symbols
@@ -833,20 +838,20 @@ async fn main() -> Result<()> {
                                         Some(text) => {
                                             let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &query_clone);
                                             if snippet.is_some() {
-                                                tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
+                                                tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
                                             } else {
-                                                tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                                                tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
                                             }
                                             // Fallback: if no symbol from enrichment, use from snippet
                                             if r.symbol_loc.is_none() && snippet_symbol.is_some() {
                                                 r.symbol_loc = snippet_symbol.clone();
                                                 r.symbol = snippet_symbol.map(|s| s.name);
                                             }
-                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo_clone, "branch": branch_clone})
+                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": repo_for_results, "branch": branch_clone})
                                         }
                                         None => {
-                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
-                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo_clone, "branch": branch_clone})
+                                            tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
+                                            json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": repo_for_results, "branch": branch_clone})
                                         }
                                     }
                                 })
@@ -975,6 +980,7 @@ async fn main() -> Result<()> {
 
                     let idx_clone = idx.clone();
                     let actual_repo_root = idx.repo_root(); // Use the actual repo root from index metadata
+                    let original_url = idx.original_url(); // Get the original repository URL if available
                     let resolved_repo_clone = resolved_repo.clone();
                     let query_clone = params.q.clone();
                     let context_lines_clone = params.context_lines;
@@ -984,6 +990,10 @@ async fn main() -> Result<()> {
                         .and_then(|r| r.branch.clone())
                         .unwrap_or_else(|| "main".to_string());
                     let branch_clone = branch.clone();
+                    // Use original URL if available, otherwise use resolved repo
+                    let repo_for_results = original_url.clone().unwrap_or_else(|| resolved_repo_clone.clone());
+                    // Use original URL for logging if available
+                    let repo_for_logging = original_url.clone().unwrap_or_else(|| resolved_repo_clone.clone());
                     let fut = tokio::task::spawn_blocking(move || {
                         // Same enrichment as the GET handler: attach symbol metadata
                         // to results when possible by scanning content and using
@@ -1095,20 +1105,20 @@ async fn main() -> Result<()> {
                                     Some(text) => {
                                         let (snippet, snippet_symbol) = make_snippet(&text, &full_path.display().to_string(), context, &query_clone);
                                         if snippet.is_some() {
-                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
+                                            tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "snippet produced for result");
                                         } else {
-                                            tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
+                                            tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "no snippet available for result");
                                         }
                                         // Fallback: if no symbol from enrichment, use from snippet
                                         if r.symbol_loc.is_none() && snippet_symbol.is_some() {
                                             r.symbol_loc = snippet_symbol.clone();
                                             r.symbol = snippet_symbol.map(|s| s.name);
                                         }
-                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": resolved_repo_clone, "branch": branch_clone})
+                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": snippet, "repo": repo_for_results, "branch": branch_clone})
                                     }
                                     None => {
-                                        tracing::info!(repo=%actual_repo_root.display(), path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
-                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": resolved_repo_clone, "branch": branch_clone})
+                                        tracing::info!(repo=%repo_for_logging, path=%r.path, doc=r.doc, has_symbol=%r.symbol.is_some(), symbol_loc=?r.symbol_loc, "failed to read file for snippet");
+                                        json!({"doc": r.doc, "path": r.path, "symbol": r.symbol, "symbol_loc": r.symbol_loc, "snippet": serde_json::Value::Null, "repo": repo_for_results, "branch": branch_clone})
                                     }
                                 }
                             })

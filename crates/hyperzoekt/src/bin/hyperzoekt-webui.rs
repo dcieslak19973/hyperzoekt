@@ -688,120 +688,6 @@ impl Database {
 
         Ok(entities)
     }
-
-    pub async fn insert_test_data(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Insert test entities using direct SQL with all required fields
-        let queries = vec![
-            r#"CREATE entity CONTENT {
-                stable_id: "test1",
-                name: "getUserData",
-                repo_name: "hyperzoekt-abc123",
-                signature: "def getUserData() -> User",
-                file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/user.py",
-                language: "python",
-                kind: "function",
-                parent: null,
-                start_line: 10,
-                end_line: 15,
-                calls: [],
-                doc: null,
-                rank: 0.8,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-            r#"CREATE entity CONTENT {
-                stable_id: "test2",
-                name: "processData",
-                repo_name: "hyperzoekt-abc123",
-                signature: "def processData(data: Data) -> None",
-                file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/data.py",
-                language: "python",
-                kind: "function",
-                parent: null,
-                start_line: 20,
-                end_line: 25,
-                calls: [],
-                doc: null,
-                rank: 0.7,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-            r#"CREATE entity CONTENT {
-                stable_id: "test3",
-                name: "UserService",
-                repo_name: "gpt-researcher-def456",
-                signature: "class UserService",
-                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/service.ts",
-                language: "typescript",
-                kind: "class",
-                parent: null,
-                start_line: 5,
-                end_line: 30,
-                calls: [],
-                doc: null,
-                rank: 0.9,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-            r#"CREATE entity CONTENT {
-                stable_id: "test4",
-                name: "calculateTotal",
-                repo_name: "gpt-researcher-def456",
-                signature: "function calculateTotal(items: Item[]): number",
-                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/math.ts",
-                language: "typescript",
-                kind: "function",
-                parent: null,
-                start_line: 12,
-                end_line: 18,
-                calls: [],
-                doc: null,
-                rank: 0.6,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-            r#"CREATE entity CONTENT {
-                stable_id: "test5",
-                name: "DatabaseConnection",
-                repo_name: "gpt-researcher-def456",
-                signature: "class DatabaseConnection",
-                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/db.tsx",
-                language: "tsx",
-                kind: "class",
-                parent: null,
-                start_line: 1,
-                end_line: 50,
-                calls: [],
-                doc: null,
-                rank: 0.85,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-            r#"CREATE entity CONTENT {
-                stable_id: "test6",
-                name: "validateInput",
-                repo_name: "gpt-researcher-def456",
-                signature: "function validateInput(input: string): boolean",
-                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/validation.js",
-                language: "javascript",
-                kind: "function",
-                parent: null,
-                start_line: 5,
-                end_line: 20,
-                calls: [],
-                doc: null,
-                rank: 0.75,
-                imports: [],
-                unresolved_imports: []
-            }"#,
-        ];
-
-        for query in queries {
-            self.db.query(query).await?;
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
@@ -825,14 +711,15 @@ fn clean_file_path(file_path: &str) -> String {
             // Extract repo-relative path (everything after the first '/')
             let relative_path = &after_clones[slash_pos + 1..];
 
-            // If repo_part contains a UUID pattern (like "repo-uuid"), extract just the repo name
-            if let Some(uuid_start) = repo_part.find('-') {
-                // Look for UUID pattern (32 hex chars or similar)
-                let potential_uuid = &repo_part[uuid_start + 1..];
-                if potential_uuid.len() >= 32 && potential_uuid.chars().all(|c| c.is_alphanumeric())
-                {
-                    // This looks like a UUID, extract just the repo name
-                    let repo_name = &repo_part[..uuid_start];
+            // If repo_part contains a UUID suffix, it's typically after the last '-'.
+            // Use rfind so repo names with '-' are preserved.
+            if let Some(last_dash) = repo_part.rfind('-') {
+                let potential_uuid = &repo_part[last_dash + 1..];
+                // Accept UUIDs that contain hyphens by removing them for the check.
+                let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+                if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+                    // Looks like a UUID suffix; keep the repo name portion before the last dash
+                    let repo_name = &repo_part[..last_dash];
                     return format!("{}/{}", repo_name, relative_path);
                 }
             }
@@ -842,13 +729,60 @@ fn clean_file_path(file_path: &str) -> String {
         }
     }
 
-    // If we can't parse the path, return it as-is but try to make it more readable
-    // Remove the /tmp/hyperzoekt-clones/ prefix if present
-    if let Some(clones_pos) = file_path.find("/tmp/hyperzoekt-clones/") {
-        file_path[clones_pos + "/tmp/hyperzoekt-clones/".len()..].to_string()
-    } else {
-        file_path.to_string()
+    // If the path doesn't include the /tmp prefix, also handle the case where the
+    // stored path begins with a leading repo directory that contains a UUID suffix,
+    // e.g. "gpt-researcher-<uuid>/path/to/file" -> "gpt-researcher/path/to/file".
+    if let Some(slash_pos) = file_path.find('/') {
+        let leading = &file_path[..slash_pos];
+        if let Some(last_dash) = leading.rfind('-') {
+            let potential_uuid = &leading[last_dash + 1..];
+            let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+            if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+                let repo_root = &leading[..last_dash];
+                let rest = &file_path[slash_pos + 1..];
+                return format!("{}/{}", repo_root, rest);
+            }
+        }
     }
+
+    // Fallback: return as-is
+    file_path.to_string()
+}
+
+/// Normalize various git URL forms into an https base URL without a trailing `.git`.
+/// Examples:
+/// - git@github.com:owner/repo.git -> https://github.com/owner/repo
+/// - https://github.com/owner/repo.git -> https://github.com/owner/repo
+/// - http://... -> http://...
+///   Returns None for local paths (file:// or absolute filesystem paths) where a web URL
+///   cannot be constructed.
+fn normalize_git_url(git_url: &str) -> Option<String> {
+    if git_url.is_empty() {
+        return None;
+    }
+
+    // Local paths are not convertible to web URLs
+    if git_url.starts_with("file://") || std::path::Path::new(git_url).is_absolute() {
+        return None;
+    }
+
+    // SSH style: git@host:owner/repo.git -> https://host/owner/repo
+    if git_url.starts_with("git@") {
+        if let Some(colon) = git_url.find(':') {
+            let host = &git_url[4..colon]; // strip "git@"
+            let rest = &git_url[colon + 1..];
+            let s = format!("https://{}/{}", host, rest.trim_end_matches(".git"));
+            return Some(s);
+        }
+    }
+
+    // HTTP/HTTPS style: strip trailing .git
+    if git_url.starts_with("http://") || git_url.starts_with("https://") {
+        return Some(git_url.trim_end_matches(".git").to_string());
+    }
+
+    // Fallback: try to treat as https host/path
+    Some(git_url.trim_end_matches(".git").to_string())
 }
 
 #[tokio::main]
@@ -894,14 +828,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e);
         }
     };
-
-    // Insert test data for demo purposes
-    if let Err(e) = db.insert_test_data().await {
-        log::warn!("Failed to insert test data: {}", e);
-        // Don't fail the startup if test data insertion fails
-    } else {
-        log::info!("Test data inserted successfully");
-    }
 
     // Initialize template engine
     let mut templates = Environment::new();
@@ -1058,8 +984,131 @@ async fn entity_handler(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    log::info!("Raw entity.file: {}", entity.file);
+
     // Clean up the file path
     entity.file = clean_file_path(&entity.file);
+
+    log::info!("Cleaned entity.file: {}", entity.file);
+
+    // Clean the repo_name to remove UUID suffix if present
+    let clean_repo_name = if let Some(last_dash) = entity.repo_name.rfind('-') {
+        let potential_uuid = &entity.repo_name[last_dash + 1..];
+        let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+        if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+            entity.repo_name[..last_dash].to_string()
+        } else {
+            entity.repo_name.clone()
+        }
+    } else {
+        entity.repo_name.clone()
+    };
+
+    log::info!("clean_repo_name: {}", clean_repo_name);
+
+    // If entity.file still contains a leading repo directory with a UUID suffix
+    // (for example: "gpt-researcher-<uuid>/gpt_researcher/agent.py"), normalize it to
+    // remove the UUID so later URL construction uses the clean repo name.
+    // This mirrors the UUID-detection used above (strip dashes before hex check).
+    if let Some(slash_pos) = entity.file.find('/') {
+        let leading = &entity.file[..slash_pos];
+        if let Some(last_dash) = leading.rfind('-') {
+            let potential_uuid = &leading[last_dash + 1..];
+            let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+            if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Replace leading "<name>-<uuid>/" with "<name>/"
+                let repo_root = &leading[..last_dash];
+                let rest = &entity.file[slash_pos + 1..];
+                entity.file = format!("{}/{}", repo_root, rest);
+            }
+        }
+    }
+
+    // Compute source URL if not provided
+    let mut _template_source_base: Option<String> = None;
+    let mut _template_source_branch: Option<String> = None;
+    if entity.source_url.is_none() && !clean_repo_name.is_empty() {
+        // First, try to look up repo metadata from the `repo` table to get the canonical
+        // git_url and branch for this repository. If that fails, fall back to environment
+        // configured SOURCE_BASE_URL and SOURCE_BRANCH.
+        #[derive(Deserialize)]
+        struct RepoRow {
+            git_url: String,
+            branch: Option<String>,
+        }
+
+        let mut repo_base: Option<String> = None;
+        let mut repo_branch: Option<String> = None;
+
+        // Query the repo table for a matching name
+        let query_sql = "SELECT git_url, branch FROM repo WHERE name = $name LIMIT 1";
+        if let Ok(mut res) = match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn
+                    .query(query_sql)
+                    .bind(("name", clean_repo_name.clone()))
+                    .await
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn
+                    .query(query_sql)
+                    .bind(("name", clean_repo_name.clone()))
+                    .await
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn
+                    .query(query_sql)
+                    .bind(("name", clean_repo_name.clone()))
+                    .await
+            }
+        } {
+            if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
+                if let Some(r) = rows.into_iter().next() {
+                    log::info!(
+                        "Repo found: git_url={}, branch={}",
+                        r.git_url,
+                        r.branch.as_ref().unwrap_or(&"none".to_string())
+                    );
+                    if let Some(normalized) = normalize_git_url(&r.git_url) {
+                        repo_base = Some(normalized);
+                    }
+                    repo_branch = r.branch;
+                } else {
+                    log::info!("No repo row found");
+                }
+            } else {
+                log::info!("Repo query failed");
+            }
+        }
+
+        // Fallbacks
+        let source_base = repo_base.unwrap_or_else(|| {
+            std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string())
+        });
+        let source_branch = repo_branch
+            .or_else(|| std::env::var("SOURCE_BRANCH").ok())
+            .unwrap_or_else(|| "main".to_string());
+
+        log::info!(
+            "source_base: {}, source_branch: {}",
+            source_base,
+            source_branch
+        );
+
+        let file_path = entity.file.replace(&format!("{}/", clean_repo_name), "");
+        let url = format!(
+            "{}/{}/blob/{}/{}",
+            source_base.trim_end_matches('/'),
+            clean_repo_name,
+            source_branch,
+            file_path
+        );
+        entity.source_url = Some(url);
+
+        log::info!("entity.source_url: {}", entity.source_url.as_ref().unwrap());
+        _template_source_base = Some(source_base.clone());
+        _template_source_branch = Some(source_branch.clone());
+    }
     // Resolve callers and callees via DB queries to avoid scanning all entities in memory
     // Read a limit for relations from environment (default 50)
     let relations_limit: usize = std::env::var("ENTITY_RELATIONS_LIMIT")
@@ -1093,11 +1142,10 @@ async fn entity_handler(
 
     let template = state.templates.get_template("entity").unwrap();
     // Ensure repo_name is available to the template (entity.html references `repo_name`)
-    let repo_name = entity.repo_name.clone();
     let html = template
         .render(context! {
             entity => entity,
-            repo_name => repo_name,
+            repo_name => clean_repo_name,
             callers => callers,
             callees => callees,
             title => format!("Entity: {}", entity.name)
