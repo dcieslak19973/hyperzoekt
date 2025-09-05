@@ -238,6 +238,10 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
                     "ALTER TABLE entity CREATE FIELD stable_id TYPE string;",
                 ],
                 vec![
+                    "DEFINE FIELD repo_name ON entity TYPE string;",
+                    "ALTER TABLE entity CREATE FIELD repo_name TYPE string;",
+                ],
+                vec![
                     "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
                     "CREATE INDEX idx_entity_stable_id ON entity (stable_id);",
                 ],

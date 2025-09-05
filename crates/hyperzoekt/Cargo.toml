@@ -58,6 +58,7 @@ minijinja = "1.0"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[bin]]
 name = "hyperzoekt-indexer"

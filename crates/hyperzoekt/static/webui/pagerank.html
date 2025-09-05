@@ -1,0 +1,151 @@
+{% extends "base" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>📈 PageRank Analysis</h2>
+    </div>
+    <div class="card-body">
+        <p>Explore entities ranked by PageRank importance. Select a repository to view ranked tables for different
+            entity types.</p>
+
+        <div class="search-form">
+            <label for="repo-select" style="display: block; margin-bottom: 0.5rem; font-weight: bold;">Select
+                Repository:</label>
+            <select id="repo-select" class="search-input" onchange="loadPageRankData()">
+                <option value="">Choose a repository...</option>
+                {% for repo in repos %}
+                <option value="{{ repo.name }}">{{ repo.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div id="loading" style="display: none; text-align: center; padding: 2rem;">
+            <p>Loading PageRank data...</p>
+        </div>
+
+        <div id="pagerank-content" style="display: none;">
+            <div id="entity-tables"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    async function loadPageRankData() {
+        const repoSelect = document.getElementById('repo-select');
+        const selectedRepo = repoSelect.value;
+        const loadingDiv = document.getElementById('loading');
+        const contentDiv = document.getElementById('pagerank-content');
+        const tablesDiv = document.getElementById('entity-tables');
+
+        if (!selectedRepo) {
+            contentDiv.style.display = 'none';
+            return;
+        }
+
+        loadingDiv.style.display = 'block';
+        contentDiv.style.display = 'none';
+
+        try {
+            const response = await fetch(`/api/pagerank?repo=${encodeURIComponent(selectedRepo)}`);
+            const data = await response.json();
+
+            // Group entities by kind
+            const entitiesByKind = {};
+            data.forEach(entity => {
+                if (!entitiesByKind[entity.kind]) {
+                    entitiesByKind[entity.kind] = [];
+                }
+                entitiesByKind[entity.kind].push(entity);
+            });
+
+            // Sort each group by rank descending
+            Object.keys(entitiesByKind).forEach(kind => {
+                entitiesByKind[kind].sort((a, b) => b.rank - a.rank);
+            });
+
+            // Generate HTML tables
+            let html = '';
+            const kinds = Object.keys(entitiesByKind).sort();
+
+            kinds.forEach(kind => {
+                const entities = entitiesByKind[kind];
+                const capitalizedKind = kind.charAt(0).toUpperCase() + kind.slice(1);
+
+                html += `
+                <div class="card" style="margin-bottom: 2rem;">
+                    <div class="card-header">
+                        <h3>${capitalizedKind}s (${entities.length})</h3>
+                    </div>
+                    <div class="card-body">
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; border-collapse: collapse;">
+                                <thead>
+                                    <tr style="background: var(--panel); border-bottom: 2px solid var(--input-border);">
+                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Rank</th>
+                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Name</th>
+                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">File</th>
+                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Signature</th>
+                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">PageRank</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+            `;
+
+                entities.forEach((entity, index) => {
+                    const cleanFile = entity.file.replace(/^\/tmp\/hyperzoekt-clones\//, '');
+                    const rankClass = index < 3 ? 'top-rank' : '';
+                    const rankDisplay = (index + 1).toString().padStart(2, '0');
+
+                    html += `
+                    <tr class="${rankClass}" style="border-bottom: 1px solid var(--input-border);">
+                        <td style="padding: 0.75rem; font-weight: bold; color: var(--accent);">${rankDisplay}</td>
+                        <td style="padding: 0.75rem;">
+                            <a href="/entity/${entity.stable_id}" style="color: var(--accent); text-decoration: none; font-weight: 500;">
+                                ${entity.name}
+                            </a>
+                        </td>
+                        <td style="padding: 0.75rem; font-size: 0.9rem; color: var(--muted);">${cleanFile}</td>
+                        <td style="padding: 0.75rem; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 0.85rem;">
+                            ${entity.signature.length > 60 ? entity.signature.substring(0, 60) + '...' : entity.signature}
+                        </td>
+                        <td style="padding: 0.75rem; font-weight: bold; color: #22c55e;">${entity.rank.toFixed(6)}</td>
+                    </tr>
+                `;
+                });
+
+                html += `
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            `;
+            });
+
+            tablesDiv.innerHTML = html;
+            loadingDiv.style.display = 'none';
+            contentDiv.style.display = 'block';
+
+        } catch (error) {
+            console.error('Error loading PageRank data:', error);
+            loadingDiv.innerHTML = '<p style="color: #ef4444;">Error loading PageRank data. Please try again.</p>';
+        }
+    }
+
+    // Load repositories on page load
+    document.addEventListener('DOMContentLoaded', function () {
+        // Repositories are already loaded in the template
+    });
+</script>
+
+<style>
+    .top-rank {
+        background: linear-gradient(135deg, rgba(34, 197, 94, 0.05), rgba(34, 197, 94, 0.02)) !important;
+    }
+
+    .top-rank:hover {
+        background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(34, 197, 94, 0.05)) !important;
+    }
+</style>
+{% endblock %}

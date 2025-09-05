@@ -479,6 +479,7 @@ impl EventProcessor {
                                 imports,
                                 unresolved_imports,
                                 stable_id,
+                                repo_name: repo_name.clone(),
                             }
                         })
                         .collect();

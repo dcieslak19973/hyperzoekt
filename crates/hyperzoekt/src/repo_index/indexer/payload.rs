@@ -43,4 +43,5 @@ pub struct EntityPayload {
     pub imports: Vec<ImportItem>,
     pub unresolved_imports: Vec<UnresolvedImport>,
     pub stable_id: String,
+    pub repo_name: String,
 }

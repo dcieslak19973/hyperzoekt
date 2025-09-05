@@ -39,6 +39,7 @@ const INDEX_TEMPLATE: &str = include_str!("../../static/webui/index.html");
 const REPO_TEMPLATE: &str = include_str!("../../static/webui/repo.html");
 const ENTITY_TEMPLATE: &str = include_str!("../../static/webui/entity.html");
 const SEARCH_TEMPLATE: &str = include_str!("../../static/webui/search.html");
+const PAGERANK_TEMPLATE: &str = include_str!("../../static/webui/pagerank.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -312,10 +313,11 @@ impl Database {
     }
 
     pub async fn get_repo_summaries(&self) -> Result<Vec<RepoSummary>, Box<dyn std::error::Error>> {
-        // Extract repository name from file paths and aggregate stats
+        // Use the stored repo_name field instead of parsing from file paths
+        // Handle cases where repo_name might be null for existing data
         let query = r#"
             SELECT
-                string::split(file, '/')[0] as repo_name,
+                repo_name ?? 'unknown' as repo_name,
                 count() as entity_count,
                 array::distinct(file) as files,
                 array::distinct(language) as languages
@@ -330,7 +332,6 @@ impl Database {
         Ok(query_results
             .into_iter()
             .map(|s| {
-                // Extract repo name from the grouped result
                 let file_count = s.files.len() as u64; // Count distinct files
                 RepoSummary {
                     name: s.repo_name,
@@ -422,6 +423,114 @@ impl Database {
         let entities: Vec<EntityPayload> = response.take(0)?;
 
         Ok(entities)
+    }
+
+    pub async fn insert_test_data(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Insert test entities using direct SQL with all required fields
+        let queries = vec![
+            r#"CREATE entity CONTENT {
+                stable_id: "test1",
+                name: "getUserData",
+                signature: "def getUserData() -> User",
+                file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/user.py",
+                language: "python",
+                kind: "function",
+                parent: null,
+                start_line: 10,
+                end_line: 15,
+                calls: [],
+                doc: null,
+                rank: 0.8,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+            r#"CREATE entity CONTENT {
+                stable_id: "test2",
+                name: "processData",
+                signature: "def processData(data: Data) -> None",
+                file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/data.py",
+                language: "python",
+                kind: "function",
+                parent: null,
+                start_line: 20,
+                end_line: 25,
+                calls: [],
+                doc: null,
+                rank: 0.7,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+            r#"CREATE entity CONTENT {
+                stable_id: "test3",
+                name: "UserService",
+                signature: "class UserService",
+                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/service.ts",
+                language: "typescript",
+                kind: "class",
+                parent: null,
+                start_line: 5,
+                end_line: 30,
+                calls: [],
+                doc: null,
+                rank: 0.9,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+            r#"CREATE entity CONTENT {
+                stable_id: "test4",
+                name: "calculateTotal",
+                signature: "function calculateTotal(items: Item[]): number",
+                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/math.ts",
+                language: "typescript",
+                kind: "function",
+                parent: null,
+                start_line: 12,
+                end_line: 18,
+                calls: [],
+                doc: null,
+                rank: 0.6,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+            r#"CREATE entity CONTENT {
+                stable_id: "test5",
+                name: "DatabaseConnection",
+                signature: "class DatabaseConnection",
+                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/db.tsx",
+                language: "tsx",
+                kind: "class",
+                parent: null,
+                start_line: 1,
+                end_line: 50,
+                calls: [],
+                doc: null,
+                rank: 0.85,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+            r#"CREATE entity CONTENT {
+                stable_id: "test6",
+                name: "validateInput",
+                signature: "function validateInput(input: string): boolean",
+                file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/validation.js",
+                language: "javascript",
+                kind: "function",
+                parent: null,
+                start_line: 5,
+                end_line: 20,
+                calls: [],
+                doc: null,
+                rank: 0.75,
+                imports: [],
+                unresolved_imports: []
+            }"#,
+        ];
+
+        for query in queries {
+            self.db.query(query).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -516,6 +625,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Insert test data for demo purposes
+    if let Err(e) = db.insert_test_data().await {
+        log::warn!("Failed to insert test data: {}", e);
+        // Don't fail the startup if test data insertion fails
+    } else {
+        log::info!("Test data inserted successfully");
+    }
+
     // Initialize template engine
     let mut templates = Environment::new();
     templates.add_template("base", BASE_TEMPLATE)?;
@@ -523,6 +640,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("repo", REPO_TEMPLATE)?;
     templates.add_template("entity", ENTITY_TEMPLATE)?;
     templates.add_template("search", SEARCH_TEMPLATE)?;
+    templates.add_template("pagerank", PAGERANK_TEMPLATE)?;
     log::info!("Templates loaded successfully");
 
     let state = AppState { db, templates };
@@ -543,9 +661,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/repos", get(repos_api_handler))
         .route("/api/entities", get(entities_api_handler))
         .route("/api/search", get(search_api_handler))
+        .route("/api/pagerank", get(pagerank_api_handler))
         .route("/repo/:repo_name", get(repo_handler))
         .route("/entity/:stable_id", get(entity_handler))
         .route("/search", get(search_handler))
+        .route("/pagerank", get(pagerank_handler))
         .nest_service("/static", ServeDir::new("../../static"))
         .layer(cors_layer)
         .with_state(state);
@@ -701,6 +821,52 @@ async fn entities_api_handler(
         state.db.get_all_entities().await
     }
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Clean up file paths for all entities
+    for entity in &mut entities {
+        entity.file = clean_file_path(&entity.file);
+    }
+
+    Ok(Json(entities))
+}
+
+async fn pagerank_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    log::debug!("Received request for PageRank page");
+    let repos = state.db.get_repo_summaries().await.map_err(|e| {
+        log::error!("Failed to get repo summaries: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    log::debug!("Retrieved {} repositories for PageRank", repos.len());
+    let template = state.templates.get_template("pagerank").unwrap();
+    let html = template
+        .render(context! {
+            repos => repos,
+            title => "PageRank Analysis"
+        })
+        .map_err(|e| {
+            log::error!("Failed to render pagerank template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    log::debug!("Successfully rendered PageRank page");
+    Ok(Html(html))
+}
+
+#[derive(Deserialize)]
+struct PageRankQuery {
+    repo: String,
+}
+
+async fn pagerank_api_handler(
+    State(state): State<AppState>,
+    Query(query): Query<PageRankQuery>,
+) -> Result<Json<Vec<EntityPayload>>, StatusCode> {
+    let mut entities = state
+        .db
+        .get_entities_for_repo(&query.repo)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Clean up file paths for all entities
     for entity in &mut entities {
