@@ -749,6 +749,86 @@ fn clean_file_path(file_path: &str) -> String {
     file_path.to_string()
 }
 
+/// Construct a proper source URL using repository metadata from the database
+async fn construct_source_url(
+    state: &AppState,
+    repo_name: &str,
+    file_path: &str,
+) -> Option<String> {
+    // Clean the repo_name to remove UUID suffix if present
+    let clean_repo_name = if let Some(last_dash) = repo_name.rfind('-') {
+        let potential_uuid = &repo_name[last_dash + 1..];
+        let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+        if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+            repo_name[..last_dash].to_string()
+        } else {
+            repo_name.to_string()
+        }
+    } else {
+        repo_name.to_string()
+    };
+
+    // Query the repo table for the git_url and branch
+    #[derive(Deserialize)]
+    struct RepoRow {
+        git_url: String,
+        branch: Option<String>,
+    }
+
+    let query_sql = "SELECT git_url, branch FROM repo WHERE name = $name LIMIT 1";
+    if let Ok(mut res) = match &*state.db.db {
+        SurrealConnection::Local(db_conn) => {
+            db_conn
+                .query(query_sql)
+                .bind(("name", clean_repo_name.clone()))
+                .await
+        }
+        SurrealConnection::RemoteHttp(db_conn) => {
+            db_conn
+                .query(query_sql)
+                .bind(("name", clean_repo_name.clone()))
+                .await
+        }
+        SurrealConnection::RemoteWs(db_conn) => {
+            db_conn
+                .query(query_sql)
+                .bind(("name", clean_repo_name.clone()))
+                .await
+        }
+    } {
+        if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                if let Some(normalized_base) = normalize_git_url(&r.git_url) {
+                    let branch = r.branch.unwrap_or_else(|| "main".to_string());
+                    // Remove repo name prefix from file path if present
+                    let clean_file_path = file_path.replace(&format!("{}/", clean_repo_name), "");
+                    let url = format!(
+                        "{}/blob/{}/{}",
+                        normalized_base.trim_end_matches('/'),
+                        branch,
+                        clean_file_path
+                    );
+                    return Some(url);
+                }
+            }
+        }
+    }
+
+    // Fallback to environment variables
+    let source_base =
+        std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
+    let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
+    let clean_file_path = file_path.replace(&format!("{}/", clean_repo_name), "");
+    let url = format!(
+        "{}/{}/blob/{}/{}",
+        source_base.trim_end_matches('/'),
+        clean_repo_name,
+        source_branch,
+        clean_file_path
+    );
+    Some(url)
+}
+
 /// Normalize various git URL forms into an https base URL without a trailing `.git`.
 /// Examples:
 /// - git@github.com:owner/repo.git -> https://github.com/owner/repo
@@ -925,28 +1005,17 @@ async fn repo_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Compute source base URL and branch from environment (defaults chosen for convenience)
-    let source_base =
-        std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
-    let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
-
-    // Clean up file paths and populate a direct source URL only when DB did not provide one
+    // Clean up file paths and construct proper source URLs
     for entity in &mut entities {
-        // Clean the displayed file path
         entity.file = clean_file_path(&entity.file);
 
+        // Try to construct proper source URL using repository metadata
         if entity.source_url.is_none() && !entity.repo_name.is_empty() {
-            // entity.file may already be repo-relative 'repo/path/to/file', remove leading repo if present
-            let repo = &entity.repo_name;
-            let file_path = entity.file.replace(&format!("{}/", repo), "");
-            let url = format!(
-                "{}/{}/blob/{}/{}",
-                source_base.trim_end_matches('/'),
-                repo,
-                source_branch,
-                file_path
-            );
-            entity.source_url = Some(url);
+            if let Some(source_url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file).await
+            {
+                entity.source_url = Some(source_url);
+            }
         }
     }
 
@@ -1196,9 +1265,18 @@ async fn search_api_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Clean up file paths to show repository-relative paths instead of absolute filesystem paths
+    // Clean up file paths and construct proper source URLs
     for entity in &mut results {
         entity.file = clean_file_path(&entity.file);
+
+        // Try to construct proper source URL using repository metadata
+        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
+            if let Some(source_url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file).await
+            {
+                entity.source_url = Some(source_url);
+            }
+        }
     }
 
     Ok(Json(results))
@@ -1230,9 +1308,18 @@ async fn entities_api_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Clean up file paths for all entities
+    // Clean up file paths and construct proper source URLs
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
+
+        // Try to construct proper source URL using repository metadata
+        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
+            if let Some(source_url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file).await
+            {
+                entity.source_url = Some(source_url);
+            }
+        }
     }
 
     Ok(Json(entities))
@@ -1289,9 +1376,18 @@ async fn pagerank_api_handler(
         &query.repo
     );
 
-    // Clean up file paths for all entities
+    // Clean up file paths and construct proper source URLs
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
+
+        // Try to construct proper source URL using repository metadata
+        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
+            if let Some(source_url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file).await
+            {
+                entity.source_url = Some(source_url);
+            }
+        }
     }
 
     Ok(Json(entities))
