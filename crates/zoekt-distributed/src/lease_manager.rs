@@ -17,11 +17,24 @@ use chrono::{DateTime, Utc};
 use deadpool_redis::redis::{self, AsyncCommands, RedisResult};
 use deadpool_redis::Pool;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+
+// Repository indexing event emitted by zoekt-distributed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoEvent {
+    #[serde(alias = "event")]
+    pub event_type: String,
+    pub repo_name: String,
+    pub git_url: String,
+    pub branch: Option<String>,
+    pub node_id: String,
+    pub timestamp: i64,
+}
 
 // Type aliases to reduce clippy type-complexity warnings around the meta sender.
 // MetaMsg: (name, branch, last_indexed_ms, last_duration_ms, memory_bytes, leased_node)
@@ -195,8 +208,21 @@ impl LeaseManager {
                     let key = "zoekt:indexers";
                     let timestamp = chrono::Utc::now().timestamp_millis();
 
-                    // Fetch existing meta if present
+                    // Fetch existing meta if present to calculate proper heartbeat age
                     let existing: Option<String> = conn.hget(key, node_id).await.ok().flatten();
+
+                    // Calculate age based on the previous heartbeat value before updating
+                    let prev_heartbeat = if let Some(ref existing_str) = existing {
+                        if let Ok(prev_v) = serde_json::from_str::<serde_json::Value>(existing_str)
+                        {
+                            prev_v.get("last_heartbeat").and_then(|h| h.as_i64())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     let mut v = if let Some(s) = existing {
                         serde_json::from_str::<serde_json::Value>(&s).unwrap_or(json!({}))
                     } else {
@@ -219,11 +245,9 @@ impl LeaseManager {
                             if was_new {
                                 tracing::info!(node_id=%node_id, endpoint=%endpoint, "indexer endpoint registered");
                             } else {
-                                let heartbeat_age = if let Some(last_heartbeat) =
-                                    v.get("last_heartbeat").and_then(|h| h.as_i64())
-                                {
+                                let heartbeat_age = if let Some(prev_hb) = prev_heartbeat {
                                     let now = chrono::Utc::now().timestamp_millis();
-                                    let age_seconds = (now - last_heartbeat) / 1000;
+                                    let age_seconds = (now - prev_hb) / 1000;
                                     format!("{}s ago", age_seconds)
                                 } else {
                                     "unknown".to_string()
@@ -817,8 +841,7 @@ impl LeaseManager {
         false
     }
 
-    /// Publish a repo event to Redis pub/sub if Redis is available.
-    /// Event types: "indexing_started", "indexing_finished"
+    /// Publish a repo event to Redis queue (not pub/sub) for reliable consumption
     pub async fn publish_repo_event(&self, event_type: &str, repo: &RemoteRepo, node_id: &str) {
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
@@ -830,9 +853,10 @@ impl LeaseManager {
                     "node_id": node_id,
                     "timestamp": chrono::Utc::now().timestamp_millis()
                 });
-                let channel = "zoekt:repo_events";
-                let _: RedisResult<()> = conn.publish(channel, event.to_string()).await;
-                tracing::debug!(event_type=%event_type, repo=%repo.name, branch=?repo.branch, "published repo event to Redis pub/sub");
+                let queue_key = "zoekt:repo_events_queue";
+                let _: RedisResult<()> = conn.lpush(queue_key, event.to_string()).await;
+                tracing::info!(event_type=%event_type, repo=%repo.name, branch=?repo.branch, node_id=%node_id, "emitted repo event to Redis queue");
+                tracing::debug!(event_type=%event_type, repo=%repo.name, branch=?repo.branch, "published repo event to Redis queue");
             } else {
                 tracing::debug!("failed to get Redis connection for publishing repo event");
             }

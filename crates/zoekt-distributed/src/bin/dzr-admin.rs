@@ -57,8 +57,10 @@ struct Opts {
     lease_ttl_seconds: Option<u64>,
     #[arg(long)]
     poll_interval_seconds: Option<u64>,
-    #[arg(long, default_value = "127.0.0.1:7878")]
-    bind: String,
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 7878)]
+    port: u16,
 }
 
 struct AppStateInner {
@@ -93,8 +95,8 @@ struct CreateRepoWithFreq {
 const INDEX_TEMPLATE: &str = include_str!("../../static/admin/index.html");
 const LOGIN_TEMPLATE: &str = include_str!("../../static/admin/login.html");
 const ADMIN_JS: &str = include_str!("../../static/admin/admin.js");
-const COMMON_STYLES: &str = include_str!("../../static/common/styles.css");
-const COMMON_THEME_JS: &str = include_str!("../../static/common/theme.js");
+const COMMON_STYLES: &str = include_str!("../../../../static/common/styles.css");
+const COMMON_THEME_JS: &str = include_str!("../../../../static/common/theme.js");
 
 // Reuse shared web helper functions from the crate for common HTTP helpers.
 use web_utils::{
@@ -1755,7 +1757,7 @@ fn make_app(state: AppState) -> Router {
                 bulk_import_inner(state, headers, multipart).await
             }),
         )
-        .nest_service("/static/common", tower_http::services::ServeDir::new("crates/zoekt-distributed/static/common"))
+        .nest_service("/static/common", tower_http::services::ServeDir::new("../../static/common"))
         .route("/static/admin.js", get(serve_admin_js))
         .route("/static/common/styles.css", get(serve_common_styles))
         .route("/static/common/theme.js", get(serve_common_theme_js))
@@ -2246,7 +2248,7 @@ async fn main() -> Result<()> {
     let sweeper_state = state.clone();
     tokio::spawn(async move { session_sweeper(sweeper_state).await });
 
-    let addr: SocketAddr = opts.bind.parse()?;
+    let addr: SocketAddr = format!("{}:{}", opts.host, opts.port).parse()?;
     tracing::info!("admin UI listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

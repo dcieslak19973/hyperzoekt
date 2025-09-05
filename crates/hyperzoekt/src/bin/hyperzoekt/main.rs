@@ -333,6 +333,8 @@ async fn main() -> Result<(), anyhow::Error> {
         batch_timeout_ms,
         max_retries,
         surreal_url,
+        surreal_username: std::env::var("SURREALDB_USERNAME").ok(),
+        surreal_password: std::env::var("SURREALDB_PASSWORD").ok(),
         surreal_ns: surreal_ns.clone(),
         surreal_db: surreal_db.clone(),
         initial_batch,

@@ -19,30 +19,32 @@ services:
   # Note: no in-container healthcheck because the surrealdb image may not include curl/wget.
   # An external prober service below performs the HTTP health check instead.
 
-  indexer:
+  zoekt-indexer:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
       - "7676:7676"
     environment:
+      - DISTRIBUTED_ZOEKT_REPO_EVENTS=1
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug      
       - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:7676
-      - ZOEKT_ENDPOINT=http://indexer:7676
-    command: ["/app/dzr-indexer", "--listen", "0.0.0.0:7676"]
-    restart: unless-stopped
+      - ZOEKT_ENDPOINT=http://zoekt-indexer:7676
+    command: ["/app/dzr-indexer", "--host", "0.0.0.0", "--port", "7676"]
+    # restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       surrealdb-prober:
         condition: service_healthy
 
-  admin:
+  zoekt-admin:
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -58,14 +60,14 @@ services:
       - SURREAL_DB=repos
       - ZOEKT_ADMIN_USERNAME=admin
       - ZOEKT_ADMIN_PASSWORD=password
-    command: ["/app/dzr-admin", "--bind", "0.0.0.0:7878"]
+    command: ["/app/dzr-admin", "--host", "0.0.0.0", "--port", "7878"]
     depends_on:
       redis:
         condition: service_healthy
       surrealdb-prober:
         condition: service_healthy
 
-  search:
+  zoekt-search:
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -73,20 +75,21 @@ services:
       - "8080:8080"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:8080
-    command: ["/app/dzr-http-search", "--listen", "0.0.0.0:8080"]
+    command: ["/app/dzr-http-search", "--host", "0.0.0.0", "--port", "8080"]
     depends_on:
       redis:
         condition: service_healthy
       surrealdb-prober:
         condition: service_healthy
 
-  mcp:
+  zoekt-mcp:
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -94,13 +97,58 @@ services:
       - "7979:7979"
     environment:
       - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
       - SURREALDB_URL=surrealdb:8000
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_NS=zoekt
       - SURREAL_DB=repos
       - ZOEKTD_BIND_ADDR=0.0.0.0:7979
-    command: ["/app/dzr-mcp-search", "--listen", "0.0.0.0:7979"]
+    command: ["/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "7979"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7677:7677"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
+      - SURREALDB_URL=http://surrealdb:8000
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+    command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7677"]
+    # restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-webui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=debug
+      - SURREALDB_URL=http://surrealdb:8000
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_NS=zoekt
+      - SURREAL_DB=repos
+    command: ["/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "8081"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy

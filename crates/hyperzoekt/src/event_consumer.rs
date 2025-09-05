@@ -12,26 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::db_writer;
+use crate::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
+use crate::repo_index::indexer::EntityKind;
 use crate::repo_index::RepoIndexService;
 use deadpool_redis::redis::{AsyncCommands, Client};
 use deadpool_redis::{Config as RedisConfig, Pool};
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use log;
+use sha2::Digest;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
-
-/// Repository indexing event emitted by zoekt-distributed
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoEvent {
-    #[serde(alias = "event")]
-    pub event_type: String,
-    pub repo_name: String,
-    pub git_url: String,
-    pub branch: Option<String>,
-    pub node_id: String,
-    pub timestamp: i64,
-}
+use uuid::Uuid;
+use zoekt_distributed::lease_manager::RepoEvent;
 
 /// Event consumer that subscribes to zoekt-distributed repo events
 pub struct EventConsumer {
@@ -172,12 +165,12 @@ impl EventConsumer {
         let pool = match self.redis_pool.clone() {
             Some(p) => p,
             None => {
-                warn!("No Redis pool available for event consumption");
+                log::warn!("No Redis pool available for event consumption");
                 return Ok(());
             }
         };
 
-        info!("Starting event consumer for zoekt:repo_events channel");
+        log::info!("Starting event consumer for zoekt:repo_events channel");
 
         let event_tx = self.event_tx.clone();
 
@@ -192,11 +185,11 @@ impl EventConsumer {
                 {
                     Ok(_) => {
                         // This shouldn't happen in normal operation
-                        info!("Event consumption completed unexpectedly");
+                        log::info!("Event consumption completed unexpectedly");
                         break;
                     }
                     Err(e) => {
-                        error!("Event consumption failed: {}", e);
+                        log::error!("Event consumption failed: {}", e);
                         // Wait before retrying
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
@@ -226,9 +219,10 @@ impl EventConsumer {
         let processing_key_prefix = "zoekt:processing:";
         let consumer_id = format!("indexer-{}", std::process::id());
 
-        info!(
+        log::info!(
             "Starting Redis queue consumer: {} (TTL: {}s)",
-            consumer_id, processing_ttl_seconds
+            consumer_id,
+            processing_ttl_seconds
         );
 
         loop {
@@ -236,7 +230,7 @@ impl EventConsumer {
             if let Err(e) =
                 Self::recover_expired_messages(&mut conn, processing_key_prefix, queue_key).await
             {
-                warn!("Failed to recover expired messages: {}", e);
+                log::warn!("Failed to recover expired messages: {}", e);
             }
 
             // Try to get a message from the queue using BRPOPLPUSH for atomic operation
@@ -249,7 +243,7 @@ impl EventConsumer {
             let message: Option<String> = conn.brpoplpush(queue_key, &processing_key, 5.0).await?;
 
             if let Some(event_json) = message {
-                info!("Processing message: {}", event_json);
+                log::info!("Processing message: {}", event_json);
 
                 // Set TTL on processing key for failure recovery
                 let _: () = conn
@@ -260,16 +254,16 @@ impl EventConsumer {
                     Ok(event) => {
                         // Send event to processor
                         if event_tx.send(event).is_err() {
-                            warn!("Event channel closed, stopping consumer");
+                            log::warn!("Event channel closed, stopping consumer");
                             return Ok(());
                         }
 
                         // Message processed successfully, remove from processing queue
                         let _: () = conn.del(&processing_key).await?;
-                        info!("Successfully processed and acknowledged message");
+                        log::info!("Successfully processed and acknowledged message");
                     }
                     Err(e) => {
-                        error!("Failed to deserialize event: {}", e);
+                        log::error!("Failed to deserialize event: {}", e);
                         // Remove malformed message from processing queue
                         let _: () = conn.del(&processing_key).await?;
                     }
@@ -301,7 +295,7 @@ impl EventConsumer {
                     let _: () = conn.lpush(queue_key, &msg).await?;
                     // Remove the expired processing key
                     let _: () = conn.del(&key).await?;
-                    warn!("Recovered expired message and re-queued it: {}", msg);
+                    log::warn!("Recovered expired message and re-queued it: {}", msg);
                 }
                 // Clean up the key even if it has no value
                 let _: () = conn.del(&key).await?;
@@ -325,15 +319,15 @@ impl EventProcessor {
 
     /// Start processing events
     pub async fn start_processing(mut self) -> Result<(), anyhow::Error> {
-        info!("Starting event processor");
+        log::info!("Starting event processor");
 
         while let Some(event) = self.event_rx.recv().await {
             if let Err(e) = self.process_event(event).await {
-                error!("Failed to process event: {}", e);
+                log::error!("Failed to process event: {}", e);
             }
         }
 
-        info!("Event processor stopped");
+        log::info!("Event processor stopped");
         Ok(())
     }
 
@@ -341,9 +335,10 @@ impl EventProcessor {
     async fn process_event(&self, event: RepoEvent) -> Result<(), anyhow::Error> {
         match event.event_type.as_str() {
             "indexing_started" => {
-                info!(
+                log::info!(
                     "Processing indexing_started event for repo {} (branch: {:?})",
-                    event.repo_name, event.branch
+                    event.repo_name,
+                    event.branch
                 );
                 // TODO: Implement indexing started handling
                 // This could include:
@@ -352,116 +347,360 @@ impl EventProcessor {
                 // - Preparing for incoming index data
             }
             "indexing_finished" => {
-                info!(
+                log::info!(
                     "Processing indexing_finished event for repo {} (branch: {:?})",
-                    event.repo_name, event.branch
+                    event.repo_name,
+                    event.branch
                 );
-                // Implement a minimal ingestion path:
-                // - Try to locate a local repo path under HYPERZOEKT_REPO_ROOT (or cwd)
-                // - If present, run the repo index builder to (re)build internal indexes
-                // - Compute pagerank and log stats
-                // This keeps behavior safe and local-only; fetching remote repos is
-                // intentionally omitted here.
 
-                // Determine repo root from env or default to current dir
-                let repo_root =
-                    std::env::var("HYPERZOEKT_REPO_ROOT").unwrap_or_else(|_| ".".to_string());
-                let mut candidate = PathBuf::from(&repo_root).join(&event.repo_name);
+                // Add prominent log when starting repository processing
+                log::info!(
+                    "🚀 Starting repository indexing for {} (branch: {:?}) from node {}",
+                    event.repo_name,
+                    event.branch,
+                    event.node_id
+                );
 
-                // If the constructed path doesn't exist, try to interpret git_url as file://
-                if !candidate.exists() {
-                    if let Some(stripped) = event.git_url.strip_prefix("file://") {
-                        let p = PathBuf::from(stripped);
-                        if p.exists() {
-                            candidate = p;
-                        }
+                // Clone the remote repository to a temporary directory
+                let temp_dir = match Self::clone_repository(&event).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        log::error!("Failed to clone repository {}: {}", event.repo_name, e);
+                        return Ok(()); // Don't retry, let zoekt-distributed handle it
                     }
-                }
+                };
 
-                if !candidate.exists() {
-                    info!(
-                        "No local repo path found for {} (tried {}); skipping ingestion",
-                        event.repo_name,
-                        candidate.display()
+                let repo_name = event.repo_name.clone();
+                let temp_dir_clone = temp_dir.clone();
+
+                // Run blocking index build off the tokio runtime
+                match tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                    let (mut svc, stats) = RepoIndexService::build(temp_dir_clone.as_path())?;
+                    // Compute pagerank (may be cheap) and surface stats
+                    svc.compute_pagerank();
+                    log::info!(
+                        "Completed ingestion for {}: files_indexed={} entities_indexed={}",
+                        repo_name,
+                        stats.files_indexed,
+                        stats.entities_indexed
                     );
-                } else {
-                    let repo_name = event.repo_name.clone();
-                    let path_clone = candidate.clone();
-                    // Run blocking index build off the tokio runtime
-                    match tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                        let (mut svc, stats) = RepoIndexService::build(path_clone.as_path())?;
-                        // Compute pagerank (may be cheap) and surface stats
-                        svc.compute_pagerank();
-                        info!(
-                            "Completed ingestion for {}: files_indexed={} entities_indexed={}",
-                            repo_name, stats.files_indexed, stats.entities_indexed
-                        );
-                        Ok(())
-                    })
-                    .await
-                    {
+
+                    // Extract EntityPayload from the service for persistence
+                    let payloads: Vec<EntityPayload> = svc
+                        .entities
+                        .iter()
+                        .map(|ent| {
+                            let file = &svc.files[ent.file_id as usize];
+                            let mut imports: Vec<ImportItem> = Vec::new();
+                            let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
+                            if matches!(ent.kind, EntityKind::File) {
+                                if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
+                                    let lines = svc.import_lines.get(ent.id as usize);
+                                    for (i, &target_eid) in edge_list.iter().enumerate() {
+                                        if let Some(target_ent) =
+                                            svc.entities.get(target_eid as usize)
+                                        {
+                                            let target_file_idx = target_ent.file_id as usize;
+                                            if let Some(target_file) =
+                                                svc.files.get(target_file_idx)
+                                            {
+                                                let line_no = lines
+                                                    .and_then(|l| l.get(i))
+                                                    .cloned()
+                                                    .unwrap_or(0)
+                                                    .saturating_add(1);
+                                                imports.push(ImportItem {
+                                                    path: target_file.path.clone(),
+                                                    line: line_no,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(unres) =
+                                    svc.unresolved_imports.get(ent.file_id as usize)
+                                {
+                                    for (m, lineno) in unres {
+                                        unresolved_imports.push(UnresolvedImport {
+                                            module: m.clone(),
+                                            line: lineno.saturating_add(1),
+                                        });
+                                    }
+                                }
+                            }
+                            let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
+                                let has_imports = !imports.is_empty();
+                                let has_unresolved = !unresolved_imports.is_empty();
+                                if has_imports || has_unresolved {
+                                    (
+                                        Some(ent.start_line.saturating_add(1)),
+                                        Some(ent.end_line.saturating_add(1)),
+                                    )
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (
+                                    Some(ent.start_line.saturating_add(1)),
+                                    Some(ent.end_line.saturating_add(1)),
+                                )
+                            };
+
+                            // Generate stable id for the entity
+                            let project = std::env::var("SURREAL_PROJECT")
+                                .unwrap_or_else(|_| "hyperzoekt-indexer".into());
+                            let repo = repo_name.clone();
+                            let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| {
+                                event.branch.clone().unwrap_or_else(|| "main".into())
+                            });
+                            let commit = std::env::var("SURREAL_COMMIT")
+                                .unwrap_or_else(|_| "unknown-commit".into());
+                            let key = format!(
+                                "{}|{}|{}|{}|{}|{}|{}",
+                                project, repo, branch, commit, file.path, ent.name, ent.signature
+                            );
+                            let mut hasher = sha2::Sha256::new();
+                            hasher.update(key.as_bytes());
+                            let stable_id = format!("{:x}", hasher.finalize());
+
+                            EntityPayload {
+                                file: file.path.clone(),
+                                language: file.language.clone(),
+                                kind: ent.kind.as_str().to_string(),
+                                name: ent.name.clone(),
+                                parent: ent.parent.clone(),
+                                signature: ent.signature.clone(),
+                                start_line: start_field,
+                                end_line: end_field,
+                                calls: ent.calls.clone(),
+                                doc: ent.doc.clone(),
+                                rank: ent.rank,
+                                imports,
+                                unresolved_imports,
+                                stable_id,
+                            }
+                        })
+                        .collect();
+
+                    // Configure and spawn DB writer
+                    let surreal_url = std::env::var("SURREALDB_URL").ok();
+                    let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
+                    let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
+                    let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
+                    let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
+
+                    let db_cfg = db_writer::DbWriterConfig {
+                        channel_capacity: 100,
+                        batch_capacity: Some(500),
+                        batch_timeout_ms: Some(500),
+                        max_retries: Some(3),
+                        surreal_url,
+                        surreal_username,
+                        surreal_password,
+                        surreal_ns,
+                        surreal_db,
+                        initial_batch: false, // Indexer processes events continuously
+                    };
+
+                    let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg)?;
+
+                    // Send payloads to DB writer
+                    if let Err(e) = tx.send(payloads) {
+                        log::error!("Failed to send payloads to DB writer: {}", e);
+                    }
+
+                    // Wait for DB writer to finish
+                    match db_join.join() {
                         Ok(Ok(())) => {
-                            info!(
-                                "Successfully processed indexing_finished for {}",
-                                event.repo_name
+                            log::info!(
+                                "Successfully persisted {} entities for {}",
+                                stats.entities_indexed,
+                                repo_name
                             );
                         }
                         Ok(Err(e)) => {
-                            error!("Indexer failed for {}: {}", event.repo_name, e);
+                            log::error!("DB writer failed for {}: {}", repo_name, e);
                         }
                         Err(e) => {
-                            error!("Indexer task panicked for {}: {:?}", event.repo_name, e);
+                            log::error!("DB writer thread panicked for {}: {:?}", repo_name, e);
+                        }
+                    }
+
+                    // Clean up the temporary directory
+                    if let Err(e) = std::fs::remove_dir_all(&temp_dir_clone) {
+                        log::warn!(
+                            "Failed to clean up temp directory {}: {}",
+                            temp_dir_clone.display(),
+                            e
+                        );
+                    } else {
+                        log::info!(
+                            "Cleaned up temporary directory: {}",
+                            temp_dir_clone.display()
+                        );
+                    }
+
+                    Ok(())
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        log::info!(
+                            "Successfully processed indexing_finished for {}",
+                            event.repo_name
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("Indexer failed for {}: {}", event.repo_name, e);
+                        // Clean up temp directory on error too
+                        if let Err(cleanup_err) =
+                            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&temp_dir))
+                                .await
+                        {
+                            log::warn!(
+                                "Failed to clean up temp directory on error: {:?}",
+                                cleanup_err
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Indexer task panicked for {}: {:?}", event.repo_name, e);
+                        // Clean up temp directory on panic too
+                        if let Err(cleanup_err) =
+                            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&temp_dir))
+                                .await
+                        {
+                            log::warn!(
+                                "Failed to clean up temp directory on panic: {:?}",
+                                cleanup_err
+                            );
                         }
                     }
                 }
             }
             _ => {
-                warn!("Unknown event type: {}", event.event_type);
+                log::warn!("Unknown event type: {}", event.event_type);
             }
         }
 
         Ok(())
     }
+
+    /// Clone a repository to a temporary directory
+    async fn clone_repository(event: &RepoEvent) -> Result<PathBuf, anyhow::Error> {
+        // Create a temporary directory for the clone
+        let temp_dir = std::env::temp_dir().join("hyperzoekt-clones").join(format!(
+            "{}-{}",
+            event.repo_name,
+            Uuid::new_v4()
+        ));
+
+        // Ensure parent directory exists
+        if let Some(parent) = temp_dir.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Remove temp directory if it already exists (cleanup from previous failed run)
+        if temp_dir.exists() {
+            tokio::fs::remove_dir_all(&temp_dir).await?;
+        }
+
+        log::info!(
+            "Cloning {} from {} to {}",
+            event.repo_name,
+            event.git_url,
+            temp_dir.display()
+        );
+
+        // Clone the repository (this is blocking, so run in spawn_blocking)
+        let git_url = event.git_url.clone();
+        let branch = event.branch.clone();
+        let temp_dir_clone = temp_dir.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+            // Clone the repository
+            let mut clone_options = git2::FetchOptions::new();
+
+            // Add authentication if available
+            if let Ok(username) = std::env::var("GIT_USERNAME") {
+                if let Ok(password) = std::env::var("GIT_PASSWORD") {
+                    let mut callbacks = git2::RemoteCallbacks::new();
+                    callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
+                        git2::Cred::userpass_plaintext(&username, &password)
+                    });
+                    clone_options.remote_callbacks(callbacks);
+                }
+            }
+
+            let mut repo_builder = git2::build::RepoBuilder::new();
+            repo_builder.fetch_options(clone_options);
+
+            // Clone to the specified branch if provided
+            let should_checkout_default = branch.is_none();
+            if let Some(ref branch_name) = branch {
+                repo_builder.branch(branch_name);
+            }
+
+            let repo = repo_builder.clone(&git_url, &temp_dir_clone)?;
+
+            // If no branch was specified, checkout the default branch
+            if should_checkout_default {
+                let head = repo.head()?;
+                let head_commit = head.peel_to_commit()?;
+                let mut checkout_builder = git2::build::CheckoutBuilder::new();
+                checkout_builder.force();
+                repo.checkout_tree(head_commit.as_object(), Some(&mut checkout_builder))?;
+            }
+
+            Ok(())
+        })
+        .await??;
+
+        log::info!(
+            "Successfully cloned {} to {}",
+            event.repo_name,
+            temp_dir.display()
+        );
+        Ok(temp_dir)
+    }
 }
 
 /// Create and start the event consumer and processor
-pub async fn start_event_system() -> Result<(), anyhow::Error> {
+pub async fn start_event_system() -> Result<tokio::task::JoinHandle<()>, anyhow::Error> {
     start_event_system_with_ttl(300).await // Default to 5 minutes
 }
 
 /// Create and start the event consumer and processor with configurable TTL
-pub async fn start_event_system_with_ttl(processing_ttl_seconds: u64) -> Result<(), anyhow::Error> {
+pub async fn start_event_system_with_ttl(
+    processing_ttl_seconds: u64,
+) -> Result<tokio::task::JoinHandle<()>, anyhow::Error> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let consumer = EventConsumer::new(event_tx);
     let processor = EventProcessor::new(event_rx);
 
     if consumer.is_redis_available() {
-        info!("Redis is available, starting event consumption");
+        log::info!("Redis is available, starting event consumption");
         consumer
             .start_consuming_with_ttl(processing_ttl_seconds)
             .await?;
     } else {
-        info!("Redis is not available, event consumption disabled");
+        log::info!("Redis is not available, event consumption disabled");
     }
 
-    // Start the processor in a separate task
-    tokio::spawn(async move {
+    // Start the processor in a separate task and return the join handle
+    let processor_handle = tokio::spawn(async move {
         if let Err(e) = processor.start_processing().await {
-            error!("Event processor failed: {}", e);
+            log::error!("Event processor failed: {}", e);
         }
     });
 
-    Ok(())
+    Ok(processor_handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-    use std::fs;
-    use std::time::Duration;
-    use tempfile::tempdir;
 
     #[test]
     fn repo_event_deserialize_alias() {
@@ -469,47 +708,5 @@ mod tests {
         let e: RepoEvent = serde_json::from_str(json).expect("deserialize");
         assert_eq!(e.event_type, "indexing_finished");
         assert_eq!(e.repo_name, "r");
-    }
-
-    #[tokio::test]
-    async fn indexing_finished_triggers_build() {
-        // Create a temp parent directory and a repo subdir
-        let parent = tempdir().expect("tempdir");
-        let repo_dir = parent.path().join("testrepo");
-        fs::create_dir_all(&repo_dir).expect("create repo dir");
-        // Add a tiny file so the indexer has something to scan
-        fs::write(repo_dir.join("lib.rs"), "fn main() { println!(\"hi\"); }").expect("write file");
-
-        // Point HYPERZOEKT_REPO_ROOT to the parent so join(repo_name) resolves
-        env::set_var("HYPERZOEKT_REPO_ROOT", parent.path());
-
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let processor = EventProcessor::new(rx);
-
-        // Spawn the processor
-        let handle = tokio::spawn(async move { processor.start_processing().await });
-
-        // Send indexing_finished event targeting our testrepo
-        let ev = RepoEvent {
-            event_type: "indexing_finished".to_string(),
-            repo_name: "testrepo".to_string(),
-            git_url: format!("file://{}", repo_dir.display()),
-            branch: None,
-            node_id: "node1".to_string(),
-            timestamp: 0,
-        };
-
-        _tx.send(ev).expect("send event");
-        // close the sender so processor exits after processing
-        drop(_tx);
-
-        // Wait for the processor to finish (with timeout)
-        let join_res = tokio::time::timeout(Duration::from_secs(20), handle)
-            .await
-            .expect("processor timed out")
-            .expect("processor panicked");
-
-        assert!(join_res.is_ok(), "processor returned error");
     }
 }

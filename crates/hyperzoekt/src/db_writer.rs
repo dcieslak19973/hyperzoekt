@@ -20,7 +20,41 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::Duration;
 use surrealdb::engine::local::Mem;
+use surrealdb::engine::remote::http::Http;
+use surrealdb::engine::remote::ws::Ws;
 use surrealdb::Surreal;
+
+enum SurrealConnection {
+    Local(Surreal<surrealdb::engine::local::Db>),
+    RemoteHttp(Surreal<surrealdb::engine::remote::http::Client>),
+    RemoteWs(Surreal<surrealdb::engine::remote::ws::Client>),
+}
+
+impl SurrealConnection {
+    async fn use_ns(&self, namespace: &str) -> Result<(), surrealdb::Error> {
+        match self {
+            SurrealConnection::Local(db) => db.use_ns(namespace).await,
+            SurrealConnection::RemoteHttp(db) => db.use_ns(namespace).await,
+            SurrealConnection::RemoteWs(db) => db.use_ns(namespace).await,
+        }
+    }
+
+    async fn use_db(&self, database: &str) -> Result<(), surrealdb::Error> {
+        match self {
+            SurrealConnection::Local(db) => db.use_db(database).await,
+            SurrealConnection::RemoteHttp(db) => db.use_db(database).await,
+            SurrealConnection::RemoteWs(db) => db.use_db(database).await,
+        }
+    }
+
+    async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
+        match self {
+            SurrealConnection::Local(db) => db.query(sql).await,
+            SurrealConnection::RemoteHttp(db) => db.query(sql).await,
+            SurrealConnection::RemoteWs(db) => db.query(sql).await,
+        }
+    }
+}
 
 pub type SpawnResult = Result<
     (
@@ -37,6 +71,8 @@ pub struct DbWriterConfig {
     pub batch_timeout_ms: Option<u64>,
     pub max_retries: Option<usize>,
     pub surreal_url: Option<String>,
+    pub surreal_username: Option<String>,
+    pub surreal_password: Option<String>,
     pub surreal_ns: String,
     pub surreal_db: String,
     pub initial_batch: bool,
@@ -57,19 +93,65 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
         rt.block_on(async move {
             let db = {
                 if let Some(url) = &cfg.surreal_url {
-                    warn!("SURREAL_URL is set ({}), but remote connections are not yet supported in this build; falling back to embedded Mem", url);
-                }
-                info!("Starting embedded SurrealDB (Mem) namespace={} db={}", cfg.surreal_ns, cfg.surreal_db);
-                match Surreal::new::<Mem>(()).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to start embedded SurrealDB: {}", e);
-                        return Err::<(), anyhow::Error>(anyhow::anyhow!(e));
+                    // Try to connect to external SurrealDB
+                    if url.starts_with("ws://") || url.starts_with("wss://") {
+                        info!("Connecting to SurrealDB via WebSocket: {}", url);
+                        let connection = Surreal::new::<Ws>(url).await?;
+                                                // Authenticate if credentials are provided
+                        if let (Some(username), Some(password)) = (&cfg.surreal_username, &cfg.surreal_password) {
+                            connection.signin(surrealdb::opt::auth::Root {
+                                username,
+                                password,
+                            }).await?;
+                            info!("Authenticated with SurrealDB as user: {}", username);
+                        }
+                        SurrealConnection::RemoteWs(connection)
+                    } else if url.starts_with("http://") || url.starts_with("https://") {
+                        // HTTP connection to SurrealDB - extract host and port
+                        let url_str = url.trim_start_matches("http://").trim_start_matches("https://");
+                        info!("Connecting to SurrealDB via HTTP: {} (parsed from {})", url_str, url);
+                        let connection = Surreal::new::<Http>(url_str).await?;
+                        // Authenticate if credentials are provided
+                        if let (Some(username), Some(password)) = (&cfg.surreal_username, &cfg.surreal_password) {
+                            connection.signin(surrealdb::opt::auth::Root {
+                                username,
+                                password,
+                            }).await?;
+                            info!("Authenticated with SurrealDB as user: {}", username);
+                        }
+                        SurrealConnection::RemoteHttp(connection)
+                    } else {
+                        // Assume HTTP connection for URLs without protocol prefix
+                        let http_url = format!("http://{}", url);
+                        info!("Connecting to SurrealDB via HTTP: {} (inferred from {})", http_url, url);
+                        let connection = Surreal::new::<Http>(&http_url).await?;
+                        // Authenticate if credentials are provided
+                        if let (Some(username), Some(password)) = (&cfg.surreal_username, &cfg.surreal_password) {
+                            connection.signin(surrealdb::opt::auth::Root {
+                                username,
+                                password,
+                            }).await?;
+                            info!("Authenticated with SurrealDB as user: {}", username);
+                        }
+                        SurrealConnection::RemoteHttp(connection)
+                    }
+                } else {
+                    info!("No SURREALDB_URL provided, using embedded SurrealDB (Mem) namespace={} db={}", cfg.surreal_ns, cfg.surreal_db);
+                    match Surreal::new::<Mem>(()).await {
+                        Ok(s) => SurrealConnection::Local(s),
+                        Err(e) => {
+                            error!("Failed to start embedded SurrealDB: {}", e);
+                            return Err::<(), anyhow::Error>(anyhow::anyhow!(e));
+                        }
                     }
                 }
             };
-            if let Err(e) = db.use_ns(&cfg.surreal_ns).use_db(&cfg.surreal_db).await {
-                error!("use_ns/use_db failed: {}", e);
+            if let Err(e) = db.use_ns(&cfg.surreal_ns).await {
+                error!("use_ns failed: {}", e);
+                return Err::<(), anyhow::Error>(anyhow::anyhow!(e));
+            }
+            if let Err(e) = db.use_db(&cfg.surreal_db).await {
+                error!("use_db failed: {}", e);
                 return Err::<(), anyhow::Error>(anyhow::anyhow!(e));
             }
 
@@ -161,14 +243,14 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
             for group in schema_groups.iter() {
                 let mut applied = false;
                 for q in group.iter() {
-                    match db.query(*q).await {
+                    match db.query(q).await {
                         Ok(_) => {
-                            info!("Schema applied: {}", *q);
+                            info!("Schema applied: {}", q);
                             applied = true;
                             break;
                         }
                         Err(e) => {
-                            trace!("Schema variant failed: {} -> {}", *q, e);
+                            trace!("Schema variant failed: {} -> {}", q, e);
                         }
                     }
                 }

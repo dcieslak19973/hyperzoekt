@@ -302,7 +302,10 @@ struct Opts {
     remote_url: Vec<String>,
     /// Address to listen on for HTTP search (env: ZOEKTD_BIND_ADDR)
     #[arg(long)]
-    listen: Option<String>,
+    host: Option<String>,
+    /// Port to listen on for HTTP search
+    #[arg(long)]
+    port: Option<u16>,
     /// Disable periodic reindexing (useful for dev when you don't want frequent re-index)
     #[arg(long)]
     disable_reindex: bool,
@@ -477,18 +480,28 @@ async fn main() -> Result<()> {
 
     let opts = Opts::parse();
 
-    // determine bind address from CLI flag, env var, or default
-    let _bind_addr = opts
-        .listen
+    // determine bind address from CLI flags, env var, or default
+    let host = opts
+        .host
         .clone()
-        .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:3000".into());
+        .or_else(|| std::env::var("ZOEKTD_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = opts
+        .port
+        .or_else(|| {
+            std::env::var("ZOEKTD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(3000);
 
-    // Determine endpoint for registration: prefer ZOEKT_ENDPOINT env var, fallback to listen addr
+    let bind_addr = format!("{}:{}", host, port);
+
+    // Determine endpoint for registration: prefer ZOEKT_ENDPOINT env var, fallback to constructed bind address
     let endpoint = if let Ok(e) = std::env::var("ZOEKT_ENDPOINT") {
         Some(e)
     } else {
-        opts.listen.as_ref().map(|addr| format!("http://{}", addr))
+        Some(format!("http://{}:{}", host, port))
     };
 
     let cfg = zoekt_distributed::load_node_config(
@@ -1173,11 +1186,6 @@ async fn main() -> Result<()> {
     .layer(Extension(registered_repos))
     .layer(Extension(lease_mgr));
 
-    // determine bind address from CLI flag, env var, or default
-    let bind_addr = opts
-        .listen
-        .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:3000".into());
     tracing::info!(binding = %bind_addr, "starting http search server");
     let addr: std::net::SocketAddr = bind_addr.parse().expect("invalid bind address");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

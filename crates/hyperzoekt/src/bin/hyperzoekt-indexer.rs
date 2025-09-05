@@ -24,6 +24,10 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long)]
     repo_root: Option<PathBuf>,
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 3001)]
+    port: u16,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -84,9 +88,21 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Starting continuous indexer, waiting for Redis events from zoekt-distributed...");
 
-    // Start the event consumer system
-    if let Err(e) = event_consumer::start_event_system_with_ttl(processing_ttl_seconds).await {
-        eprintln!("Failed to start event system: {}", e);
+    // Start the event consumer system and get the processor handle
+    let processor_handle =
+        match event_consumer::start_event_system_with_ttl(processing_ttl_seconds).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::error!("Failed to start event system: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    info!("Event system started successfully. Indexer will run continuously waiting for Redis events...");
+
+    // Wait for the processor to complete (this should never happen in normal operation)
+    if let Err(e) = processor_handle.await {
+        log::error!("Event processor task panicked: {:?}", e);
         std::process::exit(1);
     }
 

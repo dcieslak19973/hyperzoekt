@@ -27,7 +27,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # SurrealDB client for importer/streaming integration. This is a core dependency.
-surrealdb = { version = "2.3", features = ["kv-mem"] }
+surrealdb = { version = "2.3", features = ["kv-mem", "protocol-ws", "protocol-http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 notify = "8.2"
 toml = "0.7"
@@ -40,6 +40,21 @@ deadpool-redis = "0.17"
 redis = { version = "0.27", features = ["tokio-comp"] }
 libc = "0.2"
 
+# Git for cloning remote repositories
+git2 = "0.20"
+
+# UUID for unique temporary directory names
+uuid = { version = "1.0", features = ["v4"] }
+
+# zoekt-distributed for shared event types
+zoekt-distributed = { path = "../zoekt-distributed" }
+
+# Web UI dependencies
+axum = { version = "0.7", features = ["json", "query"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+minijinja = "1.0"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
@@ -49,13 +64,13 @@ predicates = "3"
 name = "hyperzoekt-indexer"
 path = "src/bin/hyperzoekt-indexer.rs"
 
-[[bin]]
-name = "hyperzoekt-watcher"
-path = "src/bin/hyperzoekt-watcher.rs"
-
 # Keep the original binary for backwards compatibility
 [[bin]]
 name = "hyperzoekt"
 path = "src/bin/hyperzoekt/main.rs"
+
+[[bin]]
+name = "hyperzoekt-webui"
+path = "src/bin/hyperzoekt-webui.rs"
 
 

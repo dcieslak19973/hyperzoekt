@@ -33,15 +33,41 @@ Build locally with Rust and Cargo (install via https://rustup.rs/):
 
 Running the indexer
 -------------------
+The project provides two sets of binaries:
+
+**Legacy Zoekt-Distributed:**
 The `dzr-indexer` binary supports a one-shot indexing mode which will index each configured repo once and then skip further reindex attempts. Enable it with the `--index-once` flag or set the `ZOEKTD_INDEX_ONCE=true` environment variable.
 
 Example (run the indexer and index repos once):
-
 ```bash
 RUST_LOG=info cargo run -p zoekt-distributed --bin dzr-indexer -- --remote-url /path/to/repo --listen 127.0.0.1:3000 --index-once
 ```
 
-You can also control reindexing via `--disable-reindex` (prevent periodic reindex entirely) and the `ZOEKTD_ENABLE_REINDEX` env var.
+**New Hyperzoekt:**
+The `hyperzoekt-indexer` binary supports enhanced indexing with Tree-sitter semantic analysis.
+
+Example (run the indexer):
+```bash
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-indexer
+```
+
+Running the web UI
+------------------
+**Legacy Admin UI:**
+The `dzr-admin` binary provides a web interface for managing repositories.
+
+Example (run the admin UI):
+```bash
+RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 ZOEKT_ADMIN_USERNAME=admin ZOEKT_ADMIN_PASSWORD=password cargo run --bin dzr-admin -- --bind 127.0.0.1:7878
+```
+
+**New Hyperzoekt Web UI:**
+The `hyperzoekt-webui` binary provides a modern web interface for browsing indexed repositories and entities.
+
+Example (run the web UI):
+```bash
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+```
 
 Configuration
 -------------
@@ -140,15 +166,22 @@ cd docker && docker-compose up --build
 This will start:
 - **Redis** on port 6379 (for distributed coordination)
 - **SurrealDB** on port 8000 (for repository metadata and permissions)
+
+**Zoekt-Distributed Services (Legacy):**
 - **Indexer** on port 7676 (for indexing repositories)
 - **Admin UI** on port 7878 (web interface for managing repositories)
 - **Search API** on port 8080 (HTTP search endpoint)
 - **MCP Server** on port 7979 (Model Context Protocol for AI assistants)
 
+**Hyperzoekt Services (New):**
+- **Indexer** on port 7677 (enhanced indexing with Tree-sitter)
+- **Web UI** on port 7879 (modern web interface for browsing/searching)
+
 2. **Access the services:**
-- Admin UI: http://localhost:7878 (username: `admin`, password: `password`)
-- Search API: http://localhost:8080
-- SurrealDB: ws://localhost:8000/rpc
+- **Legacy Admin UI**: http://localhost:7878 (username: `admin`, password: `password`)
+- **Legacy Search API**: http://localhost:8080
+- **New Web UI**: http://localhost:7879 (browse repositories, entities, and search)
+- **SurrealDB**: ws://localhost:8000/rpc
 
 3. **Environment variables for Docker:**
 The Docker Compose file sets up the following environment variables for all services:
@@ -163,7 +196,7 @@ environment:
 ```
 
 4. **Adding repositories:**
-Use the Admin UI at http://localhost:7878 to add repositories for indexing.
+Use the Admin UI at http://localhost:7878 to add repositories for indexing, or the new Web UI at http://localhost:7879 for enhanced browsing.
 
 5. **Stop services:**
 ```bash
@@ -173,16 +206,16 @@ cd docker && docker-compose down
 Running the full system locally
 -------------------
 
-In generaly, you'll need a REDIs instance running for the Admin UI, the Indexer,
-and the Search UI to work together.
+Running the full system locally
+-------------------------------
+
+You'll need Redis and SurrealDB running for all components to work together.
+
+**Legacy Zoekt-Distributed Services:**
 
 1. Run the Indexer:
 ```bash
 cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3001 --remote-url /workspaces/hyperzoekt --disable-reindex
-```
-OR
-```bash
-cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-indexer -- --listen 127.0.0.1:3002
 ```
 2. Run the Admin UI:
 ```bash
@@ -192,9 +225,20 @@ cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 ZOE
 ```bash
 cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-http-search -- --listen 127.0.0.1:8080
 ```
-3. Run the MCP UI:
+4. Run the MCP Server:
 ```bash
-cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-mcp-search -- --listen 127.0.0.1:8081
+cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 cargo run --bin dzr-mcp-search -- --listen 127.0.0.1:7979
+```
+
+**New Hyperzoekt Services:**
+
+1. **Run the Indexer:**
+```bash
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-indexer
+```
+2. **Run the Web UI:**
+```bash
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
 ```
 
 License
