@@ -114,6 +114,7 @@ impl TestDatabase {
             r#"CREATE entity CONTENT {
                 stable_id: "test1",
                 name: "getUserData",
+                repo_name: "repo1",
                 signature: "fn getUserData() -> User",
                 file: "/repo1/user.rs",
                 language: "rust",
@@ -130,6 +131,7 @@ impl TestDatabase {
             r#"CREATE entity CONTENT {
                 stable_id: "test2",
                 name: "processData",
+                repo_name: "repo1",
                 signature: "fn processData(data: &Data)",
                 file: "/repo1/data.rs",
                 language: "rust",
@@ -146,6 +148,7 @@ impl TestDatabase {
             r#"CREATE entity CONTENT {
                 stable_id: "test3",
                 name: "UserService",
+                repo_name: "repo2",
                 signature: "struct UserService { ... }",
                 file: "/repo2/service.rs",
                 language: "rust",
@@ -162,6 +165,7 @@ impl TestDatabase {
             r#"CREATE entity CONTENT {
                 stable_id: "test4",
                 name: "calculateTotal",
+                repo_name: "repo2",
                 signature: "fn calculateTotal(items: Vec<Item>) -> f64",
                 file: "/repo2/math.rs",
                 language: "rust",

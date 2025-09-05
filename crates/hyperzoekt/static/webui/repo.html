@@ -30,11 +30,17 @@
                         entity.language }}</span>
                 </div>
                 <div class="entity-meta">
-                    📄 <a
-                        href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                    📄 {% if entity.source_url %}
+                    <a href="{{ entity.source_url }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
                         target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.file }}{% if
                         entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% else %}
+                    <a href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                        target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.file }}{% if
+                        entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% endif %}
                     {% if entity.end_line %}-{{ entity.end_line }}{% endif %}
+                    • 🔢 Rank: <strong>{{ entity.rank }}</strong>
                     {% if entity.parent %}
                     • 📦 {{ entity.parent }}
                     {% endif %}

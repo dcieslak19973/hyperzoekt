@@ -384,6 +384,33 @@ impl EventProcessor {
                         stats.entities_indexed
                     );
 
+                    // Helper: normalize git_url to an https base (strip .git, convert ssh forms)
+                    fn normalize_git_url(git_url: &str) -> Option<String> {
+                        if git_url.is_empty() {
+                            return None;
+                        }
+                        // Handle SSH style: git@github.com:owner/repo.git -> https://github.com/owner/repo
+                        if git_url.starts_with("git@") {
+                            // git@host:owner/repo.git
+                            if let Some(colon) = git_url.find(':') {
+                                let host = &git_url[4..colon];
+                                let rest = &git_url[colon + 1..];
+                                let rest = rest.strip_suffix(".git").unwrap_or(rest);
+                                return Some(format!("https://{}/{}", host, rest));
+                            }
+                        }
+
+                        // Handle http/https
+                        if git_url.starts_with("http://") || git_url.starts_with("https://") {
+                            let s = git_url.trim_end_matches(".git");
+                            return Some(s.to_string());
+                        }
+
+                        // Fallback: try to treat as path-like and prefix https://
+                        let s = git_url.trim_end_matches(".git");
+                        Some(format!("https://{}", s))
+                    }
+
                     // Extract EntityPayload from the service for persistence
                     let payloads: Vec<EntityPayload> = svc
                         .entities
@@ -464,6 +491,20 @@ impl EventProcessor {
                                 &ent.signature,
                             );
 
+                            // Build a source_url from the RepoEvent.git_url and branch, prefer event.branch
+                            let branch_ref = event.branch.clone().unwrap_or_else(|| "main".into());
+                            let source_base = normalize_git_url(&event.git_url);
+                            let computed_source = source_base.map(|base| {
+                                // file.path is the repo-relative path; construct blob URL
+                                let rel = file.path.trim_start_matches('/');
+                                format!(
+                                    "{}/blob/{}/{}",
+                                    base.trim_end_matches('/'),
+                                    branch_ref,
+                                    rel
+                                )
+                            });
+
                             EntityPayload {
                                 file: file.path.clone(),
                                 language: file.language.clone(),
@@ -480,6 +521,7 @@ impl EventProcessor {
                                 unresolved_imports,
                                 stable_id,
                                 repo_name: repo_name.clone(),
+                                source_url: computed_source,
                             }
                         })
                         .collect();
@@ -597,7 +639,7 @@ impl EventProcessor {
             .map(|c| match c {
                 '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
                 c if c.is_control() => '_',
-                c => c,
+                other => other,
             })
             .collect::<String>();
 

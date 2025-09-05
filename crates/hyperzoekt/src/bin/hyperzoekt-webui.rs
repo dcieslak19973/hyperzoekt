@@ -347,19 +347,58 @@ impl Database {
         &self,
         repo_name: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let query = format!(
-            r#"
-            SELECT * FROM entity
-            WHERE string::starts_with(file, '{}')
-            ORDER BY file, start_line
-        "#,
-            repo_name.replace("'", "\\'")
-        );
+        // Prefer filtering on the explicit `repo_name` field (safer and more direct).
+        // Fall back to matching file path prefixes for older/imported records that
+        // don't have `repo_name` populated.
+        let entities: Vec<EntityPayload> = match &*self.db {
+            SurrealConnection::Local(db_conn) => db_conn
+                .query("SELECT * FROM entity WHERE repo_name = $repo ORDER BY file, start_line")
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+            SurrealConnection::RemoteHttp(db_conn) => db_conn
+                .query("SELECT * FROM entity WHERE repo_name = $repo ORDER BY file, start_line")
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+            SurrealConnection::RemoteWs(db_conn) => db_conn
+                .query("SELECT * FROM entity WHERE repo_name = $repo ORDER BY file, start_line")
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+        };
 
-        let mut response = self.db.query(&query).await?;
-        let entities: Vec<EntityPayload> = response.take(0)?;
+        if !entities.is_empty() {
+            return Ok(entities);
+        }
 
-        Ok(entities)
+        // Fallback: look for file paths that start with the provided repo_name.
+        // Use a parameterized query to avoid injection.
+        let entities2: Vec<EntityPayload> = match &*self.db {
+            SurrealConnection::Local(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE string::starts_with(file, $repo) ORDER BY file, start_line",
+                )
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+            SurrealConnection::RemoteHttp(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE string::starts_with(file, $repo) ORDER BY file, start_line",
+                )
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+            SurrealConnection::RemoteWs(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE string::starts_with(file, $repo) ORDER BY file, start_line",
+                )
+                .bind(("repo", repo_name.to_string()))
+                .await?
+                .take(0)?,
+        };
+
+        Ok(entities2)
     }
 
     pub async fn get_all_entities(&self) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
@@ -431,6 +470,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test1",
                 name: "getUserData",
+                repo_name: "hyperzoekt-abc123",
                 signature: "def getUserData() -> User",
                 file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/user.py",
                 language: "python",
@@ -447,6 +487,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test2",
                 name: "processData",
+                repo_name: "hyperzoekt-abc123",
                 signature: "def processData(data: Data) -> None",
                 file: "/tmp/hyperzoekt-clones/hyperzoekt-abc123/src/data.py",
                 language: "python",
@@ -463,6 +504,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test3",
                 name: "UserService",
+                repo_name: "gpt-researcher-def456",
                 signature: "class UserService",
                 file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/service.ts",
                 language: "typescript",
@@ -479,6 +521,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test4",
                 name: "calculateTotal",
+                repo_name: "gpt-researcher-def456",
                 signature: "function calculateTotal(items: Item[]): number",
                 file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/math.ts",
                 language: "typescript",
@@ -495,6 +538,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test5",
                 name: "DatabaseConnection",
+                repo_name: "gpt-researcher-def456",
                 signature: "class DatabaseConnection",
                 file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/db.tsx",
                 language: "tsx",
@@ -511,6 +555,7 @@ impl Database {
             r#"CREATE entity CONTENT {
                 stable_id: "test6",
                 name: "validateInput",
+                repo_name: "gpt-researcher-def456",
                 signature: "function validateInput(input: string): boolean",
                 file: "/tmp/hyperzoekt-clones/gpt-researcher-def456/src/validation.js",
                 language: "javascript",
@@ -721,9 +766,29 @@ async fn repo_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Clean up file paths for all entities
+    // Compute source base URL and branch from environment (defaults chosen for convenience)
+    let source_base =
+        std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
+    let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
+
+    // Clean up file paths and populate a direct source URL only when DB did not provide one
     for entity in &mut entities {
+        // Clean the displayed file path
         entity.file = clean_file_path(&entity.file);
+
+        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
+            // entity.file may already be repo-relative 'repo/path/to/file', remove leading repo if present
+            let repo = &entity.repo_name;
+            let file_path = entity.file.replace(&format!("{}/", repo), "");
+            let url = format!(
+                "{}/{}/blob/{}/{}",
+                source_base.trim_end_matches('/'),
+                repo,
+                source_branch,
+                file_path
+            );
+            entity.source_url = Some(url);
+        }
     }
 
     let template = state.templates.get_template("repo").unwrap();

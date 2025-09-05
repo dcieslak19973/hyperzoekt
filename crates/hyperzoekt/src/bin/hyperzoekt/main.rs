@@ -308,6 +308,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 unresolved_imports,
                 stable_id,
                 repo_name: repo.clone(),
+                source_url: None,
             }
         })
         .collect();

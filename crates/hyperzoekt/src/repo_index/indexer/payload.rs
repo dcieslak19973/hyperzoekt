@@ -44,4 +44,6 @@ pub struct EntityPayload {
     pub unresolved_imports: Vec<UnresolvedImport>,
     pub stable_id: String,
     pub repo_name: String,
+    // Optional URL pointing to the source hosting (e.g. GitHub) for quick navigation from the UI
+    pub source_url: Option<String>,
 }

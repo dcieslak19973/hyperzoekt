@@ -73,43 +73,72 @@
                 const capitalizedKind = kind.charAt(0).toUpperCase() + kind.slice(1);
 
                 html += `
-                <div class="card" style="margin-bottom: 2rem;">
+                <div class="card pagerank-card" style="margin-bottom: 2rem;">
                     <div class="card-header">
-                        <h3>${capitalizedKind}s (${entities.length})</h3>
+                        <h3>
+                            <button class="pagerank-card-toggle" aria-expanded="false" data-kind="${kind}" title="Toggle ${capitalizedKind} list">
+                                <span class="chev">▶</span>&nbsp;<span class="pagerank-card-label">${capitalizedKind}s (${entities.length})</span>
+                            </button>
+                        </h3>
                     </div>
-                    <div class="card-body">
-                        <div style="overflow-x: auto;">
-                            <table style="width: 100%; border-collapse: collapse;">
-                                <thead>
-                                    <tr style="background: var(--panel); border-bottom: 2px solid var(--input-border);">
-                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Rank</th>
-                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Name</th>
-                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">File</th>
-                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">Signature</th>
-                                        <th style="padding: 0.75rem; text-align: left; font-weight: bold;">PageRank</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
+                    <div class="card-body" style="display: none;">
+                                <div style="overflow-x: hidden;">
+                                    <table class="pagerank-table" style="width: 100%; border-collapse: collapse;">
+                                        <thead>
+                                            <tr class="pagerank-header">
+                                                <th class="col-rank">Rank</th>
+                                                <th class="col-name">Name</th>
+                                                <th class="col-file">File</th>
+                                                <th class="col-signature">Signature</th>
+                                                <th class="col-score">PageRank</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
             `;
 
                 entities.forEach((entity, index) => {
-                    const cleanFile = entity.file.replace(/^\/tmp\/hyperzoekt-clones\//, '');
+                    // Normalize file path: remove local clone root and repo name prefix when possible
+                    let cleanFile = (entity.file || '').replace(/^\/tmp\/hyperzoekt-clones\/[0-9a-fA-F-]+\//, '');
+                    // Iteratively strip common clone-directory prefixes so we end up with a path
+                    // relative to the repository root. This handles variants like:
+                    //  - /tmp/hyperzoekt-clones/<uuid>/repo-name-<uuid>/...
+                    //  - repo-name-<uuid>/...
+                    //  - clone-*/...
+                    const parts = cleanFile.split('/').filter(p => p !== '');
+                    while (parts.length > 1) {
+                        const first = parts[0];
+                        // UUID-suffixed segments like name-8e9834cb-6abb-4381-90f4-...
+                        const isUuidSuffix = /^[^\/]+-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(first);
+                        // common clone prefixes
+                        const isCloneLike = /^clone-|^tmp-|^tmp$/.test(first) || /^\d+$/.test(first);
+                        // repo name exact or repo-name-prefixed segments
+                        const isRepoName = entity.repo_name && (first === entity.repo_name || first === (entity.repo_name + '-clone') || first.startsWith(entity.repo_name + '-'));
+                        if (isUuidSuffix || isCloneLike || isRepoName) {
+                            parts.shift();
+                            continue;
+                        }
+                        // If the first segment equals the repo name followed by slash, strip it
+                        if (entity.repo_name && first === entity.repo_name) {
+                            parts.shift();
+                            continue;
+                        }
+                        break;
+                    }
+                    cleanFile = parts.join('/');
                     const rankClass = index < 3 ? 'top-rank' : '';
                     const rankDisplay = (index + 1).toString().padStart(2, '0');
 
                     html += `
-                    <tr class="${rankClass}" style="border-bottom: 1px solid var(--input-border);">
-                        <td style="padding: 0.75rem; font-weight: bold; color: var(--accent);">${rankDisplay}</td>
-                        <td style="padding: 0.75rem;">
-                            <a href="/entity/${entity.stable_id}" style="color: var(--accent); text-decoration: none; font-weight: 500;">
+                    <tr class="${rankClass} pagerank-row">
+                        <td class="col-rank">${rankDisplay}</td>
+                        <td class="col-name">
+                            <a href="/entity/${entity.stable_id}" class="entity-link">
                                 ${entity.name}
                             </a>
                         </td>
-                        <td style="padding: 0.75rem; font-size: 0.9rem; color: var(--muted);">${cleanFile}</td>
-                        <td style="padding: 0.75rem; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 0.85rem;">
-                            ${entity.signature.length > 60 ? entity.signature.substring(0, 60) + '...' : entity.signature}
-                        </td>
-                        <td style="padding: 0.75rem; font-weight: bold; color: #22c55e;">${entity.rank.toFixed(6)}</td>
+                        <td class="col-file">${cleanFile}</td>
+                        <td class="col-signature">${entity.signature.length > 120 ? entity.signature.substring(0, 120) + '...' : entity.signature}</td>
+                        <td class="col-score">${entity.rank.toFixed(6)}</td>
                     </tr>
                 `;
                 });
@@ -124,6 +153,29 @@
             });
 
             tablesDiv.innerHTML = html;
+
+            // Attach collapse/expand handlers: default state is collapsed
+            const toggles = tablesDiv.querySelectorAll('.pagerank-card-toggle');
+            toggles.forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const b = e.currentTarget;
+                    const card = b.closest('.pagerank-card');
+                    if (!card) return;
+                    const body = card.querySelector('.card-body');
+                    const chev = b.querySelector('.chev');
+                    const expanded = b.getAttribute('aria-expanded') === 'true';
+                    if (expanded) {
+                        b.setAttribute('aria-expanded', 'false');
+                        if (chev) chev.textContent = '▶';
+                        if (body) body.style.display = 'none';
+                    } else {
+                        b.setAttribute('aria-expanded', 'true');
+                        if (chev) chev.textContent = '▼';
+                        if (body) body.style.display = 'block';
+                    }
+                });
+            });
+
             loadingDiv.style.display = 'none';
             contentDiv.style.display = 'block';
 
@@ -147,5 +199,117 @@
     .top-rank:hover {
         background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(34, 197, 94, 0.05)) !important;
     }
+
+    /* Pagerank table responsive layout to avoid horizontal scrolling */
+    .pagerank-table {
+        table-layout: fixed;
+        /* Enforce column widths */
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.95rem;
+    }
+
+    .pagerank-table thead th {
+        padding: 0.75rem;
+        text-align: left;
+        font-weight: bold;
+        background: var(--panel);
+        border-bottom: 2px solid var(--input-border);
+    }
+
+    .pagerank-row td {
+        padding: 0.75rem;
+        border-bottom: 1px solid var(--input-border);
+        vertical-align: top;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* Column width hints -- adjust as needed */
+    .col-rank {
+        width: 6%;
+        max-width: 60px;
+    }
+
+    .col-name {
+        width: 22%;
+    }
+
+    .col-file {
+        width: 32%;
+    }
+
+    .col-signature {
+        width: 30%;
+    }
+
+    .col-score {
+        width: 10%;
+        max-width: 120px;
+        text-align: right;
+    }
+
+    /* Ensure links and signatures behave when truncated */
+    .entity-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 500;
+        display: inline-block;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .col-signature {
+        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        font-size: 0.85rem;
+        color: var(--muted);
+    }
+
+    /* On narrow screens, allow file and signature to wrap but limit height */
+    @media (max-width: 800px) {
+        .pagerank-table {
+            table-layout: auto;
+        }
+
+        .pagerank-row td {
+            white-space: normal;
+        }
+
+        .col-rank {
+            width: 8%;
+        }
+
+        .col-name {
+            width: 28%;
+        }
+
+        .col-file {
+            width: 32%;
+        }
+
+        .col-signature {
+            width: 32%;
+        }
+    }
+
+    /* Collapsible card toggle */
+    .pagerank-card-toggle {
+        background: transparent;
+        border: none;
+        color: var(--text);
+        font-weight: 700;
+        font-size: 1rem;
+        cursor: pointer;
+        padding: 0;
+    }
+
+    .pagerank-card-toggle:focus {
+        outline: 2px solid rgba(14, 165, 164, 0.25);
+        outline-offset: 2px;
+    }
 </style>
+
 {% endblock %}

@@ -113,6 +113,7 @@ pub fn index_single_file(
             unresolved_imports,
             stable_id,
             repo_name: repo.clone(),
+            source_url: None,
         });
     }
     Ok((payloads, stats))
