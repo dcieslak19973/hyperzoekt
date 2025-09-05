@@ -24,6 +24,7 @@ use minijinja::{context, Environment};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use surrealdb::engine::local::Mem;
 use surrealdb::engine::remote::http::Http;
 use surrealdb::engine::remote::ws::Ws;
@@ -213,11 +214,20 @@ impl SurrealConnection {
     }
 
     async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
-        match self {
+        // Centralized logging for all SurrealDB queries: log SQL and duration
+        log::debug!("Executing SurrealDB query: {}", sql);
+        let start = Instant::now();
+        let res = match self {
             SurrealConnection::Local(db) => db.query(sql).await,
             SurrealConnection::RemoteHttp(db) => db.query(sql).await,
             SurrealConnection::RemoteWs(db) => db.query(sql).await,
+        };
+        let elapsed = start.elapsed();
+        match &res {
+            Ok(_) => log::debug!("SurrealDB query succeeded in {:?}: {}", elapsed, sql),
+            Err(e) => log::debug!("SurrealDB query failed in {:?}: {} -> {}", elapsed, sql, e),
         }
+        res
     }
 }
 
@@ -427,6 +437,221 @@ impl Database {
         let entities: Vec<EntityPayload> = response.take(0)?;
 
         Ok(entities.into_iter().next())
+    }
+
+    /// Query the database for callers and callees of an entity using SurrealDB queries.
+    /// Returns (callers, callees) where each is a Vec<(name, Option<stable_id>)>
+    pub async fn get_entity_relations(
+        &self,
+        stable_id: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<
+        (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>),
+        Box<dyn std::error::Error>,
+    > {
+        // Callees: resolve entries in this entity's `calls` array to entities by stable_id or name
+        // We'll perform two queries: one matching stable_id in calls, and one matching name in calls.
+        let mut callers: Vec<(String, Option<String>)> = Vec::new();
+        let mut callees: Vec<(String, Option<String>)> = Vec::new();
+
+        // Query callers: find entities where this stable_id or name appears in their calls array
+        let callers_query = r#"
+            SELECT name, stable_id, rank FROM entity WHERE $id IN calls OR $name IN calls ORDER BY rank DESC LIMIT $limit
+        "#;
+
+        // Query callees by matching calls array elements to existing entities' stable_id or name
+        // We use a two-step approach: fetch distinct call strings from this entity, then lookup entities
+        let callees_distinct_query = r#"
+            SELECT array::distinct(calls) as calls FROM entity WHERE stable_id = $id LIMIT 1
+        "#;
+
+        // Execute callers query
+        let mut response = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn
+                    .query(callers_query)
+                    .bind(("id", stable_id.to_string()))
+                    .bind(("name", name.to_string()))
+                    .bind(("limit", limit as i64))
+                    .await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn
+                    .query(callers_query)
+                    .bind(("id", stable_id.to_string()))
+                    .bind(("name", name.to_string()))
+                    .bind(("limit", limit as i64))
+                    .await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn
+                    .query(callers_query)
+                    .bind(("id", stable_id.to_string()))
+                    .bind(("name", name.to_string()))
+                    .bind(("limit", limit as i64))
+                    .await?
+            }
+        };
+
+        // Extract callers
+        if let Ok(rows) = response.take::<Vec<serde_json::Value>>(0) {
+            for row in rows.into_iter() {
+                if let (Some(n), Some(id)) = (row.get("name"), row.get("stable_id")) {
+                    let n = n.as_str().unwrap_or_default().to_string();
+                    let id = id.as_str().map(|s| s.to_string());
+                    callers.push((n, id));
+                }
+            }
+        }
+
+        // Get distinct calls from this entity
+        let mut resp2 = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn
+                    .query(callees_distinct_query)
+                    .bind(("id", stable_id.to_string()))
+                    .await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn
+                    .query(callees_distinct_query)
+                    .bind(("id", stable_id.to_string()))
+                    .await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn
+                    .query(callees_distinct_query)
+                    .bind(("id", stable_id.to_string()))
+                    .await?
+            }
+        };
+
+        let calls_list: Vec<String> = if let Ok(vals) = resp2.take::<Vec<serde_json::Value>>(0) {
+            if let Some(first) = vals.into_iter().next() {
+                if let Some(calls_val) = first.get("calls") {
+                    if calls_val.is_array() {
+                        calls_val
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !calls_list.is_empty() {
+            // Lookup entities whose stable_id or name is in calls_list
+            // Build an IN-list safely by binding each as a separate parameter is tedious; instead use array::contains in Surreal
+            // We'll perform two queries: match stable_id in array, then name in array
+            let lookup_by_id = r#"
+                SELECT name, stable_id, rank FROM entity WHERE stable_id IN $calls ORDER BY rank DESC LIMIT $limit
+            "#;
+
+            let lookup_by_name = r#"
+                SELECT name, stable_id, rank FROM entity WHERE name IN $calls ORDER BY rank DESC LIMIT $limit
+            "#;
+
+            // Bind calls as a JSON array string
+            let calls_json = serde_json::to_value(&calls_list)?;
+
+            let mut resp_id = match &*self.db {
+                SurrealConnection::Local(db_conn) => {
+                    db_conn
+                        .query(lookup_by_id)
+                        .bind(("calls", calls_json.clone()))
+                        .bind(("limit", limit as i64))
+                        .await?
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    db_conn
+                        .query(lookup_by_id)
+                        .bind(("calls", calls_json.clone()))
+                        .await?
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    db_conn
+                        .query(lookup_by_id)
+                        .bind(("calls", calls_json.clone()))
+                        .bind(("limit", limit as i64))
+                        .await?
+                }
+            };
+
+            if let Ok(rows) = resp_id.take::<Vec<serde_json::Value>>(0) {
+                for row in rows.into_iter() {
+                    let n = row
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let id = row
+                        .get("stable_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    callees.push((n, id));
+                }
+            }
+
+            let mut resp_name = match &*self.db {
+                SurrealConnection::Local(db_conn) => {
+                    db_conn
+                        .query(lookup_by_name)
+                        .bind(("calls", calls_json.clone()))
+                        .bind(("limit", limit as i64))
+                        .await?
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    db_conn
+                        .query(lookup_by_name)
+                        .bind(("calls", calls_json.clone()))
+                        .await?
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    db_conn
+                        .query(lookup_by_name)
+                        .bind(("calls", calls_json.clone()))
+                        .bind(("limit", limit as i64))
+                        .await?
+                }
+            };
+
+            if let Ok(rows) = resp_name.take::<Vec<serde_json::Value>>(0) {
+                for row in rows.into_iter() {
+                    let n = row
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let id = row
+                        .get("stable_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    // Avoid duplicates
+                    if !callees.iter().any(|(cn, cid)| cn == &n && cid == &id) {
+                        callees.push((n, id));
+                    }
+                }
+            }
+            // Include unresolved call strings as (call, None) entries so callers/callees page shows unknown targets
+            for call in calls_list.iter() {
+                if !callees.iter().any(|(cn, _)| cn == call) {
+                    callees.push((call.clone(), None));
+                }
+            }
+        }
+
+        Ok((callers, callees))
     }
 
     pub async fn search_entities(
@@ -760,11 +985,19 @@ async fn repo_handler(
     State(state): State<AppState>,
     axum::extract::Path(repo_name): axum::extract::Path<String>,
 ) -> Result<Html<String>, StatusCode> {
+    log::debug!("repo_handler: fetching entities for repo={}", repo_name);
     let mut entities = state
         .db
         .get_entities_for_repo(&repo_name)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!(
+                "repo_handler: get_entities_for_repo failed for {}: {}",
+                repo_name,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Compute source base URL and branch from environment (defaults chosen for convenience)
     let source_base =
@@ -798,7 +1031,10 @@ async fn repo_handler(
             entities => entities,
             title => format!("Repository: {}", repo_name)
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!("Failed to render repo template for {}: {}", repo_name, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Html(html))
 }
@@ -807,23 +1043,73 @@ async fn entity_handler(
     State(state): State<AppState>,
     axum::extract::Path(stable_id): axum::extract::Path<String>,
 ) -> Result<Html<String>, StatusCode> {
+    log::debug!("entity_handler: fetching entity stable_id={}", stable_id);
     let mut entity = state
         .db
         .get_entity_by_id(&stable_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            log::error!(
+                "entity_handler: get_entity_by_id failed for {}: {}",
+                stable_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     // Clean up the file path
     entity.file = clean_file_path(&entity.file);
+    // Resolve callers and callees via DB queries to avoid scanning all entities in memory
+    // Read a limit for relations from environment (default 50)
+    let relations_limit: usize = std::env::var("ENTITY_RELATIONS_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    log::debug!(
+        "entity_handler: resolving relations for {} (limit={})",
+        entity.stable_id,
+        relations_limit
+    );
+    let (callers, callees) = state
+        .db
+        .get_entity_relations(&entity.stable_id, &entity.name, relations_limit)
+        .await
+        .map_err(|e| {
+            log::error!(
+                "Failed to resolve callers/callees from DB for {}: {}",
+                entity.stable_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    log::debug!(
+        "entity_handler: resolved callers={} callees={} for {}",
+        callers.len(),
+        callees.len(),
+        entity.stable_id
+    );
 
     let template = state.templates.get_template("entity").unwrap();
+    // Ensure repo_name is available to the template (entity.html references `repo_name`)
+    let repo_name = entity.repo_name.clone();
     let html = template
         .render(context! {
             entity => entity,
+            repo_name => repo_name,
+            callers => callers,
+            callees => callees,
             title => format!("Entity: {}", entity.name)
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!(
+                "Failed to render entity template for {}: {}",
+                entity.stable_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Html(html))
 }
@@ -834,7 +1120,10 @@ async fn search_handler(State(state): State<AppState>) -> Result<Html<String>, S
         .render(context! {
             title => "Search HyperZoekt Index"
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!("Failed to render search template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Html(html))
 }
@@ -849,11 +1138,15 @@ async fn search_api_handler(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<EntityPayload>>, StatusCode> {
+    log::debug!("search_api_handler: q='{}' repo={:?}", query.q, query.repo);
     let mut results = state
         .db
         .search_entities(&query.q, query.repo.as_deref())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!("search_entities failed for q='{}': {}", query.q, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Clean up file paths to show repository-relative paths instead of absolute filesystem paths
     for entity in &mut results {
@@ -866,11 +1159,10 @@ async fn search_api_handler(
 async fn repos_api_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<RepoSummary>>, StatusCode> {
-    let repos = state
-        .db
-        .get_repo_summaries()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let repos = state.db.get_repo_summaries().await.map_err(|e| {
+        log::error!("Failed to fetch repo summaries: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(repos))
 }
@@ -885,7 +1177,10 @@ async fn entities_api_handler(
     } else {
         state.db.get_all_entities().await
     }
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        log::error!("Failed to fetch entities (repo={:?}): {}", repo, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Clean up file paths for all entities
     for entity in &mut entities {
@@ -927,11 +1222,24 @@ async fn pagerank_api_handler(
     State(state): State<AppState>,
     Query(query): Query<PageRankQuery>,
 ) -> Result<Json<Vec<EntityPayload>>, StatusCode> {
+    log::debug!("pagerank_api_handler: repo={}", &query.repo);
     let mut entities = state
         .db
         .get_entities_for_repo(&query.repo)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            log::error!(
+                "pagerank get_entities_for_repo failed for {}: {}",
+                &query.repo,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    log::debug!(
+        "pagerank_api_handler: fetched {} entities for repo={}",
+        entities.len(),
+        &query.repo
+    );
 
     // Clean up file paths for all entities
     for entity in &mut entities {

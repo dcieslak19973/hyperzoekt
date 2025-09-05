@@ -421,6 +421,65 @@
             color: var(--text);
         }
 
+        /* Signature pre/code block styling */
+        pre code {
+            display: block;
+            white-space: pre-wrap;
+            /* preserve newlines but wrap long lines */
+            word-break: break-word;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            background: var(--input-bg);
+            padding: 0.75rem;
+            border-radius: var(--border-radius);
+            border: 1px solid var(--input-border);
+            color: var(--text);
+            font-size: 0.9rem;
+            overflow-x: auto;
+            margin: 0.25rem 0 0.5rem 0;
+        }
+
+        /* Callers / Callees lists */
+        .relations {
+            display: flex;
+            gap: 2rem;
+            flex-wrap: wrap;
+            margin-top: 0.5rem;
+        }
+
+        .relations .relation-card {
+            background: var(--panel);
+            border: 1px solid var(--input-border);
+            padding: 0.5rem;
+            border-radius: var(--border-radius);
+            min-width: 220px;
+            max-width: 48%;
+        }
+
+        .relations .relation-card h4 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.95rem;
+        }
+
+        .relation-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            max-height: 360px;
+            overflow: auto;
+        }
+
+        .relation-list li a {
+            text-decoration: none;
+            color: var(--accent);
+        }
+
+        .relation-list li a:hover {
+            text-decoration: underline;
+        }
+
         .import-list {
             margin-top: 1rem;
         }
