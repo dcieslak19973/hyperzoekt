@@ -926,7 +926,10 @@ async fn construct_source_url(
                         "construct_source_url: Normalized git_url to '{}'",
                         normalized_base
                     );
-                    let branch = r.branch.unwrap_or_else(|| "main".to_string());
+                    let branch = r
+                        .branch
+                        .or_else(|| std::env::var("SOURCE_BRANCH").ok())
+                        .unwrap_or_else(|| "main".to_string());
 
                     // Use helper to compute repo-relative path
                     let repo_relative = repo_relative_from_file(file_path, &clean_repo_name);
@@ -1705,10 +1708,14 @@ async fn pagerank_api_handler(
 
     // Determine base URL and branch once
     let (source_base_opt, source_branch) = if let Some(r) = repo_row {
+        let branch = r
+            .branch
+            .or_else(|| std::env::var("SOURCE_BRANCH").ok())
+            .unwrap_or_else(|| "main".to_string());
         if let Some(norm) = normalize_git_url(&r.git_url) {
-            (Some(norm), r.branch.unwrap_or_else(|| "main".to_string()))
+            (Some(norm), branch)
         } else {
-            (None, r.branch.unwrap_or_else(|| "main".to_string()))
+            (None, branch)
         }
     } else {
         (
@@ -1754,6 +1761,7 @@ async fn pagerank_api_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Helper to create a minimal AppState with an in-memory Surreal DB and template env
     async fn make_state() -> AppState {
@@ -1766,6 +1774,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn construct_source_url_fallback_env() {
         let state = make_state().await;
 
@@ -1879,6 +1888,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn construct_source_url_local_git_url_falls_back_to_env() {
         let state = make_state().await;
         // Trigger env fallback by using a repo name that does not exist in DB
@@ -1969,6 +1979,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn construct_source_url_empty_git_url_uses_env() {
         let state = make_state().await;
 
