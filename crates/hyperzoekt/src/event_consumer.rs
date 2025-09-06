@@ -242,7 +242,8 @@ impl EventConsumer {
             let message: Option<String> = conn.brpoplpush(queue_key, &processing_key, 5.0).await?;
 
             if let Some(event_json) = message {
-                log::info!("Processing message: {}", event_json);
+                // Make the message logging more prominent
+                log::info!("🚀 Received indexing request: {}", event_json);
 
                 // Set TTL on processing key for failure recovery
                 let _: () = conn
@@ -251,6 +252,14 @@ impl EventConsumer {
 
                 match serde_json::from_str::<RepoEvent>(&event_json) {
                     Ok(event) => {
+                        // Log more details about the processing start
+                        log::info!(
+                            "📋 Starting processing for repo '{}' from node '{}' (branch: {:?})",
+                            event.repo_name,
+                            event.node_id,
+                            event.branch
+                        );
+
                         // Send event to processor
                         if event_tx.send(event).is_err() {
                             log::warn!("Event channel closed, stopping consumer");
@@ -330,6 +339,37 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// Extract owner from a git URL
+    /// Examples:
+    /// - https://github.com/owner/repo.git -> owner
+    /// - git@github.com:owner/repo.git -> owner
+    /// - https://gitlab.com/owner/repo -> owner
+    fn extract_owner_from_git_url(git_url: &str) -> Option<String> {
+        // Handle SSH style: git@host:owner/repo.git
+        if git_url.starts_with("git@") {
+            if let Some(colon) = git_url.find(':') {
+                let rest = &git_url[colon + 1..];
+                if let Some(slash) = rest.find('/') {
+                    return Some(rest[..slash].to_string());
+                }
+            }
+        }
+
+        // Handle HTTP/HTTPS style: https://host/owner/repo
+        if git_url.starts_with("http://") || git_url.starts_with("https://") {
+            let url = git_url.trim_end_matches(".git");
+            if let Some(host_start) = url.find("://") {
+                let after_host = &url[host_start + 3..];
+                let parts: Vec<&str> = after_host.split('/').collect();
+                if parts.len() >= 2 {
+                    return Some(parts[1].to_string());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Process a single repo event
     async fn process_event(&self, event: RepoEvent) -> Result<(), anyhow::Error> {
         match event.event_type.as_str() {
@@ -360,6 +400,21 @@ impl EventProcessor {
                     event.node_id
                 );
 
+                // Extract owner from git URL
+                let owner = Self::extract_owner_from_git_url(&event.git_url);
+                if let Some(ref owner_name) = owner {
+                    log::info!(
+                        "📋 Extracted owner '{}' from git URL: {}",
+                        owner_name,
+                        event.git_url
+                    );
+                } else {
+                    log::warn!(
+                        "⚠️  Could not extract owner from git URL: {}",
+                        event.git_url
+                    );
+                }
+
                 // Clone the remote repository to a temporary directory
                 let temp_dir = match Self::clone_repository(&event).await {
                     Ok(dir) => dir,
@@ -371,6 +426,8 @@ impl EventProcessor {
 
                 let repo_name = event.repo_name.clone();
                 let temp_dir_clone = temp_dir.clone();
+                // capture owner for use inside blocking closure
+                let owner_clone = owner.clone();
 
                 // Run blocking index build off the tokio runtime
                 match tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -493,16 +550,48 @@ impl EventProcessor {
 
                             // Build a source_url from the RepoEvent.git_url and branch, prefer event.branch
                             let branch_ref = event.branch.clone().unwrap_or_else(|| "main".into());
+                            // Normalize the configured git URL and use it directly. Do NOT
+                            // fall back to owner+repo — if normalization fails, we will not
+                            // generate a source URL for this entity.
                             let source_base = normalize_git_url(&event.git_url);
+
+                            // Log normalization and final URL decision for easier debugging in Docker logs
+                            if let Some(ref g) = Some(event.git_url.clone()) {
+                                log::info!(
+                                    "source_url_debug: git_url='{}' owner='{:?}' repo='{}' branch='{}'",
+                                    g,
+                                    owner_clone,
+                                    repo_name,
+                                    branch_ref
+                                );
+                            }
+
+                            if let Some(ref base) = source_base {
+                                log::info!("source_url_debug: normalized_base='{}'", base);
+                            } else {
+                                log::warn!(
+                                    "source_url_debug: normalized_base is None; no source_url will be set"
+                                );
+                            }
+
                             let computed_source = source_base.map(|base| {
-                                // file.path is the repo-relative path; construct blob URL
-                                let rel = file.path.trim_start_matches('/');
-                                format!(
+                                // file.path may include the temporary clone root (eg /tmp/hyperzoekt-clones/xxx/<repo>/...)
+                                // Strip the temp_dir_clone prefix when possible to get a repo-relative path.
+                                let rel_path = match std::path::Path::new(&file.path)
+                                    .strip_prefix(&temp_dir_clone)
+                                {
+                                    Ok(p) => p.to_string_lossy().to_string(),
+                                    Err(_) => file.path.trim_start_matches('/').to_string(),
+                                };
+                                let rel = rel_path.trim_start_matches('/');
+                                let url = format!(
                                     "{}/blob/{}/{}",
                                     base.trim_end_matches('/'),
                                     branch_ref,
                                     rel
-                                )
+                                );
+                                log::info!("source_url_debug: computed source_url='{}'", url);
+                                url
                             });
 
                             EntityPayload {
