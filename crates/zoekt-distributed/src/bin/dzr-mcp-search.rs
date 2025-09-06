@@ -410,7 +410,7 @@ async fn extract_git_headers(headers: &HeaderMap, credentials: &SharedCredential
         .and_then(|v| v.to_str().ok())
     {
         creds.github_username = Some(username.to_string());
-        tracing::info!("✅ Extracted GitHub username from header: {}", username);
+        tracing::info!("✅ Extracted GitHub username from header");
         extracted_count += 1;
     }
     if let Some(token) = headers.get("x-github-token").and_then(|v| v.to_str().ok()) {
@@ -428,7 +428,7 @@ async fn extract_git_headers(headers: &HeaderMap, credentials: &SharedCredential
         .and_then(|v| v.to_str().ok())
     {
         creds.gitlab_username = Some(username.to_string());
-        tracing::info!("✅ Extracted GitLab username from header: {}", username);
+        tracing::info!("✅ Extracted GitLab username from header");
         extracted_count += 1;
     }
     if let Some(token) = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
@@ -446,7 +446,7 @@ async fn extract_git_headers(headers: &HeaderMap, credentials: &SharedCredential
         .and_then(|v| v.to_str().ok())
     {
         creds.bitbucket_username = Some(username.to_string());
-        tracing::info!("✅ Extracted BitBucket username from header: {}", username);
+        tracing::info!("✅ Extracted BitBucket username from header");
         extracted_count += 1;
     }
     if let Some(token) = headers
@@ -1674,7 +1674,10 @@ struct Opts {
     poll_interval_seconds: Option<u64>,
     /// Address to listen on for HTTP search (env: ZOEKTD_BIND_ADDR)
     #[arg(long)]
-    listen: Option<String>,
+    host: Option<String>,
+    /// Port to listen on for HTTP search
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -1730,14 +1733,18 @@ async fn main() -> Result<()> {
     tracing::info!("✅ MCP handler created");
 
     // Determine bind address
-    let bind_addr = opts
-        .listen
-        .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:8081".into());
-
-    // Parse host and port
-    let (host, port_str) = bind_addr.rsplit_once(':').unwrap_or(("127.0.0.1", "8080"));
-    let port: u16 = port_str.parse().unwrap_or(8080);
+    let host = opts
+        .host
+        .or_else(|| std::env::var("ZOEKTD_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = opts
+        .port
+        .or_else(|| {
+            std::env::var("ZOEKTD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(8081);
 
     tracing::info!(host = %host, port = %port, "🌐 Server configuration");
     tracing::info!("🚀 Starting dzr-mcp-search MCP server on {}:{}", host, port);

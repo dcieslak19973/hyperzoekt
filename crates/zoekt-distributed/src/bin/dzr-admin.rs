@@ -57,8 +57,12 @@ struct Opts {
     lease_ttl_seconds: Option<u64>,
     #[arg(long)]
     poll_interval_seconds: Option<u64>,
-    #[arg(long, default_value = "127.0.0.1:7878")]
-    bind: String,
+    /// Address to listen on
+    #[arg(long)]
+    host: Option<String>,
+    /// Port to listen on
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 struct AppStateInner {
@@ -93,8 +97,8 @@ struct CreateRepoWithFreq {
 const INDEX_TEMPLATE: &str = include_str!("../../static/admin/index.html");
 const LOGIN_TEMPLATE: &str = include_str!("../../static/admin/login.html");
 const ADMIN_JS: &str = include_str!("../../static/admin/admin.js");
-const COMMON_STYLES: &str = include_str!("../../static/common/styles.css");
-const COMMON_THEME_JS: &str = include_str!("../../static/common/theme.js");
+const COMMON_STYLES: &str = include_str!("../../../../static/common/styles.css");
+const COMMON_THEME_JS: &str = include_str!("../../../../static/common/theme.js");
 
 // Reuse shared web helper functions from the crate for common HTTP helpers.
 use web_utils::{
@@ -156,12 +160,12 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, "index: incoming request");
+    tracing::info!("index: incoming request");
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
     let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
     let sid_opt = session_mgr.verify_and_extract_session(&headers);
     let auth_type = if is_basic { "basic" } else { "cookie" };
-    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
+
     // Accept cookie-based auth when the session id can be extracted AND the server-side
     // session map contains a non-expired entry for it. This allows unsigned (dev) cookies
     // to work as long as the server tracked the session.
@@ -177,10 +181,10 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
         // If the client prefers JSON (AJAX/API), return 401 JSON; otherwise redirect to /login
         if wants_json(&headers) {
             let body = json!({"error": "unauthorized"});
-            tracing::warn!(request_id=%req_id, user = %"", auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome = %"unauthorized");
+            tracing::warn!(user = %"", auth_type=%auth_type, pid=%std::process::id(), outcome = %"unauthorized");
             return into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
         }
-        tracing::warn!(request_id=%req_id, user = %"", auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome = %"redirect_login");
+        tracing::warn!(user = %"", auth_type=%auth_type, pid=%std::process::id(), outcome = %"redirect_login");
         return into_boxed_response(Redirect::to("/login"));
     }
 
@@ -289,12 +293,13 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                                         }
                                     }
                                     // Get current lease holder from Redis lease keys for real-time accuracy
+                                    let owner = parse_owner_from_git_url(&url);
                                     let remote_repo = RemoteRepo {
                                         name: name.clone(),
                                         git_url: url.clone(),
                                         branch: Some(branch.to_string()),
                                         visibility: zoekt_rs::types::RepoVisibility::Public,
-                                        owner: None,
+                                        owner,
                                         allowed_users: Vec::new(),
                                         last_commit_sha: None,
                                     };
@@ -366,7 +371,7 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
         "anonymous".to_string()
     };
 
-    tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome = %"index_ok");
+    tracing::info!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome = %"index_ok");
     let (parts, body) = resp.into_parts();
     let boxed = axum::body::Body::new(body);
     axum::response::Response::from_parts(parts, boxed)
@@ -522,6 +527,40 @@ fn matches_pattern(pattern: &str, branch: &str) -> bool {
     }
 }
 
+/// Parse owner/account from common Git URL forms (scp-like and http/ssh urls).
+fn parse_owner_from_git_url(git_url: &str) -> Option<String> {
+    // Handle scp-like syntax: git@host:owner/repo.git
+    if git_url.starts_with("git@") {
+        if let Some(idx) = git_url.find(':') {
+            let path = &git_url[idx + 1..];
+            let path = path.trim_end_matches(".git");
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() >= 2 {
+                return Some(parts[0].to_string());
+            }
+        }
+    }
+
+    // For URLs like https://host/owner/repo.git or ssh://git@host/owner/repo.git
+    let after_scheme = if let Some(idx) = git_url.find("://") {
+        &git_url[idx + 3..]
+    } else {
+        git_url
+    };
+    // Strip leading user@host/ part if present by taking the path after first '/'
+    let path = if let Some(pos) = after_scheme.find('/') {
+        &after_scheme[pos + 1..]
+    } else {
+        after_scheme
+    };
+    let path = path.trim_end_matches(".git");
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 2 {
+        return Some(parts[0].to_string());
+    }
+    None
+}
+
 #[allow(dead_code)]
 async fn create_inner(
     Extension(state): Extension<AppState>,
@@ -533,13 +572,12 @@ async fn create_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, "create: incoming");
+    tracing::info!("create: incoming");
     // compute user_for_log and auth_type similar to delete
     let parsed_basic = parse_basic_auth(&headers).map(|(u, _)| u);
-    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let auth_type = if basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass) {
         "basic"
-    } else if sid_log.is_empty() {
+    } else if extract_sid_for_log(&headers).is_none() {
         "none"
     } else {
         "cookie"
@@ -556,7 +594,6 @@ async fn create_inner(
     if user_for_log.is_empty() {
         user_for_log = "anonymous".to_string();
     }
-    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
     let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
     let sid_opt = session_mgr.verify_and_extract_session(&headers);
@@ -570,7 +607,7 @@ async fn create_inner(
         })
         .unwrap_or(false);
     if !is_basic && !sid_valid {
-        tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_unauthorized");
+        tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_unauthorized");
         return into_boxed_response((
             StatusCode::UNAUTHORIZED,
             Html("<h1>Unauthorized</h1>".to_string()),
@@ -589,7 +626,7 @@ async fn create_inner(
     {
         let map = state.sessions.read();
         if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
-            tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_forbidden_csrf_mismatch");
+            tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_forbidden_csrf_mismatch");
             return into_boxed_response((
                 StatusCode::FORBIDDEN,
                 Html("<h1>Forbidden</h1>".to_string()),
@@ -603,7 +640,7 @@ async fn create_inner(
                 match expand_branch_patterns(&form.url, branches_str.trim()).await {
                     Ok(expanded) => expanded,
                     Err(e) => {
-                        tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_branch_expand_error", error=?e);
+                        tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_branch_expand_error", error=?e);
                         if wants_json(&headers) {
                             let body = json!({"error": "branch_pattern_error", "message": e});
                             let mut resp =
@@ -652,7 +689,7 @@ async fn create_inner(
         {
             Ok(res) => {
                 if res == 1 {
-                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_name", name=%form.name);
+                    tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_conflict_name", name=%form.name);
                     if wants_json(&headers) {
                         let body = json!({"error": "name_conflict", "name": form.name});
                         let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
@@ -675,7 +712,7 @@ async fn create_inner(
                     return resp;
                 }
                 if res == 2 {
-                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_conflict_url", url=%form.url);
+                    tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_conflict_url", url=%form.url);
                     if wants_json(&headers) {
                         let body = json!({"error": "url_conflict", "url": form.url});
                         let mut resp = into_boxed_response((StatusCode::CONFLICT, Json(body)));
@@ -710,7 +747,7 @@ async fn create_inner(
                 meta["branches"] = json!(branches_str);
 
                 if let Err(e) = pool.hset(&meta_key, &form.name, &meta.to_string()).await {
-                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_meta_error", error=?e);
+                    tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_meta_error", error=?e);
                     return into_boxed_response((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Html("<h1>Internal Server Error</h1>".to_string()),
@@ -725,7 +762,7 @@ async fn create_inner(
                 }
             }
             Err(e) => {
-                tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"create_redis_error");
+                tracing::warn!(error=?e, pid=%std::process::id(), outcome=%"create_redis_error");
                 return into_boxed_response((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Html("<h1>Internal Server Error</h1>".to_string()),
@@ -736,7 +773,7 @@ async fn create_inner(
 
     if wants_json(&headers) {
         let body = json!({"name": form.name, "url": form.url});
-        tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_success", name=%form.name);
+        tracing::info!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_success", name=%form.name);
         let mut resp = into_boxed_response((StatusCode::CREATED, Json(body)));
         resp.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-request-id"),
@@ -745,7 +782,7 @@ async fn create_inner(
         return resp;
     }
 
-    tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"create_redirect");
+    tracing::info!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_redirect");
     let mut resp = into_boxed_response(Redirect::to("/"));
     resp.headers_mut().insert(
         axum::http::header::HeaderName::from_static("x-request-id"),
@@ -772,13 +809,12 @@ async fn delete_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, "delete: incoming");
+    tracing::info!(pid=%std::process::id(), outcome=%"delete_incoming");
     // compute user_for_log and auth_type similar to create
     let parsed_basic = parse_basic_auth(&headers).map(|(u, _)| u);
-    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let auth_type = if basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass) {
         "basic"
-    } else if sid_log.is_empty() {
+    } else if extract_sid_for_log(&headers).is_none() {
         "none"
     } else {
         "cookie"
@@ -795,7 +831,6 @@ async fn delete_inner(
     if user_for_log.is_empty() {
         user_for_log = "anonymous".to_string();
     }
-    let sid_log = extract_sid_for_log(&headers).unwrap_or_default();
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
     let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
     let sid_opt = session_mgr.verify_and_extract_session(&headers);
@@ -809,7 +844,7 @@ async fn delete_inner(
         })
         .unwrap_or(false);
     if !is_basic && !sid_valid {
-        tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_unauthorized");
+        tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"delete_unauthorized");
         return into_boxed_response((
             StatusCode::UNAUTHORIZED,
             Html("<h1>Unauthorized</h1>".to_string()),
@@ -828,7 +863,7 @@ async fn delete_inner(
     {
         let map = state.sessions.read();
         if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
-            tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_forbidden_csrf_mismatch");
+            tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"delete_forbidden_csrf_mismatch");
             return into_boxed_response((
                 StatusCode::FORBIDDEN,
                 Html("<h1>Forbidden</h1>".to_string()),
@@ -855,7 +890,7 @@ async fn delete_inner(
         {
             Ok(res) => {
                 if res == 1 {
-                    tracing::warn!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_not_found", name=%form.name);
+                    tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"delete_not_found", name=%form.name);
                     if wants_json(&headers) {
                         let body = json!({"error": "not_found", "name": form.name});
                         let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
@@ -894,7 +929,7 @@ async fn delete_inner(
                 }
             }
             Err(e) => {
-                tracing::warn!(request_id=%req_id, error=?e, pid=%std::process::id(), outcome=%"delete_redis_error");
+                tracing::warn!(error=?e, pid=%std::process::id(), outcome=%"delete_redis_error");
                 return into_boxed_response((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Html("<h1>Internal Server Error</h1>".to_string()),
@@ -905,7 +940,7 @@ async fn delete_inner(
 
     if wants_json(&headers) {
         let body = json!({"name": form.name});
-        tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_success", name=%form.name);
+        tracing::info!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"delete_success", name=%form.name);
         let mut resp = into_boxed_response((StatusCode::OK, Json(body)));
         resp.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-request-id"),
@@ -914,7 +949,7 @@ async fn delete_inner(
         return resp;
     }
 
-    tracing::info!(request_id=%req_id, user=%user_for_log, auth_type=%auth_type, sid=%sid_log, pid=%std::process::id(), outcome=%"delete_redirect");
+    tracing::info!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"delete_redirect");
     let mut resp = into_boxed_response(Redirect::to("/"));
     resp.headers_mut().insert(
         axum::http::header::HeaderName::from_static("x-request-id"),
@@ -1104,12 +1139,13 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                                     let current_lease_holder = if let Some(_pool) =
                                         &state.redis_pool
                                     {
+                                        let owner = parse_owner_from_git_url(&url);
                                         let repo = RemoteRepo {
                                             name: name.clone(),
                                             git_url: url.clone(),
                                             branch: Some(branch.to_string()),
                                             visibility: zoekt_rs::types::RepoVisibility::Public,
-                                            owner: None,
+                                            owner,
                                             allowed_users: Vec::new(),
                                             last_commit_sha: None,
                                         };
@@ -1275,7 +1311,7 @@ async fn delete_indexer_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, node_id=%form.node_id, "delete_indexer: incoming");
+    tracing::info!(node_id=%form.node_id, pid=%std::process::id(), outcome=%"delete_indexer_incoming");
 
     // Authentication check
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
@@ -1290,7 +1326,7 @@ async fn delete_indexer_inner(
         false
     };
     if !is_basic && !has_session {
-        tracing::warn!(request_id=%req_id, outcome=%"delete_indexer_unauthorized");
+        tracing::warn!(pid=%std::process::id(), outcome=%"delete_indexer_unauthorized");
         if wants_json(&headers) {
             let body = json!({"error": "unauthorized"});
             let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
@@ -1307,7 +1343,7 @@ async fn delete_indexer_inner(
     if let Some(sid) = sid_opt {
         let map = state.sessions.read();
         if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
-            tracing::warn!(request_id=%req_id, outcome=%"delete_indexer_forbidden_csrf_mismatch");
+            tracing::warn!(pid=%std::process::id(), outcome=%"delete_indexer_forbidden_csrf_mismatch");
             if wants_json(&headers) {
                 let body = json!({"error": "csrf_mismatch"});
                 let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
@@ -1333,7 +1369,7 @@ async fn delete_indexer_inner(
             .flatten()
             .is_some();
         if !exists {
-            tracing::warn!(request_id=%req_id, node_id=%form.node_id, outcome=%"delete_indexer_not_found");
+            tracing::warn!(node_id=%form.node_id, pid=%std::process::id(), outcome=%"delete_indexer_not_found");
             if wants_json(&headers) {
                 let body = json!({"error": "indexer_not_found"});
                 let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
@@ -1352,7 +1388,7 @@ async fn delete_indexer_inner(
         // Delete the indexer from zoekt:indexers
         let delete_result = pool.hdel("zoekt:indexers", &form.node_id).await;
         if delete_result.is_err() {
-            tracing::error!(request_id=%req_id, node_id=%form.node_id, error=?delete_result.err(), "Failed to delete indexer");
+            tracing::error!(node_id=%form.node_id, error=?delete_result.err(), pid=%std::process::id(), "Failed to delete indexer");
             if wants_json(&headers) {
                 let body = json!({"error": "delete_failed"});
                 let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
@@ -1385,13 +1421,7 @@ async fn delete_indexer_inner(
                             let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
                             if delete_result.is_ok() {
                                 leases_released += 1;
-                                tracing::info!(
-                                    request_id=%req_id,
-                                    node_id=%form.node_id,
-                                    repo=%repo_name,
-                                    branch=%branch,
-                                    "released lease during indexer deletion"
-                                );
+                                tracing::info!(node_id=%form.node_id, repo=%repo_name, branch=%branch, pid=%std::process::id(), outcome=%"released_lease_during_indexer_deletion");
                             }
                         }
                     }
@@ -1414,12 +1444,7 @@ async fn delete_indexer_inner(
             }
         }
 
-        tracing::info!(
-            request_id=%req_id,
-            node_id=%form.node_id,
-            leases_released=%leases_released,
-            outcome=%"delete_indexer_success"
-        );
+        tracing::info!(node_id=%form.node_id, leases_released=%leases_released, pid=%std::process::id(), outcome=%"delete_indexer_success");
 
         if wants_json(&headers) {
             let body = json!({
@@ -1443,7 +1468,7 @@ async fn delete_indexer_inner(
         );
         resp
     } else {
-        tracing::error!(request_id=%req_id, "No Redis connection available");
+        tracing::error!(pid=%std::process::id(), "No Redis connection available");
         if wants_json(&headers) {
             let body = json!({"error": "no_redis_connection"});
             let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
@@ -1470,7 +1495,7 @@ async fn delete_lease_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, repository=%form.repository, branch=%form.branch, "delete_lease: incoming");
+    tracing::info!(repository=%form.repository, branch=%form.branch, pid=%std::process::id(), outcome=%"delete_lease_incoming");
 
     // Authentication check
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
@@ -1485,7 +1510,7 @@ async fn delete_lease_inner(
         false
     };
     if !is_basic && !has_session {
-        tracing::warn!(request_id=%req_id, outcome=%"delete_lease_unauthorized");
+        tracing::warn!(pid=%std::process::id(), outcome=%"delete_lease_unauthorized");
         if wants_json(&headers) {
             let body = json!({"error": "unauthorized"});
             let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
@@ -1502,7 +1527,7 @@ async fn delete_lease_inner(
     if let Some(sid) = sid_opt {
         let map = state.sessions.read();
         if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
-            tracing::warn!(request_id=%req_id, outcome=%"delete_lease_forbidden_csrf_mismatch");
+            tracing::warn!(pid=%std::process::id(), outcome=%"delete_lease_forbidden_csrf_mismatch");
             if wants_json(&headers) {
                 let body = json!({"error": "csrf_mismatch"});
                 let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
@@ -1529,7 +1554,7 @@ async fn delete_lease_inner(
             .flatten()
             .is_some();
         if !exists {
-            tracing::warn!(request_id=%req_id, repository=%form.repository, branch=%form.branch, outcome=%"delete_lease_not_found");
+            tracing::warn!(repository=%form.repository, branch=%form.branch, pid=%std::process::id(), outcome=%"delete_lease_not_found");
             if wants_json(&headers) {
                 let body = json!({"error": "lease_not_found"});
                 let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
@@ -1555,7 +1580,7 @@ async fn delete_lease_inner(
         let git_url = match git_url {
             Some(url) => url,
             None => {
-                tracing::error!(request_id=%req_id, repository=%form.repository, branch=%form.branch, "Could not find git_url for repository branch");
+                tracing::error!(repository=%form.repository, branch=%form.branch, pid=%std::process::id(), "Could not find git_url for repository branch");
                 if wants_json(&headers) {
                     let body = json!({"error": "repository_not_found"});
                     let mut resp = into_boxed_response((StatusCode::NOT_FOUND, Json(body)));
@@ -1580,7 +1605,7 @@ async fn delete_lease_inner(
         let delete_result = pool.eval_i32("if redis.call('exists', KEYS[1]) == 1 then return redis.call('del', KEYS[1]) else return 0 end", &[&lease_key], &[]).await;
 
         if delete_result.is_err() {
-            tracing::error!(request_id=%req_id, repository=%form.repository, branch=%form.branch, error=?delete_result.err(), "Failed to delete lease");
+            tracing::error!(repository=%form.repository, branch=%form.branch, error=?delete_result.err(), pid=%std::process::id(), "Failed to delete lease");
             if wants_json(&headers) {
                 let body = json!({"error": "delete_failed"});
                 let mut resp = into_boxed_response((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
@@ -1606,12 +1631,7 @@ async fn delete_lease_inner(
             }
         }
 
-        tracing::info!(
-            request_id=%req_id,
-            repository=%form.repository,
-            branch=%form.branch,
-            outcome=%"delete_lease_success"
-        );
+        tracing::info!(repository=%form.repository, branch=%form.branch, pid=%std::process::id(), outcome=%"delete_lease_success");
 
         if wants_json(&headers) {
             let body = json!({
@@ -1774,7 +1794,7 @@ async fn bulk_import_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(gen_token);
-    tracing::info!(request_id=%req_id, "bulk_import: incoming");
+    tracing::info!(pid=%std::process::id(), outcome=%"bulk_import_incoming");
 
     // Authentication check
     let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
@@ -1789,7 +1809,7 @@ async fn bulk_import_inner(
         false
     };
     if !is_basic && !has_session {
-        tracing::warn!(request_id=%req_id, outcome=%"bulk_import_unauthorized");
+        tracing::warn!(pid=%std::process::id(), outcome=%"bulk_import_unauthorized");
         if wants_json(&headers) {
             let body = json!({"error": "unauthorized"});
             let mut resp = into_boxed_response((StatusCode::UNAUTHORIZED, Json(body)));
@@ -1819,7 +1839,7 @@ async fn bulk_import_inner(
     if let Some(sid) = sid_opt {
         let map = state.sessions.read();
         if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(csrf_token.as_str()) {
-            tracing::warn!(request_id=%req_id, outcome=%"bulk_import_forbidden_csrf_mismatch");
+            tracing::warn!(pid=%std::process::id(), outcome=%"bulk_import_forbidden_csrf_mismatch");
             if wants_json(&headers) {
                 let body = json!({"error": "csrf_mismatch"});
                 let mut resp = into_boxed_response((StatusCode::FORBIDDEN, Json(body)));
@@ -1837,7 +1857,7 @@ async fn bulk_import_inner(
     }
 
     if csv_content.is_empty() {
-        tracing::warn!(request_id=%req_id, outcome=%"bulk_import_no_file");
+        tracing::warn!(pid=%std::process::id(), outcome=%"bulk_import_no_file");
         if wants_json(&headers) {
             let body = json!({"error": "no_csv_file"});
             let mut resp = into_boxed_response((StatusCode::BAD_REQUEST, Json(body)));
@@ -1966,7 +1986,7 @@ async fn bulk_import_inner(
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(request_id=%req_id, line=%line_num, error=?e, "failed to expand branches during bulk import");
+                                    tracing::warn!(line=%line_num, error=?e, pid=%std::process::id(), outcome=%"bulk_import_expand_branches_failed");
                                 }
                             }
                             created.push(name.clone());
@@ -2246,7 +2266,22 @@ async fn main() -> Result<()> {
     let sweeper_state = state.clone();
     tokio::spawn(async move { session_sweeper(sweeper_state).await });
 
-    let addr: SocketAddr = opts.bind.parse()?;
+    // determine bind address from CLI flags, env var, or default
+    let host = opts
+        .host
+        .clone()
+        .or_else(|| std::env::var("ZOEKTD_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = opts
+        .port
+        .or_else(|| {
+            std::env::var("ZOEKTD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(7878);
+
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     tracing::info!("admin UI listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

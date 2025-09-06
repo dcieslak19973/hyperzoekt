@@ -16,8 +16,8 @@ WORKDIR /app
 # Copy the entire workspace
 COPY . .
 
-# Build the zoekt-distributed binaries
-RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search
+# Build both zoekt-distributed and hyperzoekt binaries
+RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin hyperzoekt-indexer --bin hyperzoekt-webui
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
@@ -33,10 +33,14 @@ COPY --from=builder /app/target/release/dzr-admin /app/
 COPY --from=builder /app/target/release/dzr-http-search /app/
 COPY --from=builder /app/target/release/dzr-indexer /app/
 COPY --from=builder /app/target/release/dzr-mcp-search /app/
+COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
+COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 
 # Copy configuration and static files
 COPY --from=builder /app/crates/zoekt-distributed/config.toml /app/
-COPY --from=builder /app/crates/zoekt-distributed/static /app/static/
+COPY --from=builder /app/static /static/
+COPY --from=builder /app/crates/zoekt-distributed/static /app/crates/zoekt-distributed/static/
+COPY --from=builder /app/crates/hyperzoekt/static /app/crates/hyperzoekt/static/
 
 # Default command (can be overridden)
 CMD ["/app/dzr-http-search"]

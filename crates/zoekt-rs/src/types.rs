@@ -34,6 +34,8 @@ pub struct RepoMeta {
     pub owner: Option<String>,
     pub allowed_users: Vec<String>,
     pub last_commit_sha: Option<String>,
+    /// Original repository URL (for remote repos) or local path (for local repos)
+    pub original_url: Option<String>,
 }
 
 /// A discovered symbol inside a document.
