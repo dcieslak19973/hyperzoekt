@@ -73,7 +73,9 @@ impl EventConsumer {
                 format!("redis://{}", url_str)
             };
 
-            // Try to parse using url crate
+            // Try to parse using the `url` crate. Note: `url = "2"` is declared
+            // as a dependency in `crates/hyperzoekt/Cargo.toml`, so this symbol
+            // (`url::Url`) is available to the crate.
             if let Ok(mut url) = url::Url::parse(&normalized_input) {
                 // Normalize output: remove trailing '/' if path is root
                 let make_out = |u: &url::Url| {
@@ -928,7 +930,6 @@ mod tests {
         std::env::set_var("REDIS_URL", "host:7000");
         std::env::set_var("REDIS_PASSWORD", "z");
         let got3 = EventConsumer::build_redis_url_from_env().unwrap();
-        eprintln!("DEBUG got3='{}'", got3);
         assert!(got3.contains("host:7000") && got3.contains("z"));
 
         clear_env();
