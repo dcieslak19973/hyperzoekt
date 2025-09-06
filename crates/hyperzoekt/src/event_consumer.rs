@@ -43,107 +43,103 @@ impl EventConsumer {
 
     /// Create Redis pool for event consumption
     fn create_redis_pool() -> Option<Pool> {
-        match std::env::var("REDIS_URL").ok() {
-            Some(mut url) => {
-                // Check if URL already has authentication
-                let has_auth = url.contains('@');
-
-                // If no auth in URL, try to add it from environment variables
-                if !has_auth {
-                    if let Ok(username) = std::env::var("REDIS_USERNAME") {
-                        if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                            // Insert username:password@ after redis://
-                            if let Some(pos) = url.find("://") {
-                                let auth_part = format!("{}:{}@", username, password);
-                                url.insert_str(pos + 3, &auth_part);
-                            }
-                        } else {
-                            // Username without password
-                            if let Some(pos) = url.find("://") {
-                                let auth_part = format!("{}@", username);
-                                url.insert_str(pos + 3, &auth_part);
-                            }
-                        }
-                    } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                        // Password without username
-                        if let Some(pos) = url.find("://") {
-                            let auth_part = format!(":{}@", password);
-                            url.insert_str(pos + 3, &auth_part);
-                        }
-                    }
-                }
-
-                RedisConfig::from_url(&url).create_pool(None).ok()
-            }
-            None => {
-                // No REDIS_URL provided, but check if we have auth credentials to construct one
-                if let (Ok(username), Ok(password)) = (
-                    std::env::var("REDIS_USERNAME"),
-                    std::env::var("REDIS_PASSWORD"),
-                ) {
-                    let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
-                    RedisConfig::from_url(&url).create_pool(None).ok()
-                } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                    let url = format!("redis://:{}@127.0.0.1:6379", password);
-                    RedisConfig::from_url(&url).create_pool(None).ok()
-                } else {
-                    None
-                }
-            }
+        if let Some(url) = Self::build_redis_url_from_env() {
+            RedisConfig::from_url(&url).create_pool(None).ok()
+        } else {
+            None
         }
     }
 
     /// Create a direct Redis client for pubsub operations
     fn _create_redis_client() -> Result<Client, anyhow::Error> {
-        match std::env::var("REDIS_URL").ok() {
-            Some(mut url) => {
-                // Check if URL already has authentication
-                let has_auth = url.contains('@');
+        if let Some(url) = Self::build_redis_url_from_env() {
+            Client::open(url).map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))
+        } else {
+            Client::open("redis://127.0.0.1:6379")
+                .map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))
+        }
+    }
 
-                // If no auth in URL, try to add it from environment variables
-                if !has_auth {
-                    if let Ok(username) = std::env::var("REDIS_USERNAME") {
-                        if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                            // Insert username:password@ after redis://
-                            if let Some(pos) = url.find("://") {
-                                let auth_part = format!("{}:{}@", username, password);
-                                url.insert_str(pos + 3, &auth_part);
-                            }
-                        } else {
-                            // Username without password
-                            if let Some(pos) = url.find("://") {
-                                let auth_part = format!("{}@", username);
-                                url.insert_str(pos + 3, &auth_part);
-                            }
-                        }
-                    } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                        // Password without username
-                        if let Some(pos) = url.find("://") {
-                            let auth_part = format!(":{}@", password);
-                            url.insert_str(pos + 3, &auth_part);
-                        }
+    /// Build a Redis URL from environment variables, inserting auth if needed.
+    /// Returns None if no URL can be constructed and caller may choose a default.
+    fn build_redis_url_from_env() -> Option<String> {
+        // Prefer explicit REDIS_URL
+        if let Ok(url_str) = std::env::var("REDIS_URL") {
+            // If the provided REDIS_URL doesn't include a scheme (e.g. "host:7000"),
+            // prefix it with the redis scheme so url::Url can parse it properly.
+            let normalized_input = if url_str.contains("://") {
+                url_str.clone()
+            } else {
+                format!("redis://{}", url_str)
+            };
+
+            // Try to parse using url crate
+            if let Ok(mut url) = url::Url::parse(&normalized_input) {
+                // Normalize output: remove trailing '/' if path is root
+                let make_out = |u: &url::Url| {
+                    let s = u.to_string();
+                    if s.ends_with('/') && u.path() == "/" {
+                        // safe to drop single trailing slash
+                        return s.trim_end_matches('/').to_string();
                     }
+                    s
+                };
+
+                // If user info already present, return normalized string
+                if url.username() != "" || url.password().is_some() {
+                    return Some(make_out(&url));
                 }
 
-                Client::open(url)
-            }
-            None => {
-                // No REDIS_URL provided, but check if we have auth credentials to construct one
-                if let (Ok(username), Ok(password)) = (
-                    std::env::var("REDIS_USERNAME"),
-                    std::env::var("REDIS_PASSWORD"),
-                ) {
-                    let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
-                    Client::open(url)
-                } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                    let url = format!("redis://:{}@127.0.0.1:6379", password);
-                    Client::open(url)
-                } else {
-                    Client::open("redis://127.0.0.1:6379")
+                // Otherwise inject credentials if present
+                if let Ok(username) = std::env::var("REDIS_USERNAME") {
+                    if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                        url.set_username(&username).ok();
+                        url.set_password(Some(&password)).ok();
+                        return Some(make_out(&url));
+                    }
+                    // username only
+                    url.set_username(&username).ok();
+                    return Some(make_out(&url));
                 }
+                if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                    // url::Url doesn't allow password without username; set username to empty
+                    url.set_username("").ok();
+                    url.set_password(Some(&password)).ok();
+                    return Some(make_out(&url));
+                }
+
+                return Some(make_out(&url));
+            } else {
+                // This branch is unlikely because we prefixed a scheme above, but
+                // keep a defensive fallback that builds a redis:// URL from the
+                // raw REDIS_URL and any available credentials.
+                let fallback = if let Ok(username) = std::env::var("REDIS_USERNAME") {
+                    if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                        format!("redis://{}:{}@{}", username, password, url_str)
+                    } else {
+                        format!("redis://{}@{}", username, url_str)
+                    }
+                } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+                    format!("redis://:{}@{}", password, url_str)
+                } else {
+                    format!("redis://{}", url_str)
+                };
+                return Some(fallback);
             }
         }
-        .map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))
+
+        // No REDIS_URL; build from credentials if available
+        if let (Ok(username), Ok(password)) = (
+            std::env::var("REDIS_USERNAME"),
+            std::env::var("REDIS_PASSWORD"),
+        ) {
+            return Some(format!("redis://{}:{}@127.0.0.1:6379", username, password));
+        }
+        if let Ok(password) = std::env::var("REDIS_PASSWORD") {
+            return Some(format!("redis://:{}@127.0.0.1:6379", password));
+        }
+
+        None
     }
 
     /// Check if Redis is available
@@ -882,5 +878,59 @@ mod tests {
                 .collect::<String>();
             assert_eq!(sanitized, expected, "Failed to sanitize: {}", input);
         }
+    }
+
+    #[test]
+    fn build_redis_url_from_env_tests() {
+        // Helper to clear relevant env vars
+        fn clear_env() {
+            let _ = std::env::remove_var("REDIS_URL");
+            let _ = std::env::remove_var("REDIS_USERNAME");
+            let _ = std::env::remove_var("REDIS_PASSWORD");
+        }
+
+        clear_env();
+
+        // 1) No env -> None
+        assert_eq!(EventConsumer::build_redis_url_from_env(), None);
+
+        // 2) Password-only -> redis://:password@127.0.0.1:6379
+        clear_env();
+        std::env::set_var("REDIS_PASSWORD", "p");
+        assert_eq!(
+            EventConsumer::build_redis_url_from_env(),
+            Some("redis://:p@127.0.0.1:6379".to_string())
+        );
+
+        // 3) Username+password -> redis://u:p@127.0.0.1:6379
+        clear_env();
+        std::env::set_var("REDIS_USERNAME", "u");
+        std::env::set_var("REDIS_PASSWORD", "p");
+        let got = EventConsumer::build_redis_url_from_env().unwrap();
+        assert!(got.starts_with("redis://u:p@"));
+
+        // 4) REDIS_URL full with auth preserved (normalize trailing slash)
+        clear_env();
+        std::env::set_var("REDIS_URL", "redis://a:b@host:6380");
+        let got_full = EventConsumer::build_redis_url_from_env().unwrap();
+        assert_eq!(got_full.trim_end_matches('/'), "redis://a:b@host:6380");
+
+        // 5) REDIS_URL without auth + credentials injected
+        clear_env();
+        std::env::set_var("REDIS_URL", "redis://host:6380");
+        std::env::set_var("REDIS_USERNAME", "x");
+        std::env::set_var("REDIS_PASSWORD", "y");
+        let got2 = EventConsumer::build_redis_url_from_env().unwrap();
+        assert!(got2.starts_with("redis://x:y@host:6380"));
+
+        // 6) REDIS_URL as host:port (not full URL)
+        clear_env();
+        std::env::set_var("REDIS_URL", "host:7000");
+        std::env::set_var("REDIS_PASSWORD", "z");
+        let got3 = EventConsumer::build_redis_url_from_env().unwrap();
+        eprintln!("DEBUG got3='{}'", got3);
+        assert!(got3.contains("host:7000") && got3.contains("z"));
+
+        clear_env();
     }
 }
