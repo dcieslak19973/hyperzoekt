@@ -24,16 +24,15 @@ use clap::Parser;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 use zoekt_distributed::{
     distributed_search::{DistributedSearchService, DistributedSearchTool},
     LeaseManager, NodeConfig, NodeType,
 };
 
-// Embed static templates and assets so the binary can serve them directly.
+// Embed static templates so the binary can serve them directly.
 const SEARCH_INDEX_TEMPLATE: &str = include_str!("../../static/search/index.html");
-const COMMON_STYLES: &str = include_str!("../../static/common/styles.css");
-const COMMON_THEME_JS: &str = include_str!("../../static/common/theme.js");
 
 #[derive(Deserialize, Debug)]
 struct SearchQuery {
@@ -118,14 +117,6 @@ async fn search_ui_handler() -> Html<&'static str> {
     Html(SEARCH_INDEX_TEMPLATE)
 }
 
-async fn styles_handler() -> &'static str {
-    COMMON_STYLES
-}
-
-async fn theme_js_handler() -> &'static str {
-    COMMON_THEME_JS
-}
-
 #[derive(Parser)]
 struct Opts {
     #[arg(long)]
@@ -138,7 +129,10 @@ struct Opts {
     poll_interval_seconds: Option<u64>,
     /// Address to listen on for HTTP search (env: ZOEKTD_BIND_ADDR)
     #[arg(long)]
-    listen: Option<String>,
+    host: Option<String>,
+    /// Port to listen on for HTTP search
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -174,17 +168,24 @@ async fn main() -> Result<()> {
         .route("/search", get(search_handler))
         .route("/health", get(health_handler))
         .route("/", get(search_ui_handler))
-        .route("/static/common/styles.css", get(styles_handler))
-        .route("/static/common/theme.js", get(theme_js_handler))
+        .nest_service("/static", ServeDir::new("../../static"))
         .with_state(search_service);
 
     // Determine bind address
-    let bind_addr = opts
-        .listen
-        .or_else(|| std::env::var("ZOEKTD_BIND_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:8080".into());
+    let host = opts
+        .host
+        .or_else(|| std::env::var("ZOEKTD_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = opts
+        .port
+        .or_else(|| {
+            std::env::var("ZOEKTD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(8080);
 
-    let addr: SocketAddr = bind_addr
+    let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
 

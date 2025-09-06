@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}HyperZoekt Index Browser{% endblock %}</title>
+    <link rel="stylesheet" href="/static/common/styles.css">
+    <style>
+        /* HyperZoekt-specific styles */
+        body {
+            font-family: Inter, Arial, Helvetica, sans-serif;
+            margin: 24px;
+            background: var(--bg);
+            color: var(--text);
+            transition: var(--transition);
+            font-size: 14px;
+        }
+
+        .header {
+            background: var(--panel);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: var(--shadow);
+            margin-bottom: 16px;
+            transition: var(--transition);
+        }
+
+        .header h1 {
+            margin: 0;
+            color: var(--text);
+            font-size: 1.5rem;
+        }
+
+        .nav {
+            background: var(--panel);
+            padding: 12px;
+            border-radius: var(--border-radius);
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+            transition: var(--transition);
+        }
+
+        .nav a {
+            color: var(--accent);
+            text-decoration: none;
+            margin-right: 1rem;
+            padding: 6px 12px;
+            border-radius: var(--border-radius);
+            transition: var(--transition);
+        }
+
+        .nav a:hover {
+            background: rgba(14, 165, 164, 0.1);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: var(--panel);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            margin-bottom: 1rem;
+            overflow: hidden;
+            transition: var(--transition);
+        }
+
+        .card-header {
+            background: rgba(255, 255, 255, 0.02);
+            padding: 1rem;
+            border-bottom: 1px solid var(--input-border);
+        }
+
+        .card-body {
+            padding: 1rem;
+        }
+
+        .repo-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .repo-card {
+            background: var(--panel);
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            padding: 1.5rem;
+            transition: var(--transition);
+        }
+
+        .repo-card:hover {
+            border-color: var(--accent);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .repo-card h3 {
+            margin: 0 0 0.5rem 0;
+            color: var(--text);
+        }
+
+        .repo-card h3 a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .repo-card h3 a:hover {
+            text-decoration: underline;
+        }
+
+        .repo-stats {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.9rem;
+            color: var(--muted);
+        }
+
+        .stat {
+            display: flex;
+            align-items: center;
+        }
+
+        .stat:before {
+            content: "•";
+            color: var(--accent);
+            margin-right: 0.5rem;
+        }
+
+        .entity-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .entity-item {
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            margin-bottom: 0.5rem;
+            padding: 0.75rem;
+            background: var(--panel);
+            transition: var(--transition);
+        }
+
+        .entity-item:hover {
+            border-color: var(--accent);
+            background: rgba(14, 165, 164, 0.05);
+        }
+
+        /* Entity kind-specific background colors */
+        .entity-function {
+            background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(34, 197, 94, 0.05));
+            border-left: 4px solid #22c55e;
+        }
+
+        .entity-class {
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(59, 130, 246, 0.05));
+            border-left: 4px solid #3b82f6;
+        }
+
+        .entity-enum {
+            background: linear-gradient(135deg, rgba(168, 85, 247, 0.1), rgba(168, 85, 247, 0.05));
+            border-left: 4px solid #a855f7;
+        }
+
+        .entity-module {
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(245, 158, 11, 0.05));
+            border-left: 4px solid #f59e0b;
+        }
+
+        .entity-variable {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(239, 68, 68, 0.05));
+            border-left: 4px solid #ef4444;
+        }
+
+        .entity-macro {
+            background: linear-gradient(135deg, rgba(236, 72, 153, 0.1), rgba(236, 72, 153, 0.05));
+            border-left: 4px solid #ec4899;
+        }
+
+        .entity-other {
+            background: linear-gradient(135deg, rgba(107, 114, 128, 0.1), rgba(107, 114, 128, 0.05));
+            border-left: 4px solid #6b7280;
+        }
+
+        .entity-header {
+            padding: 1rem;
+            border-radius: var(--border-radius);
+            margin-bottom: 1rem;
+            color: white;
+            font-weight: bold;
+        }
+
+        .entity-header.entity-function {
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+        }
+
+        .entity-header.entity-class {
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+        }
+
+        .entity-header.entity-enum {
+            background: linear-gradient(135deg, #a855f7, #9333ea);
+        }
+
+        .entity-header.entity-module {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+        }
+
+        .entity-header.entity-variable {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+        }
+
+        .entity-header.entity-macro {
+            background: linear-gradient(135deg, #ec4899, #db2777);
+        }
+
+        .entity-header.entity-other {
+            background: linear-gradient(135deg, #6b7280, #4b5563);
+        }
+
+        /* Language-specific badge colors */
+        .lang-rust {
+            background: linear-gradient(135deg, #000000, #1f2937) !important;
+            color: #fbbf24 !important;
+        }
+
+        .lang-python {
+            background: linear-gradient(135deg, #3776ab, #ffd343) !important;
+            color: white !important;
+        }
+
+        .lang-javascript {
+            background: linear-gradient(135deg, #f7df1e, #323330) !important;
+            color: #323330 !important;
+        }
+
+        .lang-typescript {
+            background: linear-gradient(135deg, #3178c6, #235a97) !important;
+            color: white !important;
+        }
+
+        .lang-go {
+            background: linear-gradient(135deg, #00add8, #0052cc) !important;
+            color: white !important;
+        }
+
+        .lang-java {
+            background: linear-gradient(135deg, #ed8b00, #f89820) !important;
+            color: white !important;
+        }
+
+        .lang-cpp {
+            background: linear-gradient(135deg, #00599c, #004482) !important;
+            color: white !important;
+        }
+
+        .lang-c {
+            background: linear-gradient(135deg, #a8b9cc, #2d572c) !important;
+            color: white !important;
+        }
+
+        .lang-csharp {
+            background: linear-gradient(135deg, #239120, #68217a) !important;
+            color: white !important;
+        }
+
+        .lang-swift {
+            background: linear-gradient(135deg, #fa7343, #ffac45) !important;
+            color: white !important;
+        }
+
+        .lang-kotlin {
+            background: linear-gradient(135deg, #7f52ff, #c711e1) !important;
+            color: white !important;
+        }
+
+        .lang-scala {
+            background: linear-gradient(135deg, #dc322f, #cb3837) !important;
+            color: white !important;
+        }
+
+        .lang-ruby {
+            background: linear-gradient(135deg, #cc342d, #a5140f) !important;
+            color: white !important;
+        }
+
+        .lang-php {
+            background: linear-gradient(135deg, #777bb4, #8892bf) !important;
+            color: white !important;
+        }
+
+        .lang-html {
+            background: linear-gradient(135deg, #e34f26, #f06529) !important;
+            color: white !important;
+        }
+
+        .lang-css {
+            background: linear-gradient(135deg, #1572b6, #33a9dc) !important;
+            color: white !important;
+        }
+
+        .lang-other {
+            background: linear-gradient(135deg, #6b7280, #4b5563) !important;
+            color: white !important;
+        }
+
+        .entity-name {
+            font-weight: bold;
+            color: var(--text);
+        }
+
+        .entity-meta {
+            font-size: 0.9rem;
+            color: var(--muted);
+            margin-top: 0.25rem;
+        }
+
+        .entity-signature {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            background: var(--input-bg);
+            padding: 0.5rem;
+            border-radius: var(--border-radius);
+            border: 1px solid var(--input-border);
+            margin-top: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--text);
+            overflow-x: auto;
+        }
+
+        .entity-calls {
+            font-size: 0.85rem;
+            color: var(--accent);
+            margin-top: 0.25rem;
+            font-style: italic;
+        }
+
+        .entity-doc {
+            font-size: 0.85rem;
+            color: var(--text);
+            margin-top: 0.5rem;
+            line-height: 1.4;
+            opacity: 0.8;
+        }
+
+        .call-graph {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .call-item {
+            background: var(--accent);
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            display: inline-block;
+        }
+
+        .call-item:hover {
+            background: #0891a2;
+            cursor: pointer;
+        }
+
+        .search-form {
+            background: var(--panel);
+            padding: 2rem;
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+            margin-bottom: 2rem;
+            border: 1px solid var(--input-border);
+            transition: var(--transition);
+        }
+
+        .search-input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--input-border);
+            border-radius: var(--border-radius);
+            font-size: 1rem;
+            margin-bottom: 1rem;
+            background: var(--input-bg);
+            color: var(--text);
+            transition: var(--transition);
+        }
+
+        .search-input:focus {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: var(--border-radius);
+            cursor: pointer;
+            font-size: 1rem;
+            transition: var(--transition);
+            font-weight: 500;
+        }
+
+        .btn:hover {
+            background: #0891a2;
+        }
+
+        .code {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            background: var(--input-bg);
+            padding: 1rem;
+            border-radius: var(--border-radius);
+            border: 1px solid var(--input-border);
+            overflow-x: auto;
+            font-size: 0.9rem;
+            color: var(--text);
+        }
+
+        /* Signature pre/code block styling */
+        pre code {
+            display: block;
+            white-space: pre-wrap;
+            /* preserve newlines but wrap long lines */
+            word-break: break-word;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            background: var(--input-bg);
+            padding: 0.75rem;
+            border-radius: var(--border-radius);
+            border: 1px solid var(--input-border);
+            color: var(--text);
+            font-size: 0.9rem;
+            overflow-x: auto;
+            margin: 0.25rem 0 0.5rem 0;
+        }
+
+        /* Callers / Callees lists */
+        .relations {
+            display: flex;
+            gap: 2rem;
+            flex-wrap: wrap;
+            margin-top: 0.5rem;
+        }
+
+        .relations .relation-card {
+            background: var(--panel);
+            border: 1px solid var(--input-border);
+            padding: 0.5rem;
+            border-radius: var(--border-radius);
+            min-width: 220px;
+            max-width: 48%;
+        }
+
+        .relations .relation-card h4 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.95rem;
+        }
+
+        .relation-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            max-height: 360px;
+            overflow: auto;
+        }
+
+        .relation-list li a {
+            text-decoration: none;
+            color: var(--accent);
+        }
+
+        .relation-list li a:hover {
+            text-decoration: underline;
+        }
+
+        .import-list {
+            margin-top: 1rem;
+        }
+
+        .import-item {
+            background: var(--input-bg);
+            padding: 0.5rem;
+            border-radius: var(--border-radius);
+            margin-bottom: 0.25rem;
+            font-size: 0.9rem;
+            border: 1px solid var(--input-border);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            background: var(--accent);
+            color: white;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            margin-right: 0.5rem;
+        }
+
+        /* Entity type specific badge colors */
+        .badge-entity-function {
+            background: #28a745;
+            /* Green for functions */
+        }
+
+        .badge-entity-method {
+            background: #28a745;
+            /* Green for methods */
+        }
+
+        .badge-entity-class {
+            background: #007bff;
+            /* Blue for classes */
+        }
+
+        .badge-entity-struct {
+            background: #007bff;
+            /* Blue for structs */
+        }
+
+        .badge-entity-interface {
+            background: #007bff;
+            /* Blue for interfaces */
+        }
+
+        .badge-entity-trait {
+            background: #007bff;
+            /* Blue for traits */
+        }
+
+        .badge-entity-enum {
+            background: #6f42c1;
+            /* Purple for enums */
+        }
+
+        .badge-entity-module {
+            background: #fd7e14;
+            /* Orange for modules */
+        }
+
+        .badge-entity-namespace {
+            background: #fd7e14;
+            /* Orange for namespaces */
+        }
+
+        .badge-entity-variable {
+            background: #6c757d;
+            /* Gray for variables */
+        }
+
+        .badge-entity-constant {
+            background: #6c757d;
+            /* Gray for constants */
+        }
+
+        .badge-entity-field {
+            background: #6c757d;
+            /* Gray for fields */
+        }
+
+        .badge-entity-macro {
+            background: #dc3545;
+            /* Red for macros */
+        }
+
+        .badge-entity-other {
+            background: #6c757d;
+            /* Gray for other types */
+        }
+
+        .language-badges {
+            margin-top: 0.5rem;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--muted);
+            border-top: 1px solid var(--input-border);
+            background: var(--panel);
+            margin-top: 2rem;
+            border-radius: var(--border-radius);
+        }
+
+        .theme-toggle-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+    </style>
+    <script src="/static/common/theme.js"></script>
+</head>
+
+<body>
+    <div class="theme-toggle-container">
+        <button id="theme-toggle" class="theme-toggle">
+            <span class="icon">🌙</span>
+            <span class="label">Dark mode</span>
+        </button>
+    </div>
+
+    <div class="container">
+        <div class="header">
+            <h1>🔍 HyperZoekt Index Browser</h1>
+        </div>
+        <div class="nav">
+            <a href="/">Home</a>
+            <a href="/search">Search</a>
+            <a href="/pagerank">PageRank</a>
+        </div>
+        {% block content %}{% endblock %}
+        <div class="footer">
+            <p>HyperZoekt Index Browser - Visualize your indexed code data</p>
+        </div>
+    </div>
+</body>
+
+</html>

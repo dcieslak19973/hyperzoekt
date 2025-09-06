@@ -18,4 +18,9 @@
 
 pub mod repo_index;
 pub use repo_index::RepoIndexService;
-pub mod mcp;
+
+// Shared modules for binaries
+pub mod db_writer;
+pub mod event_consumer;
+pub mod index;
+pub mod utils;

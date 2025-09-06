@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use zoekt_rs::InMemoryIndex;
 
@@ -430,6 +431,12 @@ impl<I: Indexer> Node<I> {
                     // Log ownership/permission bits for debugging prior to indexing.
                     log_path_permissions(&repo_for_index.git_url);
 
+                    if should_emit_repo_events() {
+                        self.lease_mgr
+                            .publish_repo_event("indexing_started", &repo, &self.config.id)
+                            .await;
+                    }
+
                     let index_started = std::time::Instant::now();
                     // run the synchronous indexer in a blocking task
                     let index_result = match tokio::task::spawn_blocking(move || {
@@ -444,6 +451,12 @@ impl<I: Indexer> Node<I> {
                     match index_result {
                         Ok(index) => {
                             tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+
+                            if should_emit_repo_events() {
+                                self.lease_mgr
+                                    .publish_repo_event("indexing_finished", &repo, &self.config.id)
+                                    .await;
+                            }
                             let dur = index_started.elapsed();
                             let now_ms = chrono::Utc::now().timestamp_millis();
                             let dur_ms = dur.as_millis() as i64;
@@ -514,6 +527,12 @@ impl<I: Indexer> Node<I> {
                         let lease_mgr = self.lease_mgr.clone();
                         let indexer = self.indexer.clone();
 
+                        if should_emit_repo_events() {
+                            lease_mgr
+                                .publish_repo_event("indexing_started", &repo, &self.config.id)
+                                .await;
+                        }
+
                         let index_started = std::time::Instant::now();
                         let mut index_handle = tokio::task::spawn_blocking(move || {
                             indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
@@ -548,6 +567,16 @@ impl<I: Indexer> Node<I> {
                         match index_result {
                             Ok(index) => {
                                 tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+
+                                if should_emit_repo_events() {
+                                    self.lease_mgr
+                                        .publish_repo_event(
+                                            "indexing_finished",
+                                            &repo,
+                                            &self.config.id,
+                                        )
+                                        .await;
+                                }
 
                                 // Update the last known SHA after successful indexing
                                 if let Some(ref sha) = current_sha {
@@ -619,6 +648,12 @@ impl<I: Indexer> Node<I> {
                     let lease_mgr = self.lease_mgr.clone();
                     let indexer = self.indexer.clone();
 
+                    if should_emit_repo_events() {
+                        lease_mgr
+                            .publish_repo_event("indexing_started", &repo, &self.config.id)
+                            .await;
+                    }
+
                     let index_started = std::time::Instant::now();
                     let mut index_handle = tokio::task::spawn_blocking(move || {
                         indexer.index_repo(PathBuf::from(&repo_for_index.git_url))
@@ -653,6 +688,12 @@ impl<I: Indexer> Node<I> {
                     match index_result {
                         Ok(index) => {
                             tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
+
+                            if should_emit_repo_events() {
+                                lease_mgr
+                                    .publish_repo_event("indexing_finished", &repo, &self.config.id)
+                                    .await;
+                            }
 
                             // Update the last known SHA after successful indexing
                             if let Some(ref sha) = current_sha {
@@ -703,6 +744,31 @@ impl<I: Indexer> Node<I> {
             tokio::time::sleep(self.config.poll_interval).await;
         }
         Ok(())
+    }
+}
+
+/// Check if repo events should be emitted based on DISTRIBUTED_ZOEKT_REPO_EVENTS env var.
+/// Returns true if the var is set to a truthy value (1, yes, true, case insensitive).
+static SHOULD_EMIT_REPO_EVENTS: OnceLock<bool> = OnceLock::new();
+
+pub fn should_emit_repo_events() -> bool {
+    if cfg!(test) {
+        // Don't cache in tests to allow env var changes
+        if let Ok(val) = std::env::var("DISTRIBUTED_ZOEKT_REPO_EVENTS") {
+            let val_lower = val.to_lowercase();
+            matches!(val_lower.as_str(), "1" | "yes" | "true")
+        } else {
+            false
+        }
+    } else {
+        *SHOULD_EMIT_REPO_EVENTS.get_or_init(|| {
+            if let Ok(val) = std::env::var("DISTRIBUTED_ZOEKT_REPO_EVENTS") {
+                let val_lower = val.to_lowercase();
+                matches!(val_lower.as_str(), "1" | "yes" | "true")
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -822,5 +888,49 @@ async fn get_current_commit_sha(git_url: &str) -> Option<String> {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_emit_repo_events() {
+        // Test with no env var set
+        std::env::remove_var("DISTRIBUTED_ZOEKT_REPO_EVENTS");
+        assert!(!should_emit_repo_events());
+
+        // Test with truthy values
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "1");
+        assert!(should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "yes");
+        assert!(should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "true");
+        assert!(should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "YES");
+        assert!(should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "True");
+        assert!(should_emit_repo_events());
+
+        // Test with falsy values
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "0");
+        assert!(!should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "no");
+        assert!(!should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "false");
+        assert!(!should_emit_repo_events());
+
+        std::env::set_var("DISTRIBUTED_ZOEKT_REPO_EVENTS", "anything_else");
+        assert!(!should_emit_repo_events());
+
+        // Clean up
+        std::env::remove_var("DISTRIBUTED_ZOEKT_REPO_EVENTS");
     }
 }

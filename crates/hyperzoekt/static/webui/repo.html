@@ -1,0 +1,68 @@
+{% extends "base" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>📁 Repository: {{ repo_name }}</h2>
+    </div>
+    <div class="card-body">
+        <p>Showing {{ entities|length }} entities in this repository.</p>
+
+        <div style="margin-bottom: 1rem;">
+            <a href="/" class="btn" style="margin-right: 1rem;">← Back to Repositories</a>
+            <a href="/search?repo={{ repo_name }}" class="btn">🔍 Search in {{ repo_name }}</a>
+        </div>
+
+        {% if entities %}
+        <ul class="entity-list">
+            {% for entity in entities %}
+            <li
+                class="entity-item {% if 'function' in entity.kind or 'method' in entity.kind %}entity-function{% elif 'class' in entity.kind or 'struct' in entity.kind or 'interface' in entity.kind or 'trait' in entity.kind %}entity-class{% elif 'enum' in entity.kind %}entity-enum{% elif 'module' in entity.kind or 'namespace' in entity.kind %}entity-module{% elif 'variable' in entity.kind or 'constant' in entity.kind or 'field' in entity.kind %}entity-variable{% elif 'macro' in entity.kind %}entity-macro{% else %}entity-other{% endif %}">
+                <div class="entity-name">
+                    <a href="/entity/{{ entity.stable_id }}" style="color: #333; text-decoration: none;">
+                        {{ entity.name }}
+                    </a>
+                    <span
+                        class="badge badge-{% if 'function' in entity.kind or 'method' in entity.kind %}entity-function{% elif 'class' in entity.kind or 'struct' in entity.kind or 'interface' in entity.kind or 'trait' in entity.kind %}entity-class{% elif 'enum' in entity.kind %}entity-enum{% elif 'module' in entity.kind or 'namespace' in entity.kind %}entity-module{% elif 'variable' in entity.kind or 'constant' in entity.kind or 'field' in entity.kind %}entity-variable{% elif 'macro' in entity.kind %}entity-macro{% else %}entity-other{% endif %}">{{
+                        entity.kind }}</span>
+                    <span
+                        class="badge {% if entity.language|lower == 'rust' or entity.language|lower == 'rs' %}lang-rust{% elif entity.language|lower == 'python' or entity.language|lower == 'py' %}lang-python{% elif entity.language|lower == 'javascript' or entity.language|lower == 'js' %}lang-javascript{% elif entity.language|lower == 'typescript' or entity.language|lower == 'ts' %}lang-typescript{% elif entity.language|lower == 'go' %}lang-go{% elif entity.language|lower == 'java' %}lang-java{% elif entity.language|lower == 'cpp' or entity.language|lower == 'c++' %}lang-cpp{% elif entity.language|lower == 'c' %}lang-c{% elif entity.language|lower == 'csharp' or entity.language|lower == 'c#' %}lang-csharp{% elif entity.language|lower == 'swift' %}lang-swift{% elif entity.language|lower == 'kotlin' %}lang-kotlin{% elif entity.language|lower == 'scala' %}lang-scala{% elif entity.language|lower == 'ruby' %}lang-ruby{% elif entity.language|lower == 'php' %}lang-php{% elif entity.language|lower == 'html' %}lang-html{% elif entity.language|lower == 'css' %}lang-css{% else %}lang-other{% endif %}">{{
+                        entity.language }}</span>
+                </div>
+                <div class="entity-meta">
+                    📄 {% if entity.source_url %}
+                    <a href="{{ entity.source_url }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                        target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                        entity.source_display else entity.file }}{% if
+                        entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% else %}
+                    <a href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                        target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                        entity.source_display else entity.file }}{% if
+                        entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% endif %}
+                    {% if entity.end_line %}-{{ entity.end_line }}{% endif %}
+                    • 🔢 Rank: <strong>{{ entity.rank }}</strong>
+                    {% if entity.parent %}
+                    • 📦 {{ entity.parent }}
+                    {% endif %}
+                </div>
+                {% if entity.signature %}
+                <div class="entity-signature"><code>{{ entity.signature }}</code></div>
+                {% endif %}
+                {% if entity.calls %}
+                <div class="entity-calls">📞 Calls: {{ entity.calls[:3]|join(', ') }}{% if entity.calls|length > 3 %}
+                    +{{ entity.calls|length - 3 }} more{% endif %}</div>
+                {% endif %}
+                {% if entity.doc %}
+                <div class="entity-doc">{{ entity.doc|truncate(150) }}</div>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p>No entities found in this repository.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

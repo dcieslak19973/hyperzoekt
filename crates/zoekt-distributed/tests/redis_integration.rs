@@ -141,3 +141,40 @@ async fn redis_repo_meta_contains_memory_bytes() {
         .unwrap_or(());
     tracing::info!("TEST END: redis_repo_meta_contains_memory_bytes");
 }
+
+#[tokio::test]
+async fn redis_publish_repo_event_integration() {
+    init_test_logging();
+    let _redis_url = match std::env::var("REDIS_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            tracing::info!("TEST SKIP: redis_publish_repo_event_integration (no REDIS_URL)");
+            return;
+        }
+    };
+    tracing::info!("TEST START: redis_publish_repo_event_integration");
+
+    // Create a test repo
+    let test_repo = zoekt_distributed::lease_manager::RemoteRepo {
+        name: format!("event_test_repo_{}", gen_token()),
+        git_url: "https://example.test/event-repo.git".to_string(),
+        branch: Some("main".to_string()),
+        visibility: zoekt_rs::types::RepoVisibility::Public,
+        owner: None,
+        allowed_users: Vec::new(),
+        last_commit_sha: None,
+    };
+
+    // Create lease manager
+    let lease_mgr = LeaseManager::new().await;
+
+    // Test that publishing completes without panicking
+    lease_mgr
+        .publish_repo_event("indexing_started", &test_repo, "test-node")
+        .await;
+
+    // If we get here, the publish completed without error
+    tracing::info!("Successfully published repo event without error");
+
+    tracing::info!("TEST END: redis_publish_repo_event_integration");
+}

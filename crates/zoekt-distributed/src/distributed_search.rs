@@ -69,8 +69,15 @@ impl DistributedSearchService {
         // Get indexer endpoints
         let endpoints = self.lease_mgr.get_indexer_endpoints().await;
         if endpoints.is_empty() {
+            tracing::warn!("No indexer endpoints found in Redis - no indexers are registered");
             return Err(anyhow::anyhow!("no indexers available"));
         }
+
+        tracing::info!(
+            "Found {} indexer endpoints: {:?}",
+            endpoints.len(),
+            endpoints.keys().collect::<Vec<_>>()
+        );
 
         // Build search query for indexers
         let max_results = params.max_results.unwrap_or(100);
@@ -84,6 +91,7 @@ impl DistributedSearchService {
             let client_clone = self.client.clone();
             let params_clone = params.clone();
             let task = tokio::spawn(async move {
+                tracing::debug!("Querying indexer {} at endpoint: {}", node_id, endpoint);
                 Self::search_single_indexer(
                     client_clone,
                     params_clone,
@@ -100,6 +108,7 @@ impl DistributedSearchService {
         for task in search_tasks {
             match task.await {
                 Ok(Ok(results)) => {
+                    tracing::debug!("Indexer query succeeded, got {} results", results.len());
                     for result in results {
                         if total_results >= max_results {
                             break;
@@ -110,11 +119,13 @@ impl DistributedSearchService {
                     }
                 }
                 Ok(Err(error)) => {
+                    tracing::error!("Indexer query failed: {}", error);
                     all_results.push(json!({
                         "error": format!("Error from indexer: {}", error)
                     }));
                 }
                 Err(e) => {
+                    tracing::error!("Indexer task panicked: {}", e);
                     all_results.push(json!({
                         "error": format!("Task error: {}", e)
                     }));
@@ -172,6 +183,13 @@ impl DistributedSearchService {
             .await
             .map_err(|_| "request timeout".to_string())?
             .map_err(|e| format!("request error: {}", e))?;
+
+        tracing::debug!(
+            "Indexer {} request to {} returned status: {}",
+            node_id,
+            url,
+            response.status()
+        );
 
         if !response.status().is_success() {
             return Err(format!("search failed with status: {}", response.status()));

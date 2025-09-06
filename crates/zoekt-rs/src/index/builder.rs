@@ -302,17 +302,23 @@ impl IndexBuilder {
 
     pub fn build(self) -> std::result::Result<InMemoryIndex, crate::index::IndexError> {
         // Clone remote git URLs into a tempdir and use that as repo_root.
-        let mut repo_root = self.root.clone();
-        let root_s = repo_root.to_string_lossy();
-        let mut _repo_clone_tempdir: Option<tempfile::TempDir> = None;
-        if root_s.starts_with("http://")
+        let original_root = self.root.clone();
+        let root_s = original_root.to_string_lossy();
+        let original_url = if root_s.starts_with("http://")
             || root_s.starts_with("https://")
             || root_s.starts_with("git@")
             || root_s.starts_with("ssh://")
         {
+            Some(root_s.to_string())
+        } else {
+            None
+        };
+        let mut repo_root = original_root.clone();
+        let mut _repo_clone_tempdir: Option<tempfile::TempDir> = None;
+        if let Some(url) = &original_url {
             let td =
                 tempfile::tempdir().map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
-            let authenticated_url = inject_credentials(root_s.as_ref());
+            let authenticated_url = inject_credentials(url);
             // Try libgit2 clone first, fall back to git CLI if libgit2 fails.
             match git2::Repository::clone(&authenticated_url, td.path()) {
                 Ok(_) => {
@@ -321,11 +327,7 @@ impl IndexBuilder {
                 }
                 Err(e) => {
                     // fall back to `git clone --depth 1` but run non-interactively
-                    let res = crate::index::builder::try_git_clone_fallback(
-                        root_s.as_ref(),
-                        td.path(),
-                        None,
-                    );
+                    let res = crate::index::builder::try_git_clone_fallback(url, td.path(), None);
                     match res {
                         Ok(()) => {
                             repo_root = td.path().to_path_buf();
@@ -384,6 +386,15 @@ impl IndexBuilder {
             owner: None,
             allowed_users: Vec::new(),
             last_commit_sha: None,
+            original_url: if root_s.starts_with("http://")
+                || root_s.starts_with("https://")
+                || root_s.starts_with("git@")
+                || root_s.starts_with("ssh://")
+            {
+                Some(root_s.to_string())
+            } else {
+                None
+            },
         };
 
         let mut pending: Vec<PendingFile> = Vec::new();

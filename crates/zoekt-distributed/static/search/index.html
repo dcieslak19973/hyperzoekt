@@ -556,16 +556,16 @@
                 const repoPath = sshMatch[2];
 
                 if (host === 'github.com') {
-                    return `https://github.com/${repoPath}/blob/${branch}/${path}`;
+                    return `https://github.com/${encodeURIComponent(repoPath)}/blob/${encodeURIComponent(branch)}/${encodeURIComponent(path)}`;
                 }
                 if (host === 'gitlab.com') {
-                    return `https://gitlab.com/${repoPath}/-/blob/${branch}/${path}`;
+                    return `https://gitlab.com/${encodeURIComponent(repoPath)}/-/blob/${encodeURIComponent(branch)}/${encodeURIComponent(path)}`;
                 }
                 if (host === 'bitbucket.org') {
-                    return `https://bitbucket.org/${repoPath}/src/${branch}/${path}`;
+                    return `https://bitbucket.org/${encodeURIComponent(repoPath)}/src/${encodeURIComponent(branch)}/${encodeURIComponent(path)}`;
                 }
                 // Default: assume https with same host
-                return `https://${host}/${repoPath}/blob/${branch}/${path}`;
+                return `https://${encodeURIComponent(host)}/${encodeURIComponent(repoPath)}/blob/${encodeURIComponent(branch)}/${encodeURIComponent(path)}`;
             }
 
             // Fallback to file URL for local paths

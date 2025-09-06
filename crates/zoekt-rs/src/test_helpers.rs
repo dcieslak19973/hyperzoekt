@@ -131,6 +131,7 @@ pub fn make_index_with_trigrams(
             owner: None,
             allowed_users: Vec::new(),
             last_commit_sha: None,
+            original_url: None,
         },
         docs,
         terms: std::collections::HashMap::new(),

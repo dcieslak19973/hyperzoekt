@@ -131,7 +131,41 @@ pub fn index_repository(opts: RepoIndexOptions<'_>) -> anyhow::Result<RepoIndexS
             &mut entities_local,
         );
         for e in entities_local.into_iter() {
-            writeln!(cw, "{}", serde_json::to_string(&e)?)?;
+            // convert internal 0-based line numbers to 1-based for exported JSONL
+            let mut map = serde_json::Map::new();
+            map.insert("file".to_string(), serde_json::Value::String(e.file));
+            map.insert(
+                "language".to_string(),
+                serde_json::Value::String(e.language.to_string()),
+            );
+            map.insert(
+                "kind".to_string(),
+                serde_json::Value::String(e.kind.to_string()),
+            );
+            map.insert("name".to_string(), serde_json::Value::String(e.name));
+            if let Some(p) = e.parent {
+                map.insert("parent".to_string(), serde_json::Value::String(p));
+            }
+            map.insert(
+                "signature".to_string(),
+                serde_json::Value::String(e.signature),
+            );
+            map.insert(
+                "start_line".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(e.start_line.saturating_add(1))),
+            );
+            map.insert(
+                "end_line".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(e.end_line.saturating_add(1))),
+            );
+            if let Some(calls) = e.calls {
+                map.insert("calls".to_string(), serde_json::to_value(calls)?);
+            }
+            if let Some(doc) = e.doc {
+                map.insert("doc".to_string(), serde_json::Value::String(doc));
+            }
+            let json = serde_json::Value::Object(map);
+            writeln!(cw, "{}", serde_json::to_string(&json)?)?;
         }
         files += 1;
         cw.flush()?;

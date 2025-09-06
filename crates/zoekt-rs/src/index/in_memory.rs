@@ -104,4 +104,10 @@ impl InMemoryIndex {
         let inner = self.inner.read();
         inner.repo.root.clone()
     }
+
+    /// Public accessor to retrieve the original repository URL for this index, if available.
+    pub fn original_url(&self) -> Option<String> {
+        let inner = self.inner.read();
+        inner.repo.original_url.clone()
+    }
 }
