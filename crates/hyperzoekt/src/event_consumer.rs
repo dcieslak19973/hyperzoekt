@@ -218,7 +218,7 @@ impl EventConsumer {
         let processing_key_prefix = "zoekt:processing:";
         let consumer_id = format!("indexer-{}", std::process::id());
 
-        log::info!(
+        log::debug!(
             "Starting Redis queue consumer: {} (TTL: {}s)",
             consumer_id,
             processing_ttl_seconds
@@ -242,8 +242,8 @@ impl EventConsumer {
             let message: Option<String> = conn.brpoplpush(queue_key, &processing_key, 5.0).await?;
 
             if let Some(event_json) = message {
-                // Make the message logging more prominent
-                log::info!("🚀 Received indexing request: {}", event_json);
+                // Message received (reduced verbosity)
+                log::debug!("🚀 Received indexing request: {}", event_json);
 
                 // Set TTL on processing key for failure recovery
                 let _: () = conn
@@ -253,7 +253,7 @@ impl EventConsumer {
                 match serde_json::from_str::<RepoEvent>(&event_json) {
                     Ok(event) => {
                         // Log more details about the processing start
-                        log::info!(
+                        log::debug!(
                             "📋 Starting processing for repo '{}' from node '{}' (branch: {:?})",
                             event.repo_name,
                             event.node_id,
@@ -268,7 +268,7 @@ impl EventConsumer {
 
                         // Message processed successfully, remove from processing queue
                         let _: () = conn.del(&processing_key).await?;
-                        log::info!("Successfully processed and acknowledged message");
+                        log::debug!("Successfully processed and acknowledged message");
                     }
                     Err(e) => {
                         log::error!("Failed to deserialize event: {}", e);
@@ -403,13 +403,13 @@ impl EventProcessor {
                 // Extract owner from git URL
                 let owner = Self::extract_owner_from_git_url(&event.git_url);
                 if let Some(ref owner_name) = owner {
-                    log::info!(
+                    log::debug!(
                         "📋 Extracted owner '{}' from git URL: {}",
                         owner_name,
                         event.git_url
                     );
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "⚠️  Could not extract owner from git URL: {}",
                         event.git_url
                     );
@@ -557,7 +557,7 @@ impl EventProcessor {
 
                             // Log normalization and final URL decision for easier debugging in Docker logs
                             if let Some(ref g) = Some(event.git_url.clone()) {
-                                log::info!(
+                                log::debug!(
                                     "source_url_debug: git_url='{}' owner='{:?}' repo='{}' branch='{}'",
                                     g,
                                     owner_clone,
@@ -567,9 +567,9 @@ impl EventProcessor {
                             }
 
                             if let Some(ref base) = source_base {
-                                log::info!("source_url_debug: normalized_base='{}'", base);
+                                log::debug!("source_url_debug: normalized_base='{}'", base);
                             } else {
-                                log::warn!(
+                                log::debug!(
                                     "source_url_debug: normalized_base is None; no source_url will be set"
                                 );
                             }
@@ -590,7 +590,7 @@ impl EventProcessor {
                                     branch_ref,
                                     rel
                                 );
-                                log::info!("source_url_debug: computed source_url='{}'", url);
+                                log::debug!("source_url_debug: computed source_url='{}'", url);
                                 url
                             });
 
@@ -668,7 +668,7 @@ impl EventProcessor {
                             e
                         );
                     } else {
-                        log::info!(
+                        log::debug!(
                             "Cleaned up temporary directory: {}",
                             temp_dir_clone.display()
                         );
@@ -750,7 +750,7 @@ impl EventProcessor {
             tokio::fs::remove_dir_all(&temp_dir).await?;
         }
 
-        log::info!(
+        log::debug!(
             "Cloning {} from {} to {}",
             sanitized_repo_name,
             event.git_url,
@@ -801,7 +801,7 @@ impl EventProcessor {
         })
         .await??;
 
-        log::info!(
+        log::debug!(
             "Successfully cloned {} to {}",
             sanitized_repo_name,
             temp_dir.display()

@@ -1329,12 +1329,12 @@ async fn entity_handler(
         entity.source_url
     );
 
-    log::info!("Cleaned entity.file: {}", entity.file);
+    log::debug!("Cleaned entity.file: {}", entity.file);
 
     // Clean the repo_name to remove UUID suffix if present
     let clean_repo_name = remove_uuid_suffix(&entity.repo_name);
 
-    log::info!("clean_repo_name: {}", clean_repo_name);
+    log::debug!("clean_repo_name: {}", clean_repo_name);
 
     // If entity.file still contains a leading repo directory with a UUID suffix
     // (for example: "gpt-researcher-<uuid>/gpt_researcher/agent.py"), normalize it to
