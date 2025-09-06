@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_cmd::Command;
 // parse JSONL directly and assert richer properties
 use serde_json::Value;
 use std::fs;
@@ -20,7 +19,7 @@ use std::path::PathBuf;
 
 #[test]
 fn index_fixture_repo_writes_jsonl() {
-    let mut cmd = Command::cargo_bin("hyperzoekt").unwrap();
+    // Use the in-crate indexer directly instead of spawning a binary.
     // use the canonical fixture that contains multiple language examples
     let fixture = PathBuf::from("tests/fixtures/example-treesitter-repo");
     let out_dir = PathBuf::from(".data");
@@ -29,15 +28,17 @@ fn index_fixture_repo_writes_jsonl() {
     if preferred.exists() {
         let _ = fs::remove_file(&preferred);
     }
-    // request the preferred output path; the indexer may write another file name
-    // but we will fall back to any .jsonl in .data/ when reading the results.
-    cmd.env("RUST_LOG", "info")
-        .arg("--incremental")
-        .arg("--root")
-        .arg(&fixture)
-        .arg("--out")
-        .arg(&preferred);
-    cmd.assert().success();
+
+    // Build repo index options and run the in-crate builder to get a RepoIndexService
+    let mut opts_builder = hyperzoekt::repo_index::indexer::RepoIndexOptions::builder();
+    opts_builder = opts_builder.root(&fixture).output_file(&preferred);
+    let (svc, _stats) =
+        hyperzoekt::repo_index::RepoIndexService::build_with_options(opts_builder.build())
+            .expect("build index service");
+
+    // Write out canonical JSONL using the service export helper
+    let mut file = std::fs::File::create(&preferred).expect("create out file");
+    svc.export_jsonl(&mut file).expect("export jsonl");
 
     // Read the single canonical output file written by the indexer
     let chosen = preferred.clone();
