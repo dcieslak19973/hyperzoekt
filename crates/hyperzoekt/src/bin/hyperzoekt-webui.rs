@@ -775,6 +775,26 @@ fn remove_uuid_suffix(name: &str) -> String {
     name.to_string()
 }
 
+/// Extract the repo name with UUID suffix from a file path
+/// E.g., "/tmp/hyperzoekt-clones/repo-uuid/file" -> "repo-uuid"
+fn extract_uuid_repo_name(file_path: &str) -> Option<String> {
+    let parts: Vec<&str> = file_path.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "hyperzoekt-clones" && i + 1 < parts.len() {
+            let next = parts[i + 1];
+            // Check if it looks like name-uuid
+            if let Some(last_dash) = next.rfind('-') {
+                let potential_uuid = &next[last_dash + 1..];
+                let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
+                if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(next.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Compute a repository-relative path from a (cleaned) file path and a clean repo name.
 /// Attempts to find the repo-name segment and return the remaining path. If not found,
 /// strips known clone roots and returns a reasonable relative path.
@@ -829,9 +849,18 @@ async fn construct_source_url(
     state: &AppState,
     repo_name: &str,
     file_path: &str,
+    uuid_repo_name: Option<&str>,
 ) -> Option<String> {
     // Clean the repo_name to remove UUID suffix if present
     let clean_repo_name = remove_uuid_suffix(repo_name);
+
+    log::info!(
+        "construct_source_url: repo_name='{}', clean_repo_name='{}', uuid_repo_name='{:?}', file_path='{}'",
+        repo_name,
+        clean_repo_name,
+        uuid_repo_name,
+        file_path
+    );
 
     // Query the repo table for the git_url and branch
     #[derive(Deserialize)]
@@ -840,34 +869,71 @@ async fn construct_source_url(
         branch: Option<String>,
     }
 
-    let query_sql = "SELECT git_url, branch FROM repo WHERE name = $name LIMIT 1";
+    let mut query_parts = vec!["SELECT git_url, branch FROM repo WHERE".to_string()];
+    let mut bindings = vec![];
+
+    // Always include clean_name
+    query_parts.push("name = $clean_name".to_string());
+    bindings.push(("clean_name", clean_repo_name.clone()));
+
+    // Include original_name if different
+    if repo_name != clean_repo_name {
+        query_parts.push("OR name = $original_name".to_string());
+        bindings.push(("original_name", repo_name.to_string()));
+    }
+
+    // Include uuid_repo_name if provided
+    if let Some(uuid_name) = uuid_repo_name {
+        query_parts.push("OR name = $uuid_name".to_string());
+        bindings.push(("uuid_name", uuid_name.to_string()));
+    }
+
+    query_parts.push("LIMIT 1".to_string());
+    let query_sql = query_parts.join(" ");
+
     if let Ok(mut res) = match &*state.db.db {
         SurrealConnection::Local(db_conn) => {
-            db_conn
-                .query(query_sql)
-                .bind(("name", clean_repo_name.clone()))
-                .await
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
         }
         SurrealConnection::RemoteHttp(db_conn) => {
-            db_conn
-                .query(query_sql)
-                .bind(("name", clean_repo_name.clone()))
-                .await
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
         }
         SurrealConnection::RemoteWs(db_conn) => {
-            db_conn
-                .query(query_sql)
-                .bind(("name", clean_repo_name.clone()))
-                .await
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
         }
     } {
         if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
             if let Some(r) = rows.into_iter().next() {
+                log::info!(
+                    "construct_source_url: Found repo row: git_url='{}', branch='{:?}'",
+                    r.git_url,
+                    r.branch
+                );
                 if let Some(normalized_base) = normalize_git_url(&r.git_url) {
+                    log::info!(
+                        "construct_source_url: Normalized git_url to '{}'",
+                        normalized_base
+                    );
                     let branch = r.branch.unwrap_or_else(|| "main".to_string());
 
                     // Use helper to compute repo-relative path
                     let repo_relative = repo_relative_from_file(file_path, &clean_repo_name);
+                    log::info!(
+                        "construct_source_url: Repo-relative path: '{}'",
+                        repo_relative
+                    );
 
                     let url = format!(
                         "{}/blob/{}/{}",
@@ -875,15 +941,33 @@ async fn construct_source_url(
                         branch,
                         repo_relative
                     );
+                    log::info!("construct_source_url: Constructed URL: '{}'", url);
                     return Some(url);
+                } else {
+                    log::warn!(
+                        "construct_source_url: Failed to normalize git_url '{}'",
+                        r.git_url
+                    );
                 }
+            } else {
+                log::warn!(
+                    "construct_source_url: No repo row found for query: {}",
+                    query_sql
+                );
             }
+        } else {
+            log::error!("construct_source_url: Failed to parse repo query result");
         }
+    } else {
+        log::error!("construct_source_url: Repo query failed");
     }
 
-    // Fallback to environment variables
-    let source_base =
-        std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
+    // Fallback to default values (no env vars for base URL to avoid issues with multiple repos)
+    log::warn!(
+        "construct_source_url: Using fallback for repo '{}'",
+        clean_repo_name
+    );
+    let source_base = "https://github.com".to_string();
     let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
 
     // Clean and compute repo-relative path similar to the DB-backed branch above
@@ -915,6 +999,7 @@ async fn construct_source_url(
         source_branch,
         repo_relative
     );
+    log::info!("construct_source_url: Fallback URL: '{}'", url);
     Some(url)
 }
 
@@ -1154,14 +1239,43 @@ async fn repo_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Clean up file paths and construct proper source URLs
+    // Clean up file paths and prefer stored source URLs; compute only if missing
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
 
-        // Always recompute source URL using cleaned file path
-        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
-            entity.source_url = Some(url.clone());
-            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
+        // Debug: log DB-provided source_url for pagerank API
+        log::debug!(
+            "webui: pagerank_api db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
+            entity.stable_id,
+            entity.file,
+            entity.repo_name,
+            entity.source_url
+        );
+        // Debug: log DB-provided source_url before any recomputation
+        log::debug!(
+            "webui: repo_handler db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
+            entity.stable_id,
+            entity.file,
+            entity.repo_name,
+            entity.source_url
+        );
+
+        if entity.source_url.is_none() {
+            // Compute only when DB didn't provide a source_url
+            if let Some(url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file, None).await
+            {
+                entity.source_url = Some(url.clone());
+                if entity.source_display.is_none() {
+                    entity.source_display =
+                        Some(short_display_from_source_url(&url, &entity.repo_name));
+                }
+            }
+        } else if entity.source_display.is_none() {
+            // Ensure display text exists for stored URLs
+            if let Some(ref url) = entity.source_url {
+                entity.source_display = Some(short_display_from_source_url(url, &entity.repo_name));
+            }
         }
     }
 
@@ -1201,8 +1315,19 @@ async fn entity_handler(
 
     log::info!("Raw entity.file: {}", entity.file);
 
-    // Clean up the file path
+    // Extract UUID repo name before cleaning the file path
+    let uuid_repo_name = extract_uuid_repo_name(&entity.file);
+
     entity.file = clean_file_path(&entity.file);
+
+    // Debug: log DB-provided source_url before any recomputation
+    log::debug!(
+        "webui: entity_handler db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
+        entity.stable_id,
+        entity.file,
+        entity.repo_name,
+        entity.source_url
+    );
 
     log::info!("Cleaned entity.file: {}", entity.file);
 
@@ -1229,12 +1354,32 @@ async fn entity_handler(
         }
     }
 
-    // Compute source URL if not provided
+    // Compute source URL only if DB didn't already provide one. Keep stored value otherwise.
     let mut _template_source_base: Option<String> = None;
     let mut _template_source_branch: Option<String> = None;
-    if let Some(url) = construct_source_url(&state, &clean_repo_name, &entity.file).await {
-        entity.source_url = Some(url.clone());
-        entity.source_display = Some(short_display_from_source_url(&url, &clean_repo_name));
+    if entity.source_url.is_none() {
+        if let Some(url) = construct_source_url(
+            &state,
+            &clean_repo_name,
+            &entity.file,
+            uuid_repo_name.as_deref(),
+        )
+        .await
+        {
+            entity.source_url = Some(url.clone());
+            if entity.source_display.is_none() {
+                entity.source_display = Some(short_display_from_source_url(&url, &clean_repo_name));
+            }
+            log::info!(
+                "webui: entity_handler computed source_url='{}' stable_id={}",
+                url,
+                entity.stable_id
+            );
+        }
+    } else if entity.source_display.is_none() {
+        if let Some(ref url) = entity.source_url {
+            entity.source_display = Some(short_display_from_source_url(url, &clean_repo_name));
+        }
     }
     // Resolve callers and callees via DB queries to avoid scanning all entities in memory
     // Read a limit for relations from environment (default 50)
@@ -1323,14 +1468,33 @@ async fn search_api_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Clean up file paths and construct proper source URLs
+    // Clean up file paths and prefer stored source URLs; compute only if missing
     for entity in &mut results {
         entity.file = clean_file_path(&entity.file);
 
-        // Always recompute source URL using cleaned file path
-        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
-            entity.source_url = Some(url.clone());
-            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
+        // Debug: log DB-provided source_url for search API
+        log::debug!(
+            "webui: search_api db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
+            entity.stable_id,
+            entity.file,
+            entity.repo_name,
+            entity.source_url
+        );
+
+        if entity.source_url.is_none() {
+            if let Some(url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file, None).await
+            {
+                entity.source_url = Some(url.clone());
+                if entity.source_display.is_none() {
+                    entity.source_display =
+                        Some(short_display_from_source_url(&url, &entity.repo_name));
+                }
+            }
+        } else if entity.source_display.is_none() {
+            if let Some(ref url) = entity.source_url {
+                entity.source_display = Some(short_display_from_source_url(url, &entity.repo_name));
+            }
         }
     }
 
@@ -1363,14 +1527,33 @@ async fn entities_api_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Clean up file paths and construct proper source URLs
+    // Clean up file paths and prefer stored source URLs; compute only if missing
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
 
-        // Always recompute source URL using cleaned file path
-        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
-            entity.source_url = Some(url.clone());
-            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
+        // Debug: log DB-provided source_url for entities API
+        log::debug!(
+            "webui: entities_api db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
+            entity.stable_id,
+            entity.file,
+            entity.repo_name,
+            entity.source_url
+        );
+
+        if entity.source_url.is_none() {
+            if let Some(url) =
+                construct_source_url(&state, &entity.repo_name, &entity.file, None).await
+            {
+                entity.source_url = Some(url.clone());
+                if entity.source_display.is_none() {
+                    entity.source_display =
+                        Some(short_display_from_source_url(&url, &entity.repo_name));
+                }
+            }
+        } else if entity.source_display.is_none() {
+            if let Some(ref url) = entity.source_url {
+                entity.source_display = Some(short_display_from_source_url(url, &entity.repo_name));
+            }
         }
     }
 
@@ -1433,7 +1616,8 @@ async fn pagerank_api_handler(
         entity.file = clean_file_path(&entity.file);
 
         // Always recompute source URL using cleaned file path
-        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
+        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file, None).await
+        {
             entity.source_url = Some(url.clone());
             entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
@@ -1461,13 +1645,15 @@ mod tests {
         let state = make_state().await;
 
         // Ensure no repo row exists in the in-memory DB so the function falls back to env vars
+        std::env::remove_var("SOURCE_BASE_URL");
+        std::env::remove_var("SOURCE_BRANCH");
         std::env::set_var("SOURCE_BASE_URL", "https://github.com");
         std::env::set_var("SOURCE_BRANCH", "master");
 
         let repo_name = "gpt-researcher-8e9834cb-6abb-4381-90f4-deadbeefdead";
         let file_path = "/tmp/hyperzoekt-clones/8e9834cb-6abb-4381-90f4-deadbeefdead/gpt-researcher-8e9834cb-6abb-4381-90f4-deadbeefdead/gpt_researcher/agent.py";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce url");
         assert_eq!(
@@ -1497,7 +1683,7 @@ mod tests {
         let repo_name = "gpt-researcher";
         let file_path = "gpt-researcher/gpt_researcher/agent.py";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce url from db");
         assert_eq!(
@@ -1527,7 +1713,7 @@ mod tests {
         let repo_name = "gl-repo";
         let file_path = "gl-repo/src/lib.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce url from db");
         // Our construction uses /blob/ even for GitLab-hosted repos
@@ -1558,7 +1744,7 @@ mod tests {
         let repo_name = "repo-no-branch";
         let file_path = "repo-no-branch/README.md";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce url from db fallback to main");
         assert_eq!(
@@ -1571,23 +1757,27 @@ mod tests {
     async fn construct_source_url_local_git_url_falls_back_to_env() {
         let state = make_state().await;
         // Trigger env fallback by using a repo name that does not exist in DB
+        std::env::remove_var("SOURCE_BASE_URL");
+        std::env::remove_var("SOURCE_BRANCH");
         std::env::set_var("SOURCE_BASE_URL", "https://example.com");
-        std::env::set_var("SOURCE_BRANCH", "fallback-branch");
+        std::env::set_var("SOURCE_BRANCH", "main");
 
         let repo_name = "missing-local-repo";
         let file_path = "/tmp/hyperzoekt-clones/uuid/missing-local-repo/src/main.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce fallback url");
         assert_eq!(
             url,
-            "https://example.com/missing-local-repo/blob/fallback-branch/src/main.rs"
+            "https://github.com/missing-local-repo/blob/main/src/main.rs"
         );
 
         // Set env fallback values before inserting repo so construct_source_url uses them
+        std::env::remove_var("SOURCE_BASE_URL");
+        std::env::remove_var("SOURCE_BRANCH");
         std::env::set_var("SOURCE_BASE_URL", "https://example.com");
-        std::env::set_var("SOURCE_BRANCH", "fallback-branch");
+        std::env::set_var("SOURCE_BRANCH", "main");
 
         // Insert a repo row whose git_url is a local path (not convertible)
         let insert_q = "CREATE repo SET name = 'local-repo', git_url = 'file:///home/repos/local-repo', branch = 'dev'";
@@ -1606,24 +1796,18 @@ mod tests {
         let repo_name = "local-repo";
         let file_path = "/tmp/hyperzoekt-clones/uuid/local-repo/src/main.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce fallback url");
-        assert_eq!(
-            url,
-            "https://example.com/local-repo/blob/fallback-branch/src/main.rs"
-        );
+        assert_eq!(url, "https://github.com/local-repo/blob/main/src/main.rs");
 
         let repo_name = "local-repo";
         let file_path = "/tmp/hyperzoekt-clones/local-repo-89b31936-727e-4719-ab9e-778a15263b26/local-repo/src/main.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce fallback url");
-        assert_eq!(
-            url,
-            "https://example.com/local-repo/blob/fallback-branch/src/main.rs"
-        );
+        assert_eq!(url, "https://github.com/local-repo/blob/main/src/main.rs");
     }
 
     #[test]
@@ -1653,7 +1837,7 @@ mod tests {
         let repo_name = "gl-ssh";
         let file_path = "gl-ssh/src/mod.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should produce url from ssh gitlab");
         assert_eq!(url, "https://gitlab.com/owner/gl-ssh/blob/feat/src/mod.rs");
@@ -1679,18 +1863,14 @@ mod tests {
         std::env::remove_var("SOURCE_BASE_URL");
         std::env::remove_var("SOURCE_BRANCH");
         std::env::set_var("SOURCE_BASE_URL", "https://fallback.example");
-        std::env::set_var("SOURCE_BRANCH", "fallbackbranch");
 
         let repo_name = "empty-url";
         let file_path = "/tmp/hyperzoekt-clones/uuid/empty-url/src/lib.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should fallback to env");
-        assert_eq!(
-            url,
-            "https://fallback.example/empty-url/blob/fallbackbranch/src/lib.rs"
-        );
+        assert_eq!(url, "https://github.com/empty-url/blob/main/src/lib.rs");
     }
 
     #[tokio::test]
@@ -1713,7 +1893,7 @@ mod tests {
         let repo_name = "branch-slash";
         let file_path = "branch-slash/path/file.rs";
 
-        let url = construct_source_url(&state, repo_name, file_path)
+        let url = construct_source_url(&state, repo_name, file_path, None)
             .await
             .expect("should include branch with slash");
         assert_eq!(
