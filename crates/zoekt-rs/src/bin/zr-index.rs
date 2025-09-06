@@ -41,7 +41,7 @@ fn main() -> StdResult<(), IndexError> {
     let idx = IndexBuilder::new(args.repo.clone())
         .max_file_size(max_file_size)
         .build()?;
-    // Determine shard path but only create directories / write when not in --no-write mode.
+    // Determine shard path but only create directories /write when not in --no-write mode.
     let shard = if let Some(o) = args.out.as_ref() {
         o.clone()
     } else {
