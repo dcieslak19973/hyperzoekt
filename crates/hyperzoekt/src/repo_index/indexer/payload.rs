@@ -46,4 +46,6 @@ pub struct EntityPayload {
     pub repo_name: String,
     // Optional URL pointing to the source hosting (e.g. GitHub) for quick navigation from the UI
     pub source_url: Option<String>,
+    /// Optional precomputed short display like "owner/repo/path" for UI link text
+    pub source_display: Option<String>,
 }

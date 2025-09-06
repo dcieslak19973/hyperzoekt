@@ -53,6 +53,7 @@ axum = { version = "0.7", features = ["json", "query"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 minijinja = "1.0"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -63,11 +64,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [[bin]]
 name = "hyperzoekt-indexer"
 path = "src/bin/hyperzoekt-indexer.rs"
-
-# Keep the original binary for backwards compatibility
-[[bin]]
-name = "hyperzoekt"
-path = "src/bin/hyperzoekt/main.rs"
 
 [[bin]]
 name = "hyperzoekt-webui"

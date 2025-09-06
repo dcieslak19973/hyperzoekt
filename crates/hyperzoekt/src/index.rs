@@ -114,6 +114,7 @@ pub fn index_single_file(
             stable_id,
             repo_name: repo.clone(),
             source_url: None,
+            source_display: None,
         });
     }
     Ok((payloads, stats))

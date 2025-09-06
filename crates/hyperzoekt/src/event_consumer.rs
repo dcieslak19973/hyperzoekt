@@ -522,6 +522,7 @@ impl EventProcessor {
                                 stable_id,
                                 repo_name: repo_name.clone(),
                                 source_url: computed_source,
+                                source_display: None,
                             }
                         })
                         .collect();

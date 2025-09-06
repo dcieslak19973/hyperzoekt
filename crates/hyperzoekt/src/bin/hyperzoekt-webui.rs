@@ -699,54 +699,129 @@ struct AppState {
 /// Clean up file paths to show repository-relative paths instead of absolute filesystem paths
 /// Converts paths like "/tmp/hyperzoekt-clones/repo-uuid/path/to/file.rs" to "repo/path/to/file.rs"
 fn clean_file_path(file_path: &str) -> String {
-    // Pattern: /tmp/hyperzoekt-clones/{repo-name}-{uuid}/{repo-relative-path}
-    if let Some(clones_pos) = file_path.find("/tmp/hyperzoekt-clones/") {
-        let after_clones = &file_path[clones_pos + "/tmp/hyperzoekt-clones/".len()..];
+    // Robust cleaning of file paths to handle many variants. Strategy:
+    //  - Split into path segments
+    //  - Remove any embedded /tmp/hyperzoekt-clones/<uuid>/ sequences
+    //  - For any segment that ends with a UUID-like suffix (repo-name-<uuid>), strip the suffix
+    //  - Rejoin segments
+    let mut parts: Vec<String> = file_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
 
-        // Find the first '/' after the repo name and UUID
-        if let Some(slash_pos) = after_clones.find('/') {
-            // Extract repo name (everything before the first '/')
-            let repo_part = &after_clones[..slash_pos];
-
-            // Extract repo-relative path (everything after the first '/')
-            let relative_path = &after_clones[slash_pos + 1..];
-
-            // If repo_part contains a UUID suffix, it's typically after the last '-'.
-            // Use rfind so repo names with '-' are preserved.
-            if let Some(last_dash) = repo_part.rfind('-') {
-                let potential_uuid = &repo_part[last_dash + 1..];
-                // Accept UUIDs that contain hyphens by removing them for the check.
-                let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
-                if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-                    // Looks like a UUID suffix; keep the repo name portion before the last dash
-                    let repo_name = &repo_part[..last_dash];
-                    return format!("{}/{}", repo_name, relative_path);
-                }
-            }
-
-            // Fallback: use the whole repo part
-            return format!("{}/{}", repo_part, relative_path);
+    // Remove sequences like tmp -> hyperzoekt-clones -> <uuid>
+    let mut i = 0;
+    while i + 2 < parts.len() {
+        if parts[i] == "tmp" && parts[i + 1] == "hyperzoekt-clones" {
+            // Remove tmp and hyperzoekt-clones and the following uuid-like segment
+            parts.drain(i..=i + 2);
+            // continue without incrementing i
+            continue;
         }
+        i += 1;
     }
 
-    // If the path doesn't include the /tmp prefix, also handle the case where the
-    // stored path begins with a leading repo directory that contains a UUID suffix,
-    // e.g. "gpt-researcher-<uuid>/path/to/file" -> "gpt-researcher/path/to/file".
-    if let Some(slash_pos) = file_path.find('/') {
-        let leading = &file_path[..slash_pos];
-        if let Some(last_dash) = leading.rfind('-') {
-            let potential_uuid = &leading[last_dash + 1..];
+    // Also handle the variant where only "hyperzoekt-clones" appears
+    let mut j = 0;
+    while j < parts.len() {
+        if parts[j] == "hyperzoekt-clones" {
+            // remove the hyperzoekt-clones and possibly next uuid segment
+            if j + 1 < parts.len() {
+                parts.drain(j..=j + 1);
+            } else {
+                parts.remove(j);
+            }
+            continue;
+        }
+        j += 1;
+    }
+
+    // Strip UUID suffixes from any segment like name-8e9834cb-6abb-...-deadbeef
+    for seg in parts.iter_mut() {
+        if let Some(last_dash) = seg.rfind('-') {
+            let potential_uuid = &seg[last_dash + 1..];
             let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
             if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-                let repo_root = &leading[..last_dash];
-                let rest = &file_path[slash_pos + 1..];
-                return format!("{}/{}", repo_root, rest);
+                *seg = seg[..last_dash].to_string();
             }
         }
     }
 
-    // Fallback: return as-is
-    file_path.to_string()
+    // Reconstruct path
+    if parts.is_empty() {
+        return file_path.to_string();
+    }
+    parts.join("/")
+}
+
+/// Remove a trailing UUID-style suffix from names like "repo-name-8e9834cb-6abb-4381-90f4-deadbeefdead"
+fn remove_uuid_suffix(name: &str) -> String {
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() >= 6 {
+        let tail = &parts[parts.len() - 5..];
+        let lens: [usize; 5] = [8, 4, 4, 4, 12];
+        let mut ok = true;
+        for (i, seg) in tail.iter().enumerate() {
+            if seg.len() != lens[i] || !seg.chars().all(|c| c.is_ascii_hexdigit()) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return parts[..parts.len() - 5].join("-");
+        }
+    }
+    name.to_string()
+}
+
+/// Compute a repository-relative path from a (cleaned) file path and a clean repo name.
+/// Attempts to find the repo-name segment and return the remaining path. If not found,
+/// strips known clone roots and returns a reasonable relative path.
+fn repo_relative_from_file(file_path: &str, clean_repo_name: &str) -> String {
+    let normalized = clean_file_path(file_path);
+    let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
+
+    // Try to find a segment that equals the repo name or a variant
+    for (i, p) in parts.iter().enumerate() {
+        if *p == clean_repo_name
+            || p.starts_with(&format!("{}-", clean_repo_name))
+            || *p == clean_repo_name.replace('-', "_")
+        {
+            if i + 1 < parts.len() {
+                return parts[i + 1..].join("/");
+            } else {
+                return String::new();
+            }
+        }
+    }
+
+    // If the path begins with known clone roots, strip them
+    let mut start = 0usize;
+    while start < parts.len() {
+        let p = parts[start];
+        if p == "tmp" || p == "hyperzoekt-clones" {
+            start += 1;
+            continue;
+        }
+        // UUID-like segment (hex groups)
+        if p.len() >= 8 && p.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            start += 1;
+            continue;
+        }
+        break;
+    }
+
+    if start < parts.len() {
+        return parts[start..].join("/");
+    }
+
+    // Fallback: if more than one segment, drop the first and return the rest
+    if parts.len() > 1 {
+        return parts[1..].join("/");
+    }
+
+    normalized
 }
 
 /// Construct a proper source URL using repository metadata from the database
@@ -756,17 +831,7 @@ async fn construct_source_url(
     file_path: &str,
 ) -> Option<String> {
     // Clean the repo_name to remove UUID suffix if present
-    let clean_repo_name = if let Some(last_dash) = repo_name.rfind('-') {
-        let potential_uuid = &repo_name[last_dash + 1..];
-        let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
-        if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-            repo_name[..last_dash].to_string()
-        } else {
-            repo_name.to_string()
-        }
-    } else {
-        repo_name.to_string()
-    };
+    let clean_repo_name = remove_uuid_suffix(repo_name);
 
     // Query the repo table for the git_url and branch
     #[derive(Deserialize)]
@@ -800,13 +865,15 @@ async fn construct_source_url(
             if let Some(r) = rows.into_iter().next() {
                 if let Some(normalized_base) = normalize_git_url(&r.git_url) {
                     let branch = r.branch.unwrap_or_else(|| "main".to_string());
-                    // Remove repo name prefix from file path if present
-                    let clean_file_path = file_path.replace(&format!("{}/", clean_repo_name), "");
+
+                    // Use helper to compute repo-relative path
+                    let repo_relative = repo_relative_from_file(file_path, &clean_repo_name);
+
                     let url = format!(
                         "{}/blob/{}/{}",
                         normalized_base.trim_end_matches('/'),
                         branch,
-                        clean_file_path
+                        repo_relative
                     );
                     return Some(url);
                 }
@@ -818,13 +885,35 @@ async fn construct_source_url(
     let source_base =
         std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
     let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
-    let clean_file_path = file_path.replace(&format!("{}/", clean_repo_name), "");
+
+    // Clean and compute repo-relative path similar to the DB-backed branch above
+    let normalized_file = clean_file_path(file_path);
+    let parts: Vec<&str> = normalized_file
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut repo_relative = if parts.len() > 1 {
+        parts[1..].join("/")
+    } else {
+        normalized_file.clone()
+    };
+    for (i, p) in parts.iter().enumerate() {
+        if *p == clean_repo_name || p.starts_with(&format!("{}-", clean_repo_name)) {
+            repo_relative = if i + 1 < parts.len() {
+                parts[i + 1..].join("/")
+            } else {
+                String::new()
+            };
+            break;
+        }
+    }
+
     let url = format!(
         "{}/{}/blob/{}/{}",
         source_base.trim_end_matches('/'),
         clean_repo_name,
         source_branch,
-        clean_file_path
+        repo_relative
     );
     Some(url)
 }
@@ -863,6 +952,66 @@ fn normalize_git_url(git_url: &str) -> Option<String> {
 
     // Fallback: try to treat as https host/path
     Some(git_url.trim_end_matches(".git").to_string())
+}
+
+/// Derive a short display string like "owner/repo/path/to/file" from a full source URL
+fn short_display_from_source_url(source_url: &str, repo_name: &str) -> String {
+    // Expected forms:
+    //  - https://github.com/owner/repo/blob/branch/path/to/file
+    //  - https://gitlab.com/owner/repo/-/blob/branch/path/to/file
+    // Fallback: if we can't parse, return repo_name + "/" + trailing path from source_url
+    if source_url.is_empty() {
+        return repo_name.to_string();
+    }
+
+    if let Ok(u) = url::Url::parse(source_url) {
+        let segments: Vec<String> = u
+            .path()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        // Look for 'blob' or '-/blob' markers and take the pieces after branch
+        if let Some(pos) = segments.iter().position(|s| s == "blob") {
+            // segments: owner, repo, blob, branch, rest... (GitHub style)
+            // Avoid matching the GitLab variant where the segment before 'blob' is '-' (owner/repo/-/blob/...)
+            if pos >= 2 && segments[pos - 1] != "-" {
+                let owner = &segments[pos - 2];
+                let repo = &segments[pos - 1];
+                let rest = if pos + 2 <= segments.len() - 1 {
+                    segments[pos + 2..].join("/")
+                } else {
+                    String::new()
+                };
+                if rest.is_empty() {
+                    return format!("{}/{}", owner, repo);
+                }
+                return format!("{}/{}/{}", owner, repo, rest);
+            }
+        }
+        // GitLab variant: owner/repo/-/blob/branch/path
+        if let Some(pos) = segments.iter().position(|s| s == "-") {
+            if pos + 2 < segments.len() && segments[pos + 1] == "blob" && pos >= 2 {
+                let owner = &segments[pos - 2];
+                let repo = &segments[pos - 1];
+                let rest = segments[pos + 3..].join("/");
+                return format!("{}/{}/{}", owner, repo, rest);
+            }
+        }
+    }
+
+    // fallback: try to strip the repo_name from the path
+    if let Some(pos) = source_url.find(repo_name) {
+        let tail = &source_url[pos + repo_name.len()..];
+        let tail = tail.trim_start_matches('/');
+        if tail.is_empty() {
+            return repo_name.to_string();
+        }
+        return format!("{}/{}", repo_name, tail);
+    }
+
+    // last resort: return the hostname + path
+    source_url.to_string()
 }
 
 #[tokio::main]
@@ -1009,13 +1158,10 @@ async fn repo_handler(
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
 
-        // Try to construct proper source URL using repository metadata
-        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
-            if let Some(source_url) =
-                construct_source_url(&state, &entity.repo_name, &entity.file).await
-            {
-                entity.source_url = Some(source_url);
-            }
+        // Always recompute source URL using cleaned file path
+        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
+            entity.source_url = Some(url.clone());
+            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
     }
 
@@ -1061,17 +1207,7 @@ async fn entity_handler(
     log::info!("Cleaned entity.file: {}", entity.file);
 
     // Clean the repo_name to remove UUID suffix if present
-    let clean_repo_name = if let Some(last_dash) = entity.repo_name.rfind('-') {
-        let potential_uuid = &entity.repo_name[last_dash + 1..];
-        let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
-        if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-            entity.repo_name[..last_dash].to_string()
-        } else {
-            entity.repo_name.clone()
-        }
-    } else {
-        entity.repo_name.clone()
-    };
+    let clean_repo_name = remove_uuid_suffix(&entity.repo_name);
 
     log::info!("clean_repo_name: {}", clean_repo_name);
 
@@ -1096,87 +1232,9 @@ async fn entity_handler(
     // Compute source URL if not provided
     let mut _template_source_base: Option<String> = None;
     let mut _template_source_branch: Option<String> = None;
-    if entity.source_url.is_none() && !clean_repo_name.is_empty() {
-        // First, try to look up repo metadata from the `repo` table to get the canonical
-        // git_url and branch for this repository. If that fails, fall back to environment
-        // configured SOURCE_BASE_URL and SOURCE_BRANCH.
-        #[derive(Deserialize)]
-        struct RepoRow {
-            git_url: String,
-            branch: Option<String>,
-        }
-
-        let mut repo_base: Option<String> = None;
-        let mut repo_branch: Option<String> = None;
-
-        // Query the repo table for a matching name
-        let query_sql = "SELECT git_url, branch FROM repo WHERE name = $name LIMIT 1";
-        if let Ok(mut res) = match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(query_sql)
-                    .bind(("name", clean_repo_name.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(query_sql)
-                    .bind(("name", clean_repo_name.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(query_sql)
-                    .bind(("name", clean_repo_name.clone()))
-                    .await
-            }
-        } {
-            if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
-                if let Some(r) = rows.into_iter().next() {
-                    log::info!(
-                        "Repo found: git_url={}, branch={}",
-                        r.git_url,
-                        r.branch.as_ref().unwrap_or(&"none".to_string())
-                    );
-                    if let Some(normalized) = normalize_git_url(&r.git_url) {
-                        repo_base = Some(normalized);
-                    }
-                    repo_branch = r.branch;
-                } else {
-                    log::info!("No repo row found");
-                }
-            } else {
-                log::info!("Repo query failed");
-            }
-        }
-
-        // Fallbacks
-        let source_base = repo_base.unwrap_or_else(|| {
-            std::env::var("SOURCE_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string())
-        });
-        let source_branch = repo_branch
-            .or_else(|| std::env::var("SOURCE_BRANCH").ok())
-            .unwrap_or_else(|| "main".to_string());
-
-        log::info!(
-            "source_base: {}, source_branch: {}",
-            source_base,
-            source_branch
-        );
-
-        let file_path = entity.file.replace(&format!("{}/", clean_repo_name), "");
-        let url = format!(
-            "{}/{}/blob/{}/{}",
-            source_base.trim_end_matches('/'),
-            clean_repo_name,
-            source_branch,
-            file_path
-        );
-        entity.source_url = Some(url);
-
-        log::info!("entity.source_url: {}", entity.source_url.as_ref().unwrap());
-        _template_source_base = Some(source_base.clone());
-        _template_source_branch = Some(source_branch.clone());
+    if let Some(url) = construct_source_url(&state, &clean_repo_name, &entity.file).await {
+        entity.source_url = Some(url.clone());
+        entity.source_display = Some(short_display_from_source_url(&url, &clean_repo_name));
     }
     // Resolve callers and callees via DB queries to avoid scanning all entities in memory
     // Read a limit for relations from environment (default 50)
@@ -1269,13 +1327,10 @@ async fn search_api_handler(
     for entity in &mut results {
         entity.file = clean_file_path(&entity.file);
 
-        // Try to construct proper source URL using repository metadata
-        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
-            if let Some(source_url) =
-                construct_source_url(&state, &entity.repo_name, &entity.file).await
-            {
-                entity.source_url = Some(source_url);
-            }
+        // Always recompute source URL using cleaned file path
+        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
+            entity.source_url = Some(url.clone());
+            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
     }
 
@@ -1312,13 +1367,10 @@ async fn entities_api_handler(
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
 
-        // Try to construct proper source URL using repository metadata
-        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
-            if let Some(source_url) =
-                construct_source_url(&state, &entity.repo_name, &entity.file).await
-            {
-                entity.source_url = Some(source_url);
-            }
+        // Always recompute source URL using cleaned file path
+        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
+            entity.source_url = Some(url.clone());
+            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
     }
 
@@ -1380,15 +1432,293 @@ async fn pagerank_api_handler(
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
 
-        // Try to construct proper source URL using repository metadata
-        if entity.source_url.is_none() && !entity.repo_name.is_empty() {
-            if let Some(source_url) =
-                construct_source_url(&state, &entity.repo_name, &entity.file).await
-            {
-                entity.source_url = Some(source_url);
-            }
+        // Always recompute source URL using cleaned file path
+        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file).await {
+            entity.source_url = Some(url.clone());
+            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
     }
 
     Ok(Json(entities))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to create a minimal AppState with an in-memory Surreal DB and template env
+    async fn make_state() -> AppState {
+        let db = Database::new(None, "testns", "testdb")
+            .await
+            .expect("db init");
+        let mut templates = Environment::new();
+        templates.add_template("base", BASE_TEMPLATE).unwrap();
+        AppState { db, templates }
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_fallback_env() {
+        let state = make_state().await;
+
+        // Ensure no repo row exists in the in-memory DB so the function falls back to env vars
+        std::env::set_var("SOURCE_BASE_URL", "https://github.com");
+        std::env::set_var("SOURCE_BRANCH", "master");
+
+        let repo_name = "gpt-researcher-8e9834cb-6abb-4381-90f4-deadbeefdead";
+        let file_path = "/tmp/hyperzoekt-clones/8e9834cb-6abb-4381-90f4-deadbeefdead/gpt-researcher-8e9834cb-6abb-4381-90f4-deadbeefdead/gpt_researcher/agent.py";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce url");
+        assert_eq!(
+            url,
+            "https://github.com/gpt-researcher/blob/master/gpt_researcher/agent.py"
+        );
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_db_git_ssh() {
+        let state = make_state().await;
+
+        // Insert a repo row into the in-memory SurrealDB to test DB-backed resolution
+        let insert_q = "CREATE repo SET name = 'gpt-researcher', git_url = 'git@github.com:assafelovic/gpt-researcher.git', branch = 'dev'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "gpt-researcher";
+        let file_path = "gpt-researcher/gpt_researcher/agent.py";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce url from db");
+        assert_eq!(
+            url,
+            "https://github.com/assafelovic/gpt-researcher/blob/dev/gpt_researcher/agent.py"
+        );
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_db_gitlab_http() {
+        let state = make_state().await;
+
+        // Insert a GitLab HTTP repo row with branch specified
+        let insert_q = "CREATE repo SET name = 'gl-repo', git_url = 'https://gitlab.com/owner/gl-repo.git', branch = 'feature'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "gl-repo";
+        let file_path = "gl-repo/src/lib.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce url from db");
+        // Our construction uses /blob/ even for GitLab-hosted repos
+        assert_eq!(
+            url,
+            "https://gitlab.com/owner/gl-repo/blob/feature/src/lib.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_missing_branch_uses_main() {
+        let state = make_state().await;
+
+        // Insert a repo row without branch -> should default to main
+        let insert_q = "CREATE repo SET name = 'repo-no-branch', git_url = 'https://github.com/owner/repo-no-branch.git'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "repo-no-branch";
+        let file_path = "repo-no-branch/README.md";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce url from db fallback to main");
+        assert_eq!(
+            url,
+            "https://github.com/owner/repo-no-branch/blob/main/README.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_local_git_url_falls_back_to_env() {
+        let state = make_state().await;
+        // Trigger env fallback by using a repo name that does not exist in DB
+        std::env::set_var("SOURCE_BASE_URL", "https://example.com");
+        std::env::set_var("SOURCE_BRANCH", "fallback-branch");
+
+        let repo_name = "missing-local-repo";
+        let file_path = "/tmp/hyperzoekt-clones/uuid/missing-local-repo/src/main.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce fallback url");
+        assert_eq!(
+            url,
+            "https://example.com/missing-local-repo/blob/fallback-branch/src/main.rs"
+        );
+
+        // Set env fallback values before inserting repo so construct_source_url uses them
+        std::env::set_var("SOURCE_BASE_URL", "https://example.com");
+        std::env::set_var("SOURCE_BRANCH", "fallback-branch");
+
+        // Insert a repo row whose git_url is a local path (not convertible)
+        let insert_q = "CREATE repo SET name = 'local-repo', git_url = 'file:///home/repos/local-repo', branch = 'dev'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "local-repo";
+        let file_path = "/tmp/hyperzoekt-clones/uuid/local-repo/src/main.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce fallback url");
+        assert_eq!(
+            url,
+            "https://example.com/local-repo/blob/fallback-branch/src/main.rs"
+        );
+
+        let repo_name = "local-repo";
+        let file_path = "/tmp/hyperzoekt-clones/local-repo-89b31936-727e-4719-ab9e-778a15263b26/local-repo/src/main.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce fallback url");
+        assert_eq!(
+            url,
+            "https://example.com/local-repo/blob/fallback-branch/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn short_display_parses_gitlab_dash_blob() {
+        let src = "https://gitlab.com/owner/repo/-/blob/feature/path/to/file.py";
+        let short = short_display_from_source_url(src, "repo");
+        assert_eq!(short, "owner/repo/path/to/file.py");
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_gitlab_ssh_form() {
+        let state = make_state().await;
+
+        let insert_q = "CREATE repo SET name = 'gl-ssh', git_url = 'git@gitlab.com:owner/gl-ssh.git', branch = 'feat'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "gl-ssh";
+        let file_path = "gl-ssh/src/mod.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should produce url from ssh gitlab");
+        assert_eq!(url, "https://gitlab.com/owner/gl-ssh/blob/feat/src/mod.rs");
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_empty_git_url_uses_env() {
+        let state = make_state().await;
+
+        let insert_q = "CREATE repo SET name = 'empty-url', git_url = ''";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        std::env::remove_var("SOURCE_BASE_URL");
+        std::env::remove_var("SOURCE_BRANCH");
+        std::env::set_var("SOURCE_BASE_URL", "https://fallback.example");
+        std::env::set_var("SOURCE_BRANCH", "fallbackbranch");
+
+        let repo_name = "empty-url";
+        let file_path = "/tmp/hyperzoekt-clones/uuid/empty-url/src/lib.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should fallback to env");
+        assert_eq!(
+            url,
+            "https://fallback.example/empty-url/blob/fallbackbranch/src/lib.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn construct_source_url_branch_with_slash() {
+        let state = make_state().await;
+
+        let insert_q = "CREATE repo SET name = 'branch-slash', git_url = 'https://github.com/owner/branch-slash.git', branch = 'feature/new-thing'";
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                db_conn.query(insert_q).await.expect("insert repo");
+            }
+        }
+
+        let repo_name = "branch-slash";
+        let file_path = "branch-slash/path/file.rs";
+
+        let url = construct_source_url(&state, repo_name, file_path)
+            .await
+            .expect("should include branch with slash");
+        assert_eq!(
+            url,
+            "https://github.com/owner/branch-slash/blob/feature/new-thing/path/file.rs"
+        );
+    }
 }

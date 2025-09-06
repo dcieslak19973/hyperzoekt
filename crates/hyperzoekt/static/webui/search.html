@@ -134,7 +134,7 @@
 
                 // Prefer DB-provided source_url when available so we display the repo/web URL
                 const fileLinkHtml = entity.source_url
-                    ? `<a href="${entity.source_url}${entity.start_line ? '#L' + entity.start_line : ''}" target="_blank" style="color: #0366d6; text-decoration: none;">${entity.source_url}${entity.start_line ? ':' + entity.start_line : ''}</a>`
+                    ? `<a href="${entity.source_url}${entity.start_line ? '#L' + entity.start_line : ''}" target="_blank" style="color: #0366d6; text-decoration: none;">${entity.source_display ? entity.source_display : entity.file}${entity.start_line ? ':' + entity.start_line : ''}</a>`
                     : createFileLink(entity.file, entity.start_line);
 
                 li.innerHTML = `

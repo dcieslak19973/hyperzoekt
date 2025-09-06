@@ -29,11 +29,13 @@
                 <strong>Language:</strong> {{ entity.language }}<br>
                 <strong>File:</strong> {% if entity.source_url %}
                 <a href="{{ entity.source_url }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
-                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_url }}{% if
+                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                    entity.source_display else entity.file }}{% if
                     entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                 {% else %}
                 <a href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
-                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.file }}{% if
+                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                    entity.source_display else entity.file }}{% if
                     entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                 {% endif %}<br>
                 {% if entity.start_line %}

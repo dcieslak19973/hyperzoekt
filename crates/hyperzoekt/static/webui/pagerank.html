@@ -97,8 +97,8 @@
             `;
 
                 entities.forEach((entity, index) => {
-                    // Normalize file path: remove local clone root and repo name prefix when possible
-                    let cleanFile = (entity.file || '').replace(/^\/tmp\/hyperzoekt-clones\/[0-9a-fA-F-]+\//, '');
+                    // Prefer server-provided short display (owner/repo/path) when available
+                    let cleanFile = entity.source_display || (entity.file || '').replace(/^\/tmp\/hyperzoekt-clones\/[0-9a-fA-F-]+\//, '');
                     // Iteratively strip common clone-directory prefixes so we end up with a path
                     // relative to the repository root. This handles variants like:
                     //  - /tmp/hyperzoekt-clones/<uuid>/repo-name-<uuid>/...
