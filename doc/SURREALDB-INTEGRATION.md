@@ -62,8 +62,8 @@ Integration patterns
 - Implement backpressure and graceful shutdown.
 
 Operational considerations
-- Credentials: use env vars `SURREAL_URL`, `SURREAL_NS`, `SURREAL_DB`, `SURREAL_USER`, `SURREAL_PASS`.
-- Persistence: default embedded local mode should write to `.data/surrealdb` in the repo root unless overridden.
+- Credentials: use env vars `SURREALDB_URL`, `SURREALDB_NS`, `SURREALDB_DB`, `SURREALDB_USERNAME`, `SURREALDB_PASSWORD`.
+- Persistence: default embedded local mode should write to `.data/surreal.db` in the repo root unless overridden.
 - Transactions & batching: use transactions for batches of upserts to keep DB consistent and reduce roundtrips.
 - Indexes: create indexes on `file.path`, `entity.name`, and any frequently queried fields.
 - PageRank: compute offline or in-app and store `entity.rank` in SurrealDB; SurrealDB does not provide PageRank out-of-the-box.
