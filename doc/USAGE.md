@@ -70,17 +70,18 @@ Doc generated/edited by the repo maintainer tooling.
 
 ## Embedded SurrealDB default behavior
 
-When running the indexer without a remote SurrealDB configured, the indexer will start an embedded, file-backed SurrealDB instance by default and persist its data to `.data/surreal.db`.
+
+When running the indexer without a remote SurrealDB configured, the indexer may start an embedded, file-backed SurrealDB instance to simplify local development. By default embedded storage uses `.data/surreal.db`.
 
 Configuration summary:
 
 - Environment variables:
-	- `SURREAL_URL` — if set, the indexer will connect to this remote SurrealDB instance instead of embedding.
-	- `SURREAL_EMBED_MODE` — `file` (default) or `memory` (ephemeral).
-	- `SURREAL_EMBED_PATH` — path for embedded DB files (default: `.data/surreal.db`).
+	- `SURREALDB_URL` — if set, the indexer will connect to this remote SurrealDB RPC/WebSocket endpoint (for example `ws://localhost:8000/rpc`) instead of embedding.
+	- `SURREALDB_EMBED_MODE` — `file` (default) or `memory` (ephemeral).
+	- `SURREALDB_EMBED_PATH` — path for embedded DB files (default: `.data/surreal.db`).
 
 - CLI flags (override env vars):
-	- `--surreal-url <url>`
+	- `--surrealdb-url <url>`
 	- `--embed-mode <file|memory>`
 	- `--embed-path <path>`
 

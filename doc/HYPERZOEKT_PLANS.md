@@ -1,9 +1,9 @@
 # Hyperzoekt Development Plan
 
 ## Overview
-Hyperzoekt is an extension to the zoekt ecosystem, focusing on advanced semantic analysis of code repositories. It builds on the speed and functionality of zoekt-distributed for repo processing while adding features like AST extraction, call graph analysis, and PageRank computation. The goal is to provide enriched search and insights (e.g., usage analysis, code ranking) without compromising the purity of zoekt-rs (core indexing/search) or zoekt-distributed (distributed processing/orchestration).
+Hyperzoekt extends the zoekt ecosystem to provide semantic enrichment of indexed repositories. It combines fast trigram-based indexing with AST extraction, call-graph analysis, and PageRank-style ranking to surface higher-quality search results and usage information.
 
-This plan outlines the architecture, integration, implementation steps, and trade-offs based on ongoing discussions. It assumes hyperzoekt can depend on zoekt-rs and/or zoekt-distributed for data and functionality.
+This document summarizes the architecture, trade-offs, and an implementation roadmap for incremental development. It assumes Hyperzoekt can build on `zoekt-rs` and `zoekt-distributed` rather than re-implementing core indexing logic.
 
 ## Core Objectives
 - **Semantic Enrichment**: Extract ASTs, build call graphs, compute PageRank for code entities (functions, classes, etc.).

@@ -48,7 +48,7 @@ The `hyperzoekt-indexer` binary supports enhanced indexing with Tree-sitter sema
 
 Example (run the indexer):
 ```bash
-RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-indexer
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-indexer
 ```
 
 Running the web UI
@@ -66,7 +66,7 @@ The `hyperzoekt-webui` binary provides a modern web interface for browsing index
 
 Example (run the web UI):
 ```bash
-RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
 ```
 
 Configuration
@@ -234,11 +234,11 @@ cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 car
 
 1. **Run the Indexer:**
 ```bash
-cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-indexer
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-indexer
 ```
 2. **Run the Web UI:**
 ```bash
-cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREAL_URL=127.0.0.1:8000 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
 ```
 
 License

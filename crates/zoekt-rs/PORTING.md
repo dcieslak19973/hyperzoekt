@@ -7,7 +7,7 @@ A cloned version of the upstream Go reference implementation is available at
 Our Rust implementation is in:
 
    `/workspaces/hyperzoekt/crates/zoekt`
-   `/workspaces/hyperzoekt/crates/zoekt-cli`
+   `/workspaces/hyperzoekt/crates/zoekt-rs`
 
 Scope (minus web UI):
 - Query AST and parse (and/or a builder API)

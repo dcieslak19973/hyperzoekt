@@ -12,9 +12,9 @@ This document explains the benchmarking tools included in the `zoekt` crates and
 
 ## Where the tools live
 
-- `crates/zoekt-cli/src/bin/zr-query-bench.rs` — runs query micro-benchmarks against an index/shard and writes `.bench_results/query-bench-<ts>.json`.
-- `crates/zoekt-cli/src/bin/zr-bench.rs` — runs the indexer and emits indexing metrics (writes `.bench_results/index-bench-<ts>.json`).
-- `crates/zoekt-cli/src/bin/zr-compare-bench.rs` — compares two bench JSON outputs and prints a summary table and optional JSON report.
+- `crates/zoekt-rs/src/bin/zr-query-bench.rs` — runs query micro-benchmarks against an index/shard and writes `.bench_results/query-bench-<ts>.json`.
+- `crates/zoekt-rs/src/bin/zr-bench.rs` — runs the indexer and emits indexing metrics (writes `.bench_results/index-bench-<ts>.json`).
+- `crates/zoekt-rs/src/bin/zr-compare-bench.rs` — compares two bench JSON outputs and prints a summary table and optional JSON report.
 
 ## Bench JSON schema (important fields)
 
@@ -72,15 +72,15 @@ rm -rf .bench_results/*.json
 2. Run the index/build bench (optional, `zr-bench` records indexing metadata):
 
 ```bash
-cargo run -p zoekt-cli --bin zr-bench --release -- /path/to/repo --write-shard
+cargo run -p zoekt-rs --bin zr-bench --release -- /path/to/repo --write-shard
 ```
 
 3. Run two query benches (make code or config changes between them if you are measuring an opt change):
 
 ```bash
-cargo run -p zoekt-cli --bin zr-query-bench --release -- /path/to/repo
+cargo run -p zoekt-rs --bin zr-query-bench --release -- /path/to/repo
 # make changes, rebuild or switch branch
-cargo run -p zoekt-cli --bin zr-query-bench --release -- /path/to/repo
+cargo run -p zoekt-rs --bin zr-query-bench --release -- /path/to/repo
 ```
 
 Note: `zr-query-bench` builds the index every run and, by default, writes the shard to `<path>/.data/index.shard` and records `index_path` and `index_size_bytes` in the bench JSON.
@@ -88,7 +88,7 @@ Note: `zr-query-bench` builds the index every run and, by default, writes the sh
 4. Compare two bench JSONs:
 
 ```bash
-cargo run -p zoekt-cli --bin zr-compare-bench --release -- .bench_results/query-bench-OLD.json .bench_results/query-bench-NEW.json --json-out .bench_results/compare.json
+cargo run -p zoekt-rs --bin zr-compare-bench --release -- .bench_results/query-bench-OLD.json .bench_results/query-bench-NEW.json --json-out .bench_results/compare.json
 ```
 
 The comparator prints a per-query table and, by default, a top-N regression list where `pct_mean` (percent mean increase) exceeds the configured threshold (default 10%). Use `--threshold` and `--top` to tune.
