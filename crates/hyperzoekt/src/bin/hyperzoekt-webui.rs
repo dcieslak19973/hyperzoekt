@@ -1858,6 +1858,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn construct_source_url_missing_branch_uses_main() {
         let state = make_state().await;
 
@@ -1877,6 +1878,9 @@ mod tests {
 
         let repo_name = "repo-no-branch";
         let file_path = "repo-no-branch/README.md";
+        // Ensure any test-set SOURCE_BRANCH doesn't affect this assertion
+        std::env::remove_var("SOURCE_BRANCH");
+        std::env::remove_var("SOURCE_BASE_URL");
 
         let url = construct_source_url(&state, repo_name, file_path, None)
             .await
