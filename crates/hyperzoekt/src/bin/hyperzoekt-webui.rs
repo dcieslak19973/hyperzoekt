@@ -854,7 +854,7 @@ async fn construct_source_url(
     // Clean the repo_name to remove UUID suffix if present
     let clean_repo_name = remove_uuid_suffix(repo_name);
 
-    log::info!(
+    log::debug!(
         "construct_source_url: repo_name='{}', clean_repo_name='{}', uuid_repo_name='{:?}', file_path='{}'",
         repo_name,
         clean_repo_name,
@@ -916,13 +916,13 @@ async fn construct_source_url(
     } {
         if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
             if let Some(r) = rows.into_iter().next() {
-                log::info!(
+                log::debug!(
                     "construct_source_url: Found repo row: git_url='{}', branch='{:?}'",
                     r.git_url,
                     r.branch
                 );
                 if let Some(normalized_base) = normalize_git_url(&r.git_url) {
-                    log::info!(
+                    log::debug!(
                         "construct_source_url: Normalized git_url to '{}'",
                         normalized_base
                     );
@@ -930,7 +930,7 @@ async fn construct_source_url(
 
                     // Use helper to compute repo-relative path
                     let repo_relative = repo_relative_from_file(file_path, &clean_repo_name);
-                    log::info!(
+                    log::debug!(
                         "construct_source_url: Repo-relative path: '{}'",
                         repo_relative
                     );
@@ -941,7 +941,7 @@ async fn construct_source_url(
                         branch,
                         repo_relative
                     );
-                    log::info!("construct_source_url: Constructed URL: '{}'", url);
+                    log::debug!("construct_source_url: Constructed URL: '{}'", url);
                     return Some(url);
                 } else {
                     log::warn!(
@@ -964,7 +964,7 @@ async fn construct_source_url(
 
     // Fallback to default values (no env vars for base URL to avoid issues with multiple repos)
     log::warn!(
-        "construct_source_url: Using fallback for repo '{}'",
+        "construct_source_url: Using fallback for repo '{}',",
         clean_repo_name
     );
     let source_base = "https://github.com".to_string();
@@ -999,7 +999,7 @@ async fn construct_source_url(
         source_branch,
         repo_relative
     );
-    log::info!("construct_source_url: Fallback URL: '{}'", url);
+    log::debug!("construct_source_url: Fallback URL: '{}'", url);
     Some(url)
 }
 
@@ -1586,6 +1586,7 @@ async fn pagerank_handler(State(state): State<AppState>) -> Result<Html<String>,
 #[derive(Deserialize)]
 struct PageRankQuery {
     repo: String,
+    limit: Option<usize>,
 }
 
 async fn pagerank_api_handler(
@@ -1593,31 +1594,155 @@ async fn pagerank_api_handler(
     Query(query): Query<PageRankQuery>,
 ) -> Result<Json<Vec<EntityPayload>>, StatusCode> {
     log::debug!("pagerank_api_handler: repo={}", &query.repo);
-    let mut entities = state
-        .db
-        .get_entities_for_repo(&query.repo)
-        .await
-        .map_err(|e| {
+
+    // Respect a limit to avoid fetching extremely large repos. Default to 500.
+    let limit = query.limit.unwrap_or(500usize);
+
+    // Fetch entities with a limit via a new lightweight query path to avoid pulling everything.
+    let mut response =
+        match &*state.db.db {
+            SurrealConnection::Local(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
+                )
+                .bind(("repo", query.repo.clone()))
+                .bind(("limit", limit as i64))
+                .await,
+            SurrealConnection::RemoteHttp(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
+                )
+                .bind(("repo", query.repo.clone()))
+                .bind(("limit", limit as i64))
+                .await,
+            SurrealConnection::RemoteWs(db_conn) => db_conn
+                .query(
+                    "SELECT * FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
+                )
+                .bind(("repo", query.repo.clone()))
+                .bind(("limit", limit as i64))
+                .await,
+        };
+
+    let mut entities: Vec<EntityPayload> = match &mut response {
+        Ok(r) => r.take(0).unwrap_or_default(),
+        Err(e) => {
             log::error!(
                 "pagerank get_entities_for_repo failed for {}: {}",
                 &query.repo,
                 e
             );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
     log::debug!(
-        "pagerank_api_handler: fetched {} entities for repo={}",
+        "pagerank_api_handler: fetched {} entities (limit={}) for repo={}",
         entities.len(),
+        limit,
         &query.repo
     );
 
-    // Clean up file paths and construct proper source URLs
+    // Fetch repo metadata once to construct URLs without per-entity DB queries
+    #[derive(Deserialize)]
+    struct RepoRow {
+        git_url: String,
+        branch: Option<String>,
+    }
+
+    // Try variants similar to construct_source_url: clean name, original, uuid name
+    let clean_repo = remove_uuid_suffix(&query.repo);
+    let uuid_repo_name =
+        extract_uuid_repo_name(entities.first().map(|e| e.file.as_str()).unwrap_or(""));
+
+    let mut query_parts = vec!["SELECT git_url, branch FROM repo WHERE".to_string()];
+    let mut bindings: Vec<(&str, String)> = Vec::new();
+    query_parts.push("name = $clean_name".to_string());
+    bindings.push(("clean_name", clean_repo.clone()));
+    if query.repo != clean_repo {
+        query_parts.push("OR name = $original_name".to_string());
+        bindings.push(("original_name", query.repo.clone()));
+    }
+    if let Some(uuid_name) = &uuid_repo_name {
+        query_parts.push("OR name = $uuid_name".to_string());
+        bindings.push(("uuid_name", uuid_name.clone()));
+    }
+    query_parts.push("LIMIT 1".to_string());
+    let repo_q = query_parts.join(" ");
+
+    let repo_row: Option<RepoRow> = match &*state.db.db {
+        SurrealConnection::Local(db_conn) => {
+            let mut q = db_conn.query(&repo_q);
+            for (k, v) in &bindings {
+                q = q.bind((*k, v.to_string()));
+            }
+            match q.await {
+                Ok(mut r) => r.take(0).ok().and_then(|mut v: Vec<RepoRow>| v.pop()),
+                Err(_) => None,
+            }
+        }
+        SurrealConnection::RemoteHttp(db_conn) => {
+            let mut q = db_conn.query(&repo_q);
+            for (k, v) in &bindings {
+                q = q.bind((*k, v.to_string()));
+            }
+            match q.await {
+                Ok(mut r) => r.take(0).ok().and_then(|mut v: Vec<RepoRow>| v.pop()),
+                Err(_) => None,
+            }
+        }
+        SurrealConnection::RemoteWs(db_conn) => {
+            let mut q = db_conn.query(&repo_q);
+            for (k, v) in &bindings {
+                q = q.bind((*k, v.to_string()));
+            }
+            match q.await {
+                Ok(mut r) => r.take(0).ok().and_then(|mut v: Vec<RepoRow>| v.pop()),
+                Err(_) => None,
+            }
+        }
+    };
+
+    // Determine base URL and branch once
+    let (source_base_opt, source_branch) = if let Some(r) = repo_row {
+        if let Some(norm) = normalize_git_url(&r.git_url) {
+            (Some(norm), r.branch.unwrap_or_else(|| "main".to_string()))
+        } else {
+            (None, r.branch.unwrap_or_else(|| "main".to_string()))
+        }
+    } else {
+        (
+            None,
+            std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string()),
+        )
+    };
+
+    // Construct source URLs in-memory without extra DB queries
     for entity in &mut entities {
         entity.file = clean_file_path(&entity.file);
+        let clean_repo_name = remove_uuid_suffix(&entity.repo_name);
+        let repo_relative = repo_relative_from_file(&entity.file, &clean_repo_name);
 
-        // Always recompute source URL using cleaned file path
-        if let Some(url) = construct_source_url(&state, &entity.repo_name, &entity.file, None).await
-        {
+        if let Some(base) = &source_base_opt {
+            let url = format!(
+                "{}/blob/{}/{}",
+                base.trim_end_matches('/'),
+                &source_branch,
+                repo_relative
+            );
+            entity.source_url = Some(url.clone());
+            entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
+        } else {
+            // Fallback to default base
+            let source_base = std::env::var("SOURCE_BASE_URL")
+                .unwrap_or_else(|_| "https://github.com".to_string());
+            let url = format!(
+                "{}/{}/blob/{}/{}",
+                source_base.trim_end_matches('/'),
+                clean_repo_name,
+                &source_branch,
+                repo_relative
+            );
             entity.source_url = Some(url.clone());
             entity.source_display = Some(short_display_from_source_url(&url, &entity.repo_name));
         }
