@@ -6,6 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}HyperZoekt Index Browser{% endblock %}</title>
     <link rel="stylesheet" href="/static/common/styles.css">
+    <!-- Syntax highlighting theme (dark) -->
+    <!-- removed highlight.js assets to avoid shipping unused client-side assets; server renders docs -->
     <style>
         /* HyperZoekt-specific styles */
         body {
@@ -596,6 +598,18 @@
         }
     </style>
     <script src="/static/common/theme.js"></script>
+    <!-- Small styling helper for server-rendered documentation HTML -->
+    <style>
+        .doc-html {
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: var(--text);
+        }
+
+        .doc-html pre {
+            margin: 0.5rem 0;
+        }
+    </style>
 </head>
 
 <body>

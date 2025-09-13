@@ -29,14 +29,14 @@ env_logger = "0.11"
 # SurrealDB client for importer/streaming integration. This is a core dependency.
 surrealdb = { version = "2.3", features = ["kv-mem", "protocol-ws", "protocol-http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-toml = "0.9"
+toml = "0.7"
 sha2 = "0.10"
 signal-hook = "0.3.18"
 petgraph = "0.6"
 
 # Redis for event consumption from zoekt-distributed
-deadpool-redis = "0.17"
-redis = { version = "0.27", features = ["tokio-comp"] }
+deadpool-redis = "0.22"
+redis = { version = "0.32", features = ["tokio-comp"] }
 libc = "0.2"
 
 # Git for cloning remote repositories
@@ -47,20 +47,27 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # zoekt-distributed for shared event types
 zoekt-distributed = { path = "../zoekt-distributed" }
+"zoekt-rs" = { path = "../zoekt-rs" }
 
 # Web UI dependencies
-axum = { version = "0.7", features = ["json", "query"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+axum = { version = "0.8", features = ["json", "query"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 minijinja = "1.0"
 url = "2"
+
+# For timestamps used when creating repo records
+chrono = { version = "0.4", features = ["serde"] }
+pulldown-cmark = "0.9"
+ammonia = "3.1"
 
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serial_test = "0.5"
+serial_test = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [[bin]]
 name = "hyperzoekt-indexer"

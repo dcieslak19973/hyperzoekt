@@ -84,6 +84,10 @@ impl DistributedSearchService {
         let context_lines = params.context.unwrap_or(2);
         let mut total_results = 0;
         let mut all_results = Vec::new();
+        // Track a normalized fingerprint of results so we don't return duplicates when
+        // multiple indexers respond with identical hits. We strip node-specific fields
+        // and per-index counters so equivalent results dedupe reliably.
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Query all indexers in parallel
         let mut search_tasks = Vec::new();
@@ -114,8 +118,28 @@ impl DistributedSearchService {
                             break;
                         }
 
-                        all_results.push(result);
-                        total_results += 1;
+                        // Build a normalization key that ignores node-specific metadata and
+                        // per-index values like 'doc' and 'score' that can differ across nodes.
+                        let mut normalized = result.clone();
+                        if let Some(obj) = normalized.as_object_mut() {
+                            for k in [
+                                "node_id",
+                                "regex",
+                                "context_lines",
+                                "relative_path",
+                                "doc",
+                                "score",
+                            ] {
+                                obj.remove(k);
+                            }
+                        }
+                        let key = normalized.to_string();
+                        if seen_keys.insert(key) {
+                            all_results.push(result);
+                            total_results += 1;
+                        } else {
+                            tracing::debug!("dropping duplicate result from aggregated indexers");
+                        }
                     }
                 }
                 Ok(Err(error)) => {

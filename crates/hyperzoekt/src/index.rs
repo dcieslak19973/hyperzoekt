@@ -25,10 +25,23 @@ pub fn index_single_file(
     let opts = opts_builder.output_null().build();
     let (svc, stats) = RepoIndexService::build_with_options(opts)?;
     let mut payloads: Vec<EntityPayload> = Vec::new();
+    // Compute stable-id inputs that are repo-scoped once per index run.
+    let project = std::env::var("SURREAL_PROJECT").unwrap_or_else(|_| "local-project".into());
+    let repo = std::env::var("SURREAL_REPO").unwrap_or_else(|_| {
+        std::path::Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("local-repo")
+            .to_string()
+    });
+    let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| "local-branch".into());
+    let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "local-commit".into());
+
     for ent in svc.entities.iter() {
         let file = &svc.files[ent.file_id as usize];
         let mut imports: Vec<ImportItem> = Vec::new();
         let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
+        let mut calls: Vec<String> = Vec::new();
         if matches!(ent.kind, EntityKind::File) {
             if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                 let lines = svc.import_lines.get(ent.id as usize);
@@ -41,8 +54,13 @@ pub fn index_single_file(
                                 .cloned()
                                 .unwrap_or(0)
                                 .saturating_add(1);
+                            let raw_path = target_file.path.clone();
+                            let repo_rel =
+                                crate::repo_index::indexer::payload::compute_repo_relative(
+                                    &raw_path, &repo,
+                                );
                             imports.push(ImportItem {
-                                path: target_file.path.clone(),
+                                path: repo_rel,
                                 line: line_no,
                             });
                         }
@@ -77,16 +95,6 @@ pub fn index_single_file(
         };
 
         // compute stable id
-        let project = std::env::var("SURREAL_PROJECT").unwrap_or_else(|_| "local-project".into());
-        let repo = std::env::var("SURREAL_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(&path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("local-repo")
-                .to_string()
-        });
-        let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| "local-branch".into());
-        let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "local-commit".into());
         let stable_id = crate::utils::generate_stable_id(
             &project,
             &repo,
@@ -97,8 +105,16 @@ pub fn index_single_file(
             &ent.signature,
         );
 
+        // Collect outgoing call names (raw) for db writer resolution (names only; stable_ids computed after insertion there)
+        if !matches!(ent.kind, EntityKind::File) {
+            for &callee_eid in svc.call_edges.get(ent.id as usize).unwrap_or(&Vec::new()) {
+                if let Some(callee_ent) = svc.entities.get(callee_eid as usize) {
+                    calls.push(callee_ent.name.clone());
+                }
+            }
+        }
+
         payloads.push(EntityPayload {
-            file: file.path.clone(),
             language: file.language.clone(),
             kind: ent.kind.as_str().to_string(),
             name: ent.name.clone(),
@@ -106,15 +122,17 @@ pub fn index_single_file(
             signature: ent.signature.clone(),
             start_line: start_field,
             end_line: end_field,
-            calls: ent.calls.clone(),
+            // calls removed
             doc: ent.doc.clone(),
-            rank: ent.rank,
+            rank: Some(ent.rank),
             imports,
             unresolved_imports,
+            methods: Vec::new(),
             stable_id,
             repo_name: repo.clone(),
             source_url: None,
             source_display: None,
+            calls,
         });
     }
     Ok((payloads, stats))

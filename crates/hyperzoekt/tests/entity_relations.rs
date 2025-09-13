@@ -1,15 +1,27 @@
-use serde_json;
-use surrealdb::engine::local::Mem;
-use surrealdb::Surreal;
+// Copyright 2025 HyperZoekt Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+mod test_db;
+use test_db::test_db;
 
 #[tokio::test]
 async fn test_entity_relations_basic_sql() {
-    // Setup an embedded SurrealDB instance
-    let db = Surreal::new::<Mem>(()).await.expect("start surreal");
-    db.use_ns("zoekt").use_db("repos").await.expect("use ns/db");
+    // Obtain a test DB (remote if SURREAL_TEST_HTTP_URL set, otherwise in-memory)
+    let db = test_db().await;
+    db.use_ns_db("zoekt", "repos").await;
 
     // Ensure clean state
-    let _ = db.query("REMOVE entity").await;
+    db.remove_all("entity").await;
 
     // Insert three entities: A calls B and "unknown", C calls A
     let create_a = r#"CREATE entity CONTENT {
@@ -71,14 +83,8 @@ async fn test_entity_relations_basic_sql() {
     db.query(create_c).await.expect("create c");
 
     // Run callers query (with rank in select) to ensure ORDER BY rank works
-    let callers_q = r#"SELECT name, stable_id, rank FROM entity WHERE $id IN calls OR $name IN calls ORDER BY rank DESC LIMIT $limit"#;
-    let mut resp = db
-        .query(callers_q)
-        .bind(("id", "A"))
-        .bind(("name", "Alpha"))
-        .bind(("limit", 10i64))
-        .await
-        .expect("callers q");
+    let callers_q = r#"SELECT name, stable_id, rank FROM entity WHERE 'A' IN calls OR 'Alpha' IN calls ORDER BY rank DESC LIMIT 10"#;
+    let mut resp = db.query(callers_q).await.expect("callers q");
     let rows: Vec<serde_json::Value> = resp.take(0).expect("rows");
     // Should find one caller (Gamma)
     assert!(rows
@@ -87,25 +93,22 @@ async fn test_entity_relations_basic_sql() {
 
     // Get distinct calls and lookup callees by stable_id and name
     let calls_q =
-        r#"SELECT array::distinct(calls) as calls FROM entity WHERE stable_id = $id LIMIT 1"#;
-    let mut resp2 = db.query(calls_q).bind(("id", "A")).await.expect("calls q");
+        r#"SELECT array::distinct(calls) as calls FROM entity WHERE stable_id = 'A' LIMIT 1"#;
+    let mut resp2 = db.query(calls_q).await.expect("calls q");
     let vals: Vec<serde_json::Value> = resp2.take(0).expect("vals");
     let calls_list = vals
-        .get(0)
+        .first()
         .and_then(|v| v.get("calls"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    // Now lookup by stable_id IN calls
-    let lookup_id = r#"SELECT name, stable_id, rank FROM entity WHERE stable_id IN $calls ORDER BY rank DESC LIMIT $limit"#;
-    let calls_json = serde_json::to_value(calls_list.clone()).unwrap();
-    let mut resp3 = db
-        .query(lookup_id)
-        .bind(("calls", calls_json))
-        .bind(("limit", 10i64))
+    // Ensure B appears among callees of A (calls_list) and then verify entity B exists.
+    assert!(calls_list.iter().any(|v| v.as_str() == Some("B")));
+    let mut check_b = db
+        .query("SELECT name FROM entity WHERE stable_id = 'B' LIMIT 1")
         .await
-        .expect("lookup id");
-    let rows3: Vec<serde_json::Value> = resp3.take(0).expect("rows3");
+        .expect("select b");
+    let rows3: Vec<serde_json::Value> = check_b.take(0).expect("rows b");
     assert!(rows3
         .iter()
         .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("Beta")));

@@ -26,13 +26,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use parking_lot::RwLock;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 // sha2 used by web_utils if HMAC signing is enabled
-use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zoekt_distributed::poller::preview_builder;
 use zoekt_distributed::redis_adapter::{DynRedis, RealRedis};
 use zoekt_distributed::web_utils;
 
@@ -43,8 +44,7 @@ use anyhow::Result;
 use base64::Engine;
 
 use zoekt_distributed::{
-    lease_manager::{LeaseManager, RemoteRepo},
-    load_node_config, MergeOpts, NodeConfig, NodeType,
+    lease_manager::LeaseManager, load_node_config, MergeOpts, NodeConfig, NodeType,
 };
 
 #[derive(Parser)]
@@ -76,6 +76,7 @@ struct AppStateInner {
     // HMAC key for signing session ids (optional—if empty, unsigned cookies accepted)
     session_hmac_key: Option<Vec<u8>>,
     // Lease manager for fetching current lease status
+    #[allow(dead_code)]
     lease_manager: Arc<LeaseManager>,
 }
 
@@ -90,6 +91,26 @@ struct CreateRepoWithFreq {
     url: String,
     frequency: Option<u64>,
     branches: Option<String>,
+    csrf: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CreateBuilderForm {
+    id: String,
+    base_repo: String,
+    include_branches: Option<String>,
+    exclude_branches: Option<String>,
+    include_tags: Option<String>,
+    exclude_tags: Option<String>,
+    include_owner: Option<String>,
+    exclude_owner: Option<String>,
+    default_branch: Option<String>,
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteBuilderForm {
+    id: String,
     csrf: String,
 }
 
@@ -135,16 +156,25 @@ fn human_readable_bytes(bytes: i64) -> String {
 async fn health(state: Extension<AppState>) -> impl IntoResponse {
     // If we have a redis pool, try a PING to ensure connectivity.
     if let Some(pool) = &state.redis_pool {
-        match pool.ping().await {
-            Ok(_) => {
+        // Protect ping with a short timeout so healthcheck remains responsive
+        match tokio::time::timeout(std::time::Duration::from_millis(200), pool.ping()).await {
+            Ok(Ok(_)) => {
                 tracing::info!(pid=%std::process::id(), outcome=%"health_ok");
                 return (StatusCode::OK, Json(json!({"status": "ok"}))).into_response();
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(pid=%std::process::id(), outcome=%"health_redis_ping_failed", error=?e);
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({"status": "redis_unreachable"})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                tracing::warn!(pid=%std::process::id(), outcome=%"health_redis_ping_timeout");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"status": "redis_unreachable_timeout"})),
                 )
                     .into_response();
             }
@@ -192,13 +222,25 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
     // ensure session exists and get csrf token (create if needed)
     let (_sid, csrf_token, cookie) = session_mgr.get_or_create_session(&headers);
     if let Some(pool) = &state.redis_pool {
-        if let Ok(entries) = pool.hgetall("zoekt:repos").await {
+        // Protect potentially long-running Redis calls with a short timeout so the
+        // admin UI remains responsive when Redis is slow or unreachable.
+        if let Ok(Ok(entries)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            pool.hgetall("zoekt:repos"),
+        )
+        .await
+        {
             for (name, url) in entries {
                 let safe_name = htmlescape::encode_minimal(&name);
                 // fetch meta JSON from zoekt:repo_meta
                 let mut freq = "".to_string();
                 let mut branches = "".to_string();
-                if let Ok(Some(meta_json)) = pool.hget("zoekt:repo_meta", &name).await {
+                if let Ok(Ok(Some(meta_json))) = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    pool.hget("zoekt:repo_meta", &name),
+                )
+                .await
+                {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_json) {
                         // repo_meta now stores only administrative settings: frequency and the
                         // original branch pattern. Runtime fields (last_indexed, duration,
@@ -219,12 +261,18 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                         }
                     }
                 }
+
                 // Gather branch-level details for display as structured JSON so the client can
                 // render an expandable subtable. We'll collect an array of objects with
                 // branch, last_indexed (RFC3339 or string), last_duration_ms, memory_bytes,
                 // memory_display and leased_node.
                 let mut branch_objs: Vec<serde_json::Value> = Vec::new();
-                if let Ok(entry_map) = pool.hgetall("zoekt:repo_branch_meta").await {
+                if let Ok(Ok(entry_map)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    pool.hgetall("zoekt:repo_branch_meta"),
+                )
+                .await
+                {
                     for (field, json_val) in entry_map {
                         if field.starts_with(&format!("{}|", name)) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_val) {
@@ -293,24 +341,30 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                                         }
                                     }
                                     // Get current lease holder from Redis lease keys for real-time accuracy
-                                    let owner = parse_owner_from_git_url(&url);
-                                    let remote_repo = RemoteRepo {
-                                        name: name.clone(),
-                                        git_url: url.clone(),
-                                        branch: Some(branch.to_string()),
-                                        visibility: zoekt_rs::types::RepoVisibility::Public,
-                                        owner,
-                                        allowed_users: Vec::new(),
-                                        last_commit_sha: None,
-                                    };
-                                    if let Some(current_holder) = state
-                                        .lease_manager
-                                        .get_current_lease_holder(&remote_repo)
-                                        .await
+                                    // Prefer live lease state from Redis (lease keys), falling back
+                                    // to stored `leased_node` in branch metadata when present.
+                                    if let Some(pool) = &state.redis_pool {
+                                        let lease_key = base64::engine::general_purpose::URL_SAFE
+                                            .encode(format!("{}|{}|{}", name, url, branch));
+                                        if let Ok(Some(holder)) = pool.get(&lease_key).await {
+                                            obj.insert(
+                                                "leased_node".to_string(),
+                                                serde_json::Value::String(holder),
+                                            );
+                                        } else if let Some(ln) =
+                                            v.get("leased_node").and_then(|x| x.as_str())
+                                        {
+                                            obj.insert(
+                                                "leased_node".to_string(),
+                                                serde_json::Value::String(ln.to_string()),
+                                            );
+                                        }
+                                    } else if let Some(ln) =
+                                        v.get("leased_node").and_then(|x| x.as_str())
                                     {
                                         obj.insert(
                                             "leased_node".to_string(),
-                                            serde_json::Value::String(current_holder),
+                                            serde_json::Value::String(ln.to_string()),
                                         );
                                     }
                                     branch_objs.push(serde_json::Value::Object(obj));
@@ -325,8 +379,12 @@ async fn index(state: Extension<AppState>, headers: HeaderMap) -> impl IntoRespo
                 let branch_json_escaped = htmlescape::encode_minimal(&branch_json);
 
                 // Row columns: Name (with expander), URL, Branches, Frequency, Actions
+                // Render server-side rows without the old expander glyph (client-side
+                // rendering already omits it). Branch details are attached in the
+                // data-branch-details attribute so the client can build the Branches
+                // table.
                 rows.push_str(&format!(
-                    "<tr data-name=\"{}\" data-branch-details=\"{}\"><td><span class=\"expander\">▶</span>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
+                    "<tr data-name=\"{}\" data-branch-details=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form class=\"delete-form\" method=\"post\" action=\"/delete\"><input type=\"hidden\" name=\"name\" value=\"{}\"/><input type=\"hidden\" name=\"csrf\" value=\"{}\"/><button>Delete</button></form></td></tr>",
                     safe_name,
                     branch_json_escaped,
                     htmlescape::encode_minimal(&name),
@@ -528,6 +586,7 @@ fn matches_pattern(pattern: &str, branch: &str) -> bool {
 }
 
 /// Parse owner/account from common Git URL forms (scp-like and http/ssh urls).
+#[allow(dead_code)]
 fn parse_owner_from_git_url(git_url: &str) -> Option<String> {
     // Handle scp-like syntax: git@host:owner/repo.git
     if git_url.starts_with("git@") {
@@ -634,35 +693,33 @@ async fn create_inner(
         }
     }
     if let Some(pool) = &state.redis_pool {
-        // Expand branch patterns if provided
-        let branches = if let Some(branches_str) = &form.branches {
-            if !branches_str.trim().is_empty() {
-                match expand_branch_patterns(&form.url, branches_str.trim()).await {
-                    Ok(expanded) => expanded,
-                    Err(e) => {
-                        tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_branch_expand_error", error=?e);
-                        if wants_json(&headers) {
-                            let body = json!({"error": "branch_pattern_error", "message": e});
-                            let mut resp =
-                                into_boxed_response((StatusCode::BAD_REQUEST, Json(body)));
-                            resp.headers_mut().insert(
-                                axum::http::header::HeaderName::from_static("x-request-id"),
-                                HeaderValue::from_str(&req_id)
-                                    .unwrap_or_else(|_| HeaderValue::from_static("")),
-                            );
-                            return resp;
-                        }
-                        return into_boxed_response((
-                            StatusCode::BAD_REQUEST,
-                            Html("<h1>Invalid branch pattern</h1>".to_string()),
-                        ));
-                    }
-                }
-            } else {
-                vec!["main".to_string()]
-            }
-        } else {
+        // Branch handling: avoid doing potentially slow network/git work inside the
+        // request handler. If the user supplied an explicit list of branches (no
+        // glob/wildcard), accept and write them immediately. If the user supplied a
+        // pattern containing wildcards, record the pattern in repo_meta and write a
+        // single placeholder branch ("main"). The isolated poller process will
+        // asynchronously expand patterns and populate `zoekt:repo_branches`.
+        let branches_pattern = form
+            .branches
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "main".to_string());
+
+        let branches: Vec<String> = if branches_pattern.contains('*')
+            || branches_pattern.contains('?')
+            || branches_pattern.contains('[')
+        {
+            // Defer expansion to background poller; write a safe default so indexers
+            // can start (they may fail to clone if main doesn't exist, but this
+            // avoids blocking the admin UI).
             vec!["main".to_string()]
+        } else {
+            branches_pattern
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
         };
 
         let script = r#"
@@ -743,8 +800,8 @@ async fn create_inner(
                 let mut meta = json!({
                     "frequency": form.frequency,
                 });
-                let branches_str = branches.join(",");
-                meta["branches"] = json!(branches_str);
+                // Store the original pattern or explicit branch list as provided by the user.
+                meta["branches"] = json!(branches_pattern.clone());
 
                 if let Err(e) = pool.hset(&meta_key, &form.name, &meta.to_string()).await {
                     tracing::warn!(user=%user_for_log, auth_type=%auth_type, pid=%std::process::id(), outcome=%"create_meta_error", error=?e);
@@ -989,10 +1046,13 @@ async fn login_get(state: Extension<AppState>, headers: HeaderMap) -> axum::resp
     }
 
     // Serve the embedded login template for a nicer UI.
-    let html = LOGIN_TEMPLATE.replace(
-        "{{ADMIN_USER}}",
-        &htmlescape::encode_minimal(&state.admin_user),
-    );
+    let html = LOGIN_TEMPLATE
+        .replace(
+            "{{ADMIN_USER}}",
+            &htmlescape::encode_minimal(&state.admin_user),
+        )
+        .replace("{{USERNAME_VALUE}}", "")
+        .replace("{{ERROR_BLOCK}}", "");
     into_boxed_response((StatusCode::OK, Html(html)))
 }
 
@@ -1135,29 +1195,14 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
                                             );
                                         }
                                     }
-                                    // Get current lease holder from Redis instead of stale metadata
-                                    let current_lease_holder = if let Some(_pool) =
-                                        &state.redis_pool
+                                    // Use leased_node from the stored branch metadata when present.
+                                    // Avoid performing per-branch live lease RPCs here to keep the
+                                    // API fast and avoid blocking the admin UI rendering.
+                                    if let Some(ln) = v.get("leased_node").and_then(|x| x.as_str())
                                     {
-                                        let owner = parse_owner_from_git_url(&url);
-                                        let repo = RemoteRepo {
-                                            name: name.clone(),
-                                            git_url: url.clone(),
-                                            branch: Some(branch.to_string()),
-                                            visibility: zoekt_rs::types::RepoVisibility::Public,
-                                            owner,
-                                            allowed_users: Vec::new(),
-                                            last_commit_sha: None,
-                                        };
-                                        state.lease_manager.get_current_lease_holder(&repo).await
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(lease_holder) = current_lease_holder {
                                         obj.insert(
                                             "leased_node".to_string(),
-                                            serde_json::Value::String(lease_holder),
+                                            serde_json::Value::String(ln.to_string()),
                                         );
                                     }
                                     branch_details.push(serde_json::Value::Object(obj));
@@ -1178,6 +1223,244 @@ async fn api_repos(state: Extension<AppState>) -> impl IntoResponse {
         }
     }
     Json(out)
+}
+
+// API: list builders stored in Redis hash `zoekt:repo_builders`
+async fn api_builders(state: Extension<AppState>) -> impl IntoResponse {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Some(pool) = &state.redis_pool {
+        if let Ok(entries) = pool.hgetall("zoekt:repo_builders").await {
+            for (_k, v) in entries {
+                if let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) {
+                    out.push(j);
+                }
+            }
+        }
+    }
+    Json(out)
+}
+
+async fn create_builder_inner(
+    state: Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateBuilderForm>,
+) -> impl IntoResponse {
+    // basic auth/session checks copied from create_inner for simplicity
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let sid_valid = sid_opt
+        .as_ref()
+        .map(|sid| {
+            let map = state.sessions.read();
+            map.get(sid)
+                .map(|(_tok, exp, _u)| Instant::now() < *exp)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !is_basic && !sid_valid {
+        return into_boxed_response((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        ));
+    }
+    // validate csrf
+    if let Some(sid) = sid_opt {
+        let map = state.sessions.read();
+        if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
+            return into_boxed_response((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"csrf_mismatch"})),
+            ));
+        }
+    }
+
+    let id = form.id.trim().to_string();
+    if id.is_empty() {
+        return into_boxed_response((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"id_required"})),
+        ));
+    }
+    let base_repo = form.base_repo.trim().to_string();
+    if base_repo.is_empty() {
+        return into_boxed_response((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"base_repo_required"})),
+        ));
+    }
+
+    // Helper to validate comma-separated regex patterns. Returns list of invalid patterns.
+    fn validate_patterns(s: &Option<String>) -> Vec<String> {
+        let mut bad: Vec<String> = Vec::new();
+        if let Some(v) = s {
+            for part in v.split(',') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Err(e) = regex::Regex::new(p) {
+                    bad.push(format!("{}: {}", p, e));
+                }
+            }
+        }
+        bad
+    }
+
+    // Validate all pattern fields and collect failures
+    let mut invalid: Vec<(&str, String)> = Vec::new();
+    for (field, val) in &[
+        ("include_branches", &form.include_branches),
+        ("exclude_branches", &form.exclude_branches),
+        ("include_tags", &form.include_tags),
+        ("exclude_tags", &form.exclude_tags),
+        ("include_owner", &form.include_owner),
+        ("exclude_owner", &form.exclude_owner),
+    ] {
+        for bad in validate_patterns(val) {
+            invalid.push((*field, bad));
+        }
+    }
+
+    if !invalid.is_empty() {
+        // Return structured error listing which field(s) had invalid patterns
+        let details: Vec<serde_json::Value> = invalid
+            .into_iter()
+            .map(|(f, d)| json!({"field": f, "error": d}))
+            .collect();
+        return into_boxed_response((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_regex", "details": details})),
+        ));
+    }
+
+    if let Some(pool) = &state.redis_pool {
+        // Check for id conflict
+        if let Ok(existing) = pool.hget("zoekt:repo_builders", &id).await {
+            if existing.is_some() {
+                return into_boxed_response((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "id_exists", "id": id})),
+                ));
+            }
+        }
+
+        let obj = json!({
+            "id": id,
+            "base_repo": base_repo,
+            "include_branches": form.include_branches.unwrap_or_default(),
+            "exclude_branches": form.exclude_branches.unwrap_or_default(),
+            "include_tags": form.include_tags.unwrap_or_default(),
+            "exclude_tags": form.exclude_tags.unwrap_or_default(),
+            "include_owner": form.include_owner.unwrap_or_default(),
+            "exclude_owner": form.exclude_owner.unwrap_or_default(),
+            "default_branch": form.default_branch.unwrap_or_else(|| "main".to_string()),
+        });
+
+        if let Err(e) = pool
+            .hset("zoekt:repo_builders", &id, &obj.to_string())
+            .await
+        {
+            tracing::warn!(error=?e, "create_builder: failed to write to redis");
+            return into_boxed_response((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"redis_error"})),
+            ));
+        }
+    }
+
+    into_boxed_response((StatusCode::CREATED, Json(json!({"id": id}))))
+}
+
+async fn delete_builder_inner(
+    state: Extension<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteBuilderForm>,
+) -> impl IntoResponse {
+    // auth + csrf similar to create
+    let is_basic = basic_auth_from_headers(&headers, &state.admin_user, &state.admin_pass);
+    let session_mgr = SessionManager::new(state.sessions.clone(), state.session_hmac_key.clone());
+    let sid_opt = session_mgr.verify_and_extract_session(&headers);
+    let sid_valid = sid_opt
+        .as_ref()
+        .map(|sid| {
+            let map = state.sessions.read();
+            map.get(sid)
+                .map(|(_tok, exp, _u)| Instant::now() < *exp)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !is_basic && !sid_valid {
+        return into_boxed_response((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        ));
+    }
+    if let Some(sid) = sid_opt {
+        let map = state.sessions.read();
+        if map.get(&sid).map(|(v, _exp, _u)| v.as_str()) != Some(form.csrf.as_str()) {
+            return into_boxed_response((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"csrf_mismatch"})),
+            ));
+        }
+    }
+
+    if let Some(pool) = &state.redis_pool {
+        let _ = pool.hdel("zoekt:repo_builders", &form.id).await;
+        // write a tombstone so poller can clean up builder-generated entries quickly
+        let _ = pool
+            .hset(
+                "zoekt:repo_builder_deleted",
+                &form.id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await;
+    }
+    into_boxed_response((StatusCode::OK, Json(json!({"id": form.id}))))
+}
+
+async fn preview_builder_handler(
+    Extension(_state): Extension<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let base_repo = match payload.get("base_repo").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing base_repo"})),
+            )
+        }
+    };
+
+    let max_refs = payload
+        .get("max_refs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200) as usize;
+
+    let include_branches = payload.get("include_branches").cloned();
+    let exclude_branches = payload.get("exclude_branches").cloned();
+    let include_tags = payload.get("include_tags").cloned();
+    let exclude_tags = payload.get("exclude_tags").cloned();
+    let include_owner = payload.get("include_owner").cloned();
+    let exclude_owner = payload.get("exclude_owner").cloned();
+
+    match preview_builder(
+        &base_repo,
+        include_branches,
+        exclude_branches,
+        include_tags,
+        exclude_tags,
+        include_owner,
+        exclude_owner,
+        max_refs,
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+    }
 }
 
 #[derive(Serialize)]
@@ -1680,10 +1963,19 @@ async fn login_post(
     // Validate credentials
     if form.username != state.admin_user || form.password != state.admin_pass {
         tracing::warn!(user=%form.username, pid=%std::process::id(), outcome=%"login_failed");
-        return into_boxed_response((
-            StatusCode::UNAUTHORIZED,
-            Html("<h1>Unauthorized</h1>".to_string()),
-        ));
+        // Re-render login template with friendly error message; keep username filled.
+        let error_html = "<div class=\"alert-error\" style=\"margin-top:12px;padding:10px;border:1px solid var(--danger);background:rgba(220,53,69,0.08);color:var(--danger);border-radius:4px;\">Incorrect username or password. Please try again.</div>";
+        let html = LOGIN_TEMPLATE
+            .replace(
+                "{{ADMIN_USER}}",
+                &htmlescape::encode_minimal(&state.admin_user),
+            )
+            .replace(
+                "{{USERNAME_VALUE}}",
+                &htmlescape::encode_minimal(&form.username),
+            )
+            .replace("{{ERROR_BLOCK}}", error_html);
+        return into_boxed_response((StatusCode::UNAUTHORIZED, Html(html)));
     }
 
     // Create session and set cookie
@@ -1740,6 +2032,7 @@ fn make_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/", get(index))
         .route("/api/repos", get(api_repos))
+    .route("/api/builders", get(api_builders))
         .route("/api/indexers", get(api_indexers))
         .route("/api/leases", get(api_leases))
         .route("/login", get(login_get))
@@ -1749,6 +2042,19 @@ fn make_app(state: AppState) -> Router {
             "/create",
             post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<CreateRepoWithFreq>| async move {
                 create_inner(state, headers, Form(form)).await
+            }),
+        )
+        .route(
+            "/create-builder",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<CreateBuilderForm>| async move {
+                create_builder_inner(state, headers, Form(form)).await
+            }),
+        )
+    .route("/preview-builder", post(preview_builder_handler))
+        .route(
+            "/delete-builder",
+            post(|state: Extension<AppState>, headers: HeaderMap, Form(form): Form<DeleteBuilderForm>| async move {
+                delete_builder_inner(state, headers, Form(form)).await
             }),
         )
         .route(
@@ -1943,30 +2249,14 @@ async fn bulk_import_inner(
 
                         let branches_value = if let Some(branches) = &branches {
                             if !branches.trim().is_empty() {
-                                // Validate the branch pattern by expanding it
-                                match expand_branch_patterns(&url, branches.trim()).await {
-                                    Ok(_) => {
-                                        // Store the original pattern, not the expanded branches
-                                        // The indexer will re-expand when it clones the repo
-                                        branches.trim().to_string()
-                                    }
-                                    Err(e) => {
-                                        errors.push(format!(
-                                            "Line {}: Failed to expand branch patterns '{}': {}",
-                                            line_num + 1,
-                                            branches.trim(),
-                                            e
-                                        ));
-                                        branches.trim().to_string()
-                                    }
-                                }
+                                branches.trim().to_string()
                             } else {
                                 "main".to_string()
                             }
                         } else {
                             "main".to_string()
                         };
-                        meta["branches"] = json!(branches_value);
+                        meta["branches"] = json!(branches_value.clone());
 
                         if let Err(e) = pool.hset(&meta_key, &name, &meta.to_string()).await {
                             errors.push(format!(
@@ -1975,18 +2265,30 @@ async fn bulk_import_inner(
                                 e
                             ));
                         } else {
-                            // write branch-level entries: expand stored pattern and write entries to zoekt:repo_branches
+                            // Decide whether to expand now or defer to the poller. If the
+                            // pattern contains globs, defer expansion and write a safe
+                            // default branch entry (main). Otherwise, expand locally and
+                            // write all branches so indexers can act immediately.
                             let branches_pattern = branches_value.clone();
-                            match expand_branch_patterns(&url, &branches_pattern).await {
-                                Ok(expanded) => {
-                                    let branch_map_key = "zoekt:repo_branches";
-                                    for b in expanded.iter() {
-                                        let field = format!("{}|{}", name, b);
-                                        let _ = pool.hset(branch_map_key, &field, &url).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(line=%line_num, error=?e, pid=%std::process::id(), outcome=%"bulk_import_expand_branches_failed");
+                            if branches_pattern.contains('*')
+                                || branches_pattern.contains('?')
+                                || branches_pattern.contains('[')
+                            {
+                                // Defer expansion: write a single placeholder branch
+                                let branch_map_key = "zoekt:repo_branches";
+                                let field = format!("{}|{}", name, "main");
+                                let _ = pool.hset(branch_map_key, &field, &url).await;
+                            } else {
+                                // Expand explicit list of branches locally
+                                let expanded: Vec<String> = branches_pattern
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let branch_map_key = "zoekt:repo_branches";
+                                for b in expanded.iter() {
+                                    let field = format!("{}|{}", name, b);
+                                    let _ = pool.hset(branch_map_key, &field, &url).await;
                                 }
                             }
                             created.push(name.clone());
@@ -2825,6 +3127,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_builder_valid_and_list() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                Some("user1".into()),
+            ),
+        );
+
+        // Use a mock redis that records hset calls; here we only need hget/hset/hgetall behaviors.
+        let mock = std::sync::Arc::new(MockRedis {
+            eval_response: std::sync::Mutex::new(None),
+        });
+        let state = Arc::new(AppStateInner {
+            redis_pool: Some(mock.clone()),
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
+        });
+        let app = make_app(state.clone());
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        let body = format!("id=builder1&base_repo=https%3A%2F%2Fexample.com&include_branches=main%2Cfeatures%2F%2A&csrf=testtoken");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/create-builder")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Listing builders should succeed (we don't verify Redis contents here because MockRedis
+        // returns empty hgetall; the endpoint should return an array (possibly empty) rather than error)
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/builders")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn create_builder_invalid_regex_rejected() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                Some("user1".into()),
+            ),
+        );
+
+        let state = Arc::new(AppStateInner {
+            redis_pool: None,
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
+        });
+        let app = make_app(state.clone());
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        // invalid regex - unclosed character class
+        let body = format!("id=badregex&base_repo=https%3A%2F%2Fexample.com&include_branches=main%2Cfeatures%5B&csrf=testtoken");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/create-builder")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn create_defaults_to_main_branch() {
         use axum::body::Body;
         use axum::http::Request;
@@ -3176,5 +3565,89 @@ repo3,https://github.com/org/repo3,develop"#;
         assert_eq!(created[1], "repo2");
         assert_eq!(created[2], "repo3");
         assert_eq!(errors.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_and_bulk_import_return_quickly() {
+        use axum::body::Body;
+        use axum::http::{header::AUTHORIZATION, Request};
+        use tokio::time::{timeout, Duration};
+        use tower::util::ServiceExt;
+
+        // Prepare server state with a mock redis and a valid session
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().insert(
+            "sid1".into(),
+            (
+                "testtoken".into(),
+                Instant::now() + Duration::from_secs(3600),
+                Some("user1".into()),
+            ),
+        );
+
+        let mock = std::sync::Arc::new(MockRedis {
+            eval_response: std::sync::Mutex::new(None),
+        });
+        let state = Arc::new(AppStateInner {
+            redis_pool: Some(mock),
+            admin_user: "user1".into(),
+            admin_pass: "pass1".into(),
+            sessions: sessions.clone(),
+            session_hmac_key: None,
+            lease_manager: Arc::new(LeaseManager::new().await),
+        });
+        let app = make_app(state.clone());
+
+        // Create request (branch pattern contains a glob, which should be deferred)
+        let creds = base64::engine::general_purpose::STANDARD.encode("user1:pass1");
+        let create_body =
+            "name=fastrepo&url=https%3A%2F%2Fexample.com&branches=features%2F*&csrf=testtoken";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/create")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(create_body))
+            .unwrap();
+
+        // Ensure the handler completes quickly (500ms)
+        let resp_res = timeout(Duration::from_millis(500), app.clone().oneshot(req)).await;
+        assert!(resp_res.is_ok(), "create handler timed out");
+        let resp = resp_res.unwrap().unwrap();
+        assert!(resp.status().is_redirection() || resp.status().as_u16() == 201);
+
+        // Bulk import: build a small multipart body
+        let boundary = "TESTBOUNDARY";
+        let mut multipart = String::new();
+        multipart.push_str("--");
+        multipart.push_str(boundary);
+        multipart
+            .push_str("\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\ntesttoken\r\n");
+        multipart.push_str("--");
+        multipart.push_str(boundary);
+        multipart.push_str("\r\nContent-Disposition: form-data; name=\"csv_file\"; filename=\"file.csv\"\r\nContent-Type: text/csv\r\n\r\n");
+        multipart.push_str("repoA,https://example.com,features/*,60\r\n");
+        multipart.push_str("--");
+        multipart.push_str(boundary);
+        multipart.push_str("--\r\n");
+
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/bulk-import")
+            .header(AUTHORIZATION, format!("Basic {}", creds))
+            .header("Cookie", "dzr_session=sid1|sig")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(multipart))
+            .unwrap();
+
+        let resp_res2 = timeout(Duration::from_millis(500), app.oneshot(req2)).await;
+        assert!(resp_res2.is_ok(), "bulk-import handler timed out");
+        let resp2 = resp_res2.unwrap().unwrap();
+        // bulk-import redirects back to index on success
+        assert!(resp2.status().is_redirection() || resp2.status().is_success());
     }
 }

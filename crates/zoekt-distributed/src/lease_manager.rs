@@ -34,6 +34,9 @@ pub struct RepoEvent {
     pub branch: Option<String>,
     pub node_id: String,
     pub timestamp: i64,
+    // Optional fields that publishers (e.g., zoekt-indexer) may include
+    pub last_commit_sha: Option<String>,
+    pub last_indexed_at: Option<i64>,
 }
 
 // Type aliases to reduce clippy type-complexity warnings around the meta sender.
@@ -76,7 +79,20 @@ impl LeaseManager {
     /// created, it will be used; otherwise the manager uses an in-memory map (tests).
     pub async fn new() -> Self {
         // Use the shared Redis pool creation function with authentication support
-        let redis_pool = crate::redis_adapter::create_redis_pool();
+        // If a pool is returned but a connection cannot be established, fall back
+        // to the in-memory implementation to keep tests hermetic.
+        let redis_pool = match crate::redis_adapter::create_redis_pool() {
+            Some(p) => {
+                match p.get().await {
+                    Ok(_) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("Redis pool created but connection failed: {}. Falling back to in-memory.", e);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
 
         // Initialize SurrealDB store for repository metadata
         let surreal_store = match Self::init_surreal_store().await {
@@ -96,7 +112,26 @@ impl LeaseManager {
     }
 
     async fn init_surreal_store() -> anyhow::Result<crate::surreal_repo_store::SurrealRepoStore> {
-        let surreal_url = std::env::var("SURREALDB_URL").ok();
+        let surreal_url = std::env::var("SURREALDB_URL").ok().map(|u| {
+            // lightweight normalization mirroring normalize_surreal_host
+            let mut s = u.trim().to_string();
+            if s.starts_with("http//") {
+                s = s.replacen("http//", "http://", 1);
+            } else if s.starts_with("https//") {
+                s = s.replacen("https//", "https://", 1);
+            }
+            while s.ends_with('/') {
+                s.pop();
+            }
+            let schemeful = if !(s.starts_with("http://") || s.starts_with("https://")) {
+                format!("http://{}", s)
+            } else {
+                s
+            };
+            std::env::set_var("SURREALDB_URL", &schemeful);
+            std::env::set_var("SURREALDB_HTTP_BASE", &schemeful);
+            schemeful
+        });
         let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
         let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
         let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());

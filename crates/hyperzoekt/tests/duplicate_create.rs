@@ -13,14 +13,24 @@
 // limitations under the License.
 
 use serde_json::json;
-use surrealdb::engine::local::Mem;
-use surrealdb::Surreal;
 
 #[tokio::test]
 async fn duplicate_create_updates() {
-    // Start embedded SurrealDB
-    let db = Surreal::new::<Mem>(()).await.unwrap();
-    db.use_ns("test").use_db("test").await.unwrap();
+    // Start embedded SurrealDB (or remote when configured). If a remote SURREALDB_URL
+    // is configured but unreachable, skip the test to avoid flakiness in CI.
+    use hyperzoekt::db_writer::connection::connect;
+    let db = match connect(&None, &None, &None, "testns", "testdb").await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "Skipping duplicate_create_updates: unable to connect to SURREALDB_URL: {}",
+                e
+            );
+            return;
+        }
+    };
+    db.use_ns("test").await.unwrap();
+    db.use_db("test").await.unwrap();
 
     // Ensure table and index exist
     let _ = db.query("CREATE TABLE entity;").await; // ignore errors
@@ -49,23 +59,36 @@ async fn duplicate_create_updates() {
     });
 
     // First create should succeed
-    db.query("CREATE entity CONTENT $entity")
-        .bind(("entity", payload.clone()))
+    let _ = db
+        .query_with_binds(
+            "CREATE entity CONTENT $entity",
+            vec![("entity", payload.clone())],
+        )
         .await
         .unwrap();
 
     // Second create should result in duplicate handling; emulate the binary logic
     let res = db
-        .query("CREATE entity CONTENT $entity")
-        .bind(("entity", payload.clone()))
+        .query_with_binds(
+            "CREATE entity CONTENT $entity",
+            vec![("entity", payload.clone())],
+        )
         .await;
     if let Err(e) = res {
         let msg = format!("{}", e);
         if msg.to_lowercase().contains("duplicate") || msg.to_lowercase().contains("unique") {
             // Attempt update
-            db.query("UPDATE entity CONTENT $entity WHERE stable_id = $stable_id")
-                .bind(("entity", payload.clone()))
-                .bind(("stable_id", "deadbeef"))
+            let _ = db
+                .query_with_binds(
+                    "UPDATE entity CONTENT $entity WHERE stable_id = $stable_id",
+                    vec![
+                        ("entity", payload.clone()),
+                        (
+                            "stable_id",
+                            serde_json::Value::String("deadbeef".to_string()),
+                        ),
+                    ],
+                )
                 .await
                 .unwrap();
         } else {
@@ -75,8 +98,13 @@ async fn duplicate_create_updates() {
 
     // Verify there's one entity with stable_id
     let rows = db
-        .query("SELECT * FROM entity WHERE stable_id = $stable_id")
-        .bind(("stable_id", "deadbeef"))
+        .query_with_binds(
+            "SELECT stable_id, name, file FROM entity WHERE stable_id = $stable_id",
+            vec![(
+                "stable_id",
+                serde_json::Value::String("deadbeef".to_string()),
+            )],
+        )
         .await
         .unwrap();
     let s = format!("{:?}", rows);

@@ -16,12 +16,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surrealdb::engine::local::Mem;
+use surrealdb::engine::remote::http::{Http, Https};
 use surrealdb::Surreal;
 use tokio::sync::RwLock;
 
 enum SurrealConnection {
     Local(Surreal<surrealdb::engine::local::Db>),
-    Remote(Surreal<surrealdb::engine::remote::ws::Client>),
+    Remote(Surreal<surrealdb::engine::remote::http::Client>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,9 +81,99 @@ impl SurrealRepoStore {
         namespace: String,
         database: String,
     ) -> Result<Self> {
-        use surrealdb::engine::remote::ws::Ws;
+        // Defensive sanitization: mirror hyperzoekt's normalization so callers can
+        // provide http(s), ws(s), or scheme-less host:port values.
+        let mut u = url.trim().to_string();
+        if u.starts_with("http//") {
+            u = u.replacen("http//", "http://", 1);
+        } else if u.starts_with("https//") {
+            u = u.replacen("https//", "https://", 1);
+        } else if u.starts_with("ws//") {
+            u = u.replacen("ws//", "ws://", 1);
+        } else if u.starts_with("wss//") {
+            u = u.replacen("wss//", "wss://", 1);
+        }
+        // Remove accidental duplicate schemes like "http://http://"
+        if u.contains("http://http://") {
+            u = u.replacen("http://http://", "http://", 1);
+        }
+        if u.contains("https://https://") {
+            u = u.replacen("https://https://", "https://", 1);
+        }
 
-        let db = Surreal::new::<Ws>(url).await?;
+        // Normalize to an HTTP(S) URL targeting the /rpc path.
+        let mut http_url = if u.starts_with("http://") || u.starts_with("https://") {
+            if u.contains("/rpc") {
+                u.clone()
+            } else {
+                let stripped = u.trim_end_matches('/');
+                format!("{}/rpc", stripped)
+            }
+        } else if u.starts_with("ws://") || u.starts_with("wss://") {
+            if u.starts_with("wss://") {
+                let v = u.replacen("wss://", "https://", 1);
+                if v.contains("/rpc") {
+                    v
+                } else {
+                    format!("{}/rpc", v.trim_end_matches('/'))
+                }
+            } else {
+                let v = u.replacen("ws://", "http://", 1);
+                if v.contains("/rpc") {
+                    v
+                } else {
+                    format!("{}/rpc", v.trim_end_matches('/'))
+                }
+            }
+        } else {
+            let host = u.trim_end_matches('/');
+            format!("http://{}/rpc", host)
+        };
+
+        // Sanitize common malformed forms
+        if http_url.contains("http//") {
+            http_url = http_url.replace("http//", "http://");
+        }
+        if http_url.contains("https//") {
+            http_url = http_url.replace("https//", "https://");
+        }
+        if http_url.contains("http://http://") {
+            http_url = http_url.replacen("http://http://", "http://", 1);
+        }
+        if http_url.contains("https://https://") {
+            http_url = http_url.replacen("https://https://", "https://", 1);
+        }
+
+        // Expose normalized base without /rpc for legacy callers/tests
+        let base = if http_url.ends_with("/rpc") {
+            http_url
+                .trim_end_matches("/rpc")
+                .trim_end_matches('/')
+                .to_string()
+        } else {
+            http_url.trim_end_matches('/').to_string()
+        };
+        std::env::set_var("SURREALDB_URL", &base);
+        std::env::set_var("SURREALDB_HTTP_BASE", &base);
+
+        // Prepare client target by removing scheme so Surreal::new won't double-prefix
+        let mut client_target = http_url.clone();
+        if client_target.starts_with("http://") {
+            client_target = client_target.replacen("http://", "", 1);
+        } else if client_target.starts_with("https://") {
+            client_target = client_target.replacen("https://", "", 1);
+        }
+        while client_target.starts_with('/') {
+            client_target = client_target.replacen("/", "", 1);
+        }
+
+        // Create the HTTP(S) client
+        let db = if http_url.starts_with("https://") {
+            Surreal::new::<Https>(&client_target).await?
+        } else {
+            Surreal::new::<Http>(&client_target).await?
+        };
+
         db.signin(surrealdb::opt::auth::Root {
             username: &username,
             password: &password,
@@ -151,11 +242,12 @@ impl SurrealRepoStore {
                 db_conn
                     .query("DEFINE FIELD last_indexed_at ON repo TYPE option<datetime>;")
                     .await?;
+                // Add defaults so CREATE statements without explicit timestamps succeed
                 db_conn
-                    .query("DEFINE FIELD created_at ON repo TYPE datetime;")
+                    .query("DEFINE FIELD created_at ON repo TYPE datetime DEFAULT time::now();")
                     .await?;
                 db_conn
-                    .query("DEFINE FIELD updated_at ON repo TYPE datetime;")
+                    .query("DEFINE FIELD updated_at ON repo TYPE datetime DEFAULT time::now();")
                     .await?;
 
                 // Create indexes
@@ -192,11 +284,12 @@ impl SurrealRepoStore {
                 db_conn
                     .query("DEFINE FIELD last_indexed_at ON repo TYPE option<datetime>;")
                     .await?;
+                // Add defaults so CREATE statements without explicit timestamps succeed
                 db_conn
-                    .query("DEFINE FIELD created_at ON repo TYPE datetime;")
+                    .query("DEFINE FIELD created_at ON repo TYPE datetime DEFAULT time::now();")
                     .await?;
                 db_conn
-                    .query("DEFINE FIELD updated_at ON repo TYPE datetime;")
+                    .query("DEFINE FIELD updated_at ON repo TYPE datetime DEFAULT time::now();")
                     .await?;
 
                 // Create indexes
@@ -215,16 +308,23 @@ impl SurrealRepoStore {
     pub async fn get_repo_metadata(&self, git_url: &str) -> anyhow::Result<Option<RepoMetadata>> {
         let db = self.db.read().await;
         let git_url_owned = git_url.to_string();
+        let fields = "id, name, git_url, branch, visibility, owner, allowed_users, last_commit_sha, last_indexed_at, created_at, updated_at";
         let mut result = match &*db {
             SurrealConnection::Local(db_conn) => {
                 db_conn
-                    .query("SELECT * FROM repo WHERE git_url = $git_url")
+                    .query(format!(
+                        "SELECT {} FROM repo WHERE git_url = $git_url",
+                        fields
+                    ))
                     .bind(("git_url", git_url_owned))
                     .await?
             }
             SurrealConnection::Remote(db_conn) => {
                 db_conn
-                    .query("SELECT * FROM repo WHERE git_url = $git_url")
+                    .query(format!(
+                        "SELECT {} FROM repo WHERE git_url = $git_url",
+                        fields
+                    ))
                     .bind(("git_url", git_url_owned))
                     .await?
             }
@@ -320,9 +420,18 @@ impl SurrealRepoStore {
 
     pub async fn get_all_repos(&self) -> Result<Vec<RepoMetadata>> {
         let db = self.db.read().await;
+        let fields = "id, name, git_url, branch, visibility, owner, allowed_users, last_commit_sha, last_indexed_at, created_at, updated_at";
         let mut result = match &*db {
-            SurrealConnection::Local(db_conn) => db_conn.query("SELECT * FROM repo").await?,
-            SurrealConnection::Remote(db_conn) => db_conn.query("SELECT * FROM repo").await?,
+            SurrealConnection::Local(db_conn) => {
+                db_conn
+                    .query(format!("SELECT {} FROM repo", fields))
+                    .await?
+            }
+            SurrealConnection::Remote(db_conn) => {
+                db_conn
+                    .query(format!("SELECT {} FROM repo", fields))
+                    .await?
+            }
         };
         let repos: Vec<RepoMetadata> = result.take(0)?;
         Ok(repos)

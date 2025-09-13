@@ -635,7 +635,8 @@
 
                     // Show search stats
                     const resultCount = json.results.length;
-                    searchStats.textContent = `Found ${resultCount} result${resultCount === 1 ? '' : 's'}`;
+                    const elapsed = typeof json.elapsed_ms === 'number' ? `${json.elapsed_ms} ms` : 'n/a';
+                    searchStats.textContent = `Found ${resultCount} result${resultCount === 1 ? '' : 's'} in ${elapsed}`;
                     searchStats.style.display = 'block';
                     noResults.style.display = 'none';
 

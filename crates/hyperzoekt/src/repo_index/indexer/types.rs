@@ -34,8 +34,13 @@ pub struct Entity<'a> {
     pub signature: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub calls: Option<Vec<String>>,
+    // calls removed (graph edges now)
     pub doc: Option<String>,
+    // Raw identifier names of callees encountered inside this entity (functions/methods only).
+    // These are resolved into graph call edges during index building and not persisted.
+    pub calls_raw: Vec<String>,
+    // Methods found on classes (collected when kind == class)
+    pub methods: Vec<crate::repo_index::indexer::payload::MethodItem>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -79,9 +79,10 @@ mod tests {
             signature: "".into(),
             start_line: 1,
             end_line: 1,
-            calls: vec!["b".into()],
+            calls_raw: vec![],
             doc: None,
             rank: 0.0,
+            methods: Vec::new(),
         };
         let e1 = StoredEntity {
             id: 1,
@@ -92,9 +93,10 @@ mod tests {
             signature: "".into(),
             start_line: 2,
             end_line: 2,
-            calls: vec!["c".into()],
+            calls_raw: vec![],
             doc: None,
             rank: 0.0,
+            methods: Vec::new(),
         };
         let e2 = StoredEntity {
             id: 2,
@@ -105,9 +107,10 @@ mod tests {
             signature: "".into(),
             start_line: 3,
             end_line: 3,
-            calls: vec![],
+            calls_raw: vec![],
             doc: None,
             rank: 0.0,
+            methods: Vec::new(),
         };
         let mut name_index = std::collections::HashMap::new();
         name_index.insert("a".to_string(), vec![0]);

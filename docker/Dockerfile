@@ -17,7 +17,7 @@ WORKDIR /app
 COPY . .
 
 # Build both zoekt-distributed and hyperzoekt binaries
-RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin hyperzoekt-indexer --bin hyperzoekt-webui
+RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller --bin hyperzoekt-indexer --bin hyperzoekt-webui
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
@@ -33,6 +33,7 @@ COPY --from=builder /app/target/release/dzr-admin /app/
 COPY --from=builder /app/target/release/dzr-http-search /app/
 COPY --from=builder /app/target/release/dzr-indexer /app/
 COPY --from=builder /app/target/release/dzr-mcp-search /app/
+COPY --from=builder /app/target/release/dzr-admin-poller /app/
 COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
 COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 

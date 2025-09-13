@@ -22,6 +22,7 @@ RUN apt-get update \
   docker.io \
   net-tools \
   iproute2 \
+  sudo \
   && rm -rf /var/lib/apt/lists/*
 
 # Register mold/ld.lld as alternatives for /usr/bin/ld so they can be used as the system linker
@@ -42,13 +43,21 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && apt-get install -y --no-install-recommends gh \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Helm using the official Helm apt repository
-RUN curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | tee /usr/share/keyrings/helm.gpg > /dev/null \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" \
-  | tee /etc/apt/sources.list.d/helm-stable-debian.list \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends helm \
-  && rm -rf /var/lib/apt/lists/*
+# Install Helm (pinned tarball) – avoids flaky/404 apt repo (baltocdn 404 observed)
+ARG HELM_VERSION=v3.15.3
+RUN set -eux; \
+  arch="$(uname -m)"; \
+  case "$arch" in \
+    x86_64|amd64) helm_arch=amd64 ;; \
+    aarch64|arm64) helm_arch=arm64 ;; \
+    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  curl -L "https://get.helm.sh/helm-${HELM_VERSION}-linux-${helm_arch}.tar.gz" -o /tmp/helm.tgz; \
+  tar -xzf /tmp/helm.tgz -C /tmp; \
+  mv /tmp/linux-${helm_arch}/helm /usr/local/bin/helm; \
+  chmod +x /usr/local/bin/helm; \
+  rm -rf /tmp/helm.tgz /tmp/linux-${helm_arch}; \
+  helm version || true
 
 # Install kubeconform for Kubernetes schema validation
 RUN curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
@@ -60,6 +69,22 @@ RUN curl -L https://github.com/norwoodj/helm-docs/releases/latest/download/helm-
   | tar xz -C /usr/local/bin helm-docs \
   && chmod +x /usr/local/bin/helm-docs
 
+# Install SurrealDB CLI (pin a version for reproducibility; update as needed)
+# To update: adjust SURREALDB_VERSION below. We use the official release tarball.
+ARG SURREALDB_VERSION=v2.3.7
+RUN set -eux; \
+  arch="$(uname -m)"; \
+  case "$arch" in \
+    x86_64|amd64) surreal_arch=amd64 ;; \
+    aarch64|arm64) surreal_arch=arm64 ;; \
+    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  curl -L "https://github.com/surrealdb/surrealdb/releases/download/${SURREALDB_VERSION}/surreal-${SURREALDB_VERSION}.linux-${surreal_arch}.tgz" -o /tmp/surreal.tgz; \
+  tar -xzf /tmp/surreal.tgz -C /usr/local/bin surreal; \
+  rm /tmp/surreal.tgz; \
+  chmod +x /usr/local/bin/surreal; \
+  /usr/local/bin/surreal version || true
+
 # Create workspace dir
 WORKDIR /workspaces/hyperzoekt
 
@@ -70,7 +95,6 @@ ARG USER_GID=$USER_UID
 
 RUN groupadd --gid ${USER_GID} ${USERNAME} || true \
   && useradd --uid ${USER_UID} --gid ${USER_GID} -m ${USERNAME} || true \
-  && apt-get update && apt-get install -y sudo || true \
   && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} || true \
   && usermod -aG docker ${USERNAME} || true
 
