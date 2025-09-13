@@ -127,9 +127,11 @@ mod tests {
                 signature: String::new(),
                 start_line: 0,
                 end_line: 0,
-                calls: Vec::new(),
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 1,
@@ -140,9 +142,11 @@ mod tests {
                 signature: String::new(),
                 start_line: 0,
                 end_line: 0,
-                calls: Vec::new(),
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 2,
@@ -153,9 +157,11 @@ mod tests {
                 signature: String::new(),
                 start_line: 0,
                 end_line: 0,
-                calls: Vec::new(),
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
         ];
 
@@ -244,9 +250,11 @@ mod tests {
             signature: "".into(),
             start_line: 0,
             end_line: 0,
-            calls: vec![],
+            // calls removed
             doc: None,
             rank: 0.0,
+            calls_raw: vec![],
+            methods: Vec::new(),
         }];
         let mut svc = RepoIndexService {
             files,
@@ -292,9 +300,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec!["b".into()],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 1,
@@ -305,9 +315,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec!["c".into()],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 2,
@@ -318,9 +330,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec![],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
         ];
         let n = entities.len();
@@ -377,9 +391,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec![],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 1,
@@ -390,9 +406,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec![],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
             StoredEntity {
                 id: 2,
@@ -403,9 +421,11 @@ mod tests {
                 signature: "".into(),
                 start_line: 0,
                 end_line: 0,
-                calls: vec![],
+                // calls removed
                 doc: None,
                 rank: 0.0,
+                calls_raw: vec![],
+                methods: Vec::new(),
             },
         ];
         let n = entities.len();

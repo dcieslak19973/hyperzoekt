@@ -59,4 +59,29 @@ else
 	fi
 fi
 
+# Optionally start a local SurrealDB in memory mode if not already running.
+# This lets developers use SURREALDB_URL=http://127.0.0.1:8000 easily inside the devcontainer
+# without docker-compose. To disable, set DISABLE_LOCAL_SURREAL=1.
+if [ "${DISABLE_LOCAL_SURREAL:-0}" != "1" ]; then
+	if ! pgrep -f "surreal start" >/dev/null 2>&1; then
+		if command -v surreal >/dev/null 2>&1; then
+			echo "Starting local SurrealDB (memory mode) on 0.0.0.0:8000"
+			# Run in background; basic auth root/root for parity with docker-compose
+			surreal start --bind 0.0.0.0:8000 --user root --pass root memory >/tmp/surreal.log 2>&1 &
+			disown || true
+			# Give it a moment to start
+			sleep 1
+			if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+				echo "SurrealDB is up"
+			else
+				echo "Warning: SurrealDB not responding on :8000 yet (continuing)"
+			fi
+		else
+			echo "surreal binary not found; skipping local SurrealDB startup"
+		fi
+	else
+		echo "SurrealDB already running; skipping startup"
+	fi
+fi
+
 exit 0

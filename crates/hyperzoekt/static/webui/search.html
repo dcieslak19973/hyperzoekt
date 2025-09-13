@@ -113,13 +113,16 @@
 
         try {
             const response = await fetch(`/api/search?${params}`);
-            const results = await response.json();
+            const data = await response.json();
+            // Support both new shape { results: [...], elapsed_ms } and legacy direct array
+            const results = Array.isArray(data) ? data : (data.results || []);
+            const elapsedMs = (data && typeof data === 'object' && 'elapsed_ms' in data) ? data.elapsed_ms : null;
 
             const resultsDiv = document.getElementById('results');
             const resultsList = document.getElementById('results-list');
             const resultsCount = document.getElementById('results-count');
 
-            resultsCount.textContent = `Found ${results.length} results`;
+            resultsCount.textContent = `Found ${results.length} results${elapsedMs !== null ? ' in ' + elapsedMs + ' ms' : ''}`;
             resultsList.innerHTML = '';
 
             results.forEach(entity => {
@@ -133,9 +136,10 @@
                 }
 
                 // Prefer DB-provided source_url when available so we display the repo/web URL
+                const filePathForDisplay = entity.source_display ? entity.source_display : (entity.file || '');
                 const fileLinkHtml = entity.source_url
-                    ? `<a href="${entity.source_url}${entity.start_line ? '#L' + entity.start_line : ''}" target="_blank" style="color: #0366d6; text-decoration: none;">${entity.source_display ? entity.source_display : entity.file}${entity.start_line ? ':' + entity.start_line : ''}</a>`
-                    : createFileLink(entity.file, entity.start_line);
+                    ? `<a href="${entity.source_url}${entity.start_line ? '#L' + entity.start_line : ''}" target="_blank" style="color: #0366d6; text-decoration: none;">${filePathForDisplay}${entity.start_line ? ':' + entity.start_line : ''}</a>`
+                    : createFileLink(filePathForDisplay, entity.start_line);
 
                 li.innerHTML = `
                 <div class="entity-name">

@@ -648,7 +648,9 @@ async fn main() -> Result<()> {
                     resolved_repos.push(resolved_repo);
                 }
                                 // Search across all resolved repos
-                let mut all_results = Vec::new();
+                                let mut all_results = Vec::new();
+                                // Track seen results across repos to avoid duplicates (normalize by removing unstable fields)
+                                let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for resolved_repo in resolved_repos {
                     // clone the index Arc out of the store and capture the repo root (map key)
                     let idx_pair = {
@@ -862,7 +864,17 @@ async fn main() -> Result<()> {
                         // Wait for the search task to complete and collect results
                         match tokio::time::timeout(std::time::Duration::from_secs(30), _fut).await {
                             Ok(Ok(repo_results)) => {
-                                all_results.extend(repo_results);
+                                // Deduplicate results across repos by normalizing entries (drop 'doc')
+                                for v in repo_results {
+                                    let mut norm = v.clone();
+                                    if let Some(obj) = norm.as_object_mut() {
+                                        obj.remove("doc");
+                                    }
+                                    let key = norm.to_string();
+                                    if seen_keys.insert(key) {
+                                        all_results.push(v);
+                                    }
+                                }
                             }
                             Ok(Err(e)) => {
                                 tracing::error!(repo=%resolved_repo, error=%e, "search task failed");
@@ -1129,8 +1141,21 @@ async fn main() -> Result<()> {
                     match timeout(Duration::from_secs(5), fut).await {
                         Ok(join_res) => match join_res {
                             Ok(out) => {
-                                tracing::info!(repo=%params.repo, results=%out.len(), "POST search completed");
-                                (StatusCode::OK, Json(json!({"results": out})))
+                                // Deduplicate within this repo's results as a safety (normalize by removing 'doc')
+                                let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                let mut deduped = Vec::with_capacity(out.len());
+                                for v in out {
+                                    let mut norm = v.clone();
+                                    if let Some(obj) = norm.as_object_mut() {
+                                        obj.remove("doc");
+                                    }
+                                    let key = norm.to_string();
+                                    if seen_keys.insert(key) {
+                                        deduped.push(v);
+                                    }
+                                }
+                                tracing::info!(repo=%params.repo, results=%deduped.len(), "POST search completed");
+                                (StatusCode::OK, Json(json!({"results": deduped})))
                             }
                             Err(e) => {
                                 tracing::error!(repo=%params.repo, error=%e, "search task failed");

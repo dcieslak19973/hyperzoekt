@@ -22,5 +22,8 @@ pub use repo_index::RepoIndexService;
 // Shared modules for binaries
 pub mod db_writer;
 pub mod event_consumer;
+pub mod graph_api;
 pub mod index;
-pub mod utils;
+pub mod utils; // public graph traversal API
+               // Test utilities exposed for integration tests.
+pub mod test_utils;

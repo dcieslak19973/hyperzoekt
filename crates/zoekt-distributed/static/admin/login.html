@@ -26,13 +26,14 @@
             </div>
             <form method="post" action="/login">
                 <label>Username
-                    <input type="text" name="username" required autocomplete="username" />
+                    <input type="text" name="username" value="{{USERNAME_VALUE}}" required autocomplete="username" />
                 </label>
                 <label>Password
                     <input type="password" name="password" required autocomplete="current-password" />
                 </label>
                 <button type="submit">Sign in</button>
             </form>
+            {{ERROR_BLOCK}}
             <div class="footer muted">Use your admin credentials to manage repositories.</div>
         </div>
     </div>

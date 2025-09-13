@@ -36,9 +36,10 @@
                         entity.source_display else entity.file }}{% if
                         entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                     {% else %}
-                    <a href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                    {# Server injects a `file` hint into the template JSON when needed. Use it as fallback. #}
+                    <a href="https://github.com/{{ repo_name }}/{{ (entity.file if entity.file else '')|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
                         target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
-                        entity.source_display else entity.file }}{% if
+                        entity.source_display else (entity.file if entity.file else '') }}{% if
                         entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                     {% endif %}
                     {% if entity.end_line %}-{{ entity.end_line }}{% endif %}

@@ -53,3 +53,21 @@ Pattern summary:
 
 Keep test-only helpers small and well-documented. Mark them `#[doc(hidden)]`
 or add comments explaining why they live in `src/`.
+
+## Running tests that use Redis
+
+Some integration tests in the workspace exercise a real Redis instance and
+will run only when `REDIS_URL` is set in the environment. To avoid tests
+interfering with each other (or with CI jobs), the test harness supports the
+`TEST_REDIS_DB` environment variable which selects a numeric Redis database
+index appended to `REDIS_URL` (for example: `redis://127.0.0.1:6379/13`).
+
+Examples:
+- Run zoekt-distributed tests against DB 13:
+
+  TEST_REDIS_DB=13 REDIS_URL=redis://127.0.0.1:7777 cargo test -p zoekt-distributed --lib
+
+- In CI we set `TEST_REDIS_DB` per job so parallel jobs use distinct DBs.
+
+If you see flaky tests that touch Redis, try running them with a dedicated
+`TEST_REDIS_DB` value and flushing that DB before/after the run.

@@ -1,4 +1,4 @@
-use deadpool_redis::{redis::AsyncCommands, Config as RedisConfig};
+use deadpool_redis::redis::AsyncCommands;
 use getrandom::getrandom;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -37,8 +37,26 @@ async fn branch_level_leasing_integration() {
         }
     };
 
-    let pool = RedisConfig::from_url(&redis_url).create_pool(None).unwrap();
-    let mut conn = pool.get().await.unwrap();
+    // Use the crate's create_redis_pool helper so the test honors TEST_REDIS_DB
+    // and any auth injection logic. If the helper cannot create a pool, skip the test.
+    let pool = match zoekt_distributed::redis_adapter::create_redis_pool() {
+        Some(p) => p,
+        None => {
+            tracing::info!("TEST SKIP: branch_level_leasing_integration (no REDIS_URL)");
+            return;
+        }
+    };
+    // Try to get a connection and skip the test if Redis is unreachable.
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(
+                "TEST SKIP: branch_level_leasing_integration (redis connection failed: {} )",
+                e
+            );
+            return;
+        }
+    };
 
     let repo_name = format!("int_branch_repo_{}", gen_token());
     let url = "https://example.test/repo.git".to_string();

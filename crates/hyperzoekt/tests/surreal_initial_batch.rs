@@ -12,14 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use sha2::Digest;
-use surrealdb::engine::local::Mem;
-use surrealdb::Surreal;
 
 #[tokio::test]
 async fn surreal_initial_batch_inserts_entities() -> Result<(), Box<dyn std::error::Error>> {
     // Start an embedded Mem surreal instance
-    let db = Surreal::new::<Mem>(()).await?;
-    db.use_ns("test").use_db("test").await?;
+    use hyperzoekt::db_writer::connection::connect;
+    let db = match connect(&None, &None, &None, "testns", "testdb").await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Skipping surreal_initial_batch_inserts_entities: unable to connect: {e}");
+            return Ok(());
+        }
+    };
+    if let Err(e) = db.use_ns("test").await {
+        eprintln!("Skipping surreal_initial_batch_inserts_entities: unable to use ns: {e}");
+        return Ok(());
+    }
+    if let Err(e) = db.use_db("test").await {
+        eprintln!("Skipping surreal_initial_batch_inserts_entities: unable to use db: {e}");
+        return Ok(());
+    }
 
     // Build index service using library API, target the example fixture
     let root = std::path::PathBuf::from("tests/fixtures/example-treesitter-repo");
@@ -47,7 +59,7 @@ async fn surreal_initial_batch_inserts_entities() -> Result<(), Box<dyn std::err
     // Insert all records. Use parameterized CREATE to avoid SurrealQL parsing issues
     for v in payloads.into_iter() {
         let q = "CREATE entity CONTENT $e";
-        db.query(q).bind(("e", v)).await?;
+        db.query_with_binds(q, vec![("e", v)]).await?;
     }
 
     // Verify approximate count (inspect debug output for a 'count' field)

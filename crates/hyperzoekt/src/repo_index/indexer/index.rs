@@ -158,9 +158,7 @@ pub fn index_repository(opts: RepoIndexOptions<'_>) -> anyhow::Result<RepoIndexS
                 "end_line".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(e.end_line.saturating_add(1))),
             );
-            if let Some(calls) = e.calls {
-                map.insert("calls".to_string(), serde_json::to_value(calls)?);
-            }
+            // calls removed
             if let Some(doc) = e.doc {
                 map.insert("doc".to_string(), serde_json::Value::String(doc));
             }
