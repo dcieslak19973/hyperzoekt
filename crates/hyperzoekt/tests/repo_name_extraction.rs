@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
-use surrealdb::engine::local::Mem;
-use surrealdb::Surreal;
+use serial_test::serial;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoSummary {
@@ -28,41 +27,30 @@ pub struct RepoSummary {
 struct RepoSummaryQueryResult {
     pub repo_name: String,
     pub entity_count: u64,
-    pub files: Vec<String>,
-    pub languages: Vec<String>,
-}
-
-enum SurrealConnection {
-    Local(Surreal<surrealdb::engine::local::Db>),
-}
-
-impl Clone for SurrealConnection {
-    fn clone(&self) -> Self {
-        match self {
-            SurrealConnection::Local(db) => SurrealConnection::Local(db.clone()),
-        }
-    }
-}
-
-impl SurrealConnection {
-    async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
-        match self {
-            SurrealConnection::Local(db) => db.query(sql).await,
-        }
-    }
+    // Accept optional values returned by SurrealDB and filter None when mapping
+    pub files: Vec<Option<String>>,
+    pub languages: Vec<Option<String>>,
 }
 
 #[derive(Clone)]
 struct TestDatabase {
-    db: std::sync::Arc<SurrealConnection>,
+    db: std::sync::Arc<hyperzoekt::db_writer::connection::SurrealConnection>,
 }
 
 impl TestDatabase {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let db = Surreal::new::<Mem>(()).await?;
-        db.use_ns("test").use_db("test").await?;
+        use hyperzoekt::db_writer::connection::connect;
+        // Ensure tests use the embedded in-memory SurrealDB even if
+        // SURREALDB_URL is set in the environment. Use an ephemeral Mem
+        // instance per-test to avoid shared state across concurrently or
+        // sequentially running tests.
+        std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
+        std::env::set_var("HZ_EPHEMERAL_MEM", "1");
+        let conn = connect(&None, &None, &None, "testns", "testdb").await?;
+        conn.use_ns("test").await?;
+        conn.use_db("test").await?;
         Ok(Self {
-            db: std::sync::Arc::new(SurrealConnection::Local(db)),
+            db: std::sync::Arc::new(conn),
         })
     }
 
@@ -73,7 +61,7 @@ impl TestDatabase {
             SELECT
                 repo_name ?? 'unknown' as repo_name,
                 count() as entity_count,
-                array::distinct(file) as files,
+                array::distinct(source_display) as files,
                 array::distinct(language) as languages
             FROM entity
             GROUP BY repo_name
@@ -86,12 +74,14 @@ impl TestDatabase {
         Ok(query_results
             .into_iter()
             .map(|s| {
-                let file_count = s.files.len() as u64; // Count distinct files
+                let files: Vec<String> = s.files.into_iter().flatten().collect();
+                let languages: Vec<String> = s.languages.into_iter().flatten().collect();
+                let file_count = files.len() as u64; // Count distinct files
                 RepoSummary {
                     name: s.repo_name,
                     entity_count: s.entity_count,
                     file_count,
-                    languages: s.languages,
+                    languages,
                 }
             })
             .collect())
@@ -108,7 +98,7 @@ impl TestDatabase {
                     stable_id: "{}",
                     name: "{}",
                     signature: "{}",
-                    file: "{}",
+                        source_display: "{}",
                     language: "{}",
                     kind: "{}",
                     parent: null,
@@ -125,7 +115,7 @@ impl TestDatabase {
                 entity.stable_id,
                 entity.name,
                 entity.signature,
-                entity.file,
+                entity.source_display,
                 entity.language,
                 entity.kind,
                 entity.start_line,
@@ -146,7 +136,7 @@ struct TestEntity {
     stable_id: String,
     name: String,
     signature: String,
-    file: String,
+    source_display: String,
     language: String,
     kind: String,
     start_line: usize,
@@ -155,6 +145,66 @@ struct TestEntity {
     repo_name: String,
 }
 
+#[serial]
+#[tokio::test]
+async fn test_get_repo_summaries_handles_null_array_elements(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = TestDatabase::new().await?;
+
+    // Ensure clean state
+    db.db.query("DELETE FROM entity").await?;
+
+    // Insert entities, some with null language/source_display to simulate older/dirty data
+    let q1 = r#"CREATE entity CONTENT {
+        stable_id: "n1",
+        name: "N1",
+        signature: "fn n1()",
+        source_display: null,
+        language: null,
+        kind: "function",
+        parent: null,
+        start_line: 1,
+        end_line: 2,
+        calls: [],
+        doc: null,
+        rank: 0.1,
+        imports: [],
+        unresolved_imports: [],
+        repo_name: "null-repo"
+    }"#;
+
+    let q2 = r#"CREATE entity CONTENT {
+        stable_id: "n2",
+        name: "N2",
+        signature: "fn n2()",
+        source_display: "/tmp/hyperzoekt-clones/null-repo/src/lib.rs",
+        language: "rust",
+        kind: "function",
+        parent: null,
+        start_line: 10,
+        end_line: 20,
+        calls: [],
+        doc: null,
+        rank: 0.2,
+        imports: [],
+        unresolved_imports: [],
+        repo_name: "null-repo"
+    }"#;
+
+    db.db.query(q1).await?;
+    db.db.query(q2).await?;
+
+    let summaries = db.get_repo_summaries().await?;
+    let repo = summaries
+        .iter()
+        .find(|r| r.name == "null-repo")
+        .expect("repo present");
+    // languages should not contain nulls and should include "rust"
+    assert!(repo.languages.contains(&"rust".to_string()));
+    Ok(())
+}
+
+#[serial]
 #[tokio::test]
 async fn test_get_repo_summaries_hyperzoekt_clones_pattern(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -165,7 +215,7 @@ async fn test_get_repo_summaries_hyperzoekt_clones_pattern(
             stable_id: "test1".to_string(),
             name: "getUserData".to_string(),
             signature: "def getUserData() -> User".to_string(),
-            file: "/tmp/hyperzoekt-clones/gpt-abc123/src/user.py".to_string(),
+            source_display: "/tmp/hyperzoekt-clones/gpt-abc123/src/user.py".to_string(),
             language: "python".to_string(),
             kind: "function".to_string(),
             start_line: 10,
@@ -177,7 +227,7 @@ async fn test_get_repo_summaries_hyperzoekt_clones_pattern(
             stable_id: "test2".to_string(),
             name: "processData".to_string(),
             signature: "def processData(data: Data) -> None".to_string(),
-            file: "/tmp/hyperzoekt-clones/gpt-abc123/src/data.py".to_string(),
+            source_display: "/tmp/hyperzoekt-clones/gpt-abc123/src/data.py".to_string(),
             language: "python".to_string(),
             kind: "function".to_string(),
             start_line: 20,
@@ -189,7 +239,7 @@ async fn test_get_repo_summaries_hyperzoekt_clones_pattern(
             stable_id: "test3".to_string(),
             name: "UserService".to_string(),
             signature: "class UserService".to_string(),
-            file: "/tmp/hyperzoekt-clones/hyperzoekt-def456/src/service.ts".to_string(),
+            source_display: "/tmp/hyperzoekt-clones/hyperzoekt-def456/src/service.ts".to_string(),
             language: "typescript".to_string(),
             kind: "class".to_string(),
             start_line: 5,
@@ -220,6 +270,7 @@ async fn test_get_repo_summaries_hyperzoekt_clones_pattern(
     Ok(())
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_repo_summaries_empty_database() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new().await?;
@@ -231,6 +282,7 @@ async fn test_get_repo_summaries_empty_database() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_repo_summaries_with_null_repo_name() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new().await?;
@@ -240,7 +292,7 @@ async fn test_get_repo_summaries_with_null_repo_name() -> Result<(), Box<dyn std
         stable_id: "old1".to_string(),
         name: "oldFunction".to_string(),
         signature: "def oldFunction() -> None".to_string(),
-        file: "/tmp/hyperzoekt-clones/old-repo-abc123/src/old.py".to_string(),
+        source_display: "/tmp/hyperzoekt-clones/old-repo-abc123/src/old.py".to_string(),
         language: "python".to_string(),
         kind: "function".to_string(),
         start_line: 10,
@@ -257,7 +309,7 @@ async fn test_get_repo_summaries_with_null_repo_name() -> Result<(), Box<dyn std
                 stable_id: "{}",
                 name: "{}",
                 signature: "{}",
-                file: "{}",
+                    source_display: "{}",
                 language: "{}",
                 kind: "{}",
                 parent: null,
@@ -271,7 +323,7 @@ async fn test_get_repo_summaries_with_null_repo_name() -> Result<(), Box<dyn std
             entity.stable_id,
             entity.name,
             entity.signature,
-            entity.file,
+            entity.source_display,
             entity.language,
             entity.kind,
             entity.start_line,
@@ -292,6 +344,7 @@ async fn test_get_repo_summaries_with_null_repo_name() -> Result<(), Box<dyn std
     Ok(())
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_repo_summaries_all_null_repo_names() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new().await?;
@@ -302,7 +355,7 @@ async fn test_get_repo_summaries_all_null_repo_names() -> Result<(), Box<dyn std
             stable_id: "null1".to_string(),
             name: "func1".to_string(),
             signature: "def func1()".to_string(),
-            file: "/tmp/hyperzoekt-clones/repo1-abc123/src/file1.py".to_string(),
+            source_display: "/tmp/hyperzoekt-clones/repo1-abc123/src/file1.py".to_string(),
             language: "python".to_string(),
             kind: "function".to_string(),
             start_line: 10,
@@ -314,7 +367,7 @@ async fn test_get_repo_summaries_all_null_repo_names() -> Result<(), Box<dyn std
             stable_id: "null2".to_string(),
             name: "func2".to_string(),
             signature: "def func2()".to_string(),
-            file: "/tmp/hyperzoekt-clones/repo2-def456/src/file2.py".to_string(),
+            source_display: "/tmp/hyperzoekt-clones/repo2-def456/src/file2.py".to_string(),
             language: "python".to_string(),
             kind: "function".to_string(),
             start_line: 20,
@@ -332,7 +385,7 @@ async fn test_get_repo_summaries_all_null_repo_names() -> Result<(), Box<dyn std
                 stable_id: "{}",
                 name: "{}",
                 signature: "{}",
-                file: "{}",
+                source_display: "{}",
                 language: "{}",
                 kind: "{}",
                 parent: null,
@@ -346,7 +399,7 @@ async fn test_get_repo_summaries_all_null_repo_names() -> Result<(), Box<dyn std
             entity.stable_id,
             entity.name,
             entity.signature,
-            entity.file,
+            entity.source_display,
             entity.language,
             entity.kind,
             entity.start_line,

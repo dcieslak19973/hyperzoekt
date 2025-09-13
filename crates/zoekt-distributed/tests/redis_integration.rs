@@ -1,5 +1,5 @@
 use deadpool_redis::redis::AsyncCommands;
-use deadpool_redis::Config as RedisConfig;
+// Config is unused in tests; keep import removed to silence warnings.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ fn init_test_logging() {
 #[tokio::test]
 async fn redis_persistence_integration() {
     init_test_logging();
-    let redis_url = match std::env::var("REDIS_URL") {
+    let _redis_url = match std::env::var("REDIS_URL") {
         Ok(u) => u,
         Err(_) => {
             tracing::info!("TEST SKIP: redis_persistence_integration (no REDIS_URL)");
@@ -50,11 +50,26 @@ async fn redis_persistence_integration() {
     };
     tracing::info!("TEST START: redis_persistence_integration");
 
-    // build pool
-    let pool = RedisConfig::from_url(&redis_url).create_pool(None).unwrap();
+    // build pool using shared helper so TEST_REDIS_DB and auth injection are honored
+    let pool = match zoekt_distributed::redis_adapter::create_redis_pool() {
+        Some(p) => p,
+        None => {
+            tracing::info!("TEST SKIP: redis_persistence_integration (no REDIS_URL)");
+            return;
+        }
+    };
 
     // ensure clean state for our test key
-    let mut conn = pool.get().await.unwrap();
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(
+                "TEST SKIP: redis_persistence_integration (redis connection failed: {} )",
+                e
+            );
+            return;
+        }
+    };
     let test_name = format!("int_test_repo_{}", gen_token());
     let test_url = "https://example.test/1".to_string();
     let _: () = conn.hdel("zoekt:repos", &test_name).await.unwrap_or(());
@@ -77,7 +92,16 @@ async fn redis_persistence_integration() {
     // Exercise persistence by performing the same operation the handler would do.
 
     // Exercise persistence by performing the same operation the handler would do.
-    let mut conn = pool.get().await.unwrap();
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(
+                "TEST SKIP: redis_repo_meta_contains_memory_bytes (redis connection failed: {} )",
+                e
+            );
+            return;
+        }
+    };
     let _: () = conn
         .hset("zoekt:repos", &test_name, &test_url)
         .await
@@ -95,7 +119,7 @@ async fn redis_persistence_integration() {
 #[tokio::test]
 async fn redis_repo_meta_contains_memory_bytes() {
     init_test_logging();
-    let redis_url = match std::env::var("REDIS_URL") {
+    let _redis_url = match std::env::var("REDIS_URL") {
         Ok(u) => u,
         Err(_) => {
             tracing::info!("TEST SKIP: redis_repo_meta_contains_memory_bytes (no REDIS_URL)");
@@ -104,9 +128,24 @@ async fn redis_repo_meta_contains_memory_bytes() {
     };
     tracing::info!("TEST START: redis_repo_meta_contains_memory_bytes");
 
-    // build pool
-    let pool = RedisConfig::from_url(&redis_url).create_pool(None).unwrap();
-    let mut conn = pool.get().await.unwrap();
+    // build pool using shared helper so TEST_REDIS_DB and auth injection are honored
+    let pool = match zoekt_distributed::redis_adapter::create_redis_pool() {
+        Some(p) => p,
+        None => {
+            tracing::info!("TEST SKIP: redis_repo_meta_contains_memory_bytes (no REDIS_URL)");
+            return;
+        }
+    };
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(
+                "TEST SKIP: redis_publish_repo_event_integration (redis connection failed: {} )",
+                e
+            );
+            return;
+        }
+    };
 
     let test_name = format!("meta_int_test_{}", gen_token());
     // ensure clean state

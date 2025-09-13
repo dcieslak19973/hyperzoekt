@@ -42,6 +42,10 @@ document.addEventListener('DOMContentLoaded', function () {
     const tabLeasesBtn = document.getElementById('tab-leases');
     const leasesTab = document.getElementById('leases-tab');
     const leaseTableBody = document.getElementById('lease-table-body');
+    const tabBuildersBtn = document.getElementById('tab-builders');
+    const buildersTab = document.getElementById('builders-tab');
+    const builderTableBody = document.getElementById('builder-table-body');
+    const createBuilderForm = document.getElementById('create-builder-form');
     // remember current sort state so dynamic updates can reapply it
     const TABLE_SORT_KEY = 'dzr_table_sort';
     // Load saved sort state from localStorage if present
@@ -61,56 +65,40 @@ document.addEventListener('DOMContentLoaded', function () {
         // attach branch details JSON for later use by the expander
         if (branchDetails) tr.dataset.branchDetails = JSON.stringify(branchDetails);
         const branchesVal = (typeof branches === 'string') ? branches : '';
-        // add an expander cell at the start
         // columns: name, url, branches, frequency, actions
-        tr.innerHTML = `<td><span class="expander">▶</span>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
+        tr.innerHTML = `<td>${escapeHtml(name)}</td><td>${escapeHtml(url)}</td><td>${escapeHtml(branchesVal)}</td><td>${escapeHtml(String(freq || ''))}</td><td><form class="delete-form" data-name="${escapeHtml(name)}"><input type="hidden" name="name" value="${escapeHtml(name)}"/><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/><button type="submit">Delete</button></form></td>`;
         return tr;
     }
 
     if (createForm) {
-        createForm.addEventListener('submit', function (e) {
+        createForm.addEventListener('submit', async function (e) {
             e.preventDefault();
             const formData = new URLSearchParams(new FormData(createForm));
-            fetch('/create', {
-                method: 'POST',
-                body: formData,
-                credentials: 'same-origin',
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': 'application/json'
-                }
-            }).then(r => {
-                if (r.ok) {
-                    return r.json();
-                }
-                // Try to parse JSON error body to give a clearer message to the user
-                return r.json().then(j => {
-                    let msg = 'Create failed';
-                    if (j && j.error === 'conflict' && j.reason) {
-                        if (j.reason === 'name_exists') msg = `Create failed: name already exists (${j.name || ''})`;
-                        else if (j.reason === 'url_exists') msg = `Create failed: url already exists (${j.url || ''})`;
-                        else msg = `Create failed: ${j.reason}`;
-                    } else if (j && j.error) {
-                        msg = `Create failed: ${j.error}`;
-                    } else {
-                        msg = `Create failed: ${r.status} ${r.statusText}`;
+            try {
+                const r = await fetch('/create', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'same-origin',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
                     }
-                    throw new Error(msg);
-                }).catch(() => {
-                    // Non-JSON or parse error
-                    throw new Error(`Create failed: ${r.status} ${r.statusText}`);
                 });
-            }).then(data => {
-                // append row (guard in case table body missing)
-                if (repoTableBody) {
-                    const branches = formData.get('branches') || 'main';
-                    // server response does not include branch details for a freshly created repo
-                    repoTableBody.appendChild(makeRow(data.name, data.url, data.csrf, data.frequency, branches));
-                    // reapply current sort if any
-                    applyCurrentSort();
+                if (r.ok) {
+                    // Success: refresh repo table
+                    try { await refreshRepoTable(); } catch (e) { window.location.reload(); }
+                    createForm.reset();
+                    return;
                 }
-                createForm.reset();
-            }).catch(err => alert(err && err.message ? err.message : String(err)));
+                // Try JSON error body first, then text
+                let body = null;
+                try { body = await r.json(); } catch (je) { /* ignore */ }
+                if (body && body.error) throw new Error(String(body.error || JSON.stringify(body)));
+                const txt = await r.text().catch(() => null);
+                throw new Error(txt || `Create failed: ${r.status} ${r.statusText}`);
+            } catch (err) {
+                alert(err && err.message ? err.message : String(err));
+            }
         });
     }
 
@@ -224,64 +212,182 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         });
         // No initial memory cell formatting needed: runtime columns moved to branch-details.
-        // Add click handler for expand/collapse
-        repoTableBody.addEventListener('click', function (e) {
-            const exp = e.target.closest('.expander');
-            if (!exp) return;
-            const tr = exp.closest('tr');
-            if (!tr) return;
-            toggleBranchRow(tr, exp);
-        });
+        // expansion UI removed: repositories no longer have per-row expand/collapse controls
         // when rows change, also refresh aggregate branch listing if branches tab visible
+        // Use a small coalescing scheduler so many quick DOM mutations only trigger
+        // a single refreshBranchesTable() call (prevents spamming the function).
+        let _refreshBranchesScheduled = false;
         const observer = new MutationObserver(() => {
-            if (branchesTab && branchesTab.style.display !== 'none') refreshBranchesTable();
+            if (!branchesTab || branchesTab.style.display === 'none') return;
+            if (_refreshBranchesScheduled) return;
+            _refreshBranchesScheduled = true;
+            // schedule on next animation frame to coalesce multiple mutations
+            requestAnimationFrame(() => {
+                try { refreshBranchesTable(); } finally { _refreshBranchesScheduled = false; }
+            });
         });
         observer.observe(repoTableBody, { childList: true, subtree: false });
     }
 
-    function toggleBranchRow(tr, expanderEl) {
-        const next = tr.nextElementSibling;
-        // if next is a branch-row for this repo, remove it (collapse)
-        if (next && next.classList && next.classList.contains('branch-row')) {
-            next.remove();
-            expanderEl.textContent = '▶';
-            return;
-        }
-        // otherwise build and insert the branch details row
-        const raw = tr.dataset.branchDetails;
-        let details = null;
-        if (raw) {
-            try { details = JSON.parse(raw); } catch (e) { details = null; }
-        }
-        const br = document.createElement('tr');
-        br.className = 'branch-row';
-        const td = document.createElement('td');
-        td.colSpan = tr.children.length;
-        if (!details || !Array.isArray(details) || details.length === 0) {
-            td.innerHTML = '<em class="muted">No branch details available</em>';
-        } else {
-            // build a small table showing branch details
-            const tbl = document.createElement('table');
-            tbl.style.width = '100%';
-            tbl.style.borderCollapse = 'collapse';
-            const h = document.createElement('thead');
-            h.innerHTML = '<tr><th>Branch</th><th>Last indexed</th><th class="numeric">Duration (ms)</th><th class="numeric">Memory</th><th>Leased node</th></tr>';
-            tbl.appendChild(h);
-            const bbody = document.createElement('tbody');
-            details.forEach(d => {
-                const r = document.createElement('tr');
-                const mem = (d.memory_display) ? d.memory_display : (d.memory_bytes ? humanReadableBytes(Number(d.memory_bytes)) : '');
-                const formattedTime = formatTimestamp(d.last_indexed);
-                r.innerHTML = `<td>${escapeHtml(d.branch || '')}</td><td>${escapeHtml(formattedTime)}</td><td class="numeric">${escapeHtml(String(d.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(mem)}</td><td>${escapeHtml(d.leased_node || '')}</td>`;
-                bbody.appendChild(r);
-            });
-            tbl.appendChild(bbody);
-            td.appendChild(tbl);
-        }
-        br.appendChild(td);
-        tr.parentNode.insertBefore(br, tr.nextSibling);
-        expanderEl.textContent = '▼';
+    // Builders tab handling
+    if (tabBuildersBtn && buildersTab) {
+        tabBuildersBtn.addEventListener('click', () => {
+            // hide others
+            tabReposBtn.setAttribute('aria-pressed', 'false'); reposTab.style.display = 'none';
+            tabBranchesBtn.setAttribute('aria-pressed', 'false'); branchesTab.style.display = 'none';
+            tabIndexersBtn.setAttribute('aria-pressed', 'false'); indexersTab.style.display = 'none';
+            tabLeasesBtn.setAttribute('aria-pressed', 'false'); leasesTab.style.display = 'none';
+            tabBuildersBtn.setAttribute('aria-pressed', 'true'); buildersTab.style.display = 'block';
+            // visual tab styling
+            reposTab.classList.remove('tabbed');
+            branchesTab.classList.remove('tabbed');
+            indexersTab.classList.remove('tabbed');
+            leasesTab.classList.remove('tabbed');
+            buildersTab.classList.add('tabbed');
+            // hide add/import cards when viewing builders
+            showAddImport(false);
+            // hide any preview panel when opening builders (it will be shown when user requests preview)
+            try { if (previewResults) { previewResults.classList.remove('visible'); setTimeout(() => { previewResults.style.display = 'none'; }, 190); } } catch (e) { }
+            // ensure the add builder form is visible when viewing builders
+            try { if (createBuilderForm) createBuilderForm.style.display = ''; } catch (e) { }
+            // refresh builders list
+            fetchBuilders();
+        });
     }
+
+    async function fetchBuilders() {
+        if (!builderTableBody) return;
+        builderTableBody.innerHTML = '<tr><td colspan="8">Loading...</td></tr>';
+        try {
+            const r = await fetch('/api/builders', { credentials: 'same-origin', headers: { 'Accept': 'application/json' } });
+            if (!r.ok) { builderTableBody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>'; return; }
+            const arr = await r.json();
+            builderTableBody.innerHTML = '';
+            for (const b of arr) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${escapeHtml(b.id)}</td><td>${escapeHtml(b.base_repo)}</td><td>${escapeHtml(b.include_branches || '')}</td><td>${escapeHtml(b.exclude_branches || '')}</td><td>${escapeHtml(b.include_tags || '')}</td><td>${escapeHtml(b.exclude_tags || '')}</td><td>${escapeHtml(b.include_owner || '')}</td><td>${escapeHtml(b.exclude_owner || '')}</td><td>${escapeHtml(b.default_branch || '')}</td><td><form class="delete-builder-form" data-id="${escapeHtml(b.id)}"><input type="hidden" name="id" value="${escapeHtml(b.id)}"/><input type="hidden" name="csrf" value="${escapeHtml(document.querySelector('input[name=csrf]').value || '')}"/><button>Delete</button></form></td>`;
+                builderTableBody.appendChild(tr);
+            }
+        } catch (e) {
+            builderTableBody.innerHTML = '<tr><td colspan="8">Error loading builders</td></tr>';
+        }
+    }
+
+    if (builderTableBody) {
+        builderTableBody.addEventListener('submit', function (e) {
+            const f = e.target;
+            if (f && f.classList && f.classList.contains('delete-builder-form')) {
+                e.preventDefault();
+                if (!confirm('Delete builder ' + (f.dataset.id || '') + '?')) return;
+                const formData = new URLSearchParams(new FormData(f));
+                fetch('/delete-builder', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+                }).then(r => { if (r.ok) return r.json(); throw new Error('delete failed'); }).then(() => fetchBuilders()).catch(err => alert(err));
+            }
+        });
+    }
+
+    if (createBuilderForm) {
+        createBuilderForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            const formData = new URLSearchParams(new FormData(createBuilderForm));
+            // Always create builder only; the admin poller will expand builders into repo-branches
+            (async function () {
+                try {
+                    const r = await fetch('/create-builder', { method: 'POST', body: formData, credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' } });
+                    if (!r.ok) {
+                        let body = null;
+                        try { body = await r.json(); } catch (e) { /* ignore */ }
+                        if (body && body.error) throw new Error(String(body.error || JSON.stringify(body)));
+                        const txt = await r.text().catch(() => null);
+                        throw new Error(txt || 'create builder failed');
+                    }
+                    createBuilderForm.reset();
+                    fetchBuilders();
+                } catch (err) {
+                    alert(err && err.message ? err.message : String(err));
+                }
+            })();
+        });
+    }
+
+    // Fetch /api/repos and rebuild the Repositories table using server-provided data
+    async function refreshRepoTable() {
+        if (!repoTableBody) return;
+        repoTableBody.innerHTML = '<tr><td colspan="5">Loading...</td></tr>';
+        try {
+            const r = await fetch('/api/repos', { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+            if (!r.ok) { repoTableBody.innerHTML = '<tr><td colspan="5">Failed to load</td></tr>'; return; }
+            const arr = await r.json();
+            // Build rows using makeRow so client-side state (no expander) is preserved
+            const frag = document.createDocumentFragment();
+            for (const row of arr) {
+                // branch_details is an array; stringify and attach to dataset
+                const tr = makeRow(row.name, row.url, document.querySelector('input[name=csrf]').value || '', row.frequency, row.branches || '', row.branch_details || []);
+                frag.appendChild(tr);
+            }
+            repoTableBody.innerHTML = '';
+            repoTableBody.appendChild(frag);
+            // reapply current sort if any
+            if (window.applyCurrentSort) window.applyCurrentSort();
+        } catch (e) {
+            repoTableBody.innerHTML = '<tr><td colspan="5">Error loading repositories</td></tr>';
+        }
+    }
+
+    // Preview builder expansion without creating the builder
+    const previewBtn = document.getElementById('preview-builder-btn');
+    const previewResults = document.getElementById('preview-results');
+    const previewBranches = document.getElementById('preview-branches');
+    const previewTags = document.getElementById('preview-tags');
+    if (previewBtn && createBuilderForm) {
+        previewBtn.addEventListener('click', async function () {
+            // collect fields from createBuilderForm
+            const fd = new FormData(createBuilderForm);
+            const payload = {
+                base_repo: fd.get('base_repo') || '',
+                include_branches: fd.get('include_branches') || null,
+                exclude_branches: fd.get('exclude_branches') || null,
+                include_tags: fd.get('include_tags') || null,
+                exclude_tags: fd.get('exclude_tags') || null,
+                include_owner: fd.get('include_owner') || null,
+                exclude_owner: fd.get('exclude_owner') || null,
+                max_refs: fd.get('max_tags') ? Number(fd.get('max_tags')) : 200,
+            };
+            try {
+                previewResults.style.display = 'block';
+                // animate show
+                requestAnimationFrame(() => previewResults.classList.add('visible'));
+                previewBranches.innerHTML = 'Loading...';
+                previewTags.innerHTML = '';
+                const r = await fetch('/preview-builder', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                if (!r.ok) {
+                    const j = await r.json().catch(() => null);
+                    previewBranches.innerHTML = `<div style="color:var(--danger)">${j && j.error ? escapeHtml(j.error) : 'Preview failed'}</div>`;
+                    return;
+                }
+                const data = await r.json();
+                const b = data.branches || [];
+                const t = data.tags || [];
+                if (b.length === 0) previewBranches.innerHTML = '<em class="muted">No matching branches</em>';
+                else previewBranches.innerHTML = '<strong>Branches:</strong> ' + escapeHtml(b.join(', '));
+                if (t.length === 0) previewTags.innerHTML = '<em class="muted">No matching tags</em>';
+                else previewTags.innerHTML = '<strong>Tags:</strong> ' + escapeHtml(t.join(', '));
+            } catch (e) {
+                previewBranches.innerHTML = `<div style="color:var(--danger)">${escapeHtml(String(e && e.message ? e.message : e))}</div>`;
+            }
+        });
+    }
+
+    // Expansion functionality removed: branch details are still stored on rows for the Branches tab
 
     // Table sorting: add click handlers to sortable headers to sort tbody rows
     (function enableTableSorting() {
@@ -294,7 +400,17 @@ document.addEventListener('DOMContentLoaded', function () {
 
         function sortTable(colIndex, asc) {
             const type = headerCells[colIndex] && headerCells[colIndex].getAttribute('data-type') || 'text';
-            const rows = Array.from(tbody.querySelectorAll('tr'));
+            // Capture and detach any branch-detail rows so they don't interfere with sorting
+            const branchRowMap = new Map(); // repo name -> branch-row element
+            Array.from(tbody.querySelectorAll('tr.branch-row')).forEach(br => {
+                const prev = br.previousElementSibling;
+                const name = prev && prev.dataset ? prev.dataset.name : null;
+                if (name) branchRowMap.set(name, br);
+                br.remove();
+            });
+
+            // Only sort repository rows, excluding branch detail rows
+            const rows = Array.from(tbody.querySelectorAll('tr:not(.branch-row)'));
             rows.sort((a, b) => {
                 const aCell = a.children[colIndex];
                 const bCell = b.children[colIndex];
@@ -321,6 +437,14 @@ document.addEventListener('DOMContentLoaded', function () {
             });
             if (!asc) rows.reverse();
             rows.forEach(r => tbody.appendChild(r));
+            // Reattach saved branch rows after their corresponding repo row
+            rows.forEach(r => {
+                const name = r.dataset && r.dataset.name;
+                if (name && branchRowMap.has(name)) {
+                    const br = branchRowMap.get(name);
+                    tbody.insertBefore(br, r.nextSibling);
+                }
+            });
             // update indicators
             headerCells.forEach(h => {
                 const ind = h.querySelector('.sort-indicator');
@@ -356,31 +480,41 @@ document.addEventListener('DOMContentLoaded', function () {
     // Branches tab handling: aggregate per-row branch-details into a flat table
     function refreshBranchesTable() {
         if (!branchTableBody || !repoTableBody) return;
-        // gather branch-details from each repo row
+        console.time && console.time('refreshBranchesTable');
+        // gather branch-details from each repo row, using cached parsed details to
+        // avoid repeated JSON.parse work when users expand/collapse frequently.
         const branchRows = [];
         const repoRows = Array.from(repoTableBody.querySelectorAll('tr'));
         for (const r of repoRows) {
             const repoName = r.dataset && r.dataset.name ? r.dataset.name : (r.children[0] && r.children[0].textContent) || '';
-            const raw = r.dataset && r.dataset.branchDetails ? r.dataset.branchDetails : null;
-            if (!raw) continue;
-            let details = null;
-            try { details = JSON.parse(raw); } catch (e) { details = null; }
+            let details = r.__cachedBranchDetails;
+            if (details === undefined) {
+                const raw = r.dataset && r.dataset.branchDetails ? r.dataset.branchDetails : null;
+                if (!raw) { details = null; }
+                else {
+                    try { details = JSON.parse(raw); } catch (e) { details = null; }
+                }
+                try { r.__cachedBranchDetails = details; } catch (e) { /* ignore */ }
+            }
             if (!details || !Array.isArray(details)) continue;
             for (const d of details) {
                 branchRows.push({ repo: repoName, branch: d.branch || '', last_indexed: d.last_indexed || '', last_duration_ms: d.last_duration_ms || '', memory_display: d.memory_display || (d.memory_bytes ? humanReadableBytes(Number(d.memory_bytes)) : ''), memory_bytes: d.memory_bytes || null, leased_node: d.leased_node || '' });
             }
         }
-        // clear and repopulate
-        branchTableBody.innerHTML = '';
+        // build DOM off-screen
+        const frag = document.createDocumentFragment();
         for (const br of branchRows) {
             const tr = document.createElement('tr');
             const formattedTime = formatTimestamp(br.last_indexed);
-            tr.innerHTML = `<td>${escapeHtml(br.repo)}</td><td>${escapeHtml(br.branch)}</td><td>${escapeHtml(formattedTime)}</td><td class="numeric">${escapeHtml(String(br.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(br.memory_display || '')}</td><td>${escapeHtml(br.leased_node || '')}</td>`;
-            // attach data-bytes on memory cell to help numeric sorting
+            tr.innerHTML = `<td>${escapeHtml(br.repo)}</td><td>${escapeHtml(br.branch)}</td><td>${escapeHtml(formattedTime)}</td><td class="numeric">${escapeHtml(String(br.last_duration_ms || ''))}</td><td class="numeric">${escapeHtml(br.memory_display || '')}</td>`;
+            // attach data-bytes on memory cell to help numeric sorting (memory cell is at index 4)
             const memCell = tr.children[4];
             if (memCell && br.memory_bytes) memCell.setAttribute('data-bytes', String(br.memory_bytes));
-            branchTableBody.appendChild(tr);
+            frag.appendChild(tr);
         }
+        branchTableBody.innerHTML = '';
+        branchTableBody.appendChild(frag);
+        console.timeEnd && console.timeEnd('refreshBranchesTable');
         // apply saved sort state if the branches table header supports it
         if (window.applyCurrentSort) window.applyCurrentSort();
     }
@@ -540,72 +674,102 @@ document.addEventListener('DOMContentLoaded', function () {
     // tab switching
     if (tabReposBtn && tabBranchesBtn && tabIndexersBtn && tabLeasesBtn && reposTab && branchesTab && indexersTab && leasesTab) {
         tabReposBtn.addEventListener('click', () => {
+            try { if (previewResults) { previewResults.classList.remove('visible'); setTimeout(() => { previewResults.style.display = 'none'; }, 190); } } catch (e) { }
             reposTab.style.display = '';
             branchesTab.style.display = 'none';
             indexersTab.style.display = 'none';
             leasesTab.style.display = 'none';
+            // hide builders card when switching away
+            try { buildersTab.style.display = 'none'; } catch (e) { }
             tabReposBtn.setAttribute('aria-pressed', 'true');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
             tabIndexersBtn.setAttribute('aria-pressed', 'false');
             tabLeasesBtn.setAttribute('aria-pressed', 'false');
+            // ensure Builders tab aria state is cleared
+            try { tabBuildersBtn.setAttribute('aria-pressed', 'false'); } catch (e) { }
             // visual tab styling
             reposTab.classList.add('tabbed');
             branchesTab.classList.remove('tabbed');
             indexersTab.classList.remove('tabbed');
             leasesTab.classList.remove('tabbed');
+            // ensure Builders tab is not visually active when switching away
+            try { buildersTab.classList.remove('tabbed'); } catch (e) { }
             // show add/import cards
             showAddImport(true);
         });
         tabBranchesBtn.addEventListener('click', () => {
+            try { if (previewResults) { previewResults.classList.remove('visible'); setTimeout(() => { previewResults.style.display = 'none'; }, 190); } } catch (e) { }
             reposTab.style.display = 'none';
             branchesTab.style.display = '';
             indexersTab.style.display = 'none';
             leasesTab.style.display = 'none';
+            // hide builders card when switching away
+            try { buildersTab.style.display = 'none'; } catch (e) { }
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'true');
             tabIndexersBtn.setAttribute('aria-pressed', 'false');
             tabLeasesBtn.setAttribute('aria-pressed', 'false');
+            // ensure Builders tab aria state is cleared
+            try { tabBuildersBtn.setAttribute('aria-pressed', 'false'); } catch (e) { }
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.add('tabbed');
             indexersTab.classList.remove('tabbed');
             leasesTab.classList.remove('tabbed');
+            // ensure Builders tab is not visually active when switching away
+            try { buildersTab.classList.remove('tabbed'); } catch (e) { }
             // hide add/import cards when viewing branches
             showAddImport(false);
             refreshBranchesTable();
         });
         tabIndexersBtn.addEventListener('click', () => {
+            try { if (previewResults) { previewResults.classList.remove('visible'); setTimeout(() => { previewResults.style.display = 'none'; }, 190); } } catch (e) { }
             reposTab.style.display = 'none';
             branchesTab.style.display = 'none';
             indexersTab.style.display = '';
             leasesTab.style.display = 'none';
+            // hide builders card when switching away
+            try { buildersTab.style.display = 'none'; } catch (e) { }
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
             tabIndexersBtn.setAttribute('aria-pressed', 'true');
             tabLeasesBtn.setAttribute('aria-pressed', 'false');
+            // ensure Builders tab aria state is cleared
+            try { tabBuildersBtn.setAttribute('aria-pressed', 'false'); } catch (e) { }
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.remove('tabbed');
             indexersTab.classList.add('tabbed');
             leasesTab.classList.remove('tabbed');
+            // ensure Builders tab is not visually active when switching away
+            try { buildersTab.classList.remove('tabbed'); } catch (e) { }
             // hide add/import cards when viewing indexers
             showAddImport(false);
             refreshIndexersTable();
         });
         tabLeasesBtn.addEventListener('click', () => {
+            try { if (previewResults) { previewResults.classList.remove('visible'); setTimeout(() => { previewResults.style.display = 'none'; }, 190); } } catch (e) { }
+            // collapse builders form when switching away
+            try { if (createBuilderForm) createBuilderForm.style.display = 'none'; } catch (e) { }
             reposTab.style.display = 'none';
             branchesTab.style.display = 'none';
             indexersTab.style.display = 'none';
             leasesTab.style.display = '';
+            // hide builders card when switching away
+            try { buildersTab.style.display = 'none'; } catch (e) { }
             tabReposBtn.setAttribute('aria-pressed', 'false');
             tabBranchesBtn.setAttribute('aria-pressed', 'false');
             tabIndexersBtn.setAttribute('aria-pressed', 'false');
             tabLeasesBtn.setAttribute('aria-pressed', 'true');
+            // ensure Builders tab aria state is cleared
+            try { tabBuildersBtn.setAttribute('aria-pressed', 'false'); } catch (e) { }
             // visual tab styling
             reposTab.classList.remove('tabbed');
             branchesTab.classList.remove('tabbed');
             indexersTab.classList.remove('tabbed');
             leasesTab.classList.add('tabbed');
+            // ensure Builders tab is not visually active when switching away
+            try { buildersTab.classList.remove('tabbed'); } catch (e) { }
             // hide add/import cards when viewing leases
             showAddImport(false);
             refreshLeasesTable();
@@ -674,12 +838,20 @@ document.addEventListener('DOMContentLoaded', function () {
         function updateTableFromData(data) {
             const tbody = document.getElementById('repo-table-body');
             if (!tbody) return;
+            // Detach any existing branch-row elements and keep them in a map for reattachment
+            const branchRowMap = new Map(); // repo name -> branch-row element
+            Array.from(tbody.querySelectorAll('tr.branch-row')).forEach(br => {
+                const prev = br.previousElementSibling;
+                const name = prev && prev.dataset ? prev.dataset.name : null;
+                if (name) branchRowMap.set(name, br);
+                br.remove();
+            });
             // build a map of incoming rows by name for quick lookup
             const incoming = new Map();
             data.forEach(r => incoming.set(r.name, r));
 
             // existing rows map by repo name (assume first td contains name)
-            const existingRows = Array.from(tbody.querySelectorAll('tr'));
+            const existingRows = Array.from(tbody.querySelectorAll('tr:not(.branch-row)'));
             const seen = new Set();
             for (const tr of existingRows) {
                 const nameCell = tr.children[0];
@@ -688,6 +860,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 const name = (tr.dataset && tr.dataset.name) ? tr.dataset.name : nameCell.textContent.trim();
                 if (!incoming.has(name)) {
                     // removed on server
+                    // remove the branch-detail row if present right after
+                    const next = tr.nextElementSibling;
+                    if (next && next.classList && next.classList.contains('branch-row')) next.remove();
                     tr.remove();
                     continue;
                 }
@@ -709,12 +884,19 @@ document.addEventListener('DOMContentLoaded', function () {
                     if (freqCell.textContent !== want) freqCell.textContent = want;
                 }
                 // update branch-details dataset on the row so the expander shows fresh data
-                if (row.branch_details) {
-                    try { tr.dataset.branchDetails = JSON.stringify(row.branch_details); } catch (e) { /* ignore */ }
-                } else {
-                    // remove attribute when no details
-                    if (tr.dataset && tr.dataset.branchDetails) delete tr.dataset.branchDetails;
-                }
+                try {
+                    const newRaw = row.branch_details ? JSON.stringify(row.branch_details) : null;
+                    const oldRaw = (tr.dataset && tr.dataset.branchDetails) ? tr.dataset.branchDetails : null;
+                    if (newRaw !== oldRaw) {
+                        if (newRaw !== null) {
+                            tr.dataset.branchDetails = newRaw;
+                        } else {
+                            if (tr.dataset && tr.dataset.branchDetails) delete tr.dataset.branchDetails;
+                        }
+                        // Clear parsed cache when branchDetails change so reattachment picks up new data
+                        try { delete tr.__cachedBranchDetails; } catch (e) { /* ignore */ }
+                    }
+                } catch (e) { /* ignore serialization or dataset errors */ }
             }
 
             // add any new rows at the end
@@ -724,7 +906,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 // if a sort is active, insert in sorted position; otherwise append
                 if (tableSortState.idx >= 0) {
                     // find first existing row that should come after newRow
-                    const existingRows = Array.from(tbody.querySelectorAll('tr'));
+                    const existingRows = Array.from(tbody.querySelectorAll('tr:not(.branch-row)'));
                     let inserted = false;
                     for (const ex of existingRows) {
                         // skip rows that were removed in this pass
@@ -742,6 +924,15 @@ document.addEventListener('DOMContentLoaded', function () {
                     tbody.appendChild(newRow);
                 }
             }
+
+            // Reattach any branch-row elements we detached earlier
+            Array.from(tbody.querySelectorAll('tr:not(.branch-row)')).forEach(r => {
+                const nm = r.dataset && r.dataset.name ? r.dataset.name : (r.children[0] && r.children[0].textContent) || '';
+                if (nm && branchRowMap.has(nm)) {
+                    const br = branchRowMap.get(nm);
+                    tbody.insertBefore(br, r.nextSibling);
+                }
+            });
         }
 
         async function fetchAndRefresh() {

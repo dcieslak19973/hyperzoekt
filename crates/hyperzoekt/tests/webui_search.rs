@@ -12,58 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use hyperzoekt::db_writer::connection::{connect, SurrealConnection};
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
-use surrealdb::engine::local::Mem;
-use surrealdb::Surreal;
-
-// Import the Database struct from the webui binary
-// Since it's in a binary crate, we need to make it accessible for testing
-// For now, we'll duplicate the relevant parts for testing
-
-enum SurrealConnection {
-    Local(Surreal<surrealdb::engine::local::Db>),
-    #[allow(dead_code)]
-    RemoteHttp(Surreal<surrealdb::engine::remote::http::Client>),
-    #[allow(dead_code)]
-    RemoteWs(Surreal<surrealdb::engine::remote::ws::Client>),
-}
-
-impl Clone for SurrealConnection {
-    fn clone(&self) -> Self {
-        match self {
-            SurrealConnection::Local(db) => SurrealConnection::Local(db.clone()),
-            #[allow(unreachable_patterns)]
-            SurrealConnection::RemoteHttp(db) => SurrealConnection::RemoteHttp(db.clone()),
-            #[allow(unreachable_patterns)]
-            SurrealConnection::RemoteWs(db) => SurrealConnection::RemoteWs(db.clone()),
-        }
-    }
-}
-
-impl SurrealConnection {
-    async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
-        match self {
-            SurrealConnection::Local(db) => db.query(sql).await,
-            #[allow(unreachable_patterns)]
-            SurrealConnection::RemoteHttp(db) => db.query(sql).await,
-            #[allow(unreachable_patterns)]
-            SurrealConnection::RemoteWs(db) => db.query(sql).await,
-        }
-    }
-}
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct TestDatabase {
-    db: std::sync::Arc<SurrealConnection>,
+    db: Arc<SurrealConnection>,
 }
 
 impl TestDatabase {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let db = Surreal::new::<Mem>(()).await?;
-        db.use_ns("test").use_db("test").await?;
-        Ok(Self {
-            db: std::sync::Arc::new(SurrealConnection::Local(db)),
-        })
+        // Force using embedded in-memory SurrealDB for tests even if
+        // SURREALDB_URL is present in the environment. This avoids
+        // accidental use of a remote DB with different schema/data.
+        std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
+        // Ensure each test gets an ephemeral in-memory instance created
+        // on the current async runtime to avoid dropping a runtime that
+        // services a shared Mem instance from a different test runtime.
+        std::env::set_var("HZ_EPHEMERAL_MEM", "1");
+        let db = connect(&None, &None, &None, "testns", "testdb").await?;
+        // set a small local namespace/database for tests
+        db.use_ns("test").await?;
+        db.use_db("test").await?;
+        Ok(Self { db: Arc::new(db) })
     }
 
     pub async fn search_entities(
@@ -73,38 +45,40 @@ impl TestDatabase {
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
         let query_lower = query.to_lowercase();
 
-        // Access the underlying Surreal instance for parameterized queries
-        let db = match &*self.db {
-            SurrealConnection::Local(db) => db,
-            _ => panic!("Test database should always use local connection"),
-        };
-
-        let query_builder = if let Some(repo) = repo_filter {
-            let sql = r#"
-                SELECT * FROM entity
-                WHERE (string::matches(string::lowercase(name), $query)
-                       OR string::matches(string::lowercase(signature), $query)
-                       OR string::matches(string::lowercase(file), $query))
-                AND string::starts_with(file, $repo)
+        let fields = "file, language, kind, name, parent, signature, start_line, end_line, calls, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
+        let sql = if let Some(_repo) = repo_filter {
+            format!(
+                r#"
+          SELECT {fields} FROM entity
+          WHERE (string::matches(string::lowercase(name ?? ''), $query)
+              OR string::matches(string::lowercase(signature ?? ''), $query)
+              OR string::matches(string::lowercase(file ?? ''), $query))
+          AND string::starts_with(file ?? '', $repo)
                 ORDER BY rank DESC LIMIT 100
-            "#;
-            db.query(sql)
-                .bind(("query", query_lower.clone()))
-                .bind(("repo", repo.to_string()))
+            "#,
+                fields = fields
+            )
         } else {
-            let sql = r#"
-                SELECT * FROM entity
-                WHERE (string::matches(string::lowercase(name), $query)
-                       OR string::matches(string::lowercase(signature), $query)
-                       OR string::matches(string::lowercase(file), $query))
+            format!(
+                r#"
+          SELECT {fields} FROM entity
+          WHERE (string::matches(string::lowercase(name ?? ''), $query)
+              OR string::matches(string::lowercase(signature ?? ''), $query)
+              OR string::matches(string::lowercase(file ?? ''), $query))
                 ORDER BY rank DESC LIMIT 100
-            "#;
-            db.query(sql).bind(("query", query_lower))
+            "#,
+                fields = fields
+            )
         };
 
-        let mut response = query_builder.await?;
-        let entities: Vec<EntityPayload> = response.take(0)?;
+        // Build binds
+        let mut binds = vec![("query", serde_json::Value::String(query_lower))];
+        if let Some(repo) = repo_filter {
+            binds.push(("repo", serde_json::Value::String(repo.to_string())));
+        }
 
+        let mut response = self.db.query_with_binds(&sql, binds).await?;
+        let entities: Vec<EntityPayload> = response.take(0)?;
         Ok(entities)
     }
 

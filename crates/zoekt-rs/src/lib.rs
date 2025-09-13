@@ -25,11 +25,24 @@ pub mod trigram;
 pub mod types;
 pub mod typesitter;
 
+// Re-export selected helpers for downstream callers that prefer a flat import.
+// This keeps the public API small while allowing callers to reference helpers
+// without relying on module path resolution differences across builds.
+
 pub use crate::index::{InMemoryIndex, IndexBuilder, RepoDocId};
 // Query submodules are internal; re-export their public API here.
 pub use crate::query::{Query, QueryPlan, QueryResult, Searcher, SelectKind};
 pub use crate::shard::{SearchMatch, SearchOpts, ShardReader, ShardSearcher, ShardWriter};
 pub use crate::trigram::trigrams;
+
+// Re-export the typesitter with-tree helper at the crate root for stable cross-crate
+// calling sites. Some consumers reference this helper directly; providing a
+// crate-root re-export ensures callers can find the symbol even if module
+// layouts change during refactors.
+// Note: do not re-export typesitter helpers from the crate root here. Some
+// consumers may import directly from `crate::typesitter` to avoid exposing a
+// large flat API surface. Previous attempts to re-export caused unresolved
+// import errors during development; keep the module API stable and explicit.
 
 /// Convenience re-export for callers who want a simple one-shot build and search
 pub fn build_in_memory_index(
@@ -40,3 +53,7 @@ pub fn build_in_memory_index(
 
 #[doc(hidden)]
 pub mod test_helpers;
+
+// (No crate-root re-export for typesitter helpers — prefer callers to import
+// from the `typesitter` module to keep the crate root small and avoid
+// accidental name collisions.)

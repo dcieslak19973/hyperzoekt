@@ -17,16 +17,50 @@
 use crate::repo_index::types::{RepoEntity, RepoIndexService, StoredEntity};
 
 pub fn search(svc: &RepoIndexService, query: &str, limit: usize) -> Vec<RepoEntity> {
-    let results = search_symbol_exact(svc, query);
-    results
-        .into_iter()
-        .take(limit)
-        .map(|e| RepoEntity {
-            name: e.name.clone(),
-            path: svc.files[e.file_id as usize].path.clone(),
-            line: e.start_line as usize,
-        })
-        .collect()
+    let mut out: Vec<RepoEntity> = Vec::new();
+    let q_lower = query.to_lowercase();
+    // Use the name_index to find candidate entity ids (these may come from
+    // entity names or from method-name indexing). Preserve the insertion
+    // order as stored in the index and map each id to a RepoEntity. For method
+    // matches, set the RepoEntity.name to the queried symbol and prefer the
+    // method start_line when available.
+    if let Some(ids) = svc.name_index.get(&q_lower) {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &id in ids {
+            if out.len() >= limit {
+                break;
+            }
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.insert(id);
+            if let Some(e) = svc.entities.get(id as usize) {
+                // determine if this was a method match by checking the entity's name
+                if e.name.to_lowercase() == q_lower {
+                    out.push(RepoEntity {
+                        name: e.name.clone(),
+                        path: svc.files[e.file_id as usize].path.clone(),
+                        line: e.start_line as usize,
+                    });
+                } else {
+                    // method match: find the matching method to get a start_line if present
+                    let mut line = e.start_line as usize;
+                    for m in &e.methods {
+                        if m.name.to_lowercase() == q_lower {
+                            line = m.start_line.unwrap_or(e.start_line) as usize;
+                            break;
+                        }
+                    }
+                    out.push(RepoEntity {
+                        name: query.to_string(),
+                        path: svc.files[e.file_id as usize].path.clone(),
+                        line,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn search_symbol_exact<'a>(svc: &'a RepoIndexService, name: &str) -> Vec<&'a StoredEntity> {
@@ -141,9 +175,11 @@ mod tests {
             signature: "".into(),
             start_line: 1,
             end_line: 2,
-            calls: vec!["bar".into()],
+            // calls removed
             doc: None,
             rank: 0.5,
+            calls_raw: vec![],
+            methods: Vec::new(),
         };
         let e1 = StoredEntity {
             id: 1,
@@ -154,9 +190,11 @@ mod tests {
             signature: "".into(),
             start_line: 10,
             end_line: 11,
-            calls: vec![],
+            // calls removed
             doc: None,
             rank: 0.9,
+            calls_raw: vec![],
+            methods: Vec::new(),
         };
         let mut name_index = std::collections::HashMap::new();
         name_index.insert("foo".to_string(), vec![0]);

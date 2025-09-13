@@ -245,3 +245,25 @@ License
 -------
 This repository is licensed under the Apache License, Version 2.0. See the `LICENSE` and `NOTICE` files for details.
 
+Devcontainer SurrealDB
+----------------------
+The development container image now bundles the `surreal` CLI. When the devcontainer starts, the script `/.devcontainer/scripts/start_devcontainer.sh` will auto-start an in-memory SurrealDB on `0.0.0.0:8000` with credentials `root:root` unless you disable it by exporting:
+
+```bash
+export DISABLE_LOCAL_SURREAL=1
+```
+
+If you rely on Docker Compose's `surrealdb` service instead (e.g. `docker compose up surrealdb`), you can leave the auto-start enabled; the port bind may fail if both try to listen, so in that case disable the auto instance.
+
+Environment variables (already defaults in many examples):
+
+```bash
+SURREALDB_URL=http://127.0.0.1:8000
+SURREALDB_USERNAME=root
+SURREALDB_PASSWORD=root
+SURREAL_NS=zoekt
+SURREAL_DB=repos
+```
+
+The auto-start logs are written to `/tmp/surreal.log` inside the container.
+

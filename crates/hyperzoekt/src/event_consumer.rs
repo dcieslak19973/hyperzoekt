@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use crate::db_writer;
+use crate::repo_index::deps;
 use crate::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
 use crate::repo_index::indexer::EntityKind;
 use crate::repo_index::RepoIndexService;
 use deadpool_redis::redis::{AsyncCommands, Client};
-use deadpool_redis::{Config as RedisConfig, Pool};
+use deadpool_redis::Pool;
 use log;
 use std::path::PathBuf;
 use std::time::Duration;
+// SurrealDB usage delegated to db_writer::persist_repo_dependencies
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 use zoekt_distributed::lease_manager::RepoEvent;
@@ -43,11 +45,7 @@ impl EventConsumer {
 
     /// Create Redis pool for event consumption
     fn create_redis_pool() -> Option<Pool> {
-        if let Some(url) = Self::build_redis_url_from_env() {
-            RedisConfig::from_url(&url).create_pool(None).ok()
-        } else {
-            None
-        }
+        zoekt_distributed::redis_adapter::create_redis_pool()
     }
 
     /// Create a direct Redis client for pubsub operations
@@ -135,10 +133,35 @@ impl EventConsumer {
             std::env::var("REDIS_USERNAME"),
             std::env::var("REDIS_PASSWORD"),
         ) {
-            return Some(format!("redis://{}:{}@127.0.0.1:6379", username, password));
+            let mut url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
+            if let Ok(db) = std::env::var("TEST_REDIS_DB").or_else(|_| std::env::var("REDIS_DB")) {
+                if !db.trim().is_empty() {
+                    if !url.ends_with('/') {
+                        url.push('/');
+                    }
+                    url.push_str(&db);
+                }
+            }
+            return Some(url);
         }
         if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-            return Some(format!("redis://:{}@127.0.0.1:6379", password));
+            let mut url = format!("redis://:{}@127.0.0.1:6379", password);
+            if let Ok(db) = std::env::var("TEST_REDIS_DB").or_else(|_| std::env::var("REDIS_DB")) {
+                if !db.trim().is_empty() {
+                    if !url.ends_with('/') {
+                        url.push('/');
+                    }
+                    url.push_str(&db);
+                }
+            }
+            return Some(url);
+        }
+
+        // No explicit REDIS_URL or credentials; allow TEST_REDIS_DB to pick a local DB
+        if let Ok(db) = std::env::var("TEST_REDIS_DB").or_else(|_| std::env::var("REDIS_DB")) {
+            if !db.trim().is_empty() {
+                return Some(format!("redis://127.0.0.1:6379/{}", db));
+            }
         }
 
         None
@@ -369,7 +392,7 @@ impl EventProcessor {
     }
 
     /// Process a single repo event
-    async fn process_event(&self, event: RepoEvent) -> Result<(), anyhow::Error> {
+    pub async fn process_event(&self, event: RepoEvent) -> Result<(), anyhow::Error> {
         match event.event_type.as_str() {
             "indexing_started" => {
                 log::info!(
@@ -427,6 +450,69 @@ impl EventProcessor {
                 // capture owner for use inside blocking closure
                 let owner_clone = owner.clone();
 
+                // Collect dependencies in a blocking way before spawning the main blocking indexer
+                let deps_temp_dir = temp_dir.clone();
+                let deps_found: Vec<deps::Dependency> =
+                    match tokio::task::spawn_blocking(move || {
+                        deps::collect_dependencies(&deps_temp_dir)
+                    })
+                    .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::warn!("Failed to collect dependencies (join error): {}", e);
+                            Vec::new()
+                        }
+                    };
+
+                // Persist repo metadata and any discovered dependencies.
+                // Previously this call occurred only when dependencies were found;
+                // ensure we always create/upsert a `repo` record even if no deps
+                // were discovered so users can discover indexed repositories in
+                // SurrealDB regardless of dependency extraction results.
+                if deps_found.is_empty() {
+                    log::debug!(
+                        "No dependency entries found for {}; persisting repo metadata only",
+                        repo_name
+                    );
+                } else {
+                    log::info!(
+                        "Found {} dependency entries for {}",
+                        deps_found.len(),
+                        repo_name
+                    );
+                }
+
+                // Persist dependencies using the db_writer helper (normalized schema + idempotent upsert)
+                let surreal_url = std::env::var("SURREALDB_URL").ok();
+                let cfg = db_writer::DbWriterConfig {
+                    surreal_url,
+                    surreal_username: std::env::var("SURREALDB_USERNAME").ok(),
+                    surreal_password: std::env::var("SURREALDB_PASSWORD").ok(),
+                    surreal_ns: std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into()),
+                    surreal_db: std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into()),
+                    ..Default::default()
+                };
+
+                // Best-effort: persist using the db writer helper
+                if let Err(e) = db_writer::persist_repo_dependencies(
+                    &cfg,
+                    &repo_name,
+                    &event.git_url,
+                    owner.as_deref(),
+                    event.branch.as_deref(),
+                    event.last_commit_sha.as_deref(),
+                    event.last_indexed_at,
+                    &deps_found,
+                )
+                .await
+                {
+                    log::warn!(
+                        "Failed to persist normalized dependencies via db_writer: {}",
+                        e
+                    );
+                }
+
                 // Run blocking index build off the tokio runtime
                 match tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
                     let (mut svc, stats) = RepoIndexService::build(temp_dir_clone.as_path())?;
@@ -474,6 +560,7 @@ impl EventProcessor {
                             let file = &svc.files[ent.file_id as usize];
                             let mut imports: Vec<ImportItem> = Vec::new();
                             let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
+                                    let mut calls: Vec<String> = Vec::new();
                             if matches!(ent.kind, EntityKind::File) {
                                 if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
                                     let lines = svc.import_lines.get(ent.id as usize);
@@ -490,8 +577,10 @@ impl EventProcessor {
                                                     .cloned()
                                                     .unwrap_or(0)
                                                     .saturating_add(1);
+                                                let raw_path = target_file.path.clone();
+                                                let repo_rel = crate::repo_index::indexer::payload::compute_repo_relative(&raw_path, &repo_name);
                                                 imports.push(ImportItem {
-                                                    path: target_file.path.clone(),
+                                                    path: repo_rel,
                                                     line: line_no,
                                                 });
                                             }
@@ -593,7 +682,6 @@ impl EventProcessor {
                             });
 
                             EntityPayload {
-                                file: file.path.clone(),
                                 language: file.language.clone(),
                                 kind: ent.kind.as_str().to_string(),
                                 name: ent.name.clone(),
@@ -601,15 +689,24 @@ impl EventProcessor {
                                 signature: ent.signature.clone(),
                                 start_line: start_field,
                                 end_line: end_field,
-                                calls: ent.calls.clone(),
+                                // calls array removed (edges now)
                                 doc: ent.doc.clone(),
-                                rank: ent.rank,
+                                rank: Some(ent.rank),
                                 imports,
                                 unresolved_imports,
+                                methods: ent.methods.clone(),
                                 stable_id,
                                 repo_name: repo_name.clone(),
                                 source_url: computed_source,
                                 source_display: None,
+                                        calls: {
+                                            if !matches!(ent.kind, EntityKind::File) {
+                                                for &callee_eid in svc.call_edges.get(ent.id as usize).unwrap_or(&Vec::new()) {
+                                                    if let Some(callee_ent) = svc.entities.get(callee_eid as usize) { calls.push(callee_ent.name.clone()); }
+                                                }
+                                            }
+                                            calls
+                                        },
                             }
                         })
                         .collect();
@@ -622,26 +719,30 @@ impl EventProcessor {
                     let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
 
                     let db_cfg = db_writer::DbWriterConfig {
-                        channel_capacity: 100,
-                        batch_capacity: Some(500),
-                        batch_timeout_ms: Some(500),
-                        max_retries: Some(3),
                         surreal_url,
                         surreal_username,
                         surreal_password,
                         surreal_ns,
                         surreal_db,
-                        initial_batch: false, // Indexer processes events continuously
+                        ..Default::default()
                     };
 
                     let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg)?;
 
-                    // Send payloads to DB writer
-                    if let Err(e) = tx.send(payloads) {
-                        log::error!("Failed to send payloads to DB writer: {}", e);
+                    // Chunk payloads so writer processes multiple batches when large.
+                    let chunk_size = 500; // keep in sync with default batch_capacity
+                    for ch in payloads.chunks(chunk_size) {
+                        if let Err(e) = tx.send(ch.to_vec()) {
+                            log::error!("Failed to send payload chunk (size={}) to DB writer: {}", ch.len(), e);
+                            break;
+                        } else {
+                            log::debug!("sent payload chunk size {}", ch.len());
+                        }
                     }
+                    // Drop sender so writer can detect channel close and exit its loop naturally.
+                    drop(tx);
 
-                    // Wait for DB writer to finish
+                    // Wait for DB writer to finish after all chunks processed.
                     match db_join.join() {
                         Ok(Ok(())) => {
                             log::info!(
@@ -886,23 +987,53 @@ mod tests {
     fn build_redis_url_from_env_tests() {
         // Helper to clear relevant env vars
         fn clear_env() {
-            let _ = std::env::remove_var("REDIS_URL");
-            let _ = std::env::remove_var("REDIS_USERNAME");
-            let _ = std::env::remove_var("REDIS_PASSWORD");
+            std::env::remove_var("REDIS_URL");
+            std::env::remove_var("REDIS_USERNAME");
+            std::env::remove_var("REDIS_PASSWORD");
+        }
+
+        // Helper to temporarily unset TEST_REDIS_DB/REDIS_DB for assertions that
+        // expect no DB injection. Returns previous values so they can be
+        // restored.
+        fn unset_test_db_vars() -> (Option<String>, Option<String>) {
+            let prev_test = std::env::var("TEST_REDIS_DB").ok();
+            let prev_db = std::env::var("REDIS_DB").ok();
+            std::env::remove_var("TEST_REDIS_DB");
+            std::env::remove_var("REDIS_DB");
+            (prev_test, prev_db)
+        }
+
+        fn restore_test_db_vars(prev: (Option<String>, Option<String>)) {
+            if let Some(v) = prev.0 {
+                std::env::set_var("TEST_REDIS_DB", v);
+            } else {
+                std::env::remove_var("TEST_REDIS_DB");
+            }
+            if let Some(v) = prev.1 {
+                std::env::set_var("REDIS_DB", v);
+            } else {
+                std::env::remove_var("REDIS_DB");
+            }
         }
 
         clear_env();
 
         // 1) No env -> None
+        // Ensure TEST_REDIS_DB/REDIS_DB are not present for this assertion.
+        let prev = unset_test_db_vars();
         assert_eq!(EventConsumer::build_redis_url_from_env(), None);
+        restore_test_db_vars(prev);
 
         // 2) Password-only -> redis://:password@127.0.0.1:6379
         clear_env();
+        // ensure TEST_REDIS_DB/REDIS_DB do not affect this assertion
+        let prev = unset_test_db_vars();
         std::env::set_var("REDIS_PASSWORD", "p");
         assert_eq!(
             EventConsumer::build_redis_url_from_env(),
             Some("redis://:p@127.0.0.1:6379".to_string())
         );
+        restore_test_db_vars(prev);
 
         // 3) Username+password -> redis://u:p@127.0.0.1:6379
         clear_env();

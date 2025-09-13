@@ -33,9 +33,10 @@
                     entity.source_display else entity.file }}{% if
                     entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                 {% else %}
-                <a href="https://github.com/{{ repo_name }}/{{ entity.file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
-                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
-                    entity.source_display else entity.file }}{% if
+                {% set display_file = entity.source_display if entity.source_display else (entity.file if entity.file
+                else '') %}
+                <a href="https://github.com/{{ repo_name }}/{{ display_file|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                    target="_blank" style="color: #0366d6; text-decoration: none;">{{ display_file }}{% if
                     entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
                 {% endif %}<br>
                 {% if entity.start_line %}
@@ -54,11 +55,20 @@
             </div>
         </div>
 
-        {% if entity.doc %}
+        {% if entity.doc_html %}
         <div style="margin-bottom: 1rem;">
             <strong>Documentation:</strong><br>
-            <div style="background: #f8f9fa; padding: 1rem; border-radius: 4px; margin-top: 0.5rem;">
-                {{ entity.doc }}
+            <div class="doc-html"
+                style="background: var(--panel, #f8f9fa); padding: 1rem; border-radius: 6px; margin-top: 0.5rem; color: var(--text, #111); box-shadow: 0 1px 0 rgba(0,0,0,0.03);">
+                {{ entity.doc_html | safe }}
+            </div>
+        </div>
+        {% elif entity.doc %}
+        <div style="margin-bottom: 1rem;">
+            <strong>Documentation (raw):</strong><br>
+            <div
+                style="background: var(--panel, #f8f9fa); padding: 1rem; border-radius: 6px; margin-top: 0.5rem; color: var(--text, #111); box-shadow: 0 1px 0 rgba(0,0,0,0.03);">
+                {{ entity.doc | e }}
             </div>
         </div>
         {% endif %}
@@ -66,7 +76,38 @@
         {% if entity.signature %}
         <div style="margin-bottom: 1rem;">
             <strong>Signature:</strong><br>
-            <pre><code>{{ entity.signature }}</code></pre>
+            {# preserve whitespace and enable syntax highlighting by language #}
+            <pre><code class="language-{{ entity.language|lower }}">{{ entity.signature }}</code></pre>
+        </div>
+        {% endif %}
+
+        {# Render methods for class-like entities when provided by the server #}
+        {% set kind_lc = entity.kind|lower %}
+        {% if methods and ("class" in kind_lc or "struct" in kind_lc or "interface" in kind_lc or "trait" in kind_lc) %}
+        <div style="margin-bottom: 1rem;">
+            <strong>🧩 Methods</strong>
+            <div style="margin-top: 0.5rem; display: grid; grid-template-columns: 1fr; gap: 6px;">
+                {% for m in methods %}
+                <div class="card" style="padding:8px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <div>
+                            <a href="/entity/{{ m.stable_id }}"
+                                style="color: var(--accent); text-decoration: none; font-weight: 600;">{{ m.name }}</a>
+                            {% if m.signature %}
+                            {# multi-line signatures should preserve whitespace and be highlightable #}
+                            <pre style="margin:4px 0 0 0;">
+<code class="language-{{ m.language|lower if m.language else entity.language|lower }}">{{ m.signature }}</code>
+</pre>
+                            {% endif %}
+                        </div>
+                        {% if m.start_line %}
+                        <div style="color: var(--muted); font-size: 12px;">L{{ m.start_line }}{% if m.end_line %}-{{
+                            m.end_line }}{% endif %}</div>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
         </div>
         {% endif %}
 
@@ -80,6 +121,146 @@
             </div>
         </div>
         {% endif %}
+
+        <!-- Interactive call graph visualization (uses callers/callees provided by the server) -->
+        <div style="margin-bottom: 1rem;">
+            <strong>🤖 Call Graph</strong>
+            <div style="margin-top: 0.5rem; display:flex; gap:0.5rem; align-items:center;">
+                <button id="toggle-call-graph" class="btn" style="padding: 0.35rem 0.6rem; font-size:0.9rem;">Show
+                    graph</button>
+                <span style="color: var(--muted); font-size:0.9rem;">Click nodes to open the corresponding entity page
+                    (if available).</span>
+            </div>
+
+            <div id="call-graph-canvas"
+                style="height:420px; margin-top:0.75rem; display:none; border:1px solid var(--input-border); border-radius:8px; background:var(--panel);">
+            </div>
+        </div>
+
+        <script src="https://unpkg.com/cytoscape@3.24.0/dist/cytoscape.min.js"></script>
+        <!-- Embedded JSON data for the call graph to keep template tags out of JS parsing context -->
+        <script type="application/json" id="call-graph-data">
+            {{ call_graph_json }}
+        </script>
+
+        <script>
+            (function () {
+                const container = document.getElementById('call-graph-canvas');
+                const toggle = document.getElementById('toggle-call-graph');
+                let cy = null;
+
+                function safeId(s) {
+                    if (!s) return '';
+                    return s.toString().replace(/[^a-zA-Z0-9_\-]/g, '_');
+                }
+
+                // Build nodes & edges from template-provided callers/callees
+                const centerId = safeId('{{ entity.stable_id }}');
+                const centerLabel = `{{ entity.name }}`;
+
+                // Read callers/callees from embedded JSON script to avoid editor/parser confusion
+                const dataEl = document.getElementById('call-graph-data');
+                let _callers_raw = [];
+                let _callees_raw = [];
+                let _methods_raw = [];
+                try {
+                    if (dataEl && dataEl.textContent) {
+                        const parsed = JSON.parse(dataEl.textContent);
+                        _callers_raw = parsed.callers || [];
+                        _callees_raw = parsed.callees || [];
+                        _methods_raw = parsed.methods || [];
+                    }
+                } catch (e) {
+                    console.warn('Failed to parse call graph data', e);
+                }
+
+                const callers = Array.isArray(_callers_raw) ? _callers_raw.map(c => ({ name: c[0], id: c[1] })) : [];
+                const callees = Array.isArray(_callees_raw) ? _callees_raw.map(c => ({ name: c[0], id: c[1] })) : [];
+                const methods = Array.isArray(_methods_raw) ? _methods_raw.map(c => ({ name: c[0], id: c[1] })) : [];
+
+                function render() {
+                    if (!container) return;
+                    container.style.display = 'block';
+                    if (cy) { cy.destroy(); cy = null; }
+
+                    const elements = [];
+                    const seen = new Set();
+
+                    // center node
+                    const centerNodeId = 'node_' + safeId(centerId || centerLabel);
+                    elements.push({ data: { id: centerNodeId, label: centerLabel, stable_id: '{{ entity.stable_id }}' } });
+                    seen.add(centerNodeId);
+
+                    // callers -> center
+                    callers.forEach((c, idx) => {
+                        const nid = c.id ? ('node_' + safeId(c.id)) : ('node_callr_' + idx + '_' + safeId(c.name));
+                        if (!seen.has(nid)) {
+                            elements.push({ data: { id: nid, label: c.name, stable_id: c.id || null } });
+                            seen.add(nid);
+                        }
+                        elements.push({ data: { id: 'edge_callr_' + idx, source: nid, target: centerNodeId } });
+                    });
+
+                    // center -> callees
+                    callees.forEach((c, idx) => {
+                        const nid = c.id ? ('node_' + safeId(c.id)) : ('node_callc_' + idx + '_' + safeId(c.name));
+                        if (!seen.has(nid)) {
+                            elements.push({ data: { id: nid, label: c.name, stable_id: c.id || null } });
+                            seen.add(nid);
+                        }
+                        elements.push({ data: { id: 'edge_callc_' + idx, source: centerNodeId, target: nid } });
+                    });
+
+                    // methods (for class-like entities): center -> method
+                    methods.forEach((m, idx) => {
+                        const nid = m.id ? ('node_' + safeId(m.id)) : ('node_method_' + idx + '_' + safeId(m.name));
+                        if (!seen.has(nid)) {
+                            elements.push({ data: { id: nid, label: m.name, stable_id: m.id || null } });
+                            seen.add(nid);
+                        }
+                        elements.push({ data: { id: 'edge_method_' + idx, source: centerNodeId, target: nid } });
+                    });
+
+                    cy = cytoscape({
+                        container: container,
+                        elements: elements,
+                        style: [
+                            { selector: 'node', style: { 'label': 'data(label)', 'text-valign': 'center', 'color': '#fff', 'background-color': '#0ea5a4', 'text-outline-color': '#0ea5a4', 'text-outline-width': 6, 'font-size': 10, 'width': 'label', 'height': 'label', 'padding': '6px' } },
+                            { selector: 'node[stable_id = null]', style: { 'background-color': '#64748b', 'text-outline-color': '#64748b' } },
+                            { selector: 'edge', style: { 'width': 2, 'line-color': '#94a3b8', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#94a3b8', 'curve-style': 'bezier' } }
+                        ],
+                        layout: { name: 'breadthfirst', directed: true, padding: 10, spacingFactor: 1.4 }
+                    });
+
+                    cy.on('tap', 'node', function (evt) {
+                        const n = evt.target;
+                        const sid = n.data('stable_id');
+                        if (sid) {
+                            // Navigate to entity page for known stable_id
+                            window.location = '/entity/' + encodeURIComponent(sid);
+                        } else {
+                            // try search by name
+                            const name = n.data('label');
+                            const q = encodeURIComponent(name);
+                            window.location = '/search?q=' + q;
+                        }
+                    });
+                }
+
+                toggle.addEventListener('click', function () {
+                    if (container.style.display === 'none' || container.style.display === '') {
+                        render();
+                        toggle.textContent = 'Hide graph';
+                    } else {
+                        container.style.display = 'none';
+                        toggle.textContent = 'Show graph';
+                        if (cy) { cy.destroy(); cy = null; }
+                    }
+                });
+            })();
+        </script>
+
+        <!-- Documentation is rendered server-side and provided in `entity.doc_html` -->
 
         {% if entity.imports %}
         <div style="margin-bottom: 1rem;">

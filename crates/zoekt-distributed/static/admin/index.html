@@ -18,8 +18,34 @@
 
         table {
             border-collapse: collapse;
-            width: 100%;
-            margin-top: 16px;
+
+            .tab-button {
+                padding: 8px 14px;
+                border: none;
+                background: transparent;
+                cursor: pointer;
+                color: #333;
+                font-weight: 500;
+            }
+
+            .tab-button:hover {
+                background: rgba(0, 0, 0, 0.03);
+            }
+
+            .tab-button[aria-pressed="true"] {
+                background: #fff;
+                position: relative;
+                z-index: 2;
+                box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06) inset;
+            }
+
+            /* Make adjacent content look like a connected tab */
+            .tab-content {
+                border: 1px solid #ddd;
+                padding: 12px;
+                border-radius: 6px;
+                background: #fff;
+            }
         }
 
         th,
@@ -106,33 +132,37 @@
             padding: 12px;
         }
 
-        .expander {
-            display: inline-block;
-            width: 18px;
-            text-align: center;
-            cursor: pointer;
-            margin-right: 6px;
-            color: var(--muted);
-            user-select: none;
+        /* .expander removed: expansion UI is no longer used server- or client-side */
+
+        /* Tab bar and button visuals: make them look like connected tabs */
+        .tab-bar {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+            margin-bottom: 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--input-border);
         }
 
-        /* Tab button visuals: higher contrast and clear active state */
         .tab-button {
             background: transparent;
-            border: none;
-            border-bottom: 2px solid transparent;
-            padding: 12px 16px;
+            border: 1px solid transparent;
+            border-bottom: none;
+            /* visually connect to card */
+            padding: 10px 14px;
             cursor: pointer;
             color: var(--muted);
             font-weight: 600;
-            margin-right: 8px;
-            transition: all 0.2s ease;
+            margin-right: 0;
+            transition: all 0.12s ease;
             position: relative;
+            border-radius: 6px 6px 0 0;
         }
 
         .tab-button:hover {
             color: var(--text);
-            background: rgba(255, 255, 255, 0.03);
+            background: rgba(255, 255, 255, 0.02);
+            border-color: rgba(255, 255, 255, 0.03);
         }
 
         .tab-button:focus {
@@ -143,8 +173,10 @@
         .tab-button[aria-pressed="true"] {
             background: var(--panel);
             color: var(--text);
-            border-bottom: 2px solid var(--accent);
-            border-radius: 6px 6px 0 0;
+            border-color: var(--input-border);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+            margin-bottom: -1px;
+            /* overlap the card border */
         }
 
         .tab-button[aria-pressed="true"]:hover {
@@ -173,6 +205,20 @@
         .export-btn {
             margin-left: 6px;
         }
+
+        /* Preview panel animation */
+        #preview-results {
+            transition: opacity 180ms ease, transform 180ms ease;
+            opacity: 0;
+            transform: translateY(-4px) scale(0.995);
+            pointer-events: none;
+        }
+
+        #preview-results.visible {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            pointer-events: auto;
+        }
     </style>
     <script src="/static/common/theme.js"></script>
     <script src="/static/admin.js" defer></script>
@@ -191,7 +237,8 @@
         </nav>
 
         <!-- Tab bar -->
-        <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <div class="tab-bar">
+            <button id="tab-builders" class="tab-button" aria-pressed="false">Builders</button>
             <button id="tab-repos" class="tab-button" aria-pressed="true">Repositories</button>
             <button id="tab-branches" class="tab-button" aria-pressed="false">Branches</button>
             <button id="tab-indexers" class="tab-button" aria-pressed="false">Indexers</button>
@@ -228,11 +275,67 @@
                         <th class="sortable" data-type="date">Last indexed</th>
                         <th class="sortable numeric" data-type="number">Duration (ms)</th>
                         <th class="sortable numeric" data-type="number">Memory</th>
-                        <th>Leased node</th>
                     </tr>
                 </thead>
                 <tbody id="branch-table-body"></tbody>
             </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Builders tab (hidden by default) -->
+        <div id="builders-tab" class="card" style="display:none">
+            <h2>Repo Builders</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Base Repo</th>
+                        <th>Branches Include</th>
+                        <th>Branches Exclude</th>
+                        <th>Tags Include</th>
+                        <th>Tags Exclude</th>
+                        <th>Owner Include</th>
+                        <th>Owner Exclude</th>
+                        <th>Default Branch</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="builder-table-body"></tbody>
+            </table>
+
+            <div style="height:16px"></div>
+
+            <h3>Add builder</h3>
+            <form id="create-builder-form" method="post" action="/create-builder">
+                <label>ID: <input type="text" name="id" placeholder="builder-name" required /></label>
+                <label>Base Repo URL: <input type="url" name="base_repo" placeholder="https://github.com/org/repo.git"
+                        required /></label>
+                <label>Include Branches: <input type="text" name="include_branches"
+                        placeholder="^main$,^release-.*$" /></label>
+                <label>Exclude Branches: <input type="text" name="exclude_branches" placeholder="^wip-.*$" /></label>
+                <label>Include Tags: <input type="text" name="include_tags" placeholder="^v\\d+\\.\\d+" /></label>
+                <label>Exclude Tags: <input type="text" name="exclude_tags" placeholder="^beta-.*" /></label>
+                <label>Include Owner: <input type="text" name="include_owner" placeholder="^org-.*$" /></label>
+                <label>Exclude Owner: <input type="text" name="exclude_owner" placeholder="^bot-.*$" /></label>
+                <div style="font-size:12px;color:var(--muted);max-width:720px;margin-top:6px">Owner patterns match the
+                    owner path portion of the repository URL (everything before the final
+                    repo segment). You can use full regex (e.g. <code>^org/suborg$</code>) or simple globs using
+                    <code>*</code> (e.g. <code>org/*</code>); leave empty to match any owner.
+                </div>
+                <label>Default Branch: <input type="text" name="default_branch" value="main" /></label>
+                <label>Max Tags: <input type="number" name="max_tags" value="200" min="1" step="1" /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <!-- The base repo will be managed by the admin poller; do not auto-create a Repositories entry here. -->
+                <button type="submit">Add Builder</button>
+                <button id="preview-builder-btn" type="button">Preview</button>
+            </form>
+            <div id="preview-results"
+                style="margin-top:12px;display:none;border:1px solid var(--input-border);padding:8px;border-radius:6px;background:var(--panel);">
+                <strong>Preview</strong>
+                <div id="preview-branches" style="margin-top:8px;"></div>
+                <div id="preview-tags" style="margin-top:8px;"></div>
+            </div>
         </div>
 
         <div style="height:16px"></div>

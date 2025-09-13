@@ -60,23 +60,63 @@ pub fn create_redis_pool() -> Option<Pool> {
                     }
                 }
             }
+            // Allow tests to force a deterministic DB selection. If TEST_REDIS_DB or REDIS_DB
+            // is set, append it to the URL if the URL does not already contain a path component
+            // (i.e. no trailing "/<db>"). This lets tests pick an isolated Redis DB.
+            if let Ok(db) = std::env::var("TEST_REDIS_DB").or_else(|_| std::env::var("REDIS_DB")) {
+                if !db.trim().is_empty() {
+                    if let Some(pos) = url.find("://") {
+                        // If there is already a '/' after the authority, assume a DB is present.
+                        let after = &url[pos + 3..];
+                        if !after.contains('/') {
+                            // append the DB index
+                            if !url.ends_with('/') {
+                                url.push('/');
+                            }
+                            url.push_str(&db);
+                        }
+                    }
+                }
+            }
 
             RedisConfig::from_url(&url).create_pool(None).ok()
         }
         None => {
-            // No REDIS_URL provided, but check if we have auth credentials to construct one
-            if let (Ok(username), Ok(password)) = (
-                std::env::var("REDIS_USERNAME"),
-                std::env::var("REDIS_PASSWORD"),
-            ) {
-                let url = format!("redis://{}:{}@127.0.0.1:6379", username, password);
-                RedisConfig::from_url(&url).create_pool(None).ok()
-            } else if let Ok(password) = std::env::var("REDIS_PASSWORD") {
-                let url = format!("redis://:{}@127.0.0.1:6379", password);
-                RedisConfig::from_url(&url).create_pool(None).ok()
-            } else {
-                None
+            // No REDIS_URL provided. Only construct a default Redis URL when explicit
+            // credentials are present (so users can still configure a local Redis via
+            // REDIS_USERNAME/REDIS_PASSWORD). If no REDIS_URL and no credentials are set,
+            // return None so the caller uses the in-memory fallback (useful for tests).
+            let username = std::env::var("REDIS_USERNAME").ok();
+            let password = std::env::var("REDIS_PASSWORD").ok();
+
+            if username.is_none() && password.is_none() {
+                // No Redis configured; return None to enable in-memory fallback
+                return None;
             }
+
+            // Construct a default URL using provided credentials (or localhost without auth)
+            let mut url = if let (Some(u), Some(p)) = (username.clone(), password.clone()) {
+                format!("redis://{}:{}@127.0.0.1:6379", u, p)
+            } else if let Some(p) = password.clone() {
+                format!("redis://:{}@127.0.0.1:6379", p)
+            } else if let Some(u) = username.clone() {
+                // Username without password
+                format!("redis://{}@127.0.0.1:6379", u)
+            } else {
+                // Fallback (shouldn't happen because we returned earlier)
+                "redis://127.0.0.1:6379".to_string()
+            };
+
+            if let Ok(db) = std::env::var("TEST_REDIS_DB").or_else(|_| std::env::var("REDIS_DB")) {
+                if !db.trim().is_empty() {
+                    if !url.ends_with('/') {
+                        url.push('/');
+                    }
+                    url.push_str(&db);
+                }
+            }
+
+            RedisConfig::from_url(&url).create_pool(None).ok()
         }
     }
 }

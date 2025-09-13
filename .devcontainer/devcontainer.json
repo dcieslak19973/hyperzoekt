@@ -44,7 +44,12 @@
     "RUSTUP_HOME": "/home/vscode/.rustup",
     "PATH": "/usr/local/bin:/home/vscode/.cargo/bin:/usr/bin:/bin:${PATH}",
     "LANG": "en_US.UTF-8",
-    "LC_ALL": "C.UTF-8"
+    "LC_ALL": "C.UTF-8",
+    "DISABLE_LOCAL_SURREAL": "1",
+    "SURREAL_CAPS_ALLOW_EXPERIMENTAL": "graphql",
+    "SURREALDB_URL": "http://localhost:8000",
+    "SURREALDB_USERNAME": "root",
+    "SURREALDB_PASSWORD": "root"
   },
   "remoteUser": "vscode"
 }

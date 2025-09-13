@@ -57,6 +57,7 @@ struct SearchResponse {
     results: Vec<serde_json::Value>,
     summary: String,
     total_results: usize,
+    elapsed_ms: u128,
 }
 
 async fn search_handler(
@@ -81,8 +82,10 @@ async fn search_handler(
         bitbucket_token: None,
     };
 
+    let started = std::time::Instant::now();
     match search_service.execute_distributed_search_json(params).await {
         Ok(results) => {
+            let elapsed_ms = started.elapsed().as_millis();
             let total_results = results.len().saturating_sub(1); // Subtract 1 for summary
             let summary = if let Some(first) = results.first() {
                 first
@@ -98,6 +101,7 @@ async fn search_handler(
                 results,
                 summary,
                 total_results,
+                elapsed_ms,
             };
 
             Ok(Json(response))

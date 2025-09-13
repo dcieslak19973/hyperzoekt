@@ -36,14 +36,5 @@ fn usages_integration() {
     // is a more conservative check than resolved callee edges and matches how
     // the tree-sitter extractor records call sites in fixtures.
     // Find the `caller` entity that came from a Rust source file
-    let caller_entity = svc
-        .entities
-        .iter()
-        .find(|e| e.name == "caller" && svc.files[e.file_id as usize].language == "rust")
-        .expect("rust caller entity present");
-    assert!(
-        caller_entity.calls.iter().any(|c| c == "may_fail"),
-        "caller should have may_fail in calls: {:?}",
-        caller_entity.calls
-    );
+    // calls array removed; relation now via graph edges (tested elsewhere)
 }
