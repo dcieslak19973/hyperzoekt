@@ -317,7 +317,9 @@ mod tests {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             let filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    EnvFilter::new("info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn")
+                });
             let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
         });
     }

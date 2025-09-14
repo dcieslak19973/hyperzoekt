@@ -19,16 +19,20 @@ Note: Tree-sitter grammar crates include native build steps and may take longer 
 
 ## Run the indexer binary
 
-The indexer binary `hyperzoekt` is located in `crates/hyperzoekt/src/bin/hyperzoekt.rs` and supports writing JSONL output.
+The indexer binary is provided as `hyperzoekt-indexer` (long-running event-driven indexer) and `hyperzoekt-webui`.
+For one-shot JSONL export you can use the library API (`RepoIndexService::build`) from your own small wrapper program.
 
 ```bash
 
 cd crates/hyperzoekt
 # write full JSONL to file
-cargo run --release --bin hyperzoekt -- --root /path/to/repo --output out.jsonl
+cargo run --release --bin hyperzoekt-indexer -- --repo-root /path/to/repos
 
-# streaming/incremental mode will output lines as entities are discovered
-cargo run --release --bin hyperzoekt -- --root /path/to/repo --output out.jsonl --incremental
+# Note: The legacy `hyperzoekt` JSONL one-shot binary was removed. If you need
+# a simple JSONL exporter consider either:
+# - Using the library: call `hyperzoekt::repo_index::RepoIndexService::build_with_options(...)`
+#   from a small Rust wrapper to write JSONL to a file, or
+# - Create a thin wrapper binary in this crate that invokes the indexer library.
 ```
 
 ## Tests
@@ -53,6 +57,18 @@ Keep code formatted and clippy-clean:
 ```bash
 cargo fmt --all
 cargo clippy --workspace -- -D warnings
+
+## Indexing concurrency
+
+The indexer can process files in parallel to speed up indexing of large repositories. You control concurrency in two ways:
+
+- Environment variable: `HZ_INDEX_MAX_CONCURRENCY` — if set and the indexer builder did not set an explicit concurrency value, this value is used as the maximum number of worker threads.
+- Programmatic builder: `RepoIndexOptions::concurrency(n)` — explicitly set the number of worker threads for an indexing run. If set to `0`, the indexer will use `HZ_INDEX_MAX_CONCURRENCY` (if present) or fall back to the host CPU count.
+
+Notes:
+- Parallel indexing requires the indexer to write output to a file path (owned `File`) because arbitrary writers (for example a borrowed `&mut dyn Write`) are not Send/Sync and cannot be moved into worker threads. If you pass a writer directly, the indexer will run in serial mode.
+- Reasonable defaults: when unspecified the indexer uses the `HZ_INDEX_MAX_CONCURRENCY` value if available, otherwise it uses `num_cpus::get()`.
+
 ```
 
 ## Notes about Tree-sitter grammars
@@ -90,3 +106,61 @@ Notes:
 - The launcher will create the `.data/` directory automatically if it does not exist.
 - Use `SURREAL_EMBED_MODE=memory` for ephemeral runs (tests, CI) to avoid creating persistent files.
 - The repository's `.gitignore` should include `.data/` so DB files are not accidentally committed.
+
+## OpenTelemetry / Tracing
+
+Hyperzoekt can emit tracing spans and metrics via OpenTelemetry (OTLP) when the optional `otel` feature is enabled and runtime initialization is turned on. This helps visualize indexing phases and PageRank iterations in your observability stack (e.g., Tempo + Loki + Grafana, or Honeycomb).
+
+Enablement consists of two parts:
+
+- Build-time feature flag:
+  - Enable the `otel` feature for the `hyperzoekt` crate when running binaries:
+    ```bash
+    # From workspace root
+    cargo run -p hyperzoekt --features otel --bin hyperzoekt-indexer
+    cargo run -p hyperzoekt --features otel --bin hyperzoekt-webui
+    ```
+  - If you’re invoking from a subdirectory, add `--manifest-path` to point at the workspace root `Cargo.toml`.
+
+- Runtime initialization (env-gated):
+  - Set `HZ_ENABLE_OTEL=1` to activate tracing initialization at process start for both `hyperzoekt-indexer` and `hyperzoekt-webui`.
+  - Configure the OTLP exporter endpoint and service name via env:
+    - `OTEL_EXPORTER_OTLP_ENDPOINT` (default: `http://localhost:4317`)
+    - `OTEL_SERVICE_NAME` (default: `hyperzoekt`)
+  - Optionally set `RUST_LOG` to control console logging (e.g., `RUST_LOG=info,hyperzoekt=trace`).
+
+Example runs with OTEL enabled:
+
+```bash
+# Indexer with OTEL
+HZ_ENABLE_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  RUST_LOG=info,hyperzoekt=trace \
+  cargo run --manifest-path /workspaces/hyperzoekt/Cargo.toml -p hyperzoekt --features otel --bin hyperzoekt-indexer
+
+# Web UI with OTEL
+HZ_ENABLE_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  RUST_LOG=info,hyperzoekt=trace \
+  cargo run --manifest-path /workspaces/hyperzoekt/Cargo.toml -p hyperzoekt --features otel --bin hyperzoekt-webui -- --host 127.0.0.1 --port 7879
+```
+
+Emitted spans (when feature-enabled):
+
+- `repo_index.build` (root span for indexing a repository)
+- `walk_files` → file discovery
+- `read_file` (per-file)
+- `parse` (per-file; includes `lang`)
+- `extract` (per-file entity extraction)
+- `alias_tree` (Tree-sitter alias extraction)
+- `alias_fallback` (line-based alias fallback)
+- `module_map`
+- `scope_containment`
+- `import_edges`
+- `alias_resolution`
+- `calls_resolution`
+- `pagerank` (overall PageRank phase)
+- `pagerank_iter` (iteration loop span with per-iteration logs: `iter`, `l1_change`)
+
+Notes:
+- OTEL is optional; if you build without `--features otel`, the code compiles and runs normally, and the initialization is a no-op.
+- The OTLP pipeline uses the Tokio runtime and a batch exporter; ensure your collector accepts gRPC on the configured endpoint (default 4317).
+- You can combine OTEL with JSON/console logging by setting `RUST_LOG` as usual; traces are exported independently.

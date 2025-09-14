@@ -118,7 +118,11 @@ pub fn init_test_logging() {
     static TRACING_INIT: Once = Once::new();
     TRACING_INIT.call_once(|| {
         // Prefer env when set; fall back to a quieter default to keep output readable.
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn",
+            )
+        });
         let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     });
 }

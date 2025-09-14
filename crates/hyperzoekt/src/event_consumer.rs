@@ -856,46 +856,133 @@ impl EventProcessor {
             temp_dir.display()
         );
 
-        // Clone the repository (this is blocking, so run in spawn_blocking)
+        // Clone the repository (prefer a shallow CLI clone for speed and low bandwidth).
+        // This runs in a blocking task.
         let git_url = event.git_url.clone();
         let branch = event.branch.clone();
         let temp_dir_clone = temp_dir.clone();
 
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-            // Clone the repository
-            let mut clone_options = git2::FetchOptions::new();
+            // Helper to inject credentials into HTTPS URLs similar to zoekt-rs behavior
+            fn inject_credentials(url: &str) -> String {
+                if !url.starts_with("https://") {
+                    return url.to_string();
+                }
+                // Detect platform and get credentials
+                let (username_env, token_env) = if url.contains("github.com") {
+                    ("GITHUB_USERNAME", "GITHUB_TOKEN")
+                } else if url.contains("gitlab.com") {
+                    ("GITLAB_USERNAME", "GITLAB_TOKEN")
+                } else if url.contains("bitbucket.org") {
+                    ("BITBUCKET_USERNAME", "BITBUCKET_TOKEN")
+                } else {
+                    return url.to_string();
+                };
+                let username = std::env::var(username_env).ok();
+                let token = std::env::var(token_env).ok();
+                if let (Some(user), Some(tok)) = (username, token) {
+                    if let Some(host_start) = url.find("://") {
+                        let host_path = &url[host_start + 3..];
+                        if let Some(slash_pos) = host_path.find('/') {
+                            let host = &host_path[..slash_pos];
+                            let path = &host_path[slash_pos..];
+                            return format!("https://{}:{}@{}{}", user, tok, host, path);
+                        } else {
+                            return format!("https://{}:{}@{}", user, tok, host_path);
+                        }
+                    }
+                }
+                url.to_string()
+            }
 
-            // Add authentication if available
-            if let Ok(username) = std::env::var("GIT_USERNAME") {
-                if let Ok(password) = std::env::var("GIT_PASSWORD") {
-                    let mut callbacks = git2::RemoteCallbacks::new();
-                    callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
-                        git2::Cred::userpass_plaintext(&username, &password)
-                    });
-                    clone_options.remote_callbacks(callbacks);
+            // 1) Try shallow libgit2 clone (preferred)
+            let mut libgit2_shallow_ok = false;
+            {
+                let mut fo = git2::FetchOptions::new();
+                // Depth is supported on this git2 version; attempt a shallow fetch
+                fo.depth(1);
+
+                let mut callbacks = git2::RemoteCallbacks::new();
+                if let Ok(username) = std::env::var("GIT_USERNAME") {
+                    if let Ok(password) = std::env::var("GIT_PASSWORD") {
+                        let user = username.clone();
+                        let pass = password.clone();
+                        callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
+                            git2::Cred::userpass_plaintext(&user, &pass)
+                        });
+                    }
+                }
+                fo.remote_callbacks(callbacks);
+
+                let mut rb = git2::build::RepoBuilder::new();
+                rb.fetch_options(fo);
+                if let Some(ref br) = branch {
+                    rb.branch(br);
+                }
+                if rb.clone(&git_url, &temp_dir_clone).is_ok() {
+                    libgit2_shallow_ok = true;
                 }
             }
 
+            if libgit2_shallow_ok {
+                return Ok(());
+            }
+
+            // 2) Fallback to shallow CLI clone
+            let mut cli_url = git_url.clone();
+            if cli_url.starts_with("https://") {
+                cli_url = inject_credentials(&cli_url);
+            }
+
+            let mut args: Vec<String> = vec![
+                "clone".into(),
+                "--depth".into(),
+                "1".into(),
+                cli_url.clone(),
+            ];
+            if let Some(ref br) = branch {
+                args.push("--branch".into());
+                args.push(br.clone());
+            }
+            args.push(temp_dir_clone.to_string_lossy().to_string());
+
+            let clone_result = std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output();
+
+            match clone_result {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!("shallow git CLI clone failed: {}", stderr);
+                }
+                Err(e) => {
+                    log::warn!("failed to spawn git clone CLI: {}", e);
+                }
+            }
+
+            // 3) Final fallback: full libgit2 clone with credentials
+            let mut full_fo = git2::FetchOptions::new();
+            let mut callbacks = git2::RemoteCallbacks::new();
+            if let Ok(username) = std::env::var("GIT_USERNAME") {
+                if let Ok(password) = std::env::var("GIT_PASSWORD") {
+                    let user = username.clone();
+                    let pass = password.clone();
+                    callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
+                        git2::Cred::userpass_plaintext(&user, &pass)
+                    });
+                }
+            }
+            full_fo.remote_callbacks(callbacks);
+
             let mut repo_builder = git2::build::RepoBuilder::new();
-            repo_builder.fetch_options(clone_options);
-
-            // Clone to the specified branch if provided
-            let should_checkout_default = branch.is_none();
-            if let Some(ref branch_name) = branch {
-                repo_builder.branch(branch_name);
+            repo_builder.fetch_options(full_fo);
+            if let Some(ref br) = branch {
+                repo_builder.branch(br);
             }
 
-            let repo = repo_builder.clone(&git_url, &temp_dir_clone)?;
-
-            // If no branch was specified, checkout the default branch
-            if should_checkout_default {
-                let head = repo.head()?;
-                let head_commit = head.peel_to_commit()?;
-                let mut checkout_builder = git2::build::CheckoutBuilder::new();
-                checkout_builder.force();
-                repo.checkout_tree(head_commit.as_object(), Some(&mut checkout_builder))?;
-            }
-
+            let _repo = repo_builder.clone(&git_url, &temp_dir_clone)?;
             Ok(())
         })
         .await??;

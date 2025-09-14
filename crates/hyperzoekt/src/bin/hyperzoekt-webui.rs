@@ -1097,9 +1097,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let config = Config::from_args(args);
 
+    // Initialize OpenTelemetry/tracing if enabled via env and feature compiled.
+    // This is a no-op when the `otel` feature is not enabled.
+    let enable_otel = std::env::var("HZ_ENABLE_OTEL")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
+        .unwrap_or(false);
+    if enable_otel {
+        hyperzoekt::otel::init_otel_from_env();
+    }
+
     // Initialize logging with the configured level
     std::env::set_var("RUST_LOG", &config.log_level);
-    env_logger::init();
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
+    builder
+        .filter_module("hyper_util", log::LevelFilter::Warn)
+        .filter_module("hyper", log::LevelFilter::Warn)
+        .filter_module("h2", log::LevelFilter::Warn)
+        .filter_module("reqwest", log::LevelFilter::Warn)
+        .filter_module("tower_http", log::LevelFilter::Warn);
+    builder.init();
 
     log::info!("Starting HyperZoekt WebUI with configuration:");
     log::info!("  Host: {}", config.host);
