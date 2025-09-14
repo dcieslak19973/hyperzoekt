@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use num_cpus;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
@@ -22,6 +23,21 @@ pub struct RepoIndexStats {
     pub files_indexed: usize,
     pub entities_indexed: usize,
     pub duration: Duration,
+    pub time_reading: Duration,
+    pub time_parsing: Duration,
+    pub time_extracting: Duration,
+    pub time_alias_tree: Duration,
+    pub time_alias_fallback: Duration,
+    pub time_module_map: Duration,
+    pub time_import_edges: Duration,
+    pub time_scope_containment: Duration,
+    pub time_alias_resolution: Duration,
+    pub time_calls_resolution: Duration,
+    pub time_pagerank: Duration,
+    pub docs_nanos: u128,
+    pub calls_nanos: u128,
+    pub docs_attempts: usize,
+    pub calls_attempts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +101,7 @@ pub struct RankWeights {
     pub containment: f32,
     pub damping: f32,
     pub iterations: usize,
+    pub epsilon: f32,
 }
 impl Default for RankWeights {
     fn default() -> Self {
@@ -93,7 +110,8 @@ impl Default for RankWeights {
             import: 0.5,
             containment: 0.25,
             damping: 0.85,
-            iterations: 20,
+            iterations: 10,
+            epsilon: 1e-6,
         }
     }
 }
@@ -125,6 +143,11 @@ impl RankWeights {
                 w.iterations = i;
             }
         }
+        if let Ok(v) = std::env::var("HZ_RANK_EPS") {
+            if let Ok(f) = v.parse::<f32>() {
+                w.epsilon = f.max(0.0);
+            }
+        }
         w
     }
 }
@@ -142,6 +165,7 @@ pub struct RepoIndexOptions<'a> {
     pub output: RepoIndexOutput<'a>,
     pub include_langs: Option<std::collections::HashSet<&'a str>>,
     pub progress: Option<&'a ProgressCallback<'a>>,
+    pub concurrency: usize,
 }
 pub enum RepoIndexOutput<'a> {
     FilePath(&'a Path),
@@ -154,6 +178,7 @@ pub struct RepoIndexOptionsBuilder<'a> {
     output: Option<RepoIndexOutput<'a>>,
     include_langs: Option<std::collections::HashSet<&'a str>>,
     progress: Option<&'a ProgressCallback<'a>>,
+    concurrency: usize,
 }
 
 pub(crate) struct CountingWriter<W: Write> {
@@ -208,12 +233,35 @@ impl<'a> RepoIndexOptionsBuilder<'a> {
         self.progress = Some(cb);
         self
     }
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
     pub fn build(self) -> RepoIndexOptions<'a> {
+        let default_conc = if self.concurrency == 0 {
+            // prefer explicit env var, fallback to num_cpus
+            if let Ok(v) = std::env::var("HZ_INDEX_MAX_CONCURRENCY") {
+                if let Ok(n) = v.parse::<usize>() {
+                    if n > 0 {
+                        n
+                    } else {
+                        num_cpus::get()
+                    }
+                } else {
+                    num_cpus::get()
+                }
+            } else {
+                num_cpus::get()
+            }
+        } else {
+            self.concurrency
+        };
         RepoIndexOptions {
             root: self.root.expect("root required"),
             output: self.output.expect("output required"),
             include_langs: self.include_langs,
             progress: self.progress,
+            concurrency: default_conc,
         }
     }
 }

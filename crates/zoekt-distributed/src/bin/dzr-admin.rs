@@ -2517,7 +2517,11 @@ async fn main() -> Result<()> {
     // Emit structured logs for easier aggregation. Honor RUST_LOG via EnvFilter.
     // include pid in logs via field when needed; avoid unused variable warning
     let _pid = std::process::id();
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn",
+        )
+    });
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let opts = Opts::parse();
 

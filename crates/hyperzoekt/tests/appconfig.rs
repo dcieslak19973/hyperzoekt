@@ -26,7 +26,6 @@ fn appconfig_load_from_file() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = dir.path().join("test_config.toml");
     let toml = r#"
     debug = true
-    out = ".data/test_out.jsonl"
     channel_capacity = 42
     "#;
     std::fs::write(&cfg_path, toml)?;

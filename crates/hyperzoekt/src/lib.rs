@@ -27,3 +27,7 @@ pub mod index;
 pub mod utils; // public graph traversal API
                // Test utilities exposed for integration tests.
 pub mod test_utils;
+
+// Optional OpenTelemetry/tracing initializer. The functions inside are
+// already feature-gated to no-op when the `otel` feature is disabled.
+pub mod otel;

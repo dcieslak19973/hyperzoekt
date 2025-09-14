@@ -12,7 +12,7 @@
 	 - Assessment: the streaming-thread has a `streaming_chunked` mode (enabled via `SURREAL_STREAM_CHUNKED=1`) that is intended to split accumulated entity payloads into multiple inline-`CREATE` transactions sized by `batch_capacity`. This should prevent a single very-large transaction when the accumulator is large.
 	 - Fact-check (quick): current code applies file-related UPDATE/CREATE parts first (as one batch) and then iterates `for chunk in acc.chunks(batch_capacity)` to emit per-chunk `BEGIN; CREATE ...; COMMIT;` queries, so the implementation does perform chunking. Caveats: if the accumulated `acc` size is <= `batch_capacity` you'll still observe a single chunk; file-updates are sent as a separate batch which may skew observed metrics.
 	 - Next actions (TODO):
-		 * Add a small integration test or reproducible script that runs `--stream-once` with `SURREAL_STREAM_CHUNKED=1` and asserts `batches_sent` > 1 for large inputs (exercise acc > batch_capacity).
+			* Add a small integration test or reproducible script that exercises chunked streaming with `SURREAL_STREAM_CHUNKED=1` and asserts `batches_sent` > 1 for large inputs (exercise acc > batch_capacity).
 		 * Consider making `streaming_chunked` the default (remove env guard) after the test/validation.
 		 * Re-run the batch sweep after any change and update `doc/BATCH_SIZE_TUNING.md` and `doc/SURREALDB-INTEGRATION.md` if behavior changes.
 

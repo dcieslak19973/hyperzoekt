@@ -13,10 +13,9 @@
 // limitations under the License.
 
 use crate::repo_index::types::RepoIndexService;
-use petgraph::algo::page_rank;
-use petgraph::graph::Graph;
-use petgraph::prelude::NodeIndex;
-use petgraph::Directed;
+use rayon::prelude::*;
+#[cfg(feature = "otel")]
+use tracing::{debug_span, info};
 
 pub fn compute_pagerank(svc: &mut RepoIndexService) {
     let n = svc.entities.len();
@@ -31,43 +30,10 @@ pub fn compute_pagerank(svc: &mut RepoIndexService) {
         containment: w_contain,
         damping,
         iterations,
+        epsilon,
     } = svc.rank_weights;
 
-    // Build a directed graph with `n` nodes
-    let mut g: Graph<(), f64, Directed> = Graph::with_capacity(n, 0);
-    let mut idxs: Vec<NodeIndex> = Vec::with_capacity(n);
-    for _ in 0..n {
-        idxs.push(g.add_node(()));
-    }
-
-    // Add weighted edges according to the configured weights
-    for src in 0..n {
-        let mut edges: Vec<(usize, f32)> = Vec::new();
-        if let Some(calls) = svc.call_edges.get(src) {
-            for &t in calls {
-                edges.push((t as usize, w_call));
-            }
-        }
-        if let Some(imps) = svc.import_edges.get(src) {
-            for &t in imps {
-                edges.push((t as usize, w_import));
-            }
-        }
-        if let Some(children) = svc.containment_children.get(src) {
-            for &t in children {
-                edges.push((t as usize, w_contain));
-            }
-        }
-        if let Some(Some(p)) = svc.containment_parent.get(src) {
-            edges.push((*p as usize, w_contain));
-        }
-
-        // If there are edges, add them directly to the graph with the weight.
-        // petgraph's page_rank will use edge weights via the `edge_weight` function.
-        for (t_idx, w) in edges {
-            g.add_edge(idxs[src], idxs[t_idx], w as f64);
-        }
-    }
+    // We'll build weighted adjacency and out sums below in one pass
 
     // If damping is zero, the rank is uniform (teleport-only). Short-circuit
     // to match previous behavior/tests.
@@ -78,26 +44,106 @@ pub fn compute_pagerank(svc: &mut RepoIndexService) {
         }
         return;
     }
-
-    // petgraph::algo::page_rank expects an adjacency representation; it supports
-    // a `node_weight` and `edge_weight` selectors. We can call the basic API.
-    // The function returns a vector of ranks keyed by node order.
-    let ranks = page_rank(&g, damping as f64, iterations);
-
-    // page_rank returns a Vec<f64> indexed by the node order we created
-    let mut sum = 0.0f32;
-    for (i, v) in ranks.iter().enumerate().take(n) {
-        let r = *v as f32;
-        if let Some(ent) = svc.entities.get_mut(i) {
-            ent.rank = r;
+    // Build weighted edges and out sums efficiently
+    let mut edges_out: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    let mut out_sum: Vec<f32> = vec![0.0; n];
+    for src in 0..n {
+        let mut sum = 0.0f32;
+        if let Some(calls) = svc.call_edges.get(src) {
+            for &t in calls {
+                edges_out[src].push((t as usize, w_call));
+                sum += w_call;
+            }
         }
-        sum += r;
+        if let Some(imps) = svc.import_edges.get(src) {
+            for &t in imps {
+                edges_out[src].push((t as usize, w_import));
+                sum += w_import;
+            }
+        }
+        if let Some(children) = svc.containment_children.get(src) {
+            for &t in children {
+                edges_out[src].push((t as usize, w_contain));
+                sum += w_contain;
+            }
+        }
+        if let Some(Some(p)) = svc.containment_parent.get(src) {
+            edges_out[src].push((*p as usize, w_contain));
+            sum += w_contain;
+        }
+        out_sum[src] = sum;
     }
 
-    // Normalize ranks to sum to 1.0 (page_rank may already normalize but ensure it)
+    // Initialize ranks uniformly
+    let mut ranks: Vec<f32> = vec![1.0f32 / n as f32; n];
+    let base_tele = (1.0f32 - damping) / n as f32;
+
+    #[cfg(feature = "otel")]
+    let _span = debug_span!("pagerank_iter", iterations = iterations).entered();
+    for _iter in 0..iterations {
+        // Compute dangling mass
+        let dangling_mass: f32 = ranks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out_sum[*i] == 0.0)
+            .map(|(_, &r)| r)
+            .sum();
+
+        let uniform_dangling = damping * dangling_mass / n as f32;
+
+        // Parallel accumulation of contributions using fold/reduce
+        let contribs: Vec<f32> = (0..n)
+            .into_par_iter()
+            .fold(
+                || vec![0.0f32; n],
+                |mut acc, u| {
+                    let out = out_sum[u];
+                    if out > 0.0 {
+                        let factor = damping * (ranks[u] / out);
+                        for &(v, w) in &edges_out[u] {
+                            acc[v] += factor * w;
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0f32; n],
+                |mut a, b| {
+                    for i in 0..n {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            );
+
+        // Compose new ranks: base teleport + contributions + dangling redistribution
+        let mut l1_change = 0.0f32;
+        for i in 0..n {
+            let new_val = base_tele + uniform_dangling + contribs[i];
+            l1_change += (new_val - ranks[i]).abs();
+            ranks[i] = new_val;
+        }
+
+        #[cfg(feature = "otel")]
+        info!(iter = _iter, l1_change = l1_change, "pagerank iteration");
+        if epsilon > 0.0 && l1_change <= epsilon {
+            break;
+        }
+    }
+
+    // Normalize and assign
+    let sum: f32 = ranks.iter().copied().sum();
     if sum > 0.0 {
+        let inv = 1.0f32 / sum;
+        for (i, ent) in svc.entities.iter_mut().enumerate() {
+            ent.rank = ranks[i] * inv;
+        }
+    } else {
+        // Fallback: uniform if sum is zero
+        let v = 1.0f32 / n as f32;
         for ent in svc.entities.iter_mut() {
-            ent.rank /= sum;
+            ent.rank = v;
         }
     }
 }
@@ -194,6 +240,7 @@ mod tests {
                 containment: 0.25,
                 damping: 0.85,
                 iterations: 30,
+                epsilon: 1e-6,
             },
         };
 
@@ -274,6 +321,7 @@ mod tests {
                 containment: 0.25,
                 damping: 0.85,
                 iterations: 10,
+                epsilon: 1e-6,
             },
         };
 
@@ -356,6 +404,7 @@ mod tests {
                 containment: 0.25,
                 damping: 0.0,
                 iterations: 5,
+                epsilon: 1e-6,
             },
         };
 

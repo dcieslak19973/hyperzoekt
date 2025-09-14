@@ -269,7 +269,9 @@ pub async fn connect(
         // SURREALDB_HTTP_BASE to avoid surprises.
         std::env::set_var("SURREALDB_URL", &base);
         std::env::set_var("SURREALDB_HTTP_BASE", &base);
-        eprintln!("LOG: normalized Surreal HTTP base set in env: {}", base);
+        if surreal_debug_enabled() {
+            eprintln!("LOG: normalized Surreal HTTP base set in env: {}", base);
+        }
 
         // Diagnostics: parse and print the final http_url components so we can
         // observe how downstream clients (reqwest/hyper) will interpret it.

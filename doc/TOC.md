@@ -12,6 +12,7 @@ This file lists the primary documents in `doc/` and their main sections. Use it 
   - Notes about Tree-sitter grammars
   - Troubleshooting
   - Embedded SurrealDB default behavior
+  - OpenTelemetry / Tracing
 
 - [Hyperzoekt Development Plan](HYPERZOEKT_PLANS.md)
   - Overview

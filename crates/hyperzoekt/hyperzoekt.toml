@@ -9,14 +9,9 @@ repo_root = "."
 # and re-queued for another consumer to pick up
 processing_ttl_seconds = 300
 
-# When debug = true the binary writes JSONL to `out` and exits.
-debug = false
-
-# When incremental = true the binary streams results to `out` as files are processed.
-incremental = false
-
-# Debug output path (relative to working directory)
-out = ".data/bin_integration_out.jsonl"
+# (Removed) legacy one-shot JSONL/debug streaming options are no longer
+# supported. Use the `hyperzoekt-indexer` long-running service or the
+# library API (`RepoIndexService`) for programmatic one-shot exports.
 
 # Ingestion tuning
 channel_capacity = 100

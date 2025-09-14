@@ -16,8 +16,11 @@ WORKDIR /app
 # Copy the entire workspace
 COPY . .
 
-# Build both zoekt-distributed and hyperzoekt binaries
-RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller --bin hyperzoekt-indexer --bin hyperzoekt-webui
+# Build zoekt-distributed binaries (no extra features)
+RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller
+
+# Build hyperzoekt binaries with optional OTEL feature (safe even if unused at runtime)
+RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-webui
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
