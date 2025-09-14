@@ -58,7 +58,15 @@ Using the Admin UI to add remote repositories
 
 What happens after adding a repo
 -------------------------------
-- The indexer (legacy `dzr-indexer` or `hyperzoekt-indexer`) will receive the new repo via the orchestrator or by polling the configured repo list.
+- The indexer (for example `hyperzoekt-indexer`) will receive the new repo via the orchestrator or by polling the configured repo list.
+
+Migration note: the legacy one-shot JSONL exporter has been removed. If you need to perform a one-shot export, use the library API (`RepoIndexService`) from a short Rust program and write results to a file. Example snippet:
+
+```rust
+let mut opts = hyperzoekt::repo_index::indexer::RepoIndexOptions::builder();
+opts = opts.root("/path/to/repo").output_file("out.jsonl");
+let (_svc, _stats) = hyperzoekt::repo_index::RepoIndexService::build_with_options(opts.build())?;
+```
 - The system will clone the repo and begin indexing. Indexing includes parsing with Tree-sitter, extracting entities, building the search index, and (optionally) persisting entity metadata to SurrealDB.
 
 How to confirm a repository was processed

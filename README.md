@@ -51,6 +51,14 @@ Example (run the indexer):
 RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-indexer
 ```
 
+Migration note: the legacy one-shot JSONL exporter has been removed. To perform a one-shot export, call the library API (`RepoIndexService`) from a small Rust program and write results to a file. For example:
+
+```rust
+let mut opts = hyperzoekt::repo_index::indexer::RepoIndexOptions::builder();
+opts = opts.root("/path/to/repo").output_file("out.jsonl");
+let (_svc, _stats) = hyperzoekt::repo_index::RepoIndexService::build_with_options(opts.build())?;
+```
+
 Running the web UI
 ------------------
 **Legacy Admin UI:**
@@ -72,6 +80,8 @@ RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000
 Configuration
 -------------
 The distributed system supports various environment variables for configuration:
+
+For observability and performance tracing with OpenTelemetry, see the "OpenTelemetry / Tracing" section in `doc/USAGE.md`.
 
 ### Redis Configuration
 - `REDIS_URL`: Redis connection URL (e.g., `redis://127.0.0.1:6379`)

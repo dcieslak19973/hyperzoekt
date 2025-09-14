@@ -1685,7 +1685,11 @@ async fn main() -> Result<()> {
     let server_start = std::time::Instant::now();
 
     // Initialize tracing using the RUST_LOG env var when present, default to `info`
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn",
+        )
+    });
     let filter_str = filter.to_string();
     tracing_subscriber::fmt().with_env_filter(filter).init();
 

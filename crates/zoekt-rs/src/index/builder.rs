@@ -53,7 +53,6 @@ fn inject_credentials(url: &str) -> String {
     } else {
         return url.to_string();
     };
-
     let username = std::env::var(username_env).ok();
     let token = std::env::var(token_env).ok();
 
@@ -319,26 +318,24 @@ impl IndexBuilder {
             let td =
                 tempfile::tempdir().map_err(|e| crate::index::IndexError::Other(e.to_string()))?;
             let authenticated_url = inject_credentials(url);
-            // Try libgit2 clone first, fall back to git CLI if libgit2 fails.
-            match git2::Repository::clone(&authenticated_url, td.path()) {
-                Ok(_) => {
-                    repo_root = td.path().to_path_buf();
-                    _repo_clone_tempdir = Some(td);
-                }
-                Err(e) => {
-                    // fall back to `git clone --depth 1` but run non-interactively
-                    let res = crate::index::builder::try_git_clone_fallback(url, td.path(), None);
-                    match res {
-                        Ok(()) => {
-                            repo_root = td.path().to_path_buf();
-                            _repo_clone_tempdir = Some(td);
-                        }
-                        Err(err) => {
-                            return Err(crate::index::IndexError::Other(format!(
-                                "libgit2: {} ; fallback: {}",
-                                e, err
-                            )));
-                        }
+            // Prefer a shallow CLI clone first to reduce bandwidth and time.
+            let cli_res = crate::index::builder::try_git_clone_fallback(url, td.path(), None);
+            if cli_res.is_ok() {
+                repo_root = td.path().to_path_buf();
+                _repo_clone_tempdir = Some(td);
+            } else {
+                // If CLI shallow clone failed, try libgit2 clone as a fallback (full clone).
+                match git2::Repository::clone(&authenticated_url, td.path()) {
+                    Ok(_) => {
+                        repo_root = td.path().to_path_buf();
+                        _repo_clone_tempdir = Some(td);
+                    }
+                    Err(e) => {
+                        return Err(crate::index::IndexError::Other(format!(
+                            "git CLI fallback failed: {:?} ; libgit2 clone failed: {}",
+                            cli_res.err(),
+                            e
+                        )));
                     }
                 }
             }

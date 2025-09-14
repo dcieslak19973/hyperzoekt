@@ -10,7 +10,7 @@ mkdir -p "$TMP_DIR" "$METRICS_DIR"
 
 BATCHS=(100 500 1000 1500)
 TIMEOUTS=(100 500)
-# modes: streaming (stream_once), streaming_chunked (streaming with chunked inline-CREATEs), and initial_batch
+# modes: streaming, streaming_chunked (chunked inline-CREATEs), and initial_batch
 MODES=(streaming streaming_chunked initial_batch)
 
 for mode in "${MODES[@]}"; do
@@ -31,8 +31,11 @@ EOF
       else
         unset SURREAL_INITIAL_BATCH || true
       fi
-      # Run the binary and block until it finishes. This will build if needed.
-      cargo run -p hyperzoekt --bin hyperzoekt -- --config "$cfg" --stream-once
+  # Run the long-running indexer with the provided config. This will build if needed.
+  # The indexer is event-driven; for controlled experiments you can run a wrapper
+  # that triggers a single pass. Here we start the indexer-indexer which will
+  # process according to the config (embedding/surreal settings control DB modes).
+  cargo run -p hyperzoekt --bin hyperzoekt-indexer -- --config "$cfg"
 
       if [ -f "$metrics_file" ]; then
         echo "Metrics for cap=${cap} to=${to} mode=${mode}:"

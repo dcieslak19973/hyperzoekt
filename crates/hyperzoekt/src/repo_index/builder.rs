@@ -14,12 +14,12 @@
 
 // content moved from service/builder.rs
 
-use crate::repo_index::indexer::{
-    detect_language, extract_entities, lang_to_ts, RepoIndexOptions, RepoIndexStats,
-};
+use crate::repo_index::indexer::{detect_language, lang_to_ts, RepoIndexOptions, RepoIndexStats};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet as StdHashSet};
+#[cfg(feature = "otel")]
+use tracing::instrument;
 use tree_sitter::{Language, Parser};
 
 // Bring the types from the sibling `types` module into scope.
@@ -28,10 +28,27 @@ use super::types::{FileRecord, RepoIndexService, StoredEntity};
 /// Detailed builder that accepts `RepoIndexOptions` for advanced usage.
 ///
 /// Returns the constructed service and some indexing statistics on success.
+#[cfg_attr(feature = "otel" , instrument(name = "repo_index.build", skip_all, fields(root = %opts.root.display())))]
 pub fn build_with_options(
     opts: RepoIndexOptions<'_>,
 ) -> Result<(RepoIndexService, RepoIndexStats)> {
     let start = std::time::Instant::now();
+    // Phase timing accumulators
+    let mut time_reading = std::time::Duration::ZERO;
+    let mut time_parsing = std::time::Duration::ZERO;
+    let mut time_extracting = std::time::Duration::ZERO;
+    let mut time_alias_tree = std::time::Duration::ZERO;
+    let mut time_alias_fallback = std::time::Duration::ZERO;
+    let mut time_module_map = std::time::Duration::ZERO;
+    let mut time_import_edges = std::time::Duration::ZERO;
+    let mut time_scope_containment = std::time::Duration::ZERO;
+    let mut time_alias_resolution = std::time::Duration::ZERO;
+    let mut time_calls_resolution = std::time::Duration::ZERO;
+    let mut time_pagerank = std::time::Duration::ZERO;
+    let mut docs_nanos_acc: u128 = 0;
+    let mut calls_nanos_acc: u128 = 0;
+    let mut docs_attempts_acc: usize = 0;
+    let mut calls_attempts_acc: usize = 0;
     let root = opts.root;
     let walker = WalkBuilder::new(root)
         .standard_filters(true)
@@ -42,12 +59,17 @@ pub fn build_with_options(
     let mut entities_store: Vec<StoredEntity> = Vec::new();
     let mut name_index: HashMap<String, Vec<u32>> = HashMap::new();
     let mut file_count = 0usize;
-    let mut parser = Parser::new();
+    // Pool parsers per language to avoid repeated set_language calls
+    let mut parsers: HashMap<&'static str, Parser> = HashMap::new();
     // Temporary store of raw import module names with line numbers per file index (not entity id yet)
     let mut file_import_modules: HashMap<u32, Vec<(String, usize)>> = HashMap::new();
     // Store import aliases per file (module_token, optional_alias, lineno)
     let mut file_import_aliases: HashMap<u32, Vec<(String, Option<String>, usize)>> =
         HashMap::new();
+    #[cfg(feature = "otel")]
+    let span_walk = tracing::debug_span!("walk_files");
+    #[cfg(feature = "otel")]
+    let _g = span_walk.enter();
     for dent in walker {
         let dent = match dent {
             Ok(d) => d,
@@ -70,46 +92,76 @@ pub fn build_with_options(
             Some(l) => l,
             None => continue,
         };
+        #[cfg(feature = "otel")]
+        let _span_read = tracing::debug_span!("read_file", file = %path.display()).entered();
+        let t_read = std::time::Instant::now();
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if parser.set_language(&language).is_err() {
-            if matches!(lang, "c_sharp" | "swift") {
-                let imports =
-                    crate::repo_index::indexer::helpers::extract_import_modules(lang, &src);
-                let file_path_str = path.display().to_string();
-                // Normalize to a workspace-relative tests/fixtures path when present
-                let file_path_str = if let Some(idx) = file_path_str.find("tests/fixtures") {
-                    file_path_str[idx..].to_string()
-                } else {
-                    file_path_str
-                };
-                let file_id = *files_map.entry(file_path_str.clone()).or_insert_with(|| {
-                    let id = files.len() as u32;
-                    files.push(FileRecord {
-                        id,
-                        path: file_path_str.clone(),
-                        language: lang.to_string(),
-                        entities: Vec::new(),
+        time_reading += t_read.elapsed();
+        // Get or initialize parser for this language once
+        let parser = if let Some(p) = parsers.get_mut(lang) {
+            p
+        } else {
+            let mut p = Parser::new();
+            if p.set_language(&language).is_err() {
+                if matches!(lang, "c_sharp" | "swift") {
+                    let imports =
+                        crate::repo_index::indexer::helpers::extract_import_modules(lang, &src);
+                    let file_path_str = path.display().to_string();
+                    // Normalize to a workspace-relative tests/fixtures path when present
+                    let file_path_str = if let Some(idx) = file_path_str.find("tests/fixtures") {
+                        file_path_str[idx..].to_string()
+                    } else {
+                        file_path_str
+                    };
+                    let file_id = *files_map.entry(file_path_str.clone()).or_insert_with(|| {
+                        let id = files.len() as u32;
+                        files.push(FileRecord {
+                            id,
+                            path: file_path_str.clone(),
+                            language: lang.to_string(),
+                            entities: Vec::new(),
+                        });
+                        id
                     });
-                    id
-                });
-                if !imports.is_empty() {
-                    file_import_modules
-                        .entry(file_id)
-                        .or_default()
-                        .extend(imports);
+                    if !imports.is_empty() {
+                        file_import_modules
+                            .entry(file_id)
+                            .or_default()
+                            .extend(imports);
+                    }
                 }
+                continue;
             }
-            continue;
-        }
+            parsers.insert(lang, p);
+            parsers.get_mut(lang).unwrap()
+        };
+        #[cfg(feature = "otel")]
+        let _span_parse = tracing::debug_span!("parse", lang = lang).entered();
+        let t_parse = std::time::Instant::now();
         let tree = match parser.parse(&src, None) {
             Some(t) => t,
             None => continue,
         };
+        time_parsing += t_parse.elapsed();
         let mut entities_local = Vec::new();
-        extract_entities(lang, &tree, &src, path, &mut entities_local);
+        #[cfg(feature = "otel")]
+        let _span_extract = tracing::debug_span!("extract").entered();
+        let t_extract = std::time::Instant::now();
+        let _stats_ex = crate::repo_index::indexer::extract::extract_entities_with_stats(
+            lang,
+            &tree,
+            &src,
+            path,
+            &mut entities_local,
+        );
+        time_extracting += t_extract.elapsed();
+        docs_nanos_acc += _stats_ex.docs_nanos;
+        calls_nanos_acc += _stats_ex.calls_nanos;
+        docs_attempts_acc += _stats_ex.docs_attempts;
+        calls_attempts_acc += _stats_ex.calls_attempts;
         let imports = crate::repo_index::indexer::helpers::extract_import_modules(lang, &src);
         let file_path_str = path.display().to_string();
         // Normalize to a workspace-relative tests/fixtures path when present
@@ -141,9 +193,13 @@ pub fn build_with_options(
             "javascript" | "typescript" | "tsx" | "python" | "rust" | "go"
         ) {
             // call tree-sitter based extractor again (cheap) and store results for later alias resolution
+            #[cfg(feature = "otel")]
+            let _span_alias_tree = tracing::debug_span!("alias_tree").entered();
+            let t_alias_tree = std::time::Instant::now();
             let aliases = crate::repo_index::indexer::helpers::extract_import_aliases_from_tree(
                 lang, &tree, &src,
             );
+            time_alias_tree += t_alias_tree.elapsed();
             if !aliases.is_empty() {
                 file_import_aliases
                     .entry(file_id)
@@ -239,6 +295,9 @@ pub fn build_with_options(
     let mut import_lines: Vec<Vec<u32>> = vec![Vec::new(); entity_len];
     let mut unresolved_imports_per_file: Vec<Vec<(String, u32)>> = vec![Vec::new(); files.len()];
     let mut scope_map: HashMap<(u32, String), u32> = HashMap::new();
+    #[cfg(feature = "otel")]
+    let _span_scope = tracing::debug_span!("scope_containment").entered();
+    let t_scope = std::time::Instant::now();
     for e in &entities_store {
         scope_map.insert((e.file_id, e.name.to_lowercase()), e.id);
     }
@@ -251,6 +310,7 @@ pub fn build_with_options(
             }
         }
     }
+    time_scope_containment += t_scope.elapsed();
     for e in &entities_store {
         if matches!(e.kind, crate::repo_index::indexer::types::EntityKind::File) {
             continue;
@@ -283,6 +343,9 @@ pub fn build_with_options(
     // Build a module map: map plausible dotted module names to file entity ids.
     // For a file path like "pkg/a.py" we map "pkg.a" -> file_entity.
     let mut module_map: HashMap<String, u32> = HashMap::new();
+    #[cfg(feature = "otel")]
+    let _span_module = tracing::debug_span!("module_map").entered();
+    let t_module_map = std::time::Instant::now();
     for (idx, f) in files.iter().enumerate() {
         // derive module path from file path relative to repo root
         let path = std::path::Path::new(&f.path);
@@ -303,8 +366,12 @@ pub fn build_with_options(
             module_map.entry(modname).or_insert(file_entities[idx]);
         }
     }
+    time_module_map += t_module_map.elapsed();
     // Note: some alias entries are populated during parsing (for parsed files)
     // and others will be added here by scanning file sources for non-parsed files
+    #[cfg(feature = "otel")]
+    let _span_alias_fb = tracing::debug_span!("alias_fallback").entered();
+    let t_alias_fallback = std::time::Instant::now();
     for f in files.iter() {
         // ensure an entry exists for each file so later loops can assume presence
         file_import_aliases.entry(f.id).or_default();
@@ -326,7 +393,11 @@ pub fn build_with_options(
             }
         }
     }
+    time_alias_fallback += t_alias_fallback.elapsed();
 
+    #[cfg(feature = "otel")]
+    let _span_imports = tracing::debug_span!("import_edges").entered();
+    let t_import_edges = std::time::Instant::now();
     for (&fid, mods) in file_import_modules.iter() {
         let file_entity_id = file_entities[fid as usize];
         let mut added: StdHashSet<u32> = StdHashSet::new();
@@ -376,6 +447,7 @@ pub fn build_with_options(
             }
         }
     }
+    time_import_edges += t_import_edges.elapsed();
 
     // Collect alias candidates: (file_id, module_token, optional_alias, lineno)
     let mut alias_candidates: Vec<(u32, String, Option<String>, usize)> = Vec::new();
@@ -398,6 +470,9 @@ pub fn build_with_options(
     // Now resolve alias candidates into a concrete alias_map.
     // alias_map: (requesting_file_id, alias_lower) -> (module_or_symbol, target_entity_id)
     let mut alias_map: HashMap<(u32, String), (String, u32)> = HashMap::new();
+    #[cfg(feature = "otel")]
+    let _span_alias_res = tracing::debug_span!("alias_resolution").entered();
+    let t_alias_res = std::time::Instant::now();
     for (req_fid, module_tok, alias_opt, _ln) in alias_candidates.drain(..) {
         if let Some(alias) = alias_opt {
             let alias_l = alias.to_lowercase();
@@ -470,8 +545,12 @@ pub fn build_with_options(
             }
         }
     }
+    time_alias_resolution += t_alias_res.elapsed();
 
     // Now resolve captured raw call identifiers into edges, consulting imports
+    #[cfg(feature = "otel")]
+    let _span_calls_res = tracing::debug_span!("calls_resolution").entered();
+    let t_calls_res = std::time::Instant::now();
     for ent in &entities_store {
         if ent.calls_raw.is_empty() {
             continue;
@@ -578,11 +657,7 @@ pub fn build_with_options(
             }
         }
     }
-    let stats = RepoIndexStats {
-        files_indexed: file_count,
-        entities_indexed: entities_store.len(),
-        duration: start.elapsed(),
-    };
+    time_calls_resolution += t_calls_res.elapsed();
     let rank_weights = crate::repo_index::indexer::types::RankWeights::from_env();
     let mut svc = RepoIndexService {
         files,
@@ -598,7 +673,31 @@ pub fn build_with_options(
         unresolved_imports: unresolved_imports_per_file,
         rank_weights,
     };
+    #[cfg(feature = "otel")]
+    let _span_pr = tracing::debug_span!("pagerank").entered();
+    let t_pr = std::time::Instant::now();
     svc.compute_pagerank();
+    time_pagerank += t_pr.elapsed();
+    let stats = RepoIndexStats {
+        files_indexed: file_count,
+        entities_indexed: svc.entities.len(),
+        duration: start.elapsed(),
+        time_reading,
+        time_parsing,
+        time_extracting,
+        time_alias_tree,
+        time_alias_fallback,
+        time_module_map,
+        time_import_edges,
+        time_scope_containment,
+        time_alias_resolution,
+        time_calls_resolution,
+        time_pagerank,
+        docs_nanos: docs_nanos_acc,
+        calls_nanos: calls_nanos_acc,
+        docs_attempts: docs_attempts_acc,
+        calls_attempts: calls_attempts_acc,
+    };
     Ok((svc, stats))
 }
 

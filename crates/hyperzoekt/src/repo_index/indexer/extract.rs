@@ -14,7 +14,17 @@
 use crate::repo_index::indexer::langspec::*;
 use crate::repo_index::indexer::types::Entity;
 use std::path::Path;
+use std::time::Instant;
 use tree_sitter::Node;
+
+#[derive(Debug, Default, Clone)]
+pub struct ExtractStats {
+    pub docs_nanos: u128,
+    pub calls_nanos: u128,
+    pub docs_attempts: usize,
+    pub calls_attempts: usize,
+    pub entities_emitted: usize,
+}
 
 // Return the source slice for a node.
 fn node_text<'a>(node: Node<'a>, src: &'a str) -> &'a str {
@@ -80,6 +90,7 @@ fn generic_class_function_walk<'a>(
     path: &Path,
     out: &mut Vec<Entity<'a>>,
     spec: &dyn crate::repo_index::indexer::langspec::LangSpec,
+    stats: &mut ExtractStats,
 ) {
     let mut stack = vec![(tree.root_node(), None::<String>)];
     while let Some((node, parent)) = stack.pop() {
@@ -281,6 +292,10 @@ fn generic_class_function_walk<'a>(
                     }
                 }
             }
+            let doc_t0 = Instant::now();
+            let doc_opt = extract_doc_comments(&node, src, lang);
+            stats.docs_attempts += 1;
+            stats.docs_nanos += doc_t0.elapsed().as_nanos();
             let entity = Entity {
                 file: path.display().to_string(),
                 language: lang,
@@ -291,7 +306,7 @@ fn generic_class_function_walk<'a>(
                 start_line: node.start_position().row,
                 end_line: node.end_position().row,
                 // calls removed
-                doc: extract_doc_comments(&node, src, lang),
+                doc: doc_opt,
                 calls_raw: Vec::new(),
                 methods,
             };
@@ -404,6 +419,14 @@ fn generic_class_function_walk<'a>(
             }
 
             // Fallback: emit a top-level function entity
+            let doc_t0 = Instant::now();
+            let doc_opt = extract_doc_comments(&node, src, lang);
+            stats.docs_attempts += 1;
+            stats.docs_nanos += doc_t0.elapsed().as_nanos();
+            let calls_t0 = Instant::now();
+            let calls_vec = collect_call_idents(node, src);
+            stats.calls_attempts += 1;
+            stats.calls_nanos += calls_t0.elapsed().as_nanos();
             out.push(Entity {
                 file: path.display().to_string(),
                 language: lang,
@@ -414,8 +437,8 @@ fn generic_class_function_walk<'a>(
                 start_line: node.start_position().row,
                 end_line: node.end_position().row,
                 // calls removed
-                doc: extract_doc_comments(&node, src, lang),
-                calls_raw: collect_call_idents(node, src),
+                doc: doc_opt,
+                calls_raw: calls_vec,
                 methods: Vec::new(),
             });
             for child in node.children(&mut node.walk()) {
@@ -825,17 +848,34 @@ pub fn extract_entities<'a>(
     path: &Path,
     out: &mut Vec<Entity<'a>>,
 ) {
+    let mut _stats = ExtractStats::default();
     match lang {
-        "rust" => generic_class_function_walk(lang, tree, src, path, out, &RustLangSpec),
-        "python" => generic_class_function_walk(lang, tree, src, path, out, &PythonLangSpec),
-        "javascript" => generic_class_function_walk(lang, tree, src, path, out, &JsLangSpec),
-        "typescript" => generic_class_function_walk(lang, tree, src, path, out, &TsLangSpec),
-        "java" => generic_class_function_walk(lang, tree, src, path, out, &JavaLangSpec),
-        "go" => generic_class_function_walk(lang, tree, src, path, out, &GoLangSpec),
-        "cpp" => generic_class_function_walk(lang, tree, src, path, out, &CppLangSpec),
-        "c_sharp" => generic_class_function_walk(lang, tree, src, path, out, &CSharpLangSpec),
-        "swift" => generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec),
-        "verilog" => generic_class_function_walk(lang, tree, src, path, out, &VerilogLangSpec),
+        "rust" => {
+            generic_class_function_walk(lang, tree, src, path, out, &RustLangSpec, &mut _stats)
+        }
+        "python" => {
+            generic_class_function_walk(lang, tree, src, path, out, &PythonLangSpec, &mut _stats)
+        }
+        "javascript" => {
+            generic_class_function_walk(lang, tree, src, path, out, &JsLangSpec, &mut _stats)
+        }
+        "typescript" => {
+            generic_class_function_walk(lang, tree, src, path, out, &TsLangSpec, &mut _stats)
+        }
+        "java" => {
+            generic_class_function_walk(lang, tree, src, path, out, &JavaLangSpec, &mut _stats)
+        }
+        "go" => generic_class_function_walk(lang, tree, src, path, out, &GoLangSpec, &mut _stats),
+        "cpp" => generic_class_function_walk(lang, tree, src, path, out, &CppLangSpec, &mut _stats),
+        "c_sharp" => {
+            generic_class_function_walk(lang, tree, src, path, out, &CSharpLangSpec, &mut _stats)
+        }
+        "swift" => {
+            generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec, &mut _stats)
+        }
+        "verilog" => {
+            generic_class_function_walk(lang, tree, src, path, out, &VerilogLangSpec, &mut _stats)
+        }
         _ => {
             out.push(Entity {
                 file: path.display().to_string(),
@@ -886,4 +926,63 @@ pub fn extract_entities<'a>(
     for idx in to_remove.into_iter().rev() {
         out.remove(idx);
     }
+}
+
+pub fn extract_entities_with_stats<'a>(
+    lang: &'a str,
+    tree: &tree_sitter::Tree,
+    src: &'a str,
+    path: &Path,
+    out: &mut Vec<Entity<'a>>,
+) -> ExtractStats {
+    let mut stats = ExtractStats::default();
+    match lang {
+        "rust" => {
+            generic_class_function_walk(lang, tree, src, path, out, &RustLangSpec, &mut stats)
+        }
+        "python" => {
+            generic_class_function_walk(lang, tree, src, path, out, &PythonLangSpec, &mut stats)
+        }
+        "javascript" => {
+            generic_class_function_walk(lang, tree, src, path, out, &JsLangSpec, &mut stats)
+        }
+        "typescript" => {
+            generic_class_function_walk(lang, tree, src, path, out, &TsLangSpec, &mut stats)
+        }
+        "java" => {
+            generic_class_function_walk(lang, tree, src, path, out, &JavaLangSpec, &mut stats)
+        }
+        "go" => generic_class_function_walk(lang, tree, src, path, out, &GoLangSpec, &mut stats),
+        "cpp" => generic_class_function_walk(lang, tree, src, path, out, &CppLangSpec, &mut stats),
+        "c_sharp" => {
+            generic_class_function_walk(lang, tree, src, path, out, &CSharpLangSpec, &mut stats)
+        }
+        "swift" => {
+            generic_class_function_walk(lang, tree, src, path, out, &SwiftLangSpec, &mut stats)
+        }
+        "verilog" => {
+            generic_class_function_walk(lang, tree, src, path, out, &VerilogLangSpec, &mut stats)
+        }
+        _ => {
+            out.push(Entity {
+                file: path.display().to_string(),
+                language: lang,
+                kind: "file",
+                name: path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parent: None,
+                signature: src.lines().next().unwrap_or("").to_string(),
+                start_line: 0,
+                end_line: src.lines().count().saturating_sub(1),
+                doc: None,
+                calls_raw: Vec::new(),
+                methods: Vec::new(),
+            });
+        }
+    }
+    stats.entities_emitted += out.len();
+    stats
 }

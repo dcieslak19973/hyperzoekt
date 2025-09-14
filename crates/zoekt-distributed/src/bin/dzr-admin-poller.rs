@@ -39,7 +39,11 @@ async fn metrics_handler() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn",
+        )
+    });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Read poll interval from env or default to 5s

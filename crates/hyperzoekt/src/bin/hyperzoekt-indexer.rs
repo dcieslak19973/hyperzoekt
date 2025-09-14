@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use hyperzoekt::event_consumer;
-use log::info;
+use log::{info, LevelFilter};
 use std::path::PathBuf;
 
 /// Continuous repo indexer that subscribes to Redis events from zoekt-distributed
@@ -61,8 +61,25 @@ impl AppConfig {
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
+    // Initialize OpenTelemetry/tracing if enabled via env and feature compiled.
+    // This is a no-op when the `otel` feature is not enabled.
+    let enable_otel = std::env::var("HZ_ENABLE_OTEL")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
+        .unwrap_or(false);
+    if enable_otel {
+        hyperzoekt::otel::init_otel_from_env();
+    }
+
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
-    env_logger::Builder::from_env(env).init();
+    let mut builder = env_logger::Builder::from_env(env);
+    // Quiet down chatty HTTP/client internals while preserving debug for our crates
+    builder
+        .filter_module("hyper_util", LevelFilter::Warn)
+        .filter_module("hyper", LevelFilter::Warn)
+        .filter_module("h2", LevelFilter::Warn)
+        .filter_module("reqwest", LevelFilter::Warn)
+        .filter_module("tower_http", LevelFilter::Warn);
+    builder.init();
     let (app_cfg, cfg_path) = AppConfig::load(args.config.as_ref())?;
     info!("Loaded config from {}", cfg_path.display());
 
