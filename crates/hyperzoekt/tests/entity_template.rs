@@ -53,6 +53,7 @@ async fn render_entity_template_with_call_graph() {
         repo_name: "repo".to_string(),
         source_url: Some("https://example.com/repo/file.rs".to_string()),
         source_display: Some("repo/file.rs".to_string()),
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };
@@ -113,6 +114,7 @@ async fn render_entity_template_with_empty_relations() {
         repo_name: "r".to_string(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };
@@ -185,6 +187,7 @@ async fn render_entity_template_with_large_relations() {
         repo_name: "r".to_string(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };

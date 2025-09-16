@@ -368,7 +368,6 @@ impl SurrealRepoStore {
                             owner = $owner,
                             allowed_users = $allowed_users,
                             last_commit_sha = $last_commit_sha,
-                            last_indexed_at = $last_indexed_at,
                             updated_at = $updated_at
                         WHERE git_url = $git_url
                     "#,
@@ -380,7 +379,6 @@ impl SurrealRepoStore {
                     .bind(("owner", owner))
                     .bind(("allowed_users", allowed_users))
                     .bind(("last_commit_sha", last_commit_sha))
-                    .bind(("last_indexed_at", last_indexed_at))
                     .bind(("updated_at", updated_at))
                     .await
             }
@@ -396,7 +394,6 @@ impl SurrealRepoStore {
                             owner = $owner,
                             allowed_users = $allowed_users,
                             last_commit_sha = $last_commit_sha,
-                            last_indexed_at = $last_indexed_at,
                             updated_at = $updated_at
                         WHERE git_url = $git_url
                     "#,
@@ -408,13 +405,42 @@ impl SurrealRepoStore {
                     .bind(("owner", owner))
                     .bind(("allowed_users", allowed_users))
                     .bind(("last_commit_sha", last_commit_sha))
-                    .bind(("last_indexed_at", last_indexed_at))
                     .bind(("updated_at", updated_at))
                     .await
             }
         };
 
         query_result?.check()?;
+
+        // Apply typed datetime for last_indexed_at if provided, after UPSERT
+        if let Some(dt) = last_indexed_at {
+            match &*db {
+                SurrealConnection::Local(db_conn) => {
+                    let _ = db_conn
+                        .query(
+                            r#"
+                            UPDATE repo SET last_indexed_at = $last_indexed_at
+                            WHERE git_url = $git_url
+                        "#,
+                        )
+                        .bind(("git_url", git_url.clone()))
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+                SurrealConnection::Remote(db_conn) => {
+                    let _ = db_conn
+                        .query(
+                            r#"
+                            UPDATE repo SET last_indexed_at = $last_indexed_at
+                            WHERE git_url = $git_url
+                        "#,
+                        )
+                        .bind(("git_url", git_url.clone()))
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+            }
+        }
         Ok(())
     }
 

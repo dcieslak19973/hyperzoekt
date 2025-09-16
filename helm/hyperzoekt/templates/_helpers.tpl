@@ -66,7 +66,7 @@ SurrealDB URL helper
 */}}
 {{- define "hyperzoekt.surrealUrl" -}}
 {{- if .Values.surrealdb.enabled }}
-{{- printf "ws://%s-surrealdb:%d/rpc" (include "hyperzoekt.fullname" .) .Values.surrealdb.service.port }}
+{{- printf "http://%s-surrealdb:%d" (include "hyperzoekt.fullname" .) .Values.surrealdb.service.port }}
 {{- else }}
 {{- .Values.surrealdb.external.url }}
 {{- end }}

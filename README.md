@@ -48,7 +48,7 @@ The `hyperzoekt-indexer` binary supports enhanced indexing with Tree-sitter sema
 
 Example (run the indexer):
 ```bash
-RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-indexer
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=http://127.0.0.1:8001 cargo run --bin hyperzoekt-indexer
 ```
 
 Migration note: the legacy one-shot JSONL exporter has been removed. To perform a one-shot export, call the library API (`RepoIndexService`) from a small Rust program and write results to a file. For example:
@@ -74,7 +74,47 @@ The `hyperzoekt-webui` binary provides a modern web interface for browsing index
 
 Example (run the web UI):
 ```bash
-RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=http://127.0.0.1:8001 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+```
+
+Hyperzoekt MCP
+---------------
+The `hyperzoekt-mcp` binary exposes MCP tools for semantic similarity search and repository dupes.
+
+Env vars:
+- `SURREALDB_URL`/`SURREALDB_USERNAME`/`SURREALDB_PASSWORD`/`SURREAL_NS`/`SURREAL_DB`: SurrealDB connection
+- `HZ_MCP_HOST`/`HZ_MCP_PORT`: bind address (default `0.0.0.0:7979`)
+- `HZ_WEBUI_BASE`: base URL for WebUI (used to proxy dupes; default `http://127.0.0.1:7878` or your WebUI host)
+- `HZ_TEI_BASE`: TEI embeddings endpoint base (e.g. `http://127.0.0.1:8088` or `http://tei:80`)
+- `HZ_EMBED_MODEL`: embedding model id (e.g. `jinaai/jina-embeddings-v2-base-code`)
+- Optional: `HZ_SIMSEARCH_TOPK` (default 50), `HZ_SIMSEARCH_SAMPLE` (default 3000)
+
+Run locally:
+```bash
+RUST_LOG=info \
+SURREALDB_URL=http://127.0.0.1:8001 \
+SURREALDB_USERNAME=root SURREALDB_PASSWORD=root \
+SURREAL_NS=zoekt SURREAL_DB=repos \
+HZ_WEBUI_BASE=http://127.0.0.1:8081 \
+HZ_TEI_BASE=http://127.0.0.1:8088 \
+HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code \
+cargo run -p hyperzoekt --bin hyperzoekt-mcp -- \
+  # MCP listens on /mcp (JSON-RPC over HTTP)
+  
+```
+
+JSON-RPC examples:
+- List tools
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }
+```
+- Similarity search
+```json
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "similarity_search", "arguments": { "q": "http server router", "repo": "myorg/myrepo" } } }
+```
+- Repo dupes
+```json
+{ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "repo_dupes", "arguments": { "repo": "myorg/myrepo", "limit": 100, "min_score": 0.85 } } }
 ```
 
 Configuration
@@ -155,7 +195,7 @@ For easier deployment, use the provided wrapper script that extracts headers and
 When deployed behind a reverse proxy (like nginx or Apache), the proxy can extract the `X-*` headers and set them as `HTTP_X_*` environment variables that the wrapper script will detect.
 
 ### SurrealDB Configuration
-- `SURREALDB_URL`: SurrealDB WebSocket RPC URL (e.g., `ws://localhost:8000/rpc`)
+- `SURREALDB_URL`: SurrealDB HTTP base URL (e.g., `http://localhost:8001`)
 - `SURREALDB_USERNAME`: SurrealDB username (default: root)
 - `SURREALDB_PASSWORD`: SurrealDB password (default: root)
 - `SURREAL_NS`: SurrealDB namespace (default: zoekt)
@@ -175,30 +215,37 @@ cd docker && docker-compose up --build
 
 This will start:
 - **Redis** on port 6379 (for distributed coordination)
-- **SurrealDB** on port 8000 (for repository metadata and permissions)
+ - **SurrealDB** on port 8001 (HTTP; repository metadata and permissions)
 
-**Zoekt-Distributed Services (Legacy):**
-- **Indexer** on port 7676 (for indexing repositories)
-- **Admin UI** on port 7878 (web interface for managing repositories)
-- **Search API** on port 8080 (HTTP search endpoint)
-- **MCP Server** on port 7979 (Model Context Protocol for AI assistants)
+**Zoekt-Distributed Services (Legacy) — host ports → container ports:**
+- **Indexer** on port 7200 → 7676 (indexing)
+- **Admin UI** on port 7201 → 7878 (manage repositories)
+- **Admin Poller** on port 7202 → 9900 (health/metrics)
+- **Search API** on port 7203 → 8080 (HTTP search)
+- **MCP Server** on port 7204 → 7979 (Model Context Protocol)
 
-**Hyperzoekt Services (New):**
-- **Indexer** on port 7677 (enhanced indexing with Tree-sitter)
-- **Web UI** on port 7879 (modern web interface for browsing/searching)
+**Hyperzoekt Services (New) — host ports → container ports:**
+- **Indexer** on port 7205 → 7677 (enhanced indexing with Tree-sitter)
+- **Web UI** on port 7206 → 8081 (browse/search)
+- **MCP Server** on port 7207 → 7979 (semantic tools over MCP)
+
+**Embeddings Service (TEI):**
+- **TEI** on port 8088 → 80 (local embeddings)
 
 2. **Access the services:**
-- **Legacy Admin UI**: http://localhost:7878 (username: `admin`, password: `password`)
-- **Legacy Search API**: http://localhost:8080
-- **New Web UI**: http://localhost:7879 (browse repositories, entities, and search)
-- **SurrealDB**: ws://localhost:8000/rpc
+- **Legacy Admin UI**: http://localhost:7201 (username: `admin`, password: `password`)
+- **Legacy Search API**: http://localhost:7203
+- **Legacy MCP**: http://localhost:7204/mcp
+- **New Web UI**: http://localhost:7206 (browse repositories, entities, and search)
+- **Hyperzoekt MCP**: http://localhost:7207/mcp
+- **SurrealDB**: http://localhost:8001 (HTTP; GraphQL/health)
 
 3. **Environment variables for Docker:**
 The Docker Compose file sets up the following environment variables for all services:
 ```yaml
 environment:
   - REDIS_URL=redis://redis:6379
-  - SURREALDB_URL=ws://surrealdb:8000/rpc
+  - SURREALDB_URL=http://surrealdb:8001
   - SURREALDB_USERNAME=root
   - SURREALDB_PASSWORD=root
   - SURREAL_NS=zoekt
@@ -244,11 +291,11 @@ cd /workspaces/hyperzoekt && RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 car
 
 1. **Run the Indexer:**
 ```bash
-cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-indexer
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=http://127.0.0.1:8001 cargo run --bin hyperzoekt-indexer
 ```
 2. **Run the Web UI:**
 ```bash
-cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
+cd /workspaces/hyperzoekt && RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=http://127.0.0.1:8001 cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
 ```
 
 License
@@ -268,7 +315,7 @@ If you rely on Docker Compose's `surrealdb` service instead (e.g. `docker compos
 Environment variables (already defaults in many examples):
 
 ```bash
-SURREALDB_URL=http://127.0.0.1:8000
+SURREALDB_URL=http://127.0.0.1:8001
 SURREALDB_USERNAME=root
 SURREALDB_PASSWORD=root
 SURREAL_NS=zoekt

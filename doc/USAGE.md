@@ -92,7 +92,7 @@ When running the indexer without a remote SurrealDB configured, the indexer may 
 Configuration summary:
 
 - Environment variables:
-	- `SURREALDB_URL` — if set, the indexer will connect to this remote SurrealDB RPC/WebSocket endpoint (for example `ws://localhost:8000/rpc`) instead of embedding.
+  - `SURREALDB_URL` — if set, the indexer will connect to this remote SurrealDB HTTP endpoint (for example `http://localhost:8001`) instead of embedding.
 	- `SURREALDB_EMBED_MODE` — `file` (default) or `memory` (ephemeral).
 	- `SURREALDB_EMBED_PATH` — path for embedded DB files (default: `.data/surreal.db`).
 
@@ -106,6 +106,61 @@ Notes:
 - The launcher will create the `.data/` directory automatically if it does not exist.
 - Use `SURREAL_EMBED_MODE=memory` for ephemeral runs (tests, CI) to avoid creating persistent files.
 - The repository's `.gitignore` should include `.data/` so DB files are not accidentally committed.
+
+## Embedding Jobs (optional)
+
+You can enqueue one Redis job per indexed entity to drive background code embeddings. This is disabled by default to avoid slowing indexing.
+
+- Enable: set `HZ_ENABLE_EMBED_JOBS=1` in the `hyperzoekt-indexer` environment.
+- Queue: override with `HZ_EMBED_JOBS_QUEUE` (default: `zoekt:embed_jobs`).
+- Redis: ensure `REDIS_URL` (or `REDIS_USERNAME`/`REDIS_PASSWORD`) is configured.
+
+docker-compose example (indexer):
+
+```yaml
+    environment:
+      - REDIS_URL=redis://redis:6379
+      # Enable to enqueue embedding jobs after indexing
+      - HZ_ENABLE_EMBED_JOBS=1
+      # Optional: override the embed jobs queue key (default: zoekt:embed_jobs)
+      # - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+```
+
+Quick verification:
+
+```bash
+# Observe queue length grow after an indexing run
+docker compose exec redis redis-cli LLEN zoekt:embed_jobs
+
+# Peek a few jobs (JSON lines)
+docker compose exec redis redis-cli LRANGE zoekt:embed_jobs 0 2
+```
+
+Job schema (JSON): `{ stable_id, repo_name, language, kind, name, source_url? }`.
+
+## Similarity (embeddings)
+
+The embed worker can compute and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the embed worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
+
+Notes and requirements:
+
+- Server-side similarity requires a SurrealDB build that provides vector math functions (for example `vector::similarity::cosine`) and supports ordering by the computed score. If your SurrealDB instance does not implement these functions the embed worker will fall back to leaving no similarity relations.
+- Because scoring is done in the DB, queries may perform full-table scans unless SurrealDB provides a vector index/KNN operator. Evaluate performance on your dataset and SurrealDB version before enabling at large scale.
+
+Configuration (embed worker env vars):
+
+- `HZ_ENABLE_EMBED_SIMILARITY`: enable/disable similarity computation (set to `1`/`true` to enable).
+- `HZ_SIMILARITY_MAX_SAME_REPO`: maximum number of same-repo similar entities to fetch (default: `25`).
+- `HZ_SIMILARITY_MAX_EXTERNAL_REPO`: maximum number of external-repo similar entities to fetch (default: `50`).
+- `HZ_SIMILARITY_THRESHOLD_SAME_REPO`, `HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO`: legacy thresholds previously used by the client-side implementation; currently unused when SurrealDB server-side scoring is enabled but preserved as configuration knobs for future filtering logic.
+
+Behavior:
+
+- For each persisted embedding the worker issues two SELECT queries: one restricting to the same `repo_name` and one excluding it. Results include `stable_id` and a numeric `score` computed by `vector::similarity::cosine(embedding, $vec)` and are ordered by `score DESC` and truncated to the configured maxima.
+- The worker translates the returned rows into relation statements that `RELATE` the current entity to the candidate entities with a `score` field on the relation (`similar_same_repo` or `similar_external_repo`).
+- If SurrealDB returns an error for these queries the worker logs a warning and skips similarity relation updates for that entity.
+
+If you need a client-side fallback (for example when running against an older SurrealDB), consider toggling computation or adding a feature flag to compute cosine similarity locally in the embed worker before creating relation rows.
 
 ## OpenTelemetry / Tracing
 

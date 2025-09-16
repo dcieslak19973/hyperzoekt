@@ -349,11 +349,20 @@ async fn initial_batch_insert(
     let mut vals = Vec::new();
     for p in payloads {
         if let Ok(mut v) = serde_json::to_value(p) {
-            // do not persist the `file` field on Entity rows; remove it from the
-            // serialized JSON. File metadata remains in the separate `file` table.
             if let Some(obj) = v.as_object_mut() {
+                // Strip non-persisted field
                 obj.remove("file");
+                // Ensure source_content is not null per schema
+                if let Some(sc) = obj.get("source_content") {
+                    if sc.is_null() {
+                        obj.insert(
+                            "source_content".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
+                    }
+                }
             }
+            sanitize_json_strings(&mut v);
             vals.push(v);
         }
     }
@@ -458,6 +467,33 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
             "DEFINE FIELD repo_name ON entity TYPE string;",
             "ALTER TABLE entity CREATE FIELD repo_name TYPE string;",
         ],
+        // Embedding fields: use DEFAULTs (not VALUE) so writes are not overridden.
+        // Try to DEFINE with DEFAULT; if an older VALUE-based field exists, attempt remove+redefine.
+        vec![
+            "DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
+            "REMOVE FIELD embedding ON entity; DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
+            "ALTER TABLE entity CREATE FIELD embedding TYPE array;",
+        ],
+        vec![
+            "DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
+            "REMOVE FIELD embedding_len ON entity; DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
+            "ALTER TABLE entity CREATE FIELD embedding_len TYPE int;",
+        ],
+        vec![
+            "DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
+            "REMOVE FIELD embedding_model ON entity; DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
+            "ALTER TABLE entity CREATE FIELD embedding_model TYPE string;",
+        ],
+        vec![
+            "DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
+            "REMOVE FIELD embedding_dim ON entity; DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
+            "ALTER TABLE entity CREATE FIELD embedding_dim TYPE int;",
+        ],
+        vec![
+            "DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
+            "REMOVE FIELD embedding_created_at ON entity; DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
+            "ALTER TABLE entity CREATE FIELD embedding_created_at TYPE datetime;",
+        ],
         vec![
             "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
             "CREATE INDEX idx_entity_stable_id ON entity (stable_id);",
@@ -487,6 +523,41 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
         vec![
             "DEFINE INDEX idx_in_repo_unique ON in_repo FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_in_repo_unique ON in_repo FIELDS in, out UNIQUE;",
+        ],
+        // Store the full source content used to compute embeddings for inspection.
+        vec![
+            "DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
+            "REMOVE FIELD source_content ON entity; DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
+            "ALTER TABLE entity CREATE FIELD source_content TYPE string;",
+        ],
+        // Similarity relations between entities with score metadata
+        vec![
+            "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
+            "DEFINE TABLE similar_same_repo TYPE RELATION;",
+            "CREATE TABLE similar_same_repo;",
+        ],
+        vec![
+            "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
+            "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
+        ],
+        vec![
+            "DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
+            "REMOVE FIELD score ON similar_same_repo; DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
+            "ALTER TABLE similar_same_repo CREATE FIELD score TYPE number;",
+        ],
+        vec![
+            "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
+            "DEFINE TABLE similar_external_repo TYPE RELATION;",
+            "CREATE TABLE similar_external_repo;",
+        ],
+        vec![
+            "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
+            "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
+        ],
+        vec![
+            "DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
+            "REMOVE FIELD score ON similar_external_repo; DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
+            "ALTER TABLE similar_external_repo CREATE FIELD score TYPE number;",
         ],
     ];
     for group in schema_groups.iter() {
@@ -682,7 +753,18 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
                             }
                         }
                     }
+                    // Ensure `source_content` is not NULL to satisfy schema TYPE string
+                    if let Some(sc) = obj.get("source_content") {
+                        if sc.is_null() {
+                            obj.insert(
+                                "source_content".to_string(),
+                                serde_json::Value::String(String::new()),
+                            );
+                        }
+                    }
                 }
+                // Replace embedded NUL bytes in any string fields to satisfy Surreal's JSON rules
+                sanitize_json_strings(&mut v);
                 let eid = sanitize_id(&p.stable_id);
                 let e_json = v.to_string();
                 // Use CREATE for deterministic entity ids so the row is actually created
@@ -857,6 +939,32 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
         }
     }
     (statements, acc.len())
+}
+
+/// Recursively sanitize all string values in-place by replacing NUL bytes with spaces.
+fn sanitize_json_strings(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::String(s) => {
+            if s.contains('\u{0000}') {
+                let cleaned: String = s
+                    .chars()
+                    .map(|c| if c == '\u{0000}' { ' ' } else { c })
+                    .collect();
+                *s = cleaned;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                sanitize_json_strings(v);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                sanitize_json_strings(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Compute a repository-relative path from a file path and repo name.

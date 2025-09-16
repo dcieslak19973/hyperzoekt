@@ -114,6 +114,9 @@ pub async fn persist_repo_dependencies(
             }
         }
         let explicit_id = sanitize_id(repo_name);
+        // Do not serialize `last_indexed_at` as an RFC3339 string in the CONTENT blob
+        // because Surreal expects a datetime type. We'll set it to null here and
+        // perform a typed UPDATE after we have the repo id if a timestamp was provided.
         let repo_obj = serde_json::json!({
             "name": repo_name,
             "git_url": git_url,
@@ -121,7 +124,7 @@ pub async fn persist_repo_dependencies(
             "visibility": "public",
             "owner": owner_val,
             "last_commit_sha": last_commit_sha,
-            "last_indexed_at": last_indexed_at.map(|ms| chrono::Utc.timestamp_millis_opt(ms).single().unwrap_or_else(|| chrono::Utc.timestamp_opt(0,0).unwrap()).to_rfc3339()),
+            "last_indexed_at": serde_json::Value::Null,
             "allowed_users": []
         });
         // Use UPDATE (upsert) then CREATE fallback so we tolerate existing records and capture id
@@ -311,6 +314,35 @@ pub async fn persist_repo_dependencies(
             }
         }
     }
+    // If a last_indexed_at was provided (epoch millis), update the repo record
+    // with a properly-typed datetime using Surreal/chrono types.
+    if let Some(ms) = last_indexed_at {
+        if let Some(dt) = chrono::Utc.timestamp_millis_opt(ms).single() {
+            let update_q = format!("UPDATE {} SET last_indexed_at = $last_indexed_at;", repo_id);
+            // Bind chrono DateTime directly using the underlying Surreal client
+            match &conn {
+                super::connection::SurrealConnection::Local(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+                super::connection::SurrealConnection::RemoteHttp(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+                super::connection::SurrealConnection::RemoteWs(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+            }
+        }
+    }
+
     Ok(result)
 }
 
@@ -412,7 +444,8 @@ pub async fn persist_repo_dependencies_with_connection(
             "visibility": "public",
             "owner": owner_val,
             "last_commit_sha": last_commit_sha,
-            "last_indexed_at": last_indexed_at.map(|ms| chrono::Utc.timestamp_millis_opt(ms).single().unwrap_or_else(|| chrono::Utc.timestamp_opt(0,0).unwrap()).to_rfc3339()),
+            // Do not serialize last_indexed_at as a string; use server-side or typed update later
+            "last_indexed_at": serde_json::Value::Null,
             "allowed_users": []
         });
 
@@ -490,6 +523,34 @@ pub async fn persist_repo_dependencies_with_connection(
         )
     })?;
     result.repo_id = repo_id.clone();
+
+    // If a last_indexed_at was provided (epoch millis), update the repo record
+    // with a properly-typed datetime using the provided connection reference.
+    if let Some(ms) = last_indexed_at {
+        if let Some(dt) = chrono::Utc.timestamp_millis_opt(ms).single() {
+            let update_q = format!("UPDATE {} SET last_indexed_at = $last_indexed_at;", repo_id);
+            match conn {
+                super::connection::SurrealConnection::Local(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+                super::connection::SurrealConnection::RemoteHttp(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+                super::connection::SurrealConnection::RemoteWs(db_conn) => {
+                    let _ = db_conn
+                        .query(update_q.as_str())
+                        .bind(("last_indexed_at", dt))
+                        .await;
+                }
+            }
+        }
+    }
 
     // Dependencies
     for d in deps {

@@ -120,7 +120,7 @@ admin:
   replicaCount: 1
   service:
     type: ClusterIP
-    port: 7878
+    port: 7201
   # Exposure configuration
   exposure:
     type: service  # service or ingress
@@ -165,7 +165,7 @@ search:
   replicaCount: 1
   service:
     type: ClusterIP
-    port: 8080
+    port: 7203
   # Exposure configuration
   exposure:
     type: service  # service or ingress
@@ -189,7 +189,7 @@ search:
       memory: 256Mi
   env:
     - name: ZOEKTD_BIND_ADDR
-      value: "0.0.0.0:8080"
+      value: "0.0.0.0:7203"
   # Additional environment variables
   extraEnvVars: []
   nodeSelector: {}
@@ -208,7 +208,7 @@ mcp:
   replicaCount: 1
   service:
     type: ClusterIP
-    port: 7979
+    port: 7204
   # Exposure configuration
   exposure:
     type: service  # service or ingress
@@ -232,7 +232,7 @@ mcp:
       memory: 256Mi
   env:
     - name: ZOEKTD_BIND_ADDR
-      value: "0.0.0.0:7979"
+      value: "0.0.0.0:7204"
   # Additional environment variables
   extraEnvVars: []
   nodeSelector: {}
@@ -252,19 +252,19 @@ ingress:
           service:
             name: hyperzoekt-admin
             port:
-              number: 7878
+              number: 7201
         - path: /search
           pathType: Prefix
           service:
             name: hyperzoekt-search
             port:
-              number: 8080
+              number: 7203
         - path: /mcp
           pathType: Prefix
           service:
             name: hyperzoekt-mcp
             port:
-              number: 7979
+              number: 7204
   tls: []
 
 # Service account configuration
@@ -290,3 +290,168 @@ securityContext: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# HyperZoekt indexer (embeddings-aware indexer)
+hyperzoektIndexer:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7205
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # Enable enqueueing embedding jobs after indexing
+  enableEmbedJobs: true
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt Web UI
+hyperzoektWebui:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7206
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: webui.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt MCP server
+hyperzoektMcp:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7207
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # Defaults for MCP env
+  env:
+    - name: HZ_MCP_HOST
+      value: "0.0.0.0"
+    - name: HZ_MCP_PORT
+      value: "7207"
+    - name: HZ_EMBED_MODEL
+      value: "jinaai/jina-embeddings-v2-base-code"
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: hyperzoekt-mcp.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt embedding worker
+hyperzoektEmbedWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: HZ_EMBED_JOBS_QUEUE
+      value: "zoekt:embed_jobs"
+    - name: HZ_EMBED_PROCESSING_TTL_SECONDS
+      value: "300"
+    - name: HZ_EMBED_MODEL
+      value: "jinaai/jina-embeddings-v2-base-code"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Optional local TEI service
+tei:
+  enabled: false
+  annotations: {}
+  image:
+    registry: ghcr.io
+    repository: huggingface/text-embeddings-inference
+    tag: cpu-latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+  modelId: "jinaai/jina-embeddings-v2-base-code"
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

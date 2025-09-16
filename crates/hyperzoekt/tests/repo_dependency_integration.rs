@@ -53,6 +53,7 @@ async fn repo_dependency_relations_created() {
         source_display: None,
         calls: vec![],
         methods: vec![],
+        source_content: None,
     };
 
     // Connect to the configured SurrealDB (test runs only when SURREALDB_URL is set)

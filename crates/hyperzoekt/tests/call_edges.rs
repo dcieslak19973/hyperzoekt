@@ -33,6 +33,7 @@ async fn test_call_edges_created() {
         repo_name: "repo".into(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };
@@ -52,6 +53,7 @@ async fn test_call_edges_created() {
         repo_name: "repo".into(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec!["callee_fn".into()],
         methods: vec![],
     };
