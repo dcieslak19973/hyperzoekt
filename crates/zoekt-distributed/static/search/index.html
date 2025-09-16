@@ -619,6 +619,13 @@
             const params = new URLSearchParams();
             for (const [k, v] of fd.entries()) if (v) params.append(k, v);
 
+            // Basic client-side validation: require a non-empty `q` parameter
+            const q = fd.get('q');
+            if (!q || String(q).trim().length === 0) {
+                alert('Please enter a search query.');
+                return;
+            }
+
             // Show loading state
             resultsContainer.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--muted);">Searching...</div>';
             searchStats.style.display = 'none';
