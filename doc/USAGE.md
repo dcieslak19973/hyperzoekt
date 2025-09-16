@@ -138,6 +138,30 @@ docker compose exec redis redis-cli LRANGE zoekt:embed_jobs 0 2
 
 Job schema (JSON): `{ stable_id, repo_name, language, kind, name, source_url? }`.
 
+## Similarity (embeddings)
+
+The embed worker can compute and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the embed worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
+
+Notes and requirements:
+
+- Server-side similarity requires a SurrealDB build that provides vector math functions (for example `vector::similarity::cosine`) and supports ordering by the computed score. If your SurrealDB instance does not implement these functions the embed worker will fall back to leaving no similarity relations.
+- Because scoring is done in the DB, queries may perform full-table scans unless SurrealDB provides a vector index/KNN operator. Evaluate performance on your dataset and SurrealDB version before enabling at large scale.
+
+Configuration (embed worker env vars):
+
+- `HZ_ENABLE_EMBED_SIMILARITY`: enable/disable similarity computation (set to `1`/`true` to enable).
+- `HZ_SIMILARITY_MAX_SAME_REPO`: maximum number of same-repo similar entities to fetch (default: `25`).
+- `HZ_SIMILARITY_MAX_EXTERNAL_REPO`: maximum number of external-repo similar entities to fetch (default: `50`).
+- `HZ_SIMILARITY_THRESHOLD_SAME_REPO`, `HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO`: legacy thresholds previously used by the client-side implementation; currently unused when SurrealDB server-side scoring is enabled but preserved as configuration knobs for future filtering logic.
+
+Behavior:
+
+- For each persisted embedding the worker issues two SELECT queries: one restricting to the same `repo_name` and one excluding it. Results include `stable_id` and a numeric `score` computed by `vector::similarity::cosine(embedding, $vec)` and are ordered by `score DESC` and truncated to the configured maxima.
+- The worker translates the returned rows into relation statements that `RELATE` the current entity to the candidate entities with a `score` field on the relation (`similar_same_repo` or `similar_external_repo`).
+- If SurrealDB returns an error for these queries the worker logs a warning and skips similarity relation updates for that entity.
+
+If you need a client-side fallback (for example when running against an older SurrealDB), consider toggling computation or adding a feature flag to compute cosine similarity locally in the embed worker before creating relation rows.
+
 ## OpenTelemetry / Tracing
 
 Hyperzoekt can emit tracing spans and metrics via OpenTelemetry (OTLP) when the optional `otel` feature is enabled and runtime initialization is turned on. This helps visualize indexing phases and PageRank iterations in your observability stack (e.g., Tempo + Loki + Grafana, or Honeycomb).
