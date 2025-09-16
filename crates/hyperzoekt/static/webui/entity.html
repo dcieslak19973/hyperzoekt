@@ -81,6 +81,37 @@
         </div>
         {% endif %}
 
+        <!-- Similar code section (same repo and external) -->
+        <div style="margin-bottom: 1rem;">
+            <strong>🧭 Similar Code</strong>
+            <div style="margin-top: 0.35rem; display:flex; gap:8px; align-items:center;">
+                <label for="similar-repo-filter" style="font-size: 12px; color: var(--muted);">Restrict external to
+                    repos:</label>
+                <select id="similar-repo-filter" multiple size="3" class="search-input"
+                    style="max-width:420px; height:auto;">
+                    <!-- populated by JS -->
+                </select>
+                <button id="similar-repo-apply" class="btn"
+                    style="padding: 0.35rem 0.6rem; font-size:0.9rem;">Apply</button>
+            </div>
+            <div id="similar-loading" style="color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem;">Loading
+                similar code…</div>
+            <div id="similar-error" style="display:none; color:#b91c1c; font-size: 0.9rem; margin-top: 0.5rem;">Failed
+                to load similar code.</div>
+            <div id="similar-content" style="display:none; margin-top: 0.5rem;">
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                    <div>
+                        <div style="font-weight:600; margin-bottom: 0.25rem;">Within Repo</div>
+                        <div id="similar-same" style="display:flex; flex-direction:column; gap:6px;"></div>
+                    </div>
+                    <div>
+                        <div style="font-weight:600; margin-bottom: 0.25rem;">External Repos</div>
+                        <div id="similar-external" style="display:flex; flex-direction:column; gap:6px;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         {# Render methods for class-like entities when provided by the server #}
         {% set kind_lc = entity.kind|lower %}
         {% if methods and ("class" in kind_lc or "struct" in kind_lc or "interface" in kind_lc or "trait" in kind_lc) %}
@@ -256,6 +287,87 @@
                         toggle.textContent = 'Show graph';
                         if (cy) { cy.destroy(); cy = null; }
                     }
+                });
+            })();
+
+            // Fetch and render similar code
+            (function () {
+                const sid = encodeURIComponent('{{ entity.stable_id }}');
+                const url = `/api/entity_similar/${sid}`;
+                const loadingEl = document.getElementById('similar-loading');
+                const errorEl = document.getElementById('similar-error');
+                const contentEl = document.getElementById('similar-content');
+                const sameEl = document.getElementById('similar-same');
+                const extEl = document.getElementById('similar-external');
+                const repoSel = document.getElementById('similar-repo-filter');
+                const applyBtn = document.getElementById('similar-repo-apply');
+                const STORAGE_KEY = 'hz_entity_external_repo_filter';
+
+                function itemHtml(it) {
+                    const name = it.name || '(unknown)';
+                    const file = it.source_display || it.file || '';
+                    const score = (typeof it.score === 'number') ? it.score.toFixed(3) : '';
+                    const href = it.stable_id ? `/entity/${encodeURIComponent(it.stable_id)}` : (it.source_url || '#');
+                    return `<div class="card" style="padding:8px; display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <a href="${href}" style="color: var(--accent); text-decoration: none; font-weight: 600;">${name}</a>
+                            <div style="color: var(--muted); font-size: 12px;">${file}</div>
+                        </div>
+                        <div style="color: var(--muted); font-size: 12px;">score ${score}</div>
+                    </div>`;
+                }
+
+                function loadRepos() {
+                    fetch('/api/repos').then(r => r.json()).then(repos => {
+                        const selected = new Set(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'));
+                        // Populate options
+                        repoSel.innerHTML = '';
+                        const list = Array.isArray(repos) ? repos : [];
+                        list.forEach(r => {
+                            const opt = document.createElement('option');
+                            opt.value = r.name;
+                            opt.textContent = r.name;
+                            if (selected.has(r.name)) opt.selected = true;
+                            repoSel.appendChild(opt);
+                        });
+                    }).catch(() => { });
+                }
+
+                function getSelectedRepos() {
+                    return Array.from(repoSel.selectedOptions).map(o => o.value);
+                }
+
+                function applyExternalFilter(external) {
+                    const selected = new Set(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'));
+                    if (selected.size === 0) return external;
+                    return external.filter(it => selected.has(it.repo_name));
+                }
+
+                fetch(url).then(r => r.json()).then(data => {
+                    loadingEl.style.display = 'none';
+                    contentEl.style.display = 'block';
+                    const same = Array.isArray(data.same_repo) ? data.same_repo : [];
+                    const externalRaw = Array.isArray(data.external_repo) ? data.external_repo : [];
+                    const external = applyExternalFilter(externalRaw);
+                    sameEl.innerHTML = same.map(itemHtml).join('') || '<div class="muted">No similar within repo.</div>';
+                    extEl.innerHTML = external.map(itemHtml).join('') || '<div class="muted">No external similarities.</div>';
+                    loadRepos();
+                }).catch(() => {
+                    loadingEl.style.display = 'none';
+                    errorEl.style.display = 'block';
+                });
+
+                applyBtn.addEventListener('click', function () {
+                    const sel = getSelectedRepos();
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(sel));
+                    // Re-render external with filter applied
+                    const cards = extEl.querySelectorAll('.card');
+                    // easiest: refetch fresh so scores etc are preserved
+                    fetch(url).then(r => r.json()).then(data => {
+                        const externalRaw = Array.isArray(data.external_repo) ? data.external_repo : [];
+                        const external = applyExternalFilter(externalRaw);
+                        extEl.innerHTML = external.map(itemHtml).join('') || '<div class="muted">No external similarities.</div>';
+                    }).catch(() => { });
                 });
             })();
         </script>

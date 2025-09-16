@@ -1,0 +1,103 @@
+{{- if .Values.hyperzoektMcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-mcp
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hyperzoekt-mcp
+  {{- with .Values.hyperzoektMcp.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.hyperzoektMcp.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: hyperzoekt-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: hyperzoekt-mcp
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "hyperzoekt.serviceAccountName" . }}
+      containers:
+        - name: hyperzoekt-mcp
+          image: {{ .Values.hyperzoektMcp.image.registry }}/{{ .Values.hyperzoektMcp.image.repository }}:{{ .Values.hyperzoektMcp.image.tag }}
+          imagePullPolicy: {{ .Values.hyperzoektMcp.image.pullPolicy }}
+          command: ["/app/hyperzoekt-mcp", "--host", "0.0.0.0", "--port", {{ .Values.hyperzoektMcp.service.port | quote }}]
+          ports:
+            - name: http
+              containerPort: {{ .Values.hyperzoektMcp.service.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          env:
+            - name: SURREALDB_URL
+              value: {{ include "hyperzoekt.surrealUrl" . | quote }}
+            - name: SURREALDB_USERNAME
+              value: {{ .Values.surrealdb.external.username | default "root" | quote }}
+            - name: SURREALDB_PASSWORD
+              value: {{ .Values.surrealdb.external.password | default "root" | quote }}
+            - name: SURREAL_NS
+              value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
+            - name: SURREAL_DB
+              value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
+            - name: HZ_WEBUI_BASE
+              value: {{ printf "http://%s-hyperzoekt-webui:%d" (include "hyperzoekt.fullname" .) .Values.hyperzoektWebui.service.port | quote }}
+            - name: HZ_TEI_BASE
+              value: {{ ternary (printf "http://%s-tei:%d" (include "hyperzoekt.fullname" .) .Values.tei.service.port) ("") .Values.tei.enabled | quote }}
+            {{- with .Values.hyperzoektMcp.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.hyperzoektMcp.resources | nindent 12 }}
+      {{- with .Values.hyperzoektMcp.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hyperzoektMcp.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hyperzoektMcp.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+---
+{{- if and .Values.hyperzoektMcp.enabled (eq .Values.hyperzoektMcp.exposure.type "service") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-mcp
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hyperzoekt-mcp
+spec:
+  type: {{ .Values.hyperzoektMcp.exposure.serviceType }}
+  ports:
+    - port: {{ .Values.hyperzoektMcp.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "hyperzoekt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: hyperzoekt-mcp
+{{- end }}

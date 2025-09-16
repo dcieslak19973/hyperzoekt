@@ -1,26 +1,26 @@
-{{- if .Values.admin.enabled }}
+{{- if .Values.search.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-admin
+  name: {{ include "hyperzoekt.fullname" . }}-search
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: admin
-  {{- with .Values.admin.annotations }}
+    app.kubernetes.io/component: search
+  {{- with .Values.search.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ .Values.admin.replicaCount }}
+  replicas: {{ .Values.search.replicaCount }}
   selector:
     matchLabels:
       {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: admin
+      app.kubernetes.io/component: search
   template:
     metadata:
       labels:
         {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: admin
+        app.kubernetes.io/component: search
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -30,19 +30,28 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: admin
+        - name: search
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: {{ .Values.admin.image.registry }}/{{ .Values.admin.image.repository }}:{{ .Values.admin.image.tag }}
-          imagePullPolicy: {{ .Values.admin.image.pullPolicy }}
-          command:
-            - /app/dzr-admin
-            - --bind
-            - 0.0.0.0:{{ .Values.admin.service.port }}
+          image: {{ .Values.search.image.registry }}/{{ .Values.search.image.repository }}:{{ .Values.search.image.tag }}
+          imagePullPolicy: {{ .Values.search.image.pullPolicy }}
+          command: ["/app/zoekt-http-search", "--host", "0.0.0.0", "--port", {{ .Values.search.service.port | quote }}]
           ports:
             - name: http
-              containerPort: {{ .Values.admin.service.port }}
+              containerPort: {{ .Values.search.service.port }}
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           env:
             - name: REDIS_URL
               value: {{ include "hyperzoekt.redisUrl" . | quote }}
@@ -56,87 +65,87 @@ spec:
               value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
             - name: SURREAL_DB
               value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
-            {{- with .Values.admin.env }}
+            {{- with .Values.search.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-            {{- with .Values.admin.extraEnvVars }}
+            {{- with .Values.search.extraEnvVars }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml .Values.admin.resources | nindent 12 }}
-      {{- with .Values.admin.nodeSelector }}
+            {{- toYaml .Values.search.resources | nindent 12 }}
+      {{- with .Values.search.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.admin.tolerations }}
+      {{- with .Values.search.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.admin.affinity }}
+      {{- with .Values.search.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
 ---
-{{- if and .Values.admin.enabled (eq .Values.admin.exposure.type "service") }}
+{{- if and .Values.search.enabled (eq .Values.search.exposure.type "service") }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-admin
+  name: {{ include "hyperzoekt.fullname" . }}-search
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: admin
-  {{- with .Values.admin.annotations }}
+    app.kubernetes.io/component: search
+  {{- with .Values.search.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.admin.exposure.serviceType }}
+  type: {{ .Values.search.exposure.serviceType }}
   ports:
-    - port: {{ .Values.admin.service.port }}
+    - port: {{ .Values.search.service.port }}
       targetPort: http
       protocol: TCP
       name: http
   selector:
     {{- include "hyperzoekt.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: admin
+    app.kubernetes.io/component: search
 {{- end }}
 ---
-{{- if and .Values.admin.enabled (eq .Values.admin.exposure.type "ingress") .Values.admin.exposure.ingress.enabled }}
+{{- if and .Values.search.enabled (eq .Values.search.exposure.type "ingress") .Values.search.exposure.ingress.enabled }}
 {{- $fullName := include "hyperzoekt.fullname" . }}
-{{- $svcPort := .Values.admin.service.port }}
+{{- $svcPort := .Values.search.service.port }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ $fullName }}-admin
+  name: {{ $fullName }}-search
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: admin
-  {{- with .Values.admin.exposure.ingress.annotations }}
+    app.kubernetes.io/component: search
+  {{- with .Values.search.exposure.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- if .Values.admin.exposure.ingress.className }}
-  ingressClassName: {{ .Values.admin.exposure.ingress.className }}
+  {{- if .Values.search.exposure.ingress.className }}
+  ingressClassName: {{ .Values.search.exposure.ingress.className }}
   {{- end }}
-  {{- if and .Values.admin.exposure.ingress.tls.enabled .Values.admin.exposure.ingress.tls.secretName }}
+  {{- if and .Values.search.exposure.ingress.tls.enabled .Values.search.exposure.ingress.tls.secretName }}
   tls:
     - hosts:
-        - {{ .Values.admin.exposure.ingress.host | quote }}
-      secretName: {{ .Values.admin.exposure.ingress.tls.secretName }}
+        - {{ .Values.search.exposure.ingress.host | quote }}
+      secretName: {{ .Values.search.exposure.ingress.tls.secretName }}
   {{- end }}
   rules:
-    - host: {{ .Values.admin.exposure.ingress.host | quote }}
+    - host: {{ .Values.search.exposure.ingress.host | quote }}
       http:
         paths:
-          - path: {{ .Values.admin.exposure.ingress.path }}
-            {{- if and .Values.admin.exposure.ingress.pathType (semverCompare ">=1.18-0" $.Capabilities.KubeVersion.GitVersion) }}
-            pathType: {{ .Values.admin.exposure.ingress.pathType }}
+          - path: {{ .Values.search.exposure.ingress.path }}
+            {{- if and .Values.search.exposure.ingress.pathType (semverCompare ">=1.18-0" $.Capabilities.KubeVersion.GitVersion) }}
+            pathType: {{ .Values.search.exposure.ingress.pathType }}
             {{- end }}
             backend:
               service:
-                name: {{ $fullName }}-admin
+                name: {{ $fullName }}-search
                 port:
                   number: {{ $svcPort }}
 {{- end }}

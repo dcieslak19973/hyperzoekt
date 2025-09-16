@@ -35,10 +35,23 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ .Values.indexer.image.registry }}/{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}
           imagePullPolicy: {{ .Values.indexer.image.pullPolicy }}
-          command:
-            - /app/dzr-indexer
-            - --listen
-            - 0.0.0.0:7676
+          command: ["/app/zoekt-indexer", "--host", "0.0.0.0", "--port", "7676"]
+          ports:
+            - name: http
+              containerPort: 7676
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           env:
             - name: REDIS_URL
               value: {{ include "hyperzoekt.redisUrl" . | quote }}

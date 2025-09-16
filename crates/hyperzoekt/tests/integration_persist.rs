@@ -239,6 +239,7 @@ async fn full_index_persists_minimum_entities() {
         source_display: None,
         calls: vec![],
         methods: vec![],
+        source_content: None,
     };
     let caller = EntityPayload {
         language: "rust".into(),
@@ -258,6 +259,7 @@ async fn full_index_persists_minimum_entities() {
         source_display: None,
         calls: vec!["callee_fn".into()],
         methods: vec![],
+        source_content: None,
     };
     let (tx, handle) = spawn_db_writer(vec![], writer_cfg).expect("spawn writer");
     tx.send(vec![callee.clone(), caller.clone()])

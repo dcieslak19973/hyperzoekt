@@ -1,26 +1,26 @@
-{{- if .Values.search.enabled }}
+{{- if .Values.mcp.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-search
+  name: {{ include "hyperzoekt.fullname" . }}-mcp
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: search
-  {{- with .Values.search.annotations }}
+    app.kubernetes.io/component: mcp
+  {{- with .Values.mcp.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ .Values.search.replicaCount }}
+  replicas: {{ .Values.mcp.replicaCount }}
   selector:
     matchLabels:
       {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: search
+      app.kubernetes.io/component: mcp
   template:
     metadata:
       labels:
         {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: search
+        app.kubernetes.io/component: mcp
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -30,19 +30,28 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: search
+        - name: mcp
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: {{ .Values.search.image.registry }}/{{ .Values.search.image.repository }}:{{ .Values.search.image.tag }}
-          imagePullPolicy: {{ .Values.search.image.pullPolicy }}
-          command:
-            - /app/dzr-http-search
-            - --listen
-            - 0.0.0.0:{{ .Values.search.service.port }}
+          image: {{ .Values.mcp.image.registry }}/{{ .Values.mcp.image.repository }}:{{ .Values.mcp.image.tag }}
+          imagePullPolicy: {{ .Values.mcp.image.pullPolicy }}
+          command: ["/app/zoekt-mcp-search", "--host", "0.0.0.0", "--port", {{ .Values.mcp.service.port | quote }}]
           ports:
             - name: http
-              containerPort: {{ .Values.search.service.port }}
+              containerPort: {{ .Values.mcp.service.port }}
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           env:
             - name: REDIS_URL
               value: {{ include "hyperzoekt.redisUrl" . | quote }}
@@ -56,87 +65,87 @@ spec:
               value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
             - name: SURREAL_DB
               value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
-            {{- with .Values.search.env }}
+            {{- with .Values.mcp.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-            {{- with .Values.search.extraEnvVars }}
+            {{- with .Values.mcp.extraEnvVars }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml .Values.search.resources | nindent 12 }}
-      {{- with .Values.search.nodeSelector }}
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+      {{- with .Values.mcp.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.search.tolerations }}
+      {{- with .Values.mcp.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.search.affinity }}
+      {{- with .Values.mcp.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
 ---
-{{- if and .Values.search.enabled (eq .Values.search.exposure.type "service") }}
+{{- if and .Values.mcp.enabled (eq .Values.mcp.exposure.type "service") }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-search
+  name: {{ include "hyperzoekt.fullname" . }}-mcp
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: search
-  {{- with .Values.search.annotations }}
+    app.kubernetes.io/component: mcp
+  {{- with .Values.mcp.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.search.exposure.serviceType }}
+  type: {{ .Values.mcp.exposure.serviceType }}
   ports:
-    - port: {{ .Values.search.service.port }}
+    - port: {{ .Values.mcp.service.port }}
       targetPort: http
       protocol: TCP
       name: http
   selector:
     {{- include "hyperzoekt.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: search
+    app.kubernetes.io/component: mcp
 {{- end }}
 ---
-{{- if and .Values.search.enabled (eq .Values.search.exposure.type "ingress") .Values.search.exposure.ingress.enabled }}
+{{- if and .Values.mcp.enabled (eq .Values.mcp.exposure.type "ingress") .Values.mcp.exposure.ingress.enabled }}
 {{- $fullName := include "hyperzoekt.fullname" . }}
-{{- $svcPort := .Values.search.service.port }}
+{{- $svcPort := .Values.mcp.service.port }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ $fullName }}-search
+  name: {{ $fullName }}-mcp
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: search
-  {{- with .Values.search.exposure.ingress.annotations }}
+    app.kubernetes.io/component: mcp
+  {{- with .Values.mcp.exposure.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- if .Values.search.exposure.ingress.className }}
-  ingressClassName: {{ .Values.search.exposure.ingress.className }}
+  {{- if .Values.mcp.exposure.ingress.className }}
+  ingressClassName: {{ .Values.mcp.exposure.ingress.className }}
   {{- end }}
-  {{- if and .Values.search.exposure.ingress.tls.enabled .Values.search.exposure.ingress.tls.secretName }}
+  {{- if and .Values.mcp.exposure.ingress.tls.enabled .Values.mcp.exposure.ingress.tls.secretName }}
   tls:
     - hosts:
-        - {{ .Values.search.exposure.ingress.host | quote }}
-      secretName: {{ .Values.search.exposure.ingress.tls.secretName }}
+        - {{ .Values.mcp.exposure.ingress.host | quote }}
+      secretName: {{ .Values.mcp.exposure.ingress.tls.secretName }}
   {{- end }}
   rules:
-    - host: {{ .Values.search.exposure.ingress.host | quote }}
+    - host: {{ .Values.mcp.exposure.ingress.host | quote }}
       http:
         paths:
-          - path: {{ .Values.search.exposure.ingress.path }}
-            {{- if and .Values.search.exposure.ingress.pathType (semverCompare ">=1.18-0" $.Capabilities.KubeVersion.GitVersion) }}
-            pathType: {{ .Values.search.exposure.ingress.pathType }}
+          - path: {{ .Values.mcp.exposure.ingress.path }}
+            {{- if and .Values.mcp.exposure.ingress.pathType (semverCompare ">=1.18-0" $.Capabilities.KubeVersion.GitVersion) }}
+            pathType: {{ .Values.mcp.exposure.ingress.pathType }}
             {{- end }}
             backend:
               service:
-                name: {{ $fullName }}-search
+                name: {{ $fullName }}-mcp
                 port:
                   number: {{ $svcPort }}
 {{- end }}

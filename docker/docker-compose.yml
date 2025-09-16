@@ -18,28 +18,39 @@ services:
     restart: unless-stopped
     environment:
       SURREAL_CAPS_ALLOW_EXPERIMENTAL: graphql
-  # Note: no in-container healthcheck because the surrealdb image may not include curl/wget.
-  # An external prober service below performs the HTTP health check instead.
+
+  surrealdb-prober:
+    image: curlimages/curl:8.3.0
+    command: ["tail", "-f", "/dev/null"]
+    depends_on:
+      surrealdb:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://surrealdb:8001/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
 
   zoekt-indexer:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "7676:7676"
+      - "7200:7200"
     environment:
       - DISTRIBUTED_ZOEKT_REPO_EVENTS=1
       - REDIS_URL=redis://redis:6379
-      # - RUST_LOG=debug      
+      # - RUST_LOG=debug
       - SURREALDB_URL=surrealdb:8001
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_DB_VERBOSE_PAYLOADS=1
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:7676
-      - ZOEKT_ENDPOINT=http://zoekt-indexer:7676
-    command: ["/app/dzr-indexer", "--host", "0.0.0.0", "--port", "7676"]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7200
+      - ZOEKT_ENDPOINT=http://zoekt-indexer:7200
+    command: ["/app/zoekt-indexer", "--host", "0.0.0.0", "--port", "7200"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -52,7 +63,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "7878:7878"
+      - "7201:7201"
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -61,9 +72,9 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - ZOEKT_ADMIN_USERNAME=admin
-      - ZOEKT_ADMIN_PASSWORD=password
-    command: ["/app/dzr-admin", "--host", "0.0.0.0", "--port", "7878"]
+      - ZOEKTD_ADMIN_USERNAME=admin
+      - ZOEKTD_ADMIN_PASSWORD=password
+    command: ["/app/zoekt-admin", "--host", "0.0.0.0", "--port", "7201"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -78,16 +89,15 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
-      # Poll interval in seconds; override if you want a different cadence
       - SURREALDB_URL=surrealdb:8001
       - SURREALDB_USERNAME=root
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
       - ZOEKTD_POLL_INTERVAL_SECONDS=30
-    command: ["/app/dzr-admin-poller"]
     ports:
-      - "9900:9900"
+      - "7202:7202"
+    command: ["/app/zoekt-admin-poller", "--host", "0.0.0.0", "--port", "7202"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -100,7 +110,7 @@ services:
       zoekt-admin-poller:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS http://zoekt-admin-poller:9900/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      test: ["CMD-SHELL", "curl -sS http://zoekt-admin-poller:7202/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -111,7 +121,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "8080:8080"
+      - "7203:7203"
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -120,8 +130,8 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:8080
-    command: ["/app/dzr-http-search", "--host", "0.0.0.0", "--port", "8080"]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7203
+    command: ["/app/zoekt-http-search", "--host", "0.0.0.0", "--port", "7203"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -134,7 +144,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "7979:7979"
+      - "7204:7204"
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -143,8 +153,8 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:7979
-    command: ["/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "7979"]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:7204
+    command: ["/app/zoekt-mcp-search", "--host", "0.0.0.0", "--port", "7204"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -157,7 +167,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "7677:7677"
+      - "7205:7205"
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -166,13 +176,18 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      # - SURREAL_DB_VERBOSE_PAYLOADS=1
-    command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7677"]
+      # Enqueue embedding jobs after indexing (default ON for local dev)
+      - HZ_ENABLE_EMBED_JOBS=1
+      # Optional: override the embed jobs queue key (default: zoekt:embed_jobs)
+      # - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+    command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7205"]
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       surrealdb-prober:
+        condition: service_healthy
+      tei-prober:
         condition: service_healthy
 
   hyperzoekt-webui:
@@ -180,7 +195,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "8081:8081"
+      - "7206:7206"
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -189,7 +204,7 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-    command: ["/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "8081"]
+    command: ["/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "7206"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -197,15 +212,79 @@ services:
       surrealdb-prober:
         condition: service_healthy
 
-  surrealdb-prober:
+  hyperzoekt-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "7207:7207"
+    environment:
+      - RUST_LOG=info
+      - SURREALDB_URL=http://surrealdb:8001
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - HZ_MCP_HOST=0.0.0.0
+      - HZ_MCP_PORT=7207
+      - HZ_WEBUI_BASE=http://hyperzoekt-webui:7206
+      - HZ_TEI_BASE=http://tei:80
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+    command: ["/app/hyperzoekt-mcp", "--host", "0.0.0.0", "--port", "7207"]
+    restart: unless-stopped
+    depends_on:
+      surrealdb-prober:
+        condition: service_healthy
+      hyperzoekt-webui:
+        condition: service_started
+      tei-prober:
+        condition: service_healthy
+
+  hyperzoekt-embed-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - SURREALDB_URL=http://surrealdb:8001
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+      - HZ_EMBED_PROCESSING_TTL_SECONDS=300
+      # Model id used for embeddings (required)
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      # Debugging toggles - enable to log SQL and verify DB updates
+      # - HZ_EMBED_DEBUG_SQL=1
+      # - HZ_EMBED_DEBUG_DB=1
+    command: ["/app/hyperzoekt-embed-worker", "--host", "0.0.0.0", "--port", "7208"]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  # Local embeddings service powered by Hugging Face TEI
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    ports:
+      - "8088:80"
+    restart: unless-stopped
+    command: ["--model-id", "jinaai/jina-embeddings-v2-base-code"]
+
+  # External prober for TEI health (avoids requiring curl inside the TEI image)
+  tei-prober:
     image: curlimages/curl:8.3.0
     command: ["tail", "-f", "/dev/null"]
     depends_on:
-      surrealdb:
+      tei:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS http://surrealdb:8001/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      test: ["CMD-SHELL", "curl -sS http://tei:80/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
       interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

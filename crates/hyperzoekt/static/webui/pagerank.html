@@ -43,6 +43,11 @@
             return;
         }
 
+        // Persist selection
+        try {
+            window.localStorage.setItem('hz.pagerank.repo', selectedRepo);
+        } catch (e) { /* ignore storage errors */ }
+
         loadingDiv.style.display = 'block';
         contentDiv.style.display = 'none';
 
@@ -186,9 +191,21 @@
         }
     }
 
-    // Load repositories on page load
+    // Load repositories on page load and restore previous selection
     document.addEventListener('DOMContentLoaded', function () {
-        // Repositories are already loaded in the template
+        const select = document.getElementById('repo-select');
+        try {
+            const saved = window.localStorage.getItem('hz.pagerank.repo');
+            if (saved) {
+                // Only apply if option exists
+                const opt = Array.from(select.options).find(o => o.value === saved);
+                if (opt) {
+                    select.value = saved;
+                    // Trigger initial load
+                    loadPageRankData();
+                }
+            }
+        } catch (e) { /* ignore storage errors */ }
     });
 </script>
 

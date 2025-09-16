@@ -92,7 +92,7 @@ When running the indexer without a remote SurrealDB configured, the indexer may 
 Configuration summary:
 
 - Environment variables:
-	- `SURREALDB_URL` — if set, the indexer will connect to this remote SurrealDB RPC/WebSocket endpoint (for example `ws://localhost:8000/rpc`) instead of embedding.
+  - `SURREALDB_URL` — if set, the indexer will connect to this remote SurrealDB HTTP endpoint (for example `http://localhost:8001`) instead of embedding.
 	- `SURREALDB_EMBED_MODE` — `file` (default) or `memory` (ephemeral).
 	- `SURREALDB_EMBED_PATH` — path for embedded DB files (default: `.data/surreal.db`).
 
@@ -106,6 +106,37 @@ Notes:
 - The launcher will create the `.data/` directory automatically if it does not exist.
 - Use `SURREAL_EMBED_MODE=memory` for ephemeral runs (tests, CI) to avoid creating persistent files.
 - The repository's `.gitignore` should include `.data/` so DB files are not accidentally committed.
+
+## Embedding Jobs (optional)
+
+You can enqueue one Redis job per indexed entity to drive background code embeddings. This is disabled by default to avoid slowing indexing.
+
+- Enable: set `HZ_ENABLE_EMBED_JOBS=1` in the `hyperzoekt-indexer` environment.
+- Queue: override with `HZ_EMBED_JOBS_QUEUE` (default: `zoekt:embed_jobs`).
+- Redis: ensure `REDIS_URL` (or `REDIS_USERNAME`/`REDIS_PASSWORD`) is configured.
+
+docker-compose example (indexer):
+
+```yaml
+    environment:
+      - REDIS_URL=redis://redis:6379
+      # Enable to enqueue embedding jobs after indexing
+      - HZ_ENABLE_EMBED_JOBS=1
+      # Optional: override the embed jobs queue key (default: zoekt:embed_jobs)
+      # - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+```
+
+Quick verification:
+
+```bash
+# Observe queue length grow after an indexing run
+docker compose exec redis redis-cli LLEN zoekt:embed_jobs
+
+# Peek a few jobs (JSON lines)
+docker compose exec redis redis-cli LRANGE zoekt:embed_jobs 0 2
+```
+
+Job schema (JSON): `{ stable_id, repo_name, language, kind, name, source_url? }`.
 
 ## OpenTelemetry / Tracing
 

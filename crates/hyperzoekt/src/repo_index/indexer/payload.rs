@@ -47,6 +47,8 @@ pub struct MethodItem {
     pub signature: String,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    // Full text of this method's body (computed at index time when possible)
+    pub source_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,8 @@ pub struct EntityPayload {
     // Raw callee names or stable_ids (best-effort) used by db_writer to create call edges.
     #[serde(default, deserialize_with = "empty_vec_if_null")]
     pub calls: Vec<String>,
+    /// Full text used for embeddings. For functions/methods this is the function body text.
+    pub source_content: Option<String>,
 }
 
 /// Compute a repository-relative path from a file path and repo name.

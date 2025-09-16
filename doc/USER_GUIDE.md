@@ -8,7 +8,7 @@ Prerequisites
 -------------
 - Rust toolchain (for running local binaries): https://rustup.rs/
 - Redis (for distributed coordination). Default: `redis://127.0.0.1:6379`.
-- SurrealDB (for metadata and entity storage). Default RPC endpoint example: `ws://127.0.0.1:8000/rpc`.
+- SurrealDB (for metadata and entity storage). Default HTTP endpoint example: `http://127.0.0.1:8001`.
 - Network access to the Git repositories you want to index.
 
 For a quick development setup use the provided Docker Compose in `docker/` which starts Redis and SurrealDB for you:
@@ -31,7 +31,7 @@ RUST_LOG=debug REDIS_URL=redis://127.0.0.1:7777 ZOEKT_ADMIN_USERNAME=admin ZOEKT
 Example: start the Hyperzoekt Web UI (browsing/search) and point it at Redis + SurrealDB:
 
 ```bash
-RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=ws://127.0.0.1:8000/rpc \
+RUST_LOG=info REDIS_URL=redis://127.0.0.1:6379 SURREALDB_URL=http://127.0.0.1:8001 \
   cargo run --bin hyperzoekt-webui -- --port 7879 --host 127.0.0.1
 ```
 

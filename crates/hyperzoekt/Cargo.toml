@@ -10,6 +10,7 @@ regex = "1"
 ignore = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tree-sitter = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-python = { version = "0.23", package = "tree-sitter-python" }
@@ -50,6 +51,8 @@ uuid = { version = "1.0", features = ["v4"] }
 # zoekt-distributed for shared event types
 zoekt-distributed = { path = "../zoekt-distributed" }
 "zoekt-rs" = { path = "../zoekt-rs" }
+ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http"] }
+async-trait = "0.1"
 
 # Web UI dependencies
 axum = { version = "0.8", features = ["json", "query"] }
@@ -96,5 +99,15 @@ path = "src/bin/hyperzoekt-indexer.rs"
 [[bin]]
 name = "hyperzoekt-webui"
 path = "src/bin/hyperzoekt-webui.rs"
+
+ 
+
+[[bin]]
+name = "hyperzoekt-embed-worker"
+path = "src/bin/hyperzoekt-embed-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-mcp"
+path = "src/bin/hyperzoekt-mcp.rs"
 
 

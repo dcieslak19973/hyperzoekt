@@ -127,6 +127,7 @@ fn generic_class_function_walk<'a>(
                                 signature: extract_signature(&ch, src).to_string(),
                                 start_line: Some(ch.start_position().row as u32),
                                 end_line: Some(ch.end_position().row as u32),
+                                source_content: None,
                             });
                         } else {
                             stack_impl.push(ch);
@@ -286,6 +287,7 @@ fn generic_class_function_walk<'a>(
                             signature: extract_signature(&child, src).to_string(),
                             start_line: Some(child.start_position().row as u32),
                             end_line: Some(child.end_position().row as u32),
+                            source_content: None,
                         });
                     } else {
                         stack2.push(child);
@@ -366,6 +368,7 @@ fn generic_class_function_walk<'a>(
                                             signature: extract_signature(&node, src).to_string(),
                                             start_line: Some(node.start_position().row as u32),
                                             end_line: Some(node.end_position().row as u32),
+                                            source_content: None,
                                         },
                                     );
                                     // traverse children but do not emit a function entity
@@ -404,6 +407,7 @@ fn generic_class_function_walk<'a>(
                                                     .to_string(),
                                                 start_line: Some(node.start_position().row as u32),
                                                 end_line: Some(node.end_position().row as u32),
+                                                source_content: None,
                                             },
                                         ],
                                     });
@@ -912,6 +916,7 @@ pub fn extract_entities<'a>(
                         signature: out[i].signature.clone(),
                         start_line: Some(out[i].start_line as u32),
                         end_line: Some(out[i].end_line as u32),
+                        source_content: None,
                     };
                     out[idx].methods.push(method);
                     // remove only for non-Python languages

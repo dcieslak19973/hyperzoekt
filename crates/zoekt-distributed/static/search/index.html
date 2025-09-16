@@ -626,6 +626,17 @@
 
             try {
                 const resp = await fetch('/search?' + params.toString());
+                if (!resp.ok) {
+                    // Try to parse JSON error; otherwise use text
+                    let errMsg = `HTTP ${resp.status}`;
+                    try {
+                        const errJson = await resp.json();
+                        if (errJson && errJson.error) errMsg = errJson.error;
+                    } catch (_) {
+                        try { errMsg = await resp.text(); } catch (_) { }
+                    }
+                    throw new Error(errMsg);
+                }
                 const json = await resp.json();
 
                 if (json.results && json.results.length > 0) {
@@ -651,7 +662,8 @@
                     noResults.style.display = 'block';
                 }
             } catch (err) {
-                resultsContainer.innerHTML = `<div style="color: var(--danger); padding: 20px; text-align: center;">Error: ${err.toString()}</div>`;
+                const msg = (err && err.message) ? err.message : String(err);
+                resultsContainer.innerHTML = `<div style="color: var(--danger); padding: 20px; text-align: center;">Error: ${msg}</div>`;
                 searchStats.style.display = 'none';
                 noResults.style.display = 'none';
             }
