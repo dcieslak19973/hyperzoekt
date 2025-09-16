@@ -202,6 +202,13 @@ impl DistributedSearchService {
             url.push_str("&case=yes");
         }
 
+        // Log the exact URL and context_lines sent to the indexer for debugging
+        tracing::info!(
+            "Indexing request to {} with context_lines={}",
+            url,
+            context_lines
+        );
+
         // Make the request with timeout
         let response = timeout(Duration::from_secs(30), client.get(&url).send())
             .await
