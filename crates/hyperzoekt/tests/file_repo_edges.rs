@@ -36,6 +36,7 @@ fn make_entity(file: &str, name: &str, repo: &str, stable_suffix: &str) -> Entit
         repo_name: repo.to_string(),
         source_url: None,
         source_display: Some(file.to_string()),
+        source_content: None,
         calls: Vec::new(),
         methods: Vec::new(),
     }

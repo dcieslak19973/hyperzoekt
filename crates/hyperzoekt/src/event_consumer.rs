@@ -514,7 +514,8 @@ impl EventProcessor {
                 }
 
                 // Run blocking index build off the tokio runtime
-                match tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                // Run indexing and DB writes; return payloads for optional embed enqueue
+                match tokio::task::spawn_blocking(move || -> Result<Vec<EntityPayload>, anyhow::Error> {
                     let (mut svc, stats) = RepoIndexService::build(temp_dir_clone.as_path())?;
                     // Compute pagerank (may be cheap) and surface stats
                     svc.compute_pagerank();
@@ -553,6 +554,22 @@ impl EventProcessor {
                     }
 
                     // Extract EntityPayload from the service for persistence
+                    // Helper: extract full text for a span from a file (1-based inclusive line numbers)
+                    fn slice_file_lines(path: &str, start1: Option<u32>, end1: Option<u32>) -> Option<String> {
+                        let src = std::fs::read_to_string(path).ok()?;
+                        let lines: Vec<&str> = src.lines().collect();
+                        if lines.is_empty() {
+                            return Some(String::new());
+                        }
+                        // Convert 1-based inclusive to 0-based
+                        let s0 = start1.unwrap_or(0).saturating_sub(1) as usize;
+                        let e0 = end1.unwrap_or(0).saturating_sub(1) as usize;
+                        let s = s0.min(lines.len().saturating_sub(1));
+                        let e = e0.min(lines.len().saturating_sub(1));
+                        if s > e { return Some(String::new()); }
+                        Some(lines[s..=e].join("\n"))
+                    }
+
                     let payloads: Vec<EntityPayload> = svc
                         .entities
                         .iter()
@@ -681,6 +698,28 @@ impl EventProcessor {
                                 url
                             });
 
+                            // Compute full function text for embeddings: use non-file entities' spans
+                            let ent_source_content = if !matches!(ent.kind, EntityKind::File) {
+                                slice_file_lines(&file.path, start_field, end_field)
+                            } else {
+                                None
+                            };
+
+                            // Enrich methods with source_content based on their spans
+                            let methods_with_src: Vec<crate::repo_index::indexer::payload::MethodItem> = ent.methods.iter().map(|mi| {
+                                let start1 = mi.start_line.map(|v| v.saturating_add(1));
+                                let end1 = mi.end_line.map(|v| v.saturating_add(1));
+                                let src_txt = slice_file_lines(&file.path, start1, end1);
+                                crate::repo_index::indexer::payload::MethodItem {
+                                    name: mi.name.clone(),
+                                    visibility: mi.visibility.clone(),
+                                    signature: mi.signature.clone(),
+                                    start_line: mi.start_line,
+                                    end_line: mi.end_line,
+                                    source_content: src_txt,
+                                }
+                            }).collect();
+
                             EntityPayload {
                                 language: file.language.clone(),
                                 kind: ent.kind.as_str().to_string(),
@@ -694,7 +733,7 @@ impl EventProcessor {
                                 rank: Some(ent.rank),
                                 imports,
                                 unresolved_imports,
-                                methods: ent.methods.clone(),
+                                methods: methods_with_src,
                                 stable_id,
                                 repo_name: repo_name.clone(),
                                 source_url: computed_source,
@@ -707,6 +746,7 @@ impl EventProcessor {
                                             }
                                             calls
                                         },
+                                source_content: ent_source_content,
                             }
                         })
                         .collect();
@@ -773,15 +813,23 @@ impl EventProcessor {
                         );
                     }
 
-                    Ok(())
+                    Ok(payloads)
                 })
                 .await
                 {
-                    Ok(Ok(())) => {
+                    Ok(Ok(payloads)) => {
                         log::info!(
                             "Successfully processed indexing_finished for {}",
                             event.repo_name
                         );
+                        // Optionally enqueue embedding jobs to Redis
+                        if Self::embed_jobs_enabled() {
+                            if let Err(e) = Self::enqueue_embedding_jobs(&event.repo_name, &payloads).await {
+                                log::warn!("Failed to enqueue embedding jobs: {}", e);
+                            }
+                        } else {
+                            log::debug!("Embedding jobs disabled (HZ_ENABLE_EMBED_JOBS not set)");
+                        }
                     }
                     Ok(Err(e)) => {
                         log::error!("Indexer failed for {}: {}", event.repo_name, e);
@@ -993,6 +1041,73 @@ impl EventProcessor {
             temp_dir.display()
         );
         Ok(temp_dir)
+    }
+}
+
+impl EventProcessor {
+    fn embed_jobs_enabled() -> bool {
+        let v = std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default();
+        matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+    }
+
+    async fn enqueue_embedding_jobs(
+        repo_name: &str,
+        payloads: &[EntityPayload],
+    ) -> Result<usize, anyhow::Error> {
+        let pool_opt = zoekt_distributed::redis_adapter::create_redis_pool();
+        let pool = match pool_opt {
+            Some(p) => p,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
+                ))
+            }
+        };
+
+        #[derive(serde::Serialize)]
+        struct EmbeddingJob<'a> {
+            stable_id: &'a str,
+            repo_name: &'a str,
+            language: &'a str,
+            kind: &'a str,
+            name: &'a str,
+            source_url: Option<&'a str>,
+        }
+
+        let queue_key =
+            std::env::var("HZ_EMBED_JOBS_QUEUE").unwrap_or_else(|_| "zoekt:embed_jobs".to_string());
+
+        let mut jobs: Vec<String> = Vec::with_capacity(payloads.len());
+        for p in payloads {
+            let job = EmbeddingJob {
+                stable_id: &p.stable_id,
+                repo_name,
+                language: &p.language,
+                kind: &p.kind,
+                name: &p.name,
+                source_url: p.source_url.as_deref(),
+            };
+            match serde_json::to_string(&job) {
+                Ok(s) => jobs.push(s),
+                Err(e) => {
+                    log::warn!(
+                        "Skipping embed job for stable_id={} due to serialization error: {}",
+                        p.stable_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        let mut conn = pool.get().await?;
+        let mut total = 0usize;
+        for chunk in jobs.chunks(500) {
+            let _: () =
+                deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &queue_key, chunk).await?;
+            total += chunk.len();
+        }
+        log::info!("Enqueued {} embedding jobs to '{}'", total, queue_key);
+        Ok(total)
     }
 }
 

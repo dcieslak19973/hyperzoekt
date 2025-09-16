@@ -1,6 +1,5 @@
 #[cfg(feature = "otel")]
 pub fn init_otel_from_env() {
-    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;

@@ -444,7 +444,7 @@
                         <input type="text" name="branches" value="*" />
                     </label>
                     <label>Context lines:
-                        <select name="context_lines">
+                        <select name="context">
                             <option value="1">1</option>
                             <option value="2">2</option>
                             <option value="5" selected>5</option>
@@ -619,6 +619,13 @@
             const params = new URLSearchParams();
             for (const [k, v] of fd.entries()) if (v) params.append(k, v);
 
+            // Basic client-side validation: require a non-empty `q` parameter
+            const q = fd.get('q');
+            if (!q || String(q).trim().length === 0) {
+                alert('Please enter a search query.');
+                return;
+            }
+
             // Show loading state
             resultsContainer.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--muted);">Searching...</div>';
             searchStats.style.display = 'none';
@@ -626,6 +633,17 @@
 
             try {
                 const resp = await fetch('/search?' + params.toString());
+                if (!resp.ok) {
+                    // Try to parse JSON error; otherwise use text
+                    let errMsg = `HTTP ${resp.status}`;
+                    try {
+                        const errJson = await resp.json();
+                        if (errJson && errJson.error) errMsg = errJson.error;
+                    } catch (_) {
+                        try { errMsg = await resp.text(); } catch (_) { }
+                    }
+                    throw new Error(errMsg);
+                }
                 const json = await resp.json();
 
                 if (json.results && json.results.length > 0) {
@@ -651,7 +669,8 @@
                     noResults.style.display = 'block';
                 }
             } catch (err) {
-                resultsContainer.innerHTML = `<div style="color: var(--danger); padding: 20px; text-align: center;">Error: ${err.toString()}</div>`;
+                const msg = (err && err.message) ? err.message : String(err);
+                resultsContainer.innerHTML = `<div style="color: var(--danger); padding: 20px; text-align: center;">Error: ${msg}</div>`;
                 searchStats.style.display = 'none';
                 noResults.style.display = 'none';
             }

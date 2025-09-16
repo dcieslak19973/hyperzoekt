@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use hyperzoekt::event_consumer;
-use log::{info, LevelFilter};
+use log::{error, info, LevelFilter};
 use std::path::PathBuf;
 
 /// Continuous repo indexer that subscribes to Redis events from zoekt-distributed
@@ -105,12 +105,19 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Starting continuous indexer, waiting for Redis events from zoekt-distributed...");
 
+    // Ensure Surreal schema for embeddings exists. The indexer owns the
+    // entity table lifecycle so it is responsible for initializing fields
+    // when standing up fresh Surreal instances for local/dev environments.
+    // Schema initialization for core tables (including embedding fields) is performed
+    // by `db_writer::init_schema`. The indexer does not own table lifecycle.
+    info!("indexer skipping schema init; db_writer is authoritative for schema");
+
     // Start the event consumer system and get the processor handle
     let processor_handle =
         match event_consumer::start_event_system_with_ttl(processing_ttl_seconds).await {
             Ok(handle) => handle,
             Err(e) => {
-                log::error!("Failed to start event system: {}", e);
+                error!("Failed to start event system: {}", e);
                 std::process::exit(1);
             }
         };
@@ -119,7 +126,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Wait for the processor to complete (this should never happen in normal operation)
     if let Err(e) = processor_handle.await {
-        log::error!("Event processor task panicked: {:?}", e);
+        error!("Event processor task panicked: {:?}", e);
         std::process::exit(1);
     }
 

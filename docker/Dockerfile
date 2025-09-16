@@ -20,7 +20,7 @@ COPY . .
 RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller
 
 # Build hyperzoekt binaries with optional OTEL feature (safe even if unused at runtime)
-RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-webui
+RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-embed-worker --bin hyperzoekt-webui --bin hyperzoekt-mcp
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
@@ -33,11 +33,13 @@ WORKDIR /app
 
 # Copy the built binaries from the builder stage
 COPY --from=builder /app/target/release/dzr-admin /app/
+COPY --from=builder /app/target/release/dzr-admin-poller /app/
 COPY --from=builder /app/target/release/dzr-http-search /app/
 COPY --from=builder /app/target/release/dzr-indexer /app/
 COPY --from=builder /app/target/release/dzr-mcp-search /app/
-COPY --from=builder /app/target/release/dzr-admin-poller /app/
+COPY --from=builder /app/target/release/hyperzoekt-embed-worker /app/
 COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
+COPY --from=builder /app/target/release/hyperzoekt-mcp /app/
 COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 
 # Copy configuration and static files

@@ -26,6 +26,7 @@ pub mod graph_api;
 pub mod index;
 pub mod utils; // public graph traversal API
                // Test utilities exposed for integration tests.
+pub mod similarity;
 pub mod test_utils;
 
 // Optional OpenTelemetry/tracing initializer. The functions inside are

@@ -35,14 +35,23 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ .Values.admin.image.registry }}/{{ .Values.admin.image.repository }}:{{ .Values.admin.image.tag }}
           imagePullPolicy: {{ .Values.admin.image.pullPolicy }}
-          command:
-            - /app/dzr-admin
-            - --bind
-            - 0.0.0.0:{{ .Values.admin.service.port }}
+          command: ["/app/dzr-admin", "--bind", "0.0.0.0:{{ .Values.admin.service.port }}"]
           ports:
             - name: http
               containerPort: {{ .Values.admin.service.port }}
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           env:
             - name: REDIS_URL
               value: {{ include "hyperzoekt.redisUrl" . | quote }}

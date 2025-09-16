@@ -16,7 +16,7 @@ use anyhow::Result;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
@@ -63,8 +63,17 @@ struct SearchResponse {
 async fn search_handler(
     State(search_service): State<DistributedSearchService>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<SearchResponse>, StatusCode> {
+) -> impl IntoResponse {
     tracing::info!("HTTP search request: {:?}", query);
+
+    // Log selected important parameters to help debug context line behavior.
+    tracing::info!(
+        "search params: q='{}' context={:?} max_results={:?} repo={:?}",
+        query.q,
+        query.context,
+        query.max_results,
+        query.repo
+    );
 
     let params = DistributedSearchTool {
         regex: query.q,
@@ -104,11 +113,14 @@ async fn search_handler(
                 elapsed_ms,
             };
 
-            Ok(Json(response))
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
             tracing::error!("Search failed: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            let body = serde_json::json!({
+                "error": format!("{}", e),
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
     }
 }

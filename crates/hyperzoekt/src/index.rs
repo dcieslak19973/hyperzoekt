@@ -124,6 +124,7 @@ pub fn index_single_file(
             end_line: end_field,
             // calls removed
             doc: ent.doc.clone(),
+            source_content: None,
             rank: Some(ent.rank),
             imports,
             unresolved_imports,

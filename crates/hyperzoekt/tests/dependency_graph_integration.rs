@@ -61,6 +61,7 @@ async fn dependency_graph_integration_test() {
         repo_name: "repo_a".into(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };
@@ -82,6 +83,7 @@ async fn dependency_graph_integration_test() {
         repo_name: "repo_b".into(),
         source_url: None,
         source_display: None,
+        source_content: None,
         calls: vec![],
         methods: vec![],
     };

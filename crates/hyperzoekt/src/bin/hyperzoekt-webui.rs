@@ -25,12 +25,11 @@ use pulldown_cmark::{Options as MdOptions, Parser as MdParser};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use surrealdb::Surreal;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
+use hyperzoekt::similarity;
 
 // Minimal helper to normalize Surreal id field (string or object with tb/id)
 
@@ -41,6 +40,7 @@ const REPO_TEMPLATE: &str = include_str!("../../static/webui/repo.html");
 const ENTITY_TEMPLATE: &str = include_str!("../../static/webui/entity.html");
 const SEARCH_TEMPLATE: &str = include_str!("../../static/webui/search.html");
 const PAGERANK_TEMPLATE: &str = include_str!("../../static/webui/pagerank.html");
+const DUPES_TEMPLATE: &str = include_str!("../../static/webui/dupes.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -183,65 +183,11 @@ struct RepoSummaryQueryResult {
     pub languages: Vec<Option<String>>,
 }
 
+use hyperzoekt::db_writer::connection::SurrealConnection;
+
 #[derive(Clone)]
 pub struct Database {
     db: Arc<SurrealConnection>,
-}
-
-enum SurrealConnection {
-    Local(Surreal<surrealdb::engine::local::Db>),
-    RemoteHttp(Surreal<surrealdb::engine::remote::http::Client>),
-    RemoteWs(Surreal<surrealdb::engine::remote::http::Client>),
-}
-
-impl Clone for SurrealConnection {
-    fn clone(&self) -> Self {
-        // Since we're using Arc<SurrealConnection>, we don't actually clone the connection
-        // Instead, we return a reference to the same connection
-        // This is safe because Arc handles the reference counting
-        match self {
-            SurrealConnection::Local(db) => SurrealConnection::Local(db.clone()),
-            SurrealConnection::RemoteHttp(db) => SurrealConnection::RemoteHttp(db.clone()),
-            SurrealConnection::RemoteWs(db) => SurrealConnection::RemoteWs(db.clone()),
-        }
-    }
-}
-
-impl SurrealConnection {
-    #[allow(dead_code)]
-    async fn use_ns(&self, namespace: &str) -> Result<(), surrealdb::Error> {
-        match self {
-            SurrealConnection::Local(db) => db.use_ns(namespace).await,
-            SurrealConnection::RemoteHttp(db) => db.use_ns(namespace).await,
-            SurrealConnection::RemoteWs(db) => db.use_ns(namespace).await,
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn use_db(&self, database: &str) -> Result<(), surrealdb::Error> {
-        match self {
-            SurrealConnection::Local(db) => db.use_db(database).await,
-            SurrealConnection::RemoteHttp(db) => db.use_db(database).await,
-            SurrealConnection::RemoteWs(db) => db.use_db(database).await,
-        }
-    }
-
-    async fn query(&self, sql: &str) -> Result<surrealdb::Response, surrealdb::Error> {
-        // Centralized logging for all SurrealDB queries: log SQL and duration
-        log::debug!("Executing SurrealDB query: {}", sql);
-        let start = Instant::now();
-        let res = match self {
-            SurrealConnection::Local(db) => db.query(sql).await,
-            SurrealConnection::RemoteHttp(db) => db.query(sql).await,
-            SurrealConnection::RemoteWs(db) => db.query(sql).await,
-        };
-        let elapsed = start.elapsed();
-        match &res {
-            Ok(_) => log::debug!("SurrealDB query succeeded in {:?}: {}", elapsed, sql),
-            Err(e) => log::debug!("SurrealDB query failed in {:?}: {} -> {}", elapsed, sql, e),
-        }
-        res
-    }
 }
 
 impl Database {
@@ -250,15 +196,9 @@ impl Database {
         ns: &str,
         db_name: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use hyperzoekt::db_writer::connection::{connect, SurrealConnection as HZConn};
-
-        let conn = connect(&url.map(|s| s.to_string()), &None, &None, ns, db_name).await?;
-        let db = match conn {
-            HZConn::Local(arc) => SurrealConnection::Local(arc.as_ref().clone()),
-            HZConn::RemoteHttp(c) => SurrealConnection::RemoteHttp(c),
-            HZConn::RemoteWs(c) => SurrealConnection::RemoteWs(c),
-        };
-        Ok(Self { db: Arc::new(db) })
+        use hyperzoekt::db_writer::connection::connect as hz_connect;
+        let conn = hz_connect(&url.map(|s| s.to_string()), &None, &None, ns, db_name).await?;
+        Ok(Self { db: Arc::new(conn) })
     }
 
     pub async fn get_repo_summaries(&self) -> Result<Vec<RepoSummary>, Box<dyn std::error::Error>> {
@@ -303,66 +243,26 @@ impl Database {
         // Fall back to matching file path prefixes for older/imported records that
         // don't have `repo_name` populated.
         let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let entities: Vec<EntityPayload> = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut resp = db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY file, start_line",
-                        entity_fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .await?;
-                match resp.take::<Vec<EntityPayload>>(0) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!(
-                                "get_entities_for_repo: failed to deserialize response for repo='{}': {}",
-                                repo_name,
-                                e
-                            );
-                        return Err(Box::new(e));
-                    }
-                }
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut resp = db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY file, start_line",
-                        entity_fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .await?;
-                match resp.take::<Vec<EntityPayload>>(0) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!(
-                            "get_entities_for_repo: failed to deserialize response for repo='{}': {}",
-                            repo_name,
-                            e
-                        );
-                        return Err(Box::new(e));
-                    }
-                }
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut resp = db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY file, start_line",
-                        entity_fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .await?;
-                match resp.take::<Vec<EntityPayload>>(0) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!(
-                            "get_entities_for_repo: failed to deserialize response for repo='{}': {}",
-                            repo_name,
-                            e
-                        );
-                        return Err(Box::new(e));
-                    }
-                }
+        let sql = format!(
+            "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY file, start_line",
+            entity_fields
+        );
+        let mut resp = self
+            .db
+            .query_with_binds(
+                &sql,
+                vec![("repo", serde_json::Value::String(repo_name.to_string()))],
+            )
+            .await?;
+        let entities: Vec<EntityPayload> = match resp.take::<Vec<EntityPayload>>(0) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "get_entities_for_repo: failed to deserialize response for repo='{}': {}",
+                    repo_name,
+                    e
+                );
+                return Err(Box::new(e));
             }
         };
 
@@ -373,32 +273,18 @@ impl Database {
         // Fallback: look for file paths that start with the provided repo_name.
         // Use a parameterized query to avoid injection.
         let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let entities2: Vec<EntityPayload> = match &*self.db {
-            SurrealConnection::Local(db_conn) => db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE string::starts_with(file ?? '', $repo) ORDER BY file, start_line",
-                    entity_fields
-                ))
-                .bind(("repo", repo_name.to_string()))
-                .await?
-                .take(0)?,
-            SurrealConnection::RemoteHttp(db_conn) => db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE string::starts_with(file ?? '', $repo) ORDER BY file, start_line",
-                    entity_fields
-                ))
-                .bind(("repo", repo_name.to_string()))
-                .await?
-                .take(0)?,
-            SurrealConnection::RemoteWs(db_conn) => db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE string::starts_with(file ?? '', $repo) ORDER BY file, start_line",
-                    entity_fields
-                ))
-                .bind(("repo", repo_name.to_string()))
-                .await?
-                .take(0)?,
-        };
+        let sql2 = format!(
+            "SELECT {} FROM entity WHERE string::starts_with(file ?? '', $repo) ORDER BY file, start_line",
+            entity_fields
+        );
+        let mut resp2 = self
+            .db
+            .query_with_binds(
+                &sql2,
+                vec![("repo", serde_json::Value::String(repo_name.to_string()))],
+            )
+            .await?;
+        let entities2: Vec<EntityPayload> = resp2.take(0)?;
 
         Ok(entities2)
     }
@@ -429,38 +315,531 @@ impl Database {
         stable_id: &str,
     ) -> Result<Option<EntityPayload>, Box<dyn std::error::Error>> {
         let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let mut response = match &*self.db {
+        let sql = format!(
+            "SELECT {} FROM entity WHERE stable_id = $stable_id",
+            entity_fields
+        );
+        let mut response = self
+            .db
+            .query_with_binds(
+                &sql,
+                vec![(
+                    "stable_id",
+                    serde_json::Value::String(stable_id.to_string()),
+                )],
+            )
+            .await?;
+        let entities: Vec<EntityPayload> = response.take(0)?;
+
+        Ok(entities.into_iter().next())
+    }
+
+    /// Fetch similar entities for a given entity stable_id using relation tables with score.
+    /// Returns two lists: same-repo and external-repo, each with basic metadata and score.
+    pub async fn get_similar_for_entity(
+        &self,
+        stable_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+        // Resolve the entity Thing id from stable_id first
+        #[derive(Deserialize)]
+        struct IdRow {
+            id: surrealdb::sql::Thing,
+        }
+
+        let rows: Vec<IdRow> = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut r = db_conn
+                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
+                    .bind(("sid", stable_id.to_string()))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut r = db_conn
+                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
+                    .bind(("sid", stable_id.to_string()))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut r = db_conn
+                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
+                    .bind(("sid", stable_id.to_string()))
+                    .await?;
+                r.take(0)?
+            }
+        };
+        if rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+        let ent_id_raw = rows[0].id.to_string();
+
+        // Query edges and target entity minimal fields with scores for both relation tables
+        let sql = r#"
+            SELECT array::slice((SELECT out AS target, score FROM type::thing($id)->similar_same_repo ORDER BY score DESC), 0, $lim) AS same_repo,
+                   array::slice((SELECT out AS target, score FROM type::thing($id)->similar_external_repo ORDER BY score DESC), 0, $lim) AS external_repo;
+        "#;
+        let mut resp2 = match &*self.db {
             SurrealConnection::Local(db_conn) => {
                 db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE stable_id = $stable_id",
-                        entity_fields
-                    ))
-                    .bind(("stable_id", stable_id.to_string()))
+                    .query(sql)
+                    .bind(("id", ent_id_raw.clone()))
+                    .bind(("lim", limit as i64))
                     .await?
             }
             SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE stable_id = $stable_id",
-                        entity_fields
-                    ))
-                    .bind(("stable_id", stable_id.to_string()))
+                    .query(sql)
+                    .bind(("id", ent_id_raw.clone()))
+                    .bind(("lim", limit as i64))
                     .await?
             }
             SurrealConnection::RemoteWs(db_conn) => {
                 db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE stable_id = $stable_id",
-                        entity_fields
-                    ))
-                    .bind(("stable_id", stable_id.to_string()))
+                    .query(sql)
+                    .bind(("id", ent_id_raw.clone()))
+                    .bind(("lim", limit as i64))
                     .await?
             }
         };
-        let entities: Vec<EntityPayload> = response.take(0)?;
 
-        Ok(entities.into_iter().next())
+        #[derive(Deserialize)]
+        struct EdgeRow {
+            target: surrealdb::sql::Thing,
+            score: f64,
+        }
+
+        #[derive(Deserialize)]
+        struct RelRows {
+            same_repo: Option<Vec<EdgeRow>>,
+            external_repo: Option<Vec<EdgeRow>>,
+        }
+
+        let rels: Vec<RelRows> = resp2.take(0)?;
+        let (same_repo, external_repo): (Vec<EdgeRow>, Vec<EdgeRow>) =
+            if let Some(r) = rels.into_iter().next() {
+                (
+                    r.same_repo.unwrap_or_default(),
+                    r.external_repo.unwrap_or_default(),
+                )
+            } else {
+                (vec![], vec![])
+            };
+
+        // Gather unique target ids and fetch minimal entity data in one query
+        let mut targets: Vec<String> = Vec::new();
+        for e in same_repo.iter().chain(external_repo.iter()) {
+            let s = e.target.to_string();
+            if !targets.contains(&s) {
+                targets.push(s);
+            }
+        }
+        if targets.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        // Build a parameterized query using array::concat of type::thing
+        let mut thing_exprs: Vec<String> = Vec::with_capacity(targets.len());
+        for (i, _) in targets.iter().enumerate() {
+            thing_exprs.push(format!("type::thing($t{})", i));
+        }
+        let sql2 = format!(
+            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
+            thing_exprs.join(", ")
+        );
+        let mut resp3 = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in targets.iter().enumerate() {
+                    q = q.bind((format!("t{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in targets.iter().enumerate() {
+                    q = q.bind((format!("t{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in targets.iter().enumerate() {
+                    q = q.bind((format!("t{}", i), t.to_string()));
+                }
+                q.await?
+            }
+        };
+
+        #[derive(Deserialize)]
+        struct EntRow {
+            id: surrealdb::sql::Thing,
+            stable_id: String,
+            name: String,
+            file: Option<String>,
+            repo_name: String,
+            language: String,
+            kind: String,
+            source_url: Option<String>,
+            source_display: Option<String>,
+        }
+
+        let ents: Vec<EntRow> = resp3.take(0)?;
+        use std::collections::HashMap;
+        let mut ent_map: HashMap<String, EntRow> = HashMap::new();
+        for e in ents {
+            ent_map.insert(e.id.to_string(), e);
+        }
+
+        let mut out_same: Vec<serde_json::Value> = Vec::new();
+        let mut out_external: Vec<serde_json::Value> = Vec::new();
+        for e in same_repo.into_iter() {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
+                out_same.push(serde_json::json!({
+                    "stable_id": er.stable_id,
+                    "name": er.name,
+                    "file": er.file,
+                    "repo_name": er.repo_name,
+                    "language": er.language,
+                    "kind": er.kind,
+                    "source_url": er.source_url,
+                    "source_display": er.source_display,
+                    "score": e.score,
+                }));
+            }
+        }
+        for e in external_repo.into_iter() {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
+                out_external.push(serde_json::json!({
+                    "stable_id": er.stable_id,
+                    "name": er.name,
+                    "file": er.file,
+                    "repo_name": er.repo_name,
+                    "language": er.language,
+                    "kind": er.kind,
+                    "source_url": er.source_url,
+                    "source_display": er.source_display,
+                    "score": e.score,
+                }));
+            }
+        }
+
+        Ok((out_same, out_external))
+    }
+
+    /// Fetch top duplicate-like pairs within a repository based on similar_same_repo edges.
+    /// Returns a list of pairs {a: {...}, b: {...}, score} limited by `limit`.
+    pub async fn get_dupes_for_repo(
+        &self,
+        repo_name: &str,
+        limit: usize,
+        min_score: Option<f64>,
+        language: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        // Find edges where both endpoints are in the same repo.
+        // Use a CTE-like two-step: get edges then join on entity fields twice.
+        let edge_sql = r#"
+                        SELECT in AS a, out AS b, score
+                        FROM similar_same_repo
+                        ORDER BY score DESC
+                        LIMIT $lim
+                "#;
+
+        #[derive(Deserialize)]
+        struct EdgeRowMin {
+            a: surrealdb::sql::Thing,
+            b: surrealdb::sql::Thing,
+            score: f64,
+        }
+
+        let edge_rows: Vec<EdgeRowMin> = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+        };
+
+        if edge_rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Gather unique ids referenced and bulk load entity rows to filter by repo
+        use std::collections::{HashMap, HashSet};
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        for e in &edge_rows {
+            for tid in [e.a.to_string(), e.b.to_string()] {
+                if seen.insert(tid.clone()) {
+                    ids.push(tid);
+                }
+            }
+        }
+        let mut thing_exprs: Vec<String> = Vec::with_capacity(ids.len());
+        for (i, _) in ids.iter().enumerate() {
+            thing_exprs.push(format!("type::thing($x{})", i));
+        }
+        let sql2 = format!(
+            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
+            thing_exprs.join(", ")
+        );
+        let mut resp2 = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+        };
+
+        #[derive(Deserialize, Clone)]
+        struct EntMin {
+            id: surrealdb::sql::Thing,
+            stable_id: String,
+            name: String,
+            file: Option<String>,
+            repo_name: String,
+            language: String,
+            kind: String,
+            source_url: Option<String>,
+            source_display: Option<String>,
+        }
+
+        let ents: Vec<EntMin> = resp2.take(0)?;
+        let mut map: HashMap<String, EntMin> = HashMap::new();
+        for e in ents.into_iter() {
+            map.insert(e.id.to_string(), e);
+        }
+
+        // Build output for pairs where both entities belong to repo_name
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let lang_lc = language.map(|s| s.to_lowercase());
+        let kind_lc = kind.map(|s| s.to_lowercase());
+        for e in edge_rows.into_iter() {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
+                if ae.repo_name == repo_name && be.repo_name == repo_name {
+                    if let Some(ms) = min_score {
+                        if e.score < ms {
+                            continue;
+                        }
+                    }
+                    if let Some(ref ll) = lang_lc {
+                        if ae.language.to_lowercase() != *ll || be.language.to_lowercase() != *ll {
+                            continue;
+                        }
+                    }
+                    if let Some(ref kk) = kind_lc {
+                        if ae.kind.to_lowercase() != *kk || be.kind.to_lowercase() != *kk {
+                            continue;
+                        }
+                    }
+                    out.push(serde_json::json!({
+                        "score": e.score,
+                        "a": {
+                            "stable_id": ae.stable_id,
+                            "name": ae.name,
+                            "file": ae.file,
+                            "repo_name": ae.repo_name,
+                            "language": ae.language,
+                            "kind": ae.kind,
+                            "source_url": ae.source_url,
+                            "source_display": ae.source_display,
+                        },
+                        "b": {
+                            "stable_id": be.stable_id,
+                            "name": be.name,
+                            "file": be.file,
+                            "repo_name": be.repo_name,
+                            "language": be.language,
+                            "kind": be.kind,
+                            "source_url": be.source_url,
+                            "source_display": be.source_display,
+                        }
+                    }));
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch cross-repo duplicate-like pairs where `a` belongs to `repo_name` and `b` belongs to another repo.
+    pub async fn get_external_dupes_for_repo(
+        &self,
+        repo_name: &str,
+        limit: usize,
+        min_score: Option<f64>,
+        language: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let edge_sql = r#"
+                        SELECT in AS a, out AS b, score
+                        FROM similar_external_repo
+                        ORDER BY score DESC
+                        LIMIT $lim
+                "#;
+
+        #[derive(Deserialize)]
+        struct EdgeRowMin {
+            a: surrealdb::sql::Thing,
+            b: surrealdb::sql::Thing,
+            score: f64,
+        }
+
+        let edge_rows: Vec<EdgeRowMin> = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut r = db_conn
+                    .query(edge_sql)
+                    .bind(("lim", (limit as i64) * 4))
+                    .await?;
+                r.take(0)?
+            }
+        };
+        if edge_rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        use std::collections::{HashMap, HashSet};
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        for e in &edge_rows {
+            for tid in [e.a.to_string(), e.b.to_string()] {
+                if seen.insert(tid.clone()) {
+                    ids.push(tid);
+                }
+            }
+        }
+        let mut thing_exprs: Vec<String> = Vec::with_capacity(ids.len());
+        for (i, _) in ids.iter().enumerate() {
+            thing_exprs.push(format!("type::thing($x{})", i));
+        }
+        let sql2 = format!(
+            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
+            thing_exprs.join(", ")
+        );
+        let mut resp2 = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut q = db_conn.query(&sql2);
+                for (i, t) in ids.iter().enumerate() {
+                    q = q.bind((format!("x{}", i), t.to_string()));
+                }
+                q.await?
+            }
+        };
+        #[derive(Deserialize, Clone)]
+        struct EntMin {
+            id: surrealdb::sql::Thing,
+            stable_id: String,
+            name: String,
+            file: Option<String>,
+            repo_name: String,
+            language: String,
+            kind: String,
+            source_url: Option<String>,
+            source_display: Option<String>,
+        }
+        let ents: Vec<EntMin> = resp2.take(0)?;
+        let mut map: HashMap<String, EntMin> = HashMap::new();
+        for e in ents.into_iter() {
+            map.insert(e.id.to_string(), e);
+        }
+
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let lang_lc = language.map(|s| s.to_lowercase());
+        let kind_lc = kind.map(|s| s.to_lowercase());
+        for e in edge_rows.into_iter() {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
+                if ae.repo_name == repo_name && be.repo_name != repo_name {
+                    if let Some(ms) = min_score {
+                        if e.score < ms {
+                            continue;
+                        }
+                    }
+                    if let Some(ref ll) = lang_lc {
+                        if ae.language.to_lowercase() != *ll || be.language.to_lowercase() != *ll {
+                            continue;
+                        }
+                    }
+                    if let Some(ref kk) = kind_lc {
+                        if ae.kind.to_lowercase() != *kk || be.kind.to_lowercase() != *kk {
+                            continue;
+                        }
+                    }
+                    out.push(serde_json::json!({
+                        "score": e.score,
+                        "a": {"stable_id": ae.stable_id, "name": ae.name, "file": ae.file, "repo_name": ae.repo_name, "language": ae.language, "kind": ae.kind, "source_url": ae.source_url, "source_display": ae.source_display},
+                        "b": {"stable_id": be.stable_id, "name": be.name, "file": be.file, "repo_name": be.repo_name, "language": be.language, "kind": be.kind, "source_url": be.source_url, "source_display": be.source_display}
+                    }));
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch methods for a given class/struct/interface/trait entity by matching on parent name within the same repo.
@@ -1160,6 +1539,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("entity", ENTITY_TEMPLATE)?;
     templates.add_template("search", SEARCH_TEMPLATE)?;
     templates.add_template("pagerank", PAGERANK_TEMPLATE)?;
+    templates.add_template("dupes", DUPES_TEMPLATE)?;
+    // Reuse repo template with dupes section via route-driven render
     log::info!("Templates loaded successfully");
 
     let state = AppState { db, templates };
@@ -1181,11 +1562,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/entities", get(entities_api_handler))
         .route("/api/search", get(search_api_handler))
         .route("/api/pagerank", get(pagerank_api_handler))
+        .route("/api/repo/{repo_name}/dupes", get(repo_dupes_api_handler))
+        .route(
+            "/api/repo/{repo_name}/external_dupes",
+            get(repo_external_dupes_api_handler),
+        )
+        .route(
+            "/api/entity_similar/{stable_id}",
+            get(entity_similar_api_handler),
+        )
         .route(
             "/api/entity_graph/{stable_id}",
             get(entity_graph_api_handler),
         )
         .route("/repo/{repo_name}", get(repo_handler))
+        .route("/repo/{repo_name}/dupes", get(repo_dupes_page_handler))
+        .route("/dupes", get(dupes_index_handler))
         .route("/entity/{stable_id}", get(entity_handler))
         .route("/search", get(search_handler))
         .route("/pagerank", get(pagerank_handler))
@@ -1582,8 +1974,54 @@ async fn search_api_handler(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    log::debug!("search_api_handler: q='{}' repo={:?}", query.q, query.repo);
+    log::debug!(
+        "search_api_handler (similarity): q='{}' repo={:?}",
+        query.q,
+        query.repo
+    );
     let started = std::time::Instant::now();
+
+    // Attempt similarity search first; fallback to text search if TEI or embeddings unavailable
+    match similarity_search(&state.db, &query.q, query.repo.as_deref()).await {
+        Ok(mut results) => {
+            // Enrich links
+            for entity in &mut results {
+                if entity.rank.is_none() {
+                    entity.rank = Some(0.0);
+                }
+                let raw_file_hint = file_hint_for_entity(entity);
+                let file_hint = clean_file_path(&raw_file_hint);
+                if entity.source_url.is_none() {
+                    if let Some(url) =
+                        construct_source_url(&state, &entity.repo_name, &file_hint, None).await
+                    {
+                        entity.source_url = Some(url.clone());
+                        if entity.source_display.is_none() {
+                            entity.source_display =
+                                Some(short_display_from_source_url(&url, &entity.repo_name));
+                        }
+                    }
+                } else if entity.source_display.is_none() {
+                    if let Some(ref url) = entity.source_url {
+                        entity.source_display =
+                            Some(short_display_from_source_url(url, &entity.repo_name));
+                    }
+                }
+            }
+            let elapsed_ms = started.elapsed().as_millis();
+            return Ok(Json(
+                serde_json::json!({ "results": results, "elapsed_ms": elapsed_ms }),
+            ));
+        }
+        Err(e) => {
+            log::warn!(
+                "similarity_search failed; falling back to text search: {}",
+                e
+            );
+        }
+    }
+
+    // Fallback: legacy text search
     let results = state
         .db
         .search_entities(&query.q, query.repo.as_deref())
@@ -1592,74 +2030,19 @@ async fn search_api_handler(
             log::error!("search_entities failed for q='{}': {}", query.q, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    // Deduplicate entities: it's possible for the DB query to produce logically
-    // identical rows (e.g., overlapping name/signature matches). Use a stable key.
-    // Prefer stable_id when present; fall back to (repo_name, file, name, start_line).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut unique_results: Vec<EntityPayload> = Vec::with_capacity(results.len());
-    for ent in results.into_iter() {
-        let key = if !ent.stable_id.is_empty() {
-            format!("sid:{}", ent.stable_id)
-        } else {
-            // Fall back to a composite key of repo/name/signature/line span
-            format!(
-                "rnsse:{}|{}|{}|{}|{}",
-                ent.repo_name,
-                ent.name,
-                ent.signature,
-                ent.start_line.unwrap_or(0),
-                ent.end_line.unwrap_or(0)
-            )
-        };
-        if seen.insert(key) {
-            unique_results.push(ent);
-        }
-    }
-
-    let mut results = unique_results;
-
-    // Clean up file paths and prefer stored source URLs; compute only if missing
-    for entity in &mut results {
-        // Ensure rank present for JSON consumers
-        if entity.rank.is_none() {
-            entity.rank = Some(0.0);
-        }
-        // Compute a local file hint (do not mutate EntityPayload)
-        let raw_file_hint = file_hint_for_entity(entity);
-        let file_hint = clean_file_path(&raw_file_hint);
-
-        // Debug: log DB-provided source_url for search API
-        log::debug!(
-            "webui: search_api db source_url stable_id={} file='{}' repo='{}' source_url={:?}",
-            entity.stable_id,
-            file_hint,
-            entity.repo_name,
-            entity.source_url
-        );
-
-        if entity.source_url.is_none() {
-            if let Some(url) =
-                construct_source_url(&state, &entity.repo_name, &file_hint, None).await
-            {
-                entity.source_url = Some(url.clone());
-                if entity.source_display.is_none() {
-                    entity.source_display =
-                        Some(short_display_from_source_url(&url, &entity.repo_name));
-                }
-            }
-        } else if entity.source_display.is_none() {
-            if let Some(ref url) = entity.source_url {
-                entity.source_display = Some(short_display_from_source_url(url, &entity.repo_name));
-            }
-        }
-    }
-
     let elapsed_ms = started.elapsed().as_millis();
-    Ok(Json(serde_json::json!({
-        "results": results,
-        "elapsed_ms": elapsed_ms
-    })))
+    Ok(Json(
+        serde_json::json!({ "results": results, "elapsed_ms": elapsed_ms }),
+    ))
+}
+
+// Perform embedding-based similarity search against entity embeddings stored in SurrealDB.
+async fn similarity_search(
+    db: &Database,
+    query_text: &str,
+    repo_filter: Option<&str>,
+) -> anyhow::Result<Vec<EntityPayload>> {
+    similarity::similarity_with_conn(&db.db, query_text, repo_filter).await
 }
 
 // JSON API returning callers/callees/imports for a given entity stable_id using public graph_api
@@ -1685,6 +2068,31 @@ async fn entity_graph_api_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct SimilarQuery {
+    limit: Option<usize>,
+}
+
+// JSON API returning similar entities (same/external repo) with scores for a given entity stable_id
+async fn entity_similar_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(stable_id): axum::extract::Path<String>,
+    Query(q): Query<SimilarQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = q.limit.unwrap_or(20);
+    match state.db.get_similar_for_entity(&stable_id, limit).await {
+        Ok((same, external)) => Ok(Json(serde_json::json!({
+            "stable_id": stable_id,
+            "same_repo": same,
+            "external_repo": external,
+        }))),
+        Err(e) => {
+            log::error!("entity_similar_api_handler failed for {}: {}", stable_id, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn repos_api_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<RepoSummary>>, StatusCode> {
@@ -1696,6 +2104,102 @@ async fn repos_api_handler(
     Ok(Json(repos))
 }
 
+#[derive(Deserialize)]
+struct RepoDupesQuery {
+    limit: Option<usize>,
+    min_score: Option<f64>,
+    language: Option<String>,
+    kind: Option<String>,
+}
+
+async fn repo_dupes_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(repo_name): axum::extract::Path<String>,
+    Query(q): Query<RepoDupesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = q.limit.unwrap_or(50);
+    match state
+        .db
+        .get_dupes_for_repo(
+            &repo_name,
+            limit,
+            q.min_score,
+            q.language.as_deref(),
+            q.kind.as_deref(),
+        )
+        .await
+    {
+        Ok(pairs) => Ok(Json(serde_json::json!({
+            "repo": repo_name,
+            "pairs": pairs,
+        }))),
+        Err(e) => {
+            log::error!("repo_dupes_api_handler failed for {}: {}", repo_name, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn repo_external_dupes_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(repo_name): axum::extract::Path<String>,
+    Query(q): Query<RepoDupesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = q.limit.unwrap_or(50);
+    match state
+        .db
+        .get_external_dupes_for_repo(
+            &repo_name,
+            limit,
+            q.min_score,
+            q.language.as_deref(),
+            q.kind.as_deref(),
+        )
+        .await
+    {
+        Ok(pairs) => Ok(Json(serde_json::json!({
+            "repo": repo_name,
+            "pairs": pairs,
+        }))),
+        Err(e) => {
+            log::error!(
+                "repo_external_dupes_api_handler failed for {}: {}",
+                repo_name,
+                e
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn repo_dupes_page_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(repo_name): axum::extract::Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let template = state.templates.get_template("repo").unwrap();
+    let html = template
+        .render(context! {
+            repo_name => repo_name,
+            dupes_page => true,
+            title => "Code Dupes"
+        })
+        .map_err(|e| {
+            log::error!("Failed to render repo dupes template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Html(html))
+}
+
+async fn dupes_index_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    let template = state.templates.get_template("dupes").unwrap();
+    let html = template
+        .render(context! { title => "Code Dupes" })
+        .map_err(|e| {
+            log::error!("Failed to render dupes index template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Html(html))
+}
 async fn entities_api_handler(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
