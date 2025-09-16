@@ -256,6 +256,7 @@ services:
       - HZ_EMBED_PROCESSING_TTL_SECONDS=300
       # Model id used for embeddings (required)
       - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      - HZ_ENABLE_EMBED_SIMILARITY=1
       # Debugging toggles - enable to log SQL and verify DB updates
       # - HZ_EMBED_DEBUG_SQL=1
       # - HZ_EMBED_DEBUG_DB=1

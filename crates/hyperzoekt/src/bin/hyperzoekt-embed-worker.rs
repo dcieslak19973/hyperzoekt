@@ -163,11 +163,11 @@ async fn main() -> Result<()> {
     let enable_similarity = std::env::var("HZ_ENABLE_EMBED_SIMILARITY")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false);
-    let same_repo_threshold: f32 = std::env::var("HZ_SIMILARITY_THRESHOLD_SAME_REPO")
+    let _same_repo_threshold: f32 = std::env::var("HZ_SIMILARITY_THRESHOLD_SAME_REPO")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.90);
-    let external_repo_threshold: f32 = std::env::var("HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO")
+    let _external_repo_threshold: f32 = std::env::var("HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.95);
@@ -179,16 +179,19 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
-    let sample_same: usize = std::env::var("HZ_SIMILARITY_SAMPLE_SAME_REPO")
+    let _sample_same: usize = std::env::var("HZ_SIMILARITY_SAMPLE_SAME_REPO")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
-    let sample_external: usize = std::env::var("HZ_SIMILARITY_SAMPLE_EXTERNAL_REPO")
+    let _sample_external: usize = std::env::var("HZ_SIMILARITY_SAMPLE_EXTERNAL_REPO")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
     if enable_similarity {
-        info!("similarity enabled same_thresh={:.3} external_thresh={:.3} max_same={} max_external={} sample_same={} sample_external={}", same_repo_threshold, external_repo_threshold, max_similar_same, max_similar_external, sample_same, sample_external);
+        info!(
+            "similarity enabled max_same={} max_external={}",
+            max_similar_same, max_similar_external
+        );
     }
 
     loop {
@@ -559,12 +562,8 @@ async fn main() -> Result<()> {
                                     if enable_similarity {
                                         // Need repo name; we have it on job
                                         let sim_params = SimilarityParams {
-                                            same_threshold: same_repo_threshold,
-                                            external_threshold: external_repo_threshold,
                                             max_same: max_similar_same,
                                             max_external: max_similar_external,
-                                            sample_same,
-                                            sample_external,
                                         };
                                         match compute_similarity_arrays(
                                             &db,
@@ -1015,163 +1014,109 @@ fn parse_max_batch_from_text(body: &str, current: usize) -> usize {
 
 // Compute similarity arrays (same repo & external) returning JSON arrays of objects {stable_id, score}.
 struct SimilarityParams {
-    same_threshold: f32,
-    external_threshold: f32,
     max_same: usize,
     max_external: usize,
-    sample_same: usize,
-    sample_external: usize,
 }
 
 async fn compute_similarity_arrays(
     db: &hyperzoekt::db_writer::connection::SurrealConnection,
-    stable_id: &str,
+    _stable_id: &str,
     repo_name: &str,
     embedding: &[f32],
     params: &SimilarityParams,
 ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), anyhow::Error> {
+    // If embedding is empty, nothing to do
     if embedding.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let target_norm = embedding.iter().map(|f| f * f).sum::<f32>().sqrt();
-    if target_norm == 0.0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let sid_sanitized = sanitize_id(stable_id);
-    // Same-repo candidates
-    let same_q = "SELECT stable_id, embedding FROM entity WHERE repo_name = $r AND embedding_len > 0 LIMIT $lim;";
+
+    // Prepare vector param as JSON array of numbers (f64)
+    let vec_param: Vec<serde_json::Value> = embedding
+        .iter()
+        .map(|f| serde_json::Value::from(*f as f64))
+        .collect();
+    let dim = embedding.len() as i64;
+
+    // Server-side cosine similarity query for same-repo candidates
+    let same_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND embedding_len = $dim AND embedding_len > 0 ORDER BY score DESC LIMIT $lim;";
     let same_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
             same_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
+                ("vec", serde_json::Value::Array(vec_param.clone())),
                 (
                     "lim",
-                    serde_json::Value::Number((params.sample_same as i64).into()),
+                    serde_json::Value::Number((params.max_same as i64).into()),
                 ),
+                ("dim", serde_json::Value::Number(dim.into())),
             ],
         )
         .await
     {
         Ok(mut r) => r.take(0).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            warn!("server-side same-repo similarity query failed: {}", e);
+            Vec::new()
+        }
     };
-    let mut same_scored: Vec<(f32, String)> = Vec::new();
+    let mut same_json: Vec<serde_json::Value> = Vec::new();
     for row in same_rows.iter() {
         if let Some(obj) = row.as_object() {
-            let sid = obj.get("stable_id").and_then(|v| v.as_str()).unwrap_or("");
-            if sid.is_empty() || sanitize_id(sid) == sid_sanitized {
-                continue;
-            }
-            if let Some(arr) = obj.get("embedding").and_then(|v| v.as_array()) {
-                if arr.len() != embedding.len() {
-                    continue;
-                }
-                let mut dot = 0f32;
-                let mut norm_o = 0f32;
-                let mut valid = true;
-                for (idx, vv) in arr.iter().enumerate() {
-                    if let Some(f) = vv.as_f64() {
-                        let fv = f as f32;
-                        dot += fv * embedding[idx];
-                        norm_o += fv * fv;
-                    } else {
-                        valid = false;
-                        break;
-                    }
-                }
-                if !valid {
-                    continue;
-                }
-                let norm_o = norm_o.sqrt();
-                if norm_o == 0.0 {
-                    continue;
-                }
-                let sim = dot / (target_norm * norm_o);
-                if sim >= params.same_threshold {
-                    same_scored.push((sim, sid.to_string()));
+            if let Some(sid) = obj.get("stable_id").and_then(|v| v.as_str()) {
+                if let Some(score) = obj.get("score").and_then(|v| v.as_f64()) {
+                    let mut o = serde_json::Map::new();
+                    o.insert(
+                        "stable_id".to_string(),
+                        serde_json::Value::String(sid.to_string()),
+                    );
+                    o.insert("score".to_string(), serde_json::Value::from(score));
+                    same_json.push(serde_json::Value::Object(o));
                 }
             }
         }
     }
-    same_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    same_scored.truncate(params.max_same);
-    let same_json: Vec<serde_json::Value> = same_scored
-        .into_iter()
-        .map(|(score, sid)| {
-            let mut o = serde_json::Map::new();
-            o.insert("stable_id".to_string(), serde_json::Value::String(sid));
-            o.insert("score".to_string(), serde_json::Value::from(score));
-            serde_json::Value::Object(o)
-        })
-        .collect();
-    // External candidates
-    let ext_q = "SELECT stable_id, embedding FROM entity WHERE repo_name != $r AND embedding_len > 0 LIMIT $lim;";
+
+    // Server-side cosine similarity query for external-repo candidates
+    let ext_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND embedding_len = $dim AND embedding_len > 0 ORDER BY score DESC LIMIT $lim;";
     let ext_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
             ext_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
+                ("vec", serde_json::Value::Array(vec_param)),
                 (
                     "lim",
-                    serde_json::Value::Number((params.sample_external as i64).into()),
+                    serde_json::Value::Number((params.max_external as i64).into()),
                 ),
+                ("dim", serde_json::Value::Number(dim.into())),
             ],
         )
         .await
     {
         Ok(mut r) => r.take(0).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            warn!("server-side external-repo similarity query failed: {}", e);
+            Vec::new()
+        }
     };
-    let mut ext_scored: Vec<(f32, String)> = Vec::new();
+    let mut ext_json: Vec<serde_json::Value> = Vec::new();
     for row in ext_rows.iter() {
         if let Some(obj) = row.as_object() {
-            let sid = obj.get("stable_id").and_then(|v| v.as_str()).unwrap_or("");
-            if sid.is_empty() {
-                continue;
-            }
-            if let Some(arr) = obj.get("embedding").and_then(|v| v.as_array()) {
-                if arr.len() != embedding.len() {
-                    continue;
-                }
-                let mut dot = 0f32;
-                let mut norm_o = 0f32;
-                let mut valid = true;
-                for (idx, vv) in arr.iter().enumerate() {
-                    if let Some(f) = vv.as_f64() {
-                        let fv = f as f32;
-                        dot += fv * embedding[idx];
-                        norm_o += fv * fv;
-                    } else {
-                        valid = false;
-                        break;
-                    }
-                }
-                if !valid {
-                    continue;
-                }
-                let norm_o = norm_o.sqrt();
-                if norm_o == 0.0 {
-                    continue;
-                }
-                let sim = dot / (target_norm * norm_o);
-                if sim >= params.external_threshold {
-                    ext_scored.push((sim, sid.to_string()));
+            if let Some(sid) = obj.get("stable_id").and_then(|v| v.as_str()) {
+                if let Some(score) = obj.get("score").and_then(|v| v.as_f64()) {
+                    let mut o = serde_json::Map::new();
+                    o.insert(
+                        "stable_id".to_string(),
+                        serde_json::Value::String(sid.to_string()),
+                    );
+                    o.insert("score".to_string(), serde_json::Value::from(score));
+                    ext_json.push(serde_json::Value::Object(o));
                 }
             }
         }
     }
-    ext_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    ext_scored.truncate(params.max_external);
-    let ext_json: Vec<serde_json::Value> = ext_scored
-        .into_iter()
-        .map(|(score, sid)| {
-            let mut o = serde_json::Map::new();
-            o.insert("stable_id".to_string(), serde_json::Value::String(sid));
-            o.insert("score".to_string(), serde_json::Value::from(score));
-            serde_json::Value::Object(o)
-        })
-        .collect();
+
     Ok((same_json, ext_json))
 }
 
