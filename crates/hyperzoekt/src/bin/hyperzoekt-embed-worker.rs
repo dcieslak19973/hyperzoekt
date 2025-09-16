@@ -179,6 +179,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
+    let min_source_chars: usize = std::env::var("HZ_SIMILARITY_MIN_SOURCE_CHARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
     let _sample_same: usize = std::env::var("HZ_SIMILARITY_SAMPLE_SAME_REPO")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -189,8 +193,8 @@ async fn main() -> Result<()> {
         .unwrap_or(2000);
     if enable_similarity {
         info!(
-            "similarity enabled max_same={} max_external={}",
-            max_similar_same, max_similar_external
+            "similarity enabled max_same={} max_external={} min_source_chars={}",
+            max_similar_same, max_similar_external, min_source_chars
         );
     }
 
@@ -564,6 +568,7 @@ async fn main() -> Result<()> {
                                         let sim_params = SimilarityParams {
                                             max_same: max_similar_same,
                                             max_external: max_similar_external,
+                                            min_source_chars,
                                         };
                                         match compute_similarity_arrays(
                                             &db,
@@ -1016,11 +1021,12 @@ fn parse_max_batch_from_text(body: &str, current: usize) -> usize {
 struct SimilarityParams {
     max_same: usize,
     max_external: usize,
+    min_source_chars: usize,
 }
 
 async fn compute_similarity_arrays(
     db: &hyperzoekt::db_writer::connection::SurrealConnection,
-    _stable_id: &str,
+    stable_id: &str,
     repo_name: &str,
     embedding: &[f32],
     params: &SimilarityParams,
@@ -1038,18 +1044,24 @@ async fn compute_similarity_arrays(
     let dim = embedding.len() as i64;
 
     // Server-side cosine similarity query for same-repo candidates
-    let same_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND embedding_len = $dim AND embedding_len > 0 ORDER BY score DESC LIMIT $lim;";
+    // Exclude self (stable_id) and require minimum source length to avoid trivial matches
+    let same_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC LIMIT $lim;";
     let same_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
             same_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
+                ("sid", serde_json::Value::String(stable_id.to_string())),
                 ("vec", serde_json::Value::Array(vec_param.clone())),
                 (
                     "lim",
                     serde_json::Value::Number((params.max_same as i64).into()),
                 ),
                 ("dim", serde_json::Value::Number(dim.into())),
+                (
+                    "min_chars",
+                    serde_json::Value::Number((params.min_source_chars as i64).into()),
+                ),
             ],
         )
         .await
@@ -1078,18 +1090,23 @@ async fn compute_similarity_arrays(
     }
 
     // Server-side cosine similarity query for external-repo candidates
-    let ext_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND embedding_len = $dim AND embedding_len > 0 ORDER BY score DESC LIMIT $lim;";
+    let ext_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC LIMIT $lim;";
     let ext_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
             ext_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
+                ("sid", serde_json::Value::String(stable_id.to_string())),
                 ("vec", serde_json::Value::Array(vec_param)),
                 (
                     "lim",
                     serde_json::Value::Number((params.max_external as i64).into()),
                 ),
                 ("dim", serde_json::Value::Number(dim.into())),
+                (
+                    "min_chars",
+                    serde_json::Value::Number((params.min_source_chars as i64).into()),
+                ),
             ],
         )
         .await
