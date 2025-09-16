@@ -5,7 +5,7 @@ services:
       - "6379:6379"
     command: redis-server --appendonly yes
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -21,12 +21,12 @@ services:
 
   surrealdb-prober:
     image: curlimages/curl:8.3.0
-    command: ["tail", "-f", "/dev/null"]
+    command: [ "tail", "-f", "/dev/null" ]
     depends_on:
       surrealdb:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS http://surrealdb:8001/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      test: [ "CMD-SHELL", "curl -sS http://surrealdb:8001/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -50,7 +50,7 @@ services:
       - SURREAL_NS=zoekt
       - ZOEKTD_BIND_ADDR=0.0.0.0:7200
       - ZOEKT_ENDPOINT=http://zoekt-indexer:7200
-    command: ["/app/zoekt-indexer", "--host", "0.0.0.0", "--port", "7200"]
+    command: [ "/app/dzr-indexer", "--host", "0.0.0.0", "--port", "7200" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -74,7 +74,7 @@ services:
       - SURREAL_NS=zoekt
       - ZOEKTD_ADMIN_USERNAME=admin
       - ZOEKTD_ADMIN_PASSWORD=password
-    command: ["/app/zoekt-admin", "--host", "0.0.0.0", "--port", "7201"]
+    command: [ "/app/dzr-admin", "--host", "0.0.0.0", "--port", "7201" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -97,7 +97,7 @@ services:
       - ZOEKTD_POLL_INTERVAL_SECONDS=30
     ports:
       - "7202:7202"
-    command: ["/app/zoekt-admin-poller", "--host", "0.0.0.0", "--port", "7202"]
+    command: [ "/app/dzr-admin-poller", "--host", "0.0.0.0", "--port", "7202" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -105,12 +105,12 @@ services:
 
   poller-prober:
     image: curlimages/curl:8.3.0
-    command: ["tail", "-f", "/dev/null"]
+    command: [ "tail", "-f", "/dev/null" ]
     depends_on:
       zoekt-admin-poller:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS http://zoekt-admin-poller:7202/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      test: [ "CMD-SHELL", "curl -sS http://zoekt-admin-poller:7202/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -131,7 +131,7 @@ services:
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
       - ZOEKTD_BIND_ADDR=0.0.0.0:7203
-    command: ["/app/zoekt-http-search", "--host", "0.0.0.0", "--port", "7203"]
+    command: [ "/app/dzr-http-search", "--host", "0.0.0.0", "--port", "7203" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -154,7 +154,7 @@ services:
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
       - ZOEKTD_BIND_ADDR=0.0.0.0:7204
-    command: ["/app/zoekt-mcp-search", "--host", "0.0.0.0", "--port", "7204"]
+    command: [ "/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "7204" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -180,7 +180,7 @@ services:
       - HZ_ENABLE_EMBED_JOBS=1
       # Optional: override the embed jobs queue key (default: zoekt:embed_jobs)
       # - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
-    command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7205"]
+    command: [ "/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7205" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -204,7 +204,7 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-    command: ["/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "7206"]
+    command: [ "/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "7206" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -230,7 +230,7 @@ services:
       - HZ_WEBUI_BASE=http://hyperzoekt-webui:7206
       - HZ_TEI_BASE=http://tei:80
       - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
-    command: ["/app/hyperzoekt-mcp", "--host", "0.0.0.0", "--port", "7207"]
+    command: [ "/app/hyperzoekt-mcp", "--host", "0.0.0.0", "--port", "7207" ]
     restart: unless-stopped
     depends_on:
       surrealdb-prober:
@@ -260,7 +260,7 @@ services:
       # Debugging toggles - enable to log SQL and verify DB updates
       # - HZ_EMBED_DEBUG_SQL=1
       # - HZ_EMBED_DEBUG_DB=1
-    command: ["/app/hyperzoekt-embed-worker", "--host", "0.0.0.0", "--port", "7208"]
+    command: [ "/app/hyperzoekt-embed-worker", "--host", "0.0.0.0", "--port", "7208" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -274,17 +274,17 @@ services:
     ports:
       - "8088:80"
     restart: unless-stopped
-    command: ["--model-id", "jinaai/jina-embeddings-v2-base-code"]
+    command: [ "--model-id", "jinaai/jina-embeddings-v2-base-code" ]
 
   # External prober for TEI health (avoids requiring curl inside the TEI image)
   tei-prober:
     image: curlimages/curl:8.3.0
-    command: ["tail", "-f", "/dev/null"]
+    command: [ "tail", "-f", "/dev/null" ]
     depends_on:
       tei:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS http://tei:80/health -o /dev/null -w '%{http_code}' | grep -q '^200$'"]
+      test: [ "CMD-SHELL", "curl -sS http://tei:80/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
       interval: 10s
       timeout: 5s
       retries: 12

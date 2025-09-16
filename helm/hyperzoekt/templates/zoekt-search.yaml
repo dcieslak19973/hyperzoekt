@@ -35,7 +35,7 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ .Values.search.image.registry }}/{{ .Values.search.image.repository }}:{{ .Values.search.image.tag }}
           imagePullPolicy: {{ .Values.search.image.pullPolicy }}
-          command: ["/app/zoekt-http-search", "--host", "0.0.0.0", "--port", {{ .Values.search.service.port | quote }}]
+          command: ["/app/dzr-http-search", "--host", "0.0.0.0", "--port", {{ .Values.search.service.port | quote }}]
           ports:
             - name: http
               containerPort: {{ .Values.search.service.port }}

@@ -35,7 +35,7 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ .Values.indexer.image.registry }}/{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}
           imagePullPolicy: {{ .Values.indexer.image.pullPolicy }}
-          command: ["/app/zoekt-indexer", "--host", "0.0.0.0", "--port", "7676"]
+          command: ["/app/dzr-indexer", "--host", "0.0.0.0", "--port", "7676"]
           ports:
             - name: http
               containerPort: 7676

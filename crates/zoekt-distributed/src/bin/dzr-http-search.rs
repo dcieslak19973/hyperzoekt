@@ -66,6 +66,15 @@ async fn search_handler(
 ) -> impl IntoResponse {
     tracing::info!("HTTP search request: {:?}", query);
 
+    // Log selected important parameters to help debug context line behavior.
+    tracing::info!(
+        "search params: q='{}' context={:?} max_results={:?} repo={:?}",
+        query.q,
+        query.context,
+        query.max_results,
+        query.repo
+    );
+
     let params = DistributedSearchTool {
         regex: query.q,
         include: query.include,

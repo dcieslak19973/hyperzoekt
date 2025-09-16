@@ -35,7 +35,7 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ .Values.mcp.image.registry }}/{{ .Values.mcp.image.repository }}:{{ .Values.mcp.image.tag }}
           imagePullPolicy: {{ .Values.mcp.image.pullPolicy }}
-          command: ["/app/zoekt-mcp-search", "--host", "0.0.0.0", "--port", {{ .Values.mcp.service.port | quote }}]
+          command: ["/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", {{ .Values.mcp.service.port | quote }}]
           ports:
             - name: http
               containerPort: {{ .Values.mcp.service.port }}
