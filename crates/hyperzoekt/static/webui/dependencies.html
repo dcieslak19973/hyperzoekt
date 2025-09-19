@@ -1,0 +1,137 @@
+{% extends "base" %}
+
+{% block title %}Dependencies - HyperZoekt{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h3>📦 Repository Dependencies</h3>
+    </div>
+    <div class="card-body">
+        <div style="margin-bottom:1rem;">
+            <label for="dep-repo">Repository (select one or more):</label>
+            <div id="dep-repo-multiselect" class="search-input"
+                style="position:relative; padding:6px; background:var(--input-bg); border-radius:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-height:40px;">
+                <div id="dep-tags" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+                <input id="dep-repo-input" placeholder="Type to search repositories..."
+                    style="border:none; background:transparent; outline:none; flex:1; min-width:160px; padding:6px;">
+                <div id="dep-repo-options"
+                    style="position:absolute; left:6px; right:6px; top:46px; max-height:220px; overflow:auto; background:var(--panel); border:1px solid var(--input-border); border-radius:6px; display:none; z-index:50;">
+                </div>
+            </div>
+        </div>
+        <div style="margin-bottom:1rem;">
+            <label for="dep-ref">Ref (branch/tag, optional):</label>
+            <input id="dep-ref" class="search-input" placeholder="main">
+        </div>
+        <div style="margin-bottom:1rem;">
+            <button id="dep-load" class="btn">Load Dependencies</button>
+        </div>
+
+        <div id="deps-error" style="display:none; color:#b91c1c; margin-bottom:1rem;">Failed to load dependencies.</div>
+
+        <table id="deps-table" style="width:100%; border-collapse: collapse;">
+            <thead style="text-align:left;">
+                <tr>
+                    <th style="padding:8px; border-bottom:1px solid var(--input-border);">Name</th>
+                    <th style="padding:8px; border-bottom:1px solid var(--input-border);">Language</th>
+                    <th style="padding:8px; border-bottom:1px solid var(--input-border);">Version</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td colspan="3" class="muted">Enter a repository and click "Load Dependencies".</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script type="module">
+    import { createMultiselect } from '/static/common/multiselect.js';
+
+    const depMultiselect = createMultiselect({ inputId: 'dep-repo-input', tagsId: 'dep-tags', optionsContainerId: 'dep-repo-options', storageKey: 'hz_recent_repos' });
+    window.depMultiselect = depMultiselect;
+
+    async function loadDeps(repoList, ref) {
+        const repo = Array.isArray(repoList) ? repoList[0] : repoList;
+        const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+        try {
+            const res = await fetch(`/api/repo/${encodeURIComponent(repo)}/dependencies${qs}`);
+            if (!res.ok) throw new Error('http ' + res.status);
+            const data = await res.json();
+            const tbody = document.querySelector('#deps-table tbody');
+            const deps = Array.isArray(data.dependencies) ? data.dependencies : [];
+            if (deps.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="muted">No dependencies discovered.</td></tr>';
+                return;
+            }
+            let rows = '';
+            for (const d of deps) {
+                const name = d.name || '<unknown>';
+                const lang = d.language || '<unknown>';
+                const ver = d.version || '';
+                rows += `<tr><td style="padding:8px; border-bottom:1px solid var(--input-border);">${name}</td><td style="padding:8px; border-bottom:1px solid var(--input-border);">${lang}</td><td style="padding:8px; border-bottom:1px solid var(--input-border);">${ver}</td></tr>`;
+            }
+            tbody.innerHTML = rows;
+        } catch (e) {
+            console.error('Failed to load deps', e);
+            document.getElementById('deps-error').style.display = 'block';
+        }
+    }
+
+    async function loadDepsMulti(repoArray, ref) {
+        try {
+            const params = new URLSearchParams();
+            for (const r of repoArray) params.append('repo', r);
+            if (ref) params.append('ref', ref);
+            const res = await fetch(`/api/dependencies?${params.toString()}`);
+            if (!res.ok) throw new Error('http ' + res.status);
+            const data = await res.json();
+            const tbody = document.querySelector('#deps-table tbody');
+            const combined = [];
+            if (data && data.repos) {
+                for (const [r, deps] of Object.entries(data.repos)) {
+                    if (Array.isArray(deps)) {
+                        deps.forEach(d => combined.push(Object.assign({ _repo: r }, d)));
+                    }
+                }
+            } else if (data && data.repositories) {
+                for (const item of data.repositories) {
+                    if (item.dependencies && Array.isArray(item.dependencies)) {
+                        item.dependencies.forEach(d => combined.push(Object.assign({ _repo: item.repo }, d)));
+                    }
+                }
+            }
+            if (combined.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="muted">No dependencies discovered.</td></tr>';
+                return;
+            }
+            let rows = '';
+            for (const d of combined) {
+                const name = d.name || '<unknown>';
+                const lang = d.language || '<unknown>';
+                const ver = d.version || '';
+                rows += `<tr><td style="padding:8px; border-bottom:1px solid var(--input-border);">${name} <span style="color:var(--muted); font-size:0.9rem;">(${d._repo || ''})</span></td><td style="padding:8px; border-bottom:1px solid var(--input-border);">${lang}</td><td style="padding:8px; border-bottom:1px solid var(--input-border);">${ver}</td></tr>`;
+            }
+            tbody.innerHTML = rows;
+        } catch (e) {
+            console.error('Failed to load deps', e);
+            document.getElementById('deps-error').style.display = 'block';
+        }
+    }
+
+    document.getElementById('dep-load').addEventListener('click', () => {
+        const selected = window.depMultiselect ? window.depMultiselect.getSelected() : [];
+        const ref = document.getElementById('dep-ref').value.trim();
+        if (!selected.length) return alert('Please select at least one repository');
+        localStorage.setItem('hz_recent_repos', JSON.stringify(selected));
+        if (selected.length > 1) {
+            loadDepsMulti(selected, ref || undefined);
+        } else {
+            loadDeps(selected, ref || undefined);
+        }
+    });
+</script>
+
+{% endblock %}

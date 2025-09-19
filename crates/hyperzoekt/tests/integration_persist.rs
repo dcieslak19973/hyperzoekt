@@ -261,7 +261,7 @@ async fn full_index_persists_minimum_entities() {
         methods: vec![],
         source_content: None,
     };
-    let (tx, handle) = spawn_db_writer(vec![], writer_cfg).expect("spawn writer");
+    let (tx, handle) = spawn_db_writer(vec![], writer_cfg, None).expect("spawn writer");
     tx.send(vec![callee.clone(), caller.clone()])
         .expect("send ent batch");
     // Allow writer to process, then close channel and join.

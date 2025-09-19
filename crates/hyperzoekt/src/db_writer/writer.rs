@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use super::config::{DbWriterConfig, SpawnResult};
+use super::config::{DbWriterConfig, PersistAckSender, PersistedEntityMeta, SpawnResult};
 use super::connection::{connect, SurrealConnection};
 use super::helpers::CALL_EDGE_CAPTURE;
 use crate::repo_index::indexer::payload::EntityPayload;
@@ -24,7 +24,11 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> SpawnResult {
+pub fn spawn_db_writer(
+    payloads: Vec<EntityPayload>,
+    cfg: DbWriterConfig,
+    ack_tx: Option<PersistAckSender>,
+) -> SpawnResult {
     let (tx, rx) = sync_channel::<Vec<EntityPayload>>(cfg.channel_capacity);
     let payloads_clone = payloads.clone();
     let batch_capacity = cfg.batch_capacity.unwrap_or(500);
@@ -65,6 +69,11 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
             init_schema(&db, &cfg_clone.surreal_ns, &cfg_clone.surreal_db).await;
             info!("db_writer finished schema init");
             use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+            // Embedding enqueue setup (reuse existing gate env var). We now enqueue per batch AFTER persistence.
+            let embed_jobs_enabled = matches!(std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default().as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+            let embed_queue = std::env::var("HZ_EMBED_JOBS_QUEUE").unwrap_or_else(|_| "zoekt:embed_jobs".to_string());
+            let embed_pool = if embed_jobs_enabled { zoekt_distributed::redis_adapter::create_redis_pool() } else { None };
+            if embed_jobs_enabled && embed_pool.is_none() { info!("embed enqueue disabled: redis pool not available"); }
             let mut batches_sent=0usize; let mut entities_sent=0usize; let mut total_retries=0usize; let mut sum_ms: u128=0; let mut min_ms: Option<u128>=None; let mut max_ms: Option<u128>=None; let mut failures=0usize; let mut attempt_counts=std::collections::BTreeMap::new();
             loop {
                 info!("writer loop tick: waiting for first batch (timeout {:?})", batch_timeout);
@@ -315,6 +324,57 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
                     max_ms = Some(max_ms.map_or(dur, |m| m.max(dur)));
                     *attempt_counts.entry(attempt).or_insert(0) += 1;
                     success = true;
+                    // Per-batch embedding enqueue (after successful persistence)
+                    if embed_jobs_enabled {
+                        if let Some(ref pool) = embed_pool {
+                            if !acc.is_empty() {
+                                #[derive(serde::Serialize)]
+                                struct EmbeddingJob<'a> {
+                                    stable_id: &'a str,
+                                    repo_name: &'a str,
+                                    language: &'a str,
+                                    kind: &'a str,
+                                    name: &'a str,
+                                    source_url: Option<&'a str>,
+                                }
+                                // Build job JSON strings for this batch
+                                let mut job_buf: Vec<String> = Vec::with_capacity(acc.len());
+                                for e in &acc {
+                                    let job = EmbeddingJob { stable_id: &e.stable_id, repo_name: &e.repo_name, language: &e.language, kind: &e.kind, name: &e.name, source_url: e.source_url.as_deref() };
+                                    match serde_json::to_string(&job) { Ok(js) => job_buf.push(js), Err(err) => { warn!("serialize embed job failed stable_id={} err={}", e.stable_id, err); } }
+                                }
+                                if !job_buf.is_empty() {
+                                    match pool.get().await { Ok(mut conn) => {
+                                        // Chunk pushes to avoid extremely large single RPUSH
+                                        let mut pushed_total = 0usize;
+                                        for chunk in job_buf.chunks(500) {
+                                            let res: Result<usize, _> = deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &embed_queue, chunk).await;
+                                            match res {
+                                                Ok(_n) => { pushed_total += chunk.len(); },
+                                                Err(e) => { warn!("embed enqueue rpush failed chunk={} err={}", chunk.len(), e); break; }
+                                            }
+                                        }
+                                        info!("embed enqueue batch complete repo={} jobs={} queue={} batches_sent={}", acc.first().map(|e| e.repo_name.as_str()).unwrap_or("?"), pushed_total, embed_queue, batches_sent);
+                                    }, Err(e) => warn!("embed enqueue redis get conn failed: {}", e) }
+                                }
+                            }
+                        }
+                    }
+                    // After successful batch commit, emit acks if channel provided.
+                    if let Some(ref sender) = ack_tx {
+                        let mut metas: Vec<PersistedEntityMeta> = Vec::with_capacity(acc.len());
+                        for e in &acc {
+                            metas.push(PersistedEntityMeta {
+                                stable_id: e.stable_id.clone(),
+                                repo_name: e.repo_name.clone(),
+                                language: e.language.clone(),
+                                kind: e.kind.clone(),
+                                name: e.name.clone(),
+                                source_url: e.source_url.clone(),
+                            });
+                        }
+                        if let Err(e) = sender.send(metas) { log::warn!("persist ack send failed: {}", e); }
+                    }
                     info!("batch success size {} attempt {} ms {}", entity_count, attempt, dur);
                     // Separate count queries to avoid multi-statement response shape ambiguity
                     let repo_count = if let Ok(mut r) = db.query("SELECT count() FROM repo GROUP ALL;").await {
@@ -329,7 +389,10 @@ pub fn spawn_db_writer(payloads: Vec<EntityPayload>, cfg: DbWriterConfig) -> Spa
                     break;
                 }
                 if !success { warn!("dropping batch size={} after {} attempts", acc.len(), attempt); }
-                if batches_sent % 10 == 0 && batches_sent>0 { let avg= if batches_sent>0 { (sum_ms as f64)/(batches_sent as f64) } else {0.0}; info!("DB metrics: batches_sent={} entities_sent={} total_retries={} avg_batch_ms={:.2} min_ms={:?} max_ms={:?} failures={} attempts={:?}", batches_sent, entities_sent, total_retries, avg, min_ms, max_ms, failures, attempt_counts); }
+                if batches_sent > 0 && batches_sent.is_multiple_of(10) {
+                    let avg = (sum_ms as f64) / (batches_sent as f64);
+                    info!("DB metrics: batches_sent={} entities_sent={} total_retries={} avg_batch_ms={:.2} min_ms={:?} max_ms={:?} failures={} attempts={:?}", batches_sent, entities_sent, total_retries, avg, min_ms, max_ms, failures, attempt_counts);
+                }
                 if std::env::var("HZ_SINGLE_BATCH").ok().as_deref()==Some("1") { info!("HZ_SINGLE_BATCH set; breaking writer loop after {} batches", batches_sent); break; }
                 info!("writer loop end iteration; continuing");
             }
@@ -414,21 +477,22 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
         }
     }
     let schema_groups: Vec<Vec<&str>> = vec![
+        // Entity table: prefer the explicit SCHEMALESS + PERMISSIONS declaration.
+        // We intentionally avoid adding duplicate plain `DEFINE TABLE entity;` or
+        // `CREATE TABLE entity;` variants here to reduce ambiguity and repeated
+        // creation attempts. Other groups include simple fallbacks when needed
+        // for compatibility with older SurrealDB builds.
         vec![
             "DEFINE TABLE entity SCHEMALESS PERMISSIONS FULL;",
-            "DEFINE TABLE entity;",
-            "CREATE TABLE entity;",
         ],
         vec![
             "DEFINE TABLE file SCHEMALESS PERMISSIONS FULL;",
             "DEFINE TABLE file;",
-            "CREATE TABLE file;",
         ],
         // explicit repo table definition (was previously only created implicitly during upserts)
         vec![
             "DEFINE TABLE repo SCHEMALESS PERMISSIONS FULL;",
             "DEFINE TABLE repo;",
-            "CREATE TABLE repo;",
         ],
         // repo/file relation tables (graph)
         // Provide directional relation definitions first, then fall back to legacy generic declarations if the
@@ -461,103 +525,82 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
         ],
         vec![
             "DEFINE FIELD stable_id ON entity TYPE string;",
-            "ALTER TABLE entity CREATE FIELD stable_id TYPE string;",
         ],
         vec![
             "DEFINE FIELD repo_name ON entity TYPE string;",
-            "ALTER TABLE entity CREATE FIELD repo_name TYPE string;",
         ],
         // Embedding fields: use DEFAULTs (not VALUE) so writes are not overridden.
         // Try to DEFINE with DEFAULT; if an older VALUE-based field exists, attempt remove+redefine.
         vec![
             "DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
             "REMOVE FIELD embedding ON entity; DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
-            "ALTER TABLE entity CREATE FIELD embedding TYPE array;",
         ],
         vec![
             "DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
             "REMOVE FIELD embedding_len ON entity; DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
-            "ALTER TABLE entity CREATE FIELD embedding_len TYPE int;",
         ],
         vec![
             "DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
             "REMOVE FIELD embedding_model ON entity; DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
-            "ALTER TABLE entity CREATE FIELD embedding_model TYPE string;",
         ],
         vec![
             "DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
             "REMOVE FIELD embedding_dim ON entity; DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
-            "ALTER TABLE entity CREATE FIELD embedding_dim TYPE int;",
         ],
         vec![
             "DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
             "REMOVE FIELD embedding_created_at ON entity; DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
-            "ALTER TABLE entity CREATE FIELD embedding_created_at TYPE datetime;",
         ],
         vec![
             "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
-            "CREATE INDEX idx_entity_stable_id ON entity (stable_id);",
         ],
         vec![
             "DEFINE INDEX idx_file_path ON file COLUMNS path;",
-            "CREATE INDEX idx_file_path ON file (path);",
         ],
         vec![
-            "DEFINE INDEX idx_calls_unique ON calls FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_calls_unique ON calls FIELDS in, out UNIQUE;",
         ],
         vec![
             "DEFINE INDEX idx_imports_unique ON imports FIELDS in, out UNIQUE;",
-            "DEFINE INDEX idx_imports_unique ON imports FIELDS in, out UNIQUE;",
         ],
         vec![
-            "DEFINE INDEX idx_has_method_unique ON has_method FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_has_method_unique ON has_method FIELDS in, out UNIQUE;",
         ],
         // Note: do not create an explicit depends_on relation table here; rely on SurrealDB
         // relation/traversal features and let RELATE create relation rows as needed.
         vec![
             "DEFINE INDEX idx_has_file_unique ON has_file FIELDS in, out UNIQUE;",
-            "DEFINE INDEX idx_has_file_unique ON has_file FIELDS in, out UNIQUE;",
         ],
         vec![
-            "DEFINE INDEX idx_in_repo_unique ON in_repo FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_in_repo_unique ON in_repo FIELDS in, out UNIQUE;",
         ],
         // Store the full source content used to compute embeddings for inspection.
         vec![
             "DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
             "REMOVE FIELD source_content ON entity; DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
-            "ALTER TABLE entity CREATE FIELD source_content TYPE string;",
         ],
         // Similarity relations between entities with score metadata
         vec![
             "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
             "DEFINE TABLE similar_same_repo TYPE RELATION;",
-            "CREATE TABLE similar_same_repo;",
         ],
         vec![
-            "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
         ],
         vec![
             "DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
             "REMOVE FIELD score ON similar_same_repo; DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
-            "ALTER TABLE similar_same_repo CREATE FIELD score TYPE number;",
         ],
         vec![
             "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
             "DEFINE TABLE similar_external_repo TYPE RELATION;",
-            "CREATE TABLE similar_external_repo;",
         ],
         vec![
-            "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
             "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
         ],
         vec![
             "DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
             "REMOVE FIELD score ON similar_external_repo; DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
-            "ALTER TABLE similar_external_repo CREATE FIELD score TYPE number;",
         ],
     ];
     for group in schema_groups.iter() {

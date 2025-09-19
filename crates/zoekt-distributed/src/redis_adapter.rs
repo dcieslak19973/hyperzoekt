@@ -33,6 +33,9 @@ use deadpool_redis::{Config as RedisConfig, Pool};
 pub fn create_redis_pool() -> Option<Pool> {
     match std::env::var("REDIS_URL").ok() {
         Some(mut url) => {
+            tracing::info!(
+                "create_redis_pool: REDIS_URL provided, normalizing and attempting to create pool"
+            );
             // Check if URL already has authentication
             let has_auth = url.contains('@');
 
@@ -79,7 +82,23 @@ pub fn create_redis_pool() -> Option<Pool> {
                 }
             }
 
-            RedisConfig::from_url(&url).create_pool(None).ok()
+            match RedisConfig::from_url(&url).create_pool(None) {
+                Ok(pool) => {
+                    tracing::info!(
+                        "create_redis_pool: successfully created pool for URL={}",
+                        url
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "create_redis_pool: failed to create pool for URL={} err={}",
+                        url,
+                        e
+                    );
+                    None
+                }
+            }
         }
         None => {
             // No REDIS_URL provided. Only construct a default Redis URL when explicit
@@ -90,6 +109,7 @@ pub fn create_redis_pool() -> Option<Pool> {
             let password = std::env::var("REDIS_PASSWORD").ok();
 
             if username.is_none() && password.is_none() {
+                tracing::warn!("create_redis_pool: no REDIS_URL and no REDIS_USERNAME/REDIS_PASSWORD; returning None (in-memory fallback)");
                 // No Redis configured; return None to enable in-memory fallback
                 return None;
             }
@@ -116,7 +136,23 @@ pub fn create_redis_pool() -> Option<Pool> {
                 }
             }
 
-            RedisConfig::from_url(&url).create_pool(None).ok()
+            match RedisConfig::from_url(&url).create_pool(None) {
+                Ok(pool) => {
+                    tracing::info!(
+                        "create_redis_pool: created pool using constructed URL={}",
+                        url
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "create_redis_pool: failed to create pool for constructed URL={} err={}",
+                        url,
+                        e
+                    );
+                    None
+                }
+            }
         }
     }
 }

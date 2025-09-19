@@ -35,7 +35,7 @@ async fn duplicate_create_updates() {
     // Ensure table and index exist
     let _ = db.query("CREATE TABLE entity;").await; // ignore errors
     let _ = db
-        .query("ALTER TABLE entity CREATE FIELD stable_id TYPE string;")
+        .query("DEFINE FIELD stable_id ON entity TYPE string;")
         .await;
     let _ = db
         .query("CREATE INDEX idx_entity_stable_id ON entity (stable_id);")

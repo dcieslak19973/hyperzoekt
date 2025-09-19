@@ -85,14 +85,19 @@
         <div style="margin-bottom: 1rem;">
             <strong>🧭 Similar Code</strong>
             <div style="margin-top: 0.35rem; display:flex; gap:8px; align-items:center;">
-                <label for="similar-repo-filter" style="font-size: 12px; color: var(--muted);">Restrict external to
+                <label for="similar-repo-filter-input" style="font-size: 12px; color: var(--muted);">Restrict external
+                    to
                     repos:</label>
-                <select id="similar-repo-filter" multiple size="3" class="search-input"
-                    style="max-width:420px; height:auto;">
-                    <!-- populated by JS -->
-                </select>
+                <div style="display:flex; flex-direction:column; gap:6px; max-width:420px;">
+                    <input id="similar-repo-filter-input" class="search-input" placeholder="Type to search repos"
+                        style="width:100%;" />
+                    <div id="similar-repo-filter-tags" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+                    <div id="similar-repo-filter-options"
+                        style="display:none; border:1px solid var(--input-border); background:var(--panel); position:relative; z-index:50;">
+                    </div>
+                </div>
                 <button id="similar-repo-apply" class="btn"
-                    style="padding: 0.35rem 0.6rem; font-size:0.9rem;">Apply</button>
+                    style="padding: 0.35rem 0.6rem; font-size:0.9rem; margin-left:8px;">Apply</button>
             </div>
             <div id="similar-loading" style="color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem;">Loading
                 similar code…</div>
@@ -174,7 +179,8 @@
             {{ call_graph_json }}
         </script>
 
-        <script>
+        <script type="module">
+            import { createMultiselect } from '/static/common/multiselect.js';
             (function () {
                 const container = document.getElementById('call-graph-canvas');
                 const toggle = document.getElementById('toggle-call-graph');
@@ -299,9 +305,23 @@
                 const contentEl = document.getElementById('similar-content');
                 const sameEl = document.getElementById('similar-same');
                 const extEl = document.getElementById('similar-external');
-                const repoSel = document.getElementById('similar-repo-filter');
                 const applyBtn = document.getElementById('similar-repo-apply');
                 const STORAGE_KEY = 'hz_entity_external_repo_filter';
+
+                // Use shared multiselect for repo filtering
+                let entityMultiselect = null;
+                try {
+                    entityMultiselect = createMultiselect({
+                        inputId: 'similar-repo-filter-input',
+                        tagsId: 'similar-repo-filter-tags',
+                        optionsContainerId: 'similar-repo-filter-options',
+                        storageKey: STORAGE_KEY,
+                        apiPath: '/api/repos'
+                    });
+                    window.entityMultiselect = entityMultiselect;
+                } catch (e) {
+                    console.warn('failed to initialize multiselect', e);
+                }
 
                 function itemHtml(it) {
                     const name = it.name || '(unknown)';
@@ -317,24 +337,15 @@
                     </div>`;
                 }
 
-                function loadRepos() {
-                    fetch('/api/repos').then(r => r.json()).then(repos => {
-                        const selected = new Set(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'));
-                        // Populate options
-                        repoSel.innerHTML = '';
-                        const list = Array.isArray(repos) ? repos : [];
-                        list.forEach(r => {
-                            const opt = document.createElement('option');
-                            opt.value = r.name;
-                            opt.textContent = r.name;
-                            if (selected.has(r.name)) opt.selected = true;
-                            repoSel.appendChild(opt);
-                        });
-                    }).catch(() => { });
-                }
+                // legacy loader kept for compatibility; multiselect will load repos itself
+                function loadRepos() { /* multiselect handles repo loading */ }
 
                 function getSelectedRepos() {
-                    return Array.from(repoSel.selectedOptions).map(o => o.value);
+                    if (entityMultiselect && typeof entityMultiselect.getSelected === 'function') {
+                        return entityMultiselect.getSelected();
+                    }
+                    // fallback to localStorage (legacy)
+                    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
                 }
 
                 function applyExternalFilter(external) {
@@ -360,9 +371,7 @@
                 applyBtn.addEventListener('click', function () {
                     const sel = getSelectedRepos();
                     localStorage.setItem(STORAGE_KEY, JSON.stringify(sel));
-                    // Re-render external with filter applied
-                    const cards = extEl.querySelectorAll('.card');
-                    // easiest: refetch fresh so scores etc are preserved
+                    // Re-render external with filter applied by refetching
                     fetch(url).then(r => r.json()).then(data => {
                         const externalRaw = Array.isArray(data.external_repo) ? data.external_repo : [];
                         const external = applyExternalFilter(externalRaw);

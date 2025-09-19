@@ -10,14 +10,17 @@
             entity types.</p>
 
         <div class="search-form">
-            <label for="repo-select" style="display: block; margin-bottom: 0.5rem; font-weight: bold;">Select
+            <label for="pagerank-repo-input" style="display: block; margin-bottom: 0.5rem; font-weight: bold;">Select
                 Repository:</label>
-            <select id="repo-select" class="search-input" onchange="loadPageRankData()">
-                <option value="">Choose a repository...</option>
-                {% for repo in repos %}
-                <option value="{{ repo.name }}">{{ repo.name }}</option>
-                {% endfor %}
-            </select>
+            <div id="pagerank-repo-multiselect" class="search-input"
+                style="position:relative; padding:6px; background:var(--input-bg); border-radius:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-height:40px;">
+                <div id="pagerank-repo-tags" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+                <input id="pagerank-repo-input" placeholder="Type to search repositories..."
+                    style="border:none; background:transparent; outline:none; flex:1; min-width:160px; padding:6px;">
+                <div id="pagerank-repo-options"
+                    style="position:absolute; left:6px; right:6px; top:46px; max-height:220px; overflow:auto; background:var(--panel); border:1px solid var(--input-border); border-radius:6px; display:none; z-index:50;">
+                </div>
+            </div>
         </div>
 
         <div id="loading" style="display: none; text-align: center; padding: 2rem;">
@@ -30,10 +33,15 @@
     </div>
 </div>
 
-<script>
+<script type="module">
+    import { createMultiselect } from '/static/common/multiselect.js';
+
+    const m = createMultiselect({ inputId: 'pagerank-repo-input', tagsId: 'pagerank-repo-tags', optionsContainerId: 'pagerank-repo-options', storageKey: 'hz.pagerank.repos', apiPath: '/api/repos' });
+    window.pagerankMultiselect = m;
+
     async function loadPageRankData() {
-        const repoSelect = document.getElementById('repo-select');
-        const selectedRepo = repoSelect.value;
+        const selected = (m && typeof m.getSelected === 'function') ? m.getSelected() : [];
+        const selectedRepo = Array.isArray(selected) && selected.length ? selected[0] : '';
         const loadingDiv = document.getElementById('loading');
         const contentDiv = document.getElementById('pagerank-content');
         const tablesDiv = document.getElementById('entity-tables');
@@ -43,10 +51,7 @@
             return;
         }
 
-        // Persist selection
-        try {
-            window.localStorage.setItem('hz.pagerank.repo', selectedRepo);
-        } catch (e) { /* ignore storage errors */ }
+        try { window.localStorage.setItem('hz.pagerank.repo', selectedRepo); } catch (e) { }
 
         loadingDiv.style.display = 'block';
         contentDiv.style.display = 'none';
@@ -55,21 +60,16 @@
             const response = await fetch(`/api/pagerank?repo=${encodeURIComponent(selectedRepo)}`);
             const data = await response.json();
 
-            // Group entities by kind
             const entitiesByKind = {};
             data.forEach(entity => {
-                if (!entitiesByKind[entity.kind]) {
-                    entitiesByKind[entity.kind] = [];
-                }
+                if (!entitiesByKind[entity.kind]) entitiesByKind[entity.kind] = [];
                 entitiesByKind[entity.kind].push(entity);
             });
 
-            // Sort each group by rank descending
             Object.keys(entitiesByKind).forEach(kind => {
                 entitiesByKind[kind].sort((a, b) => b.rank - a.rank);
             });
 
-            // Generate HTML tables
             let html = '';
             const kinds = Object.keys(entitiesByKind).sort();
 
@@ -102,32 +102,16 @@
             `;
 
                 entities.forEach((entity, index) => {
-                    // Prefer server-provided short display (owner/repo/path) when available
                     const rawFile = entity.source_display || (entity.file || '');
                     let cleanFile = rawFile.replace(/^\/tmp\/hyperzoekt-clones\/[0-9a-fA-F-]+\//, '');
-                    // Iteratively strip common clone-directory prefixes so we end up with a path
-                    // relative to the repository root. This handles variants like:
-                    //  - /tmp/hyperzoekt-clones/<uuid>/repo-name-<uuid>/...
-                    //  - repo-name-<uuid>/...
-                    //  - clone-*/...
                     const parts = cleanFile.split('/').filter(p => p !== '');
                     while (parts.length > 1) {
                         const first = parts[0];
-                        // UUID-suffixed segments like name-8e9834cb-6abb-4381-90f4-...
                         const isUuidSuffix = /^[^\/]+-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(first);
-                        // common clone prefixes
                         const isCloneLike = /^clone-|^tmp-|^tmp$/.test(first) || /^\d+$/.test(first);
-                        // repo name exact or repo-name-prefixed segments
                         const isRepoName = entity.repo_name && (first === entity.repo_name || first === (entity.repo_name + '-clone') || first.startsWith(entity.repo_name + '-'));
-                        if (isUuidSuffix || isCloneLike || isRepoName) {
-                            parts.shift();
-                            continue;
-                        }
-                        // If the first segment equals the repo name followed by slash, strip it
-                        if (entity.repo_name && first === entity.repo_name) {
-                            parts.shift();
-                            continue;
-                        }
+                        if (isUuidSuffix || isCloneLike || isRepoName) { parts.shift(); continue; }
+                        if (entity.repo_name && first === entity.repo_name) { parts.shift(); continue; }
                         break;
                     }
                     cleanFile = parts.join('/');
@@ -160,7 +144,6 @@
 
             tablesDiv.innerHTML = html;
 
-            // Attach collapse/expand handlers: default state is collapsed
             const toggles = tablesDiv.querySelectorAll('.pagerank-card-toggle');
             toggles.forEach(btn => {
                 btn.addEventListener('click', (e) => {
@@ -191,22 +174,21 @@
         }
     }
 
-    // Load repositories on page load and restore previous selection
-    document.addEventListener('DOMContentLoaded', function () {
-        const select = document.getElementById('repo-select');
-        try {
-            const saved = window.localStorage.getItem('hz.pagerank.repo');
-            if (saved) {
-                // Only apply if option exists
-                const opt = Array.from(select.options).find(o => o.value === saved);
-                if (opt) {
-                    select.value = saved;
-                    // Trigger initial load
-                    loadPageRankData();
-                }
-            }
-        } catch (e) { /* ignore storage errors */ }
-    });
+    // Observe tag container for changes and auto-load when a repo is selected
+    const tagsEl = document.getElementById('pagerank-repo-tags');
+    if (tagsEl) {
+        const mo = new MutationObserver(() => {
+            const sel = m.getSelected();
+            if (sel && sel.length) loadPageRankData();
+        });
+        mo.observe(tagsEl, { childList: true });
+    }
+
+    // Restore previous single-repo selection (legacy key) if present
+    try {
+        const saved = window.localStorage.getItem('hz.pagerank.repo');
+        if (saved) { m.add(saved); loadPageRankData(); }
+    } catch (e) { }
 </script>
 
 <style>
