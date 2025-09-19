@@ -83,7 +83,7 @@ async fn test_call_edges_created() {
     };
 
     hyperzoekt::db_writer::init_call_edge_capture();
-    let (tx, handle) = spawn_db_writer(vec![], cfg.clone()).expect("spawn writer");
+    let (tx, handle) = spawn_db_writer(vec![], cfg.clone(), None).expect("spawn writer");
     tx.send(vec![ent_a.clone(), ent_b.clone()])
         .expect("send batch");
     // Allow writer thread to receive before closing channel

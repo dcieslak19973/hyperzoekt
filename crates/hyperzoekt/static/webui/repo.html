@@ -177,6 +177,78 @@
         {% else %}
         <p>No entities found in this repository.</p>
         {% endif %}
+        <hr />
+        <div class="card" id="dependencies-card" style="margin-top: 1rem;">
+            <div class="card-header">
+                <h3>📦 Dependencies</h3>
+            </div>
+            <div class="card-body">
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+                    <label for="dep-ref" style="font-size:12px; color:var(--muted);">Ref</label>
+                    <input id="dep-ref" type="text" placeholder="branch or tag (optional)" class="input"
+                        style="width:220px;" />
+                    <button id="dep-refresh" class="btn">Refresh</button>
+                </div>
+                <div id="deps-loading" style="color: var(--muted);">Loading…</div>
+                <div id="deps-error" style="display:none; color:#b91c1c;">Failed to load dependencies.</div>
+                <div id="deps-content" style="display:none;">
+                    <table style="width:100%; border-collapse:collapse;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Name</th>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Language</th>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Version</th>
+                            </tr>
+                        </thead>
+                        <tbody id="deps-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <script>
+            (function () {
+                const repo = encodeURIComponent('{{ repo_name }}');
+                const loading = document.getElementById('deps-loading');
+                const err = document.getElementById('deps-error');
+                const content = document.getElementById('deps-content');
+                const tbody = document.getElementById('deps-table-body');
+                const refInput = document.getElementById('dep-ref');
+                const btn = document.getElementById('dep-refresh');
+
+                async function loadDeps() {
+                    loading.style.display = 'block';
+                    err.style.display = 'none';
+                    content.style.display = 'none';
+                    tbody.innerHTML = '';
+                    const ref = refInput.value.trim();
+                    const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+                    try {
+                        const res = await fetch(`/api/repo/${repo}/dependencies${qs}`);
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        const data = await res.json();
+                        const deps = Array.isArray(data.dependencies) ? data.dependencies : [];
+                        if (deps.length === 0) {
+                            tbody.innerHTML = '<tr><td colspan="3" class="muted">No dependencies discovered.</td></tr>';
+                        } else {
+                            tbody.innerHTML = deps.map(d => {
+                                const name = d.name || '(unknown)';
+                                const lang = d.language || '';
+                                const ver = d.version || '';
+                                return `<tr><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${name}</td><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${lang}</td><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${ver}</td></tr>`;
+                            }).join('');
+                        }
+                        loading.style.display = 'none';
+                        content.style.display = 'block';
+                    } catch (e) {
+                        loading.style.display = 'none';
+                        err.style.display = 'block';
+                    }
+                }
+                btn.addEventListener('click', function (e) { e.preventDefault(); loadDeps(); });
+                // Try auto-loading once after a short delay to allow server-side template work
+                setTimeout(loadDeps, 200);
+            })();
+        </script>
         {% endif %}
     </div>
 </div>

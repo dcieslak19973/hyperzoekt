@@ -32,6 +32,7 @@ use tree_sitter::{Language, Node, Parser};
 use tree_sitter_c_sharp as ts_c_sharp;
 use tree_sitter_cpp as ts_cpp;
 use tree_sitter_go as ts_go;
+use tree_sitter_groovy as ts_groovy;
 use tree_sitter_java as ts_java;
 use tree_sitter_javascript as ts_js;
 use tree_sitter_ocaml as ts_ocaml;
@@ -56,6 +57,7 @@ pub fn extract_symbols_typesitter(content: &str, ext: &str) -> Vec<crate::types:
         "swift" => ts_swift::LANGUAGE.into(),
         "v" | "sv" => ts_verilog::LANGUAGE.into(),
         "ml" | "mli" | "mll" => ts_ocaml::LANGUAGE_OCAML.into(),
+        "gradle" | "groovy" | "build.gradle" => ts_groovy::LANGUAGE.into(),
         _ => return Vec::new(),
     };
 
@@ -636,6 +638,202 @@ pub fn extract_import_aliases_typesitter_with_tree(
     out
 }
 
+// --- Gradle (Groovy DSL) dependency extraction --------------------------------
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GradleDepKind {
+    External, // group:name:version or group:name
+    Project,  // project(':sub') style
+    Catalog,  // libs.xxx alias
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GradleDependency {
+    pub kind: GradleDepKind,
+    pub notation: String,
+    pub group: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub line: usize,
+}
+
+/// Extract declared dependencies from a Groovy `build.gradle` snippet.
+/// This uses a light-weight approach: locate `dependencies { ... }` blocks
+/// and apply regexes to capture common forms such as:
+/// - implementation 'group:name:version'
+/// - implementation(group: 'g', name: 'n', version: 'v')
+/// - project(':sub')
+/// - implementation libs.alias
+pub fn extract_gradle_dependencies_typesitter(content: &str) -> Vec<GradleDependency> {
+    // quick path: must contain "dependencies"
+    if !content.contains("dependencies") {
+        return Vec::new();
+    }
+
+    // Find all `dependencies { ... }` blocks using a simple brace matcher
+    let mut out: Vec<GradleDependency> = Vec::new();
+    let bytes = content.as_bytes();
+
+    // compile regexes once to avoid repeated compilation in loops (clippy)
+    struct GradleRegexes {
+        re_literal: Regex,
+        re_named: Regex,
+        re_group: Regex,
+        re_name: Regex,
+        re_version: Regex,
+        re_project: Regex,
+        re_libs: Regex,
+    }
+
+    static GRADLE_RE: OnceLock<GradleRegexes> = OnceLock::new();
+
+    fn get_gradle_regexes() -> &'static GradleRegexes {
+        GRADLE_RE.get_or_init(|| GradleRegexes {
+            re_literal: Regex::new(r#"(?m)\b(implementation|api|compile(?:Only)?|runtimeOnly|testImplementation|annotationProcessor|kapt)\s+['\"]([^'\"]+)['\"]"#).unwrap(),
+            re_named: Regex::new(r#"(?m)\b(implementation|api|compile(?:Only)?|runtimeOnly|testImplementation|annotationProcessor|kapt)\s*\(([^)]*)\)"#).unwrap(),
+            re_group: Regex::new(r#"group\s*:\s*['\"]([^'\"]+)['\"]"#).unwrap(),
+            re_name: Regex::new(r#"name\s*:\s*['\"]([^'\"]+)['\"]"#).unwrap(),
+            re_version: Regex::new(r#"version\s*:\s*['\"]([^'\"]+)['\"]"#).unwrap(),
+            re_project: Regex::new(r#"project\s*\(\s*['\"]:([^'\"]+)['\"]\s*\)"#).unwrap(),
+            re_libs: Regex::new(r#"(?m)\b(implementation|api|compile(?:Only)?|runtimeOnly|testImplementation)\s+libs\.([A-Za-z0-9_\.]+)"#).unwrap(),
+        })
+    }
+    let regs = get_gradle_regexes();
+
+    let mut idx = 0usize;
+    while let Some(pos) = content[idx..].find("dependencies") {
+        let start = idx + pos;
+        // find first '{' after the keyword
+        if let Some(brace_pos) = content[start..].find('{') {
+            let mut depth = 0isize;
+            let mut i = start + brace_pos;
+            // find matching closing brace
+            let mut end = None;
+            while i < bytes.len() {
+                match bytes[i] as char {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if let Some(end_pos) = end {
+                let block = &content[start..=end_pos];
+                // parse lines inside block for known patterns
+                // pattern 1: configuration 'group:name:version' or "..."
+                for caps in regs.re_literal.captures_iter(block) {
+                    let kind_txt = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                    let val = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                    let parts: Vec<&str> = val.split(':').collect();
+                    let (group, name, version) = match parts.as_slice() {
+                        [g, n, v] => (
+                            Some(g.to_string()),
+                            Some(n.to_string()),
+                            Some(v.to_string()),
+                        ),
+                        [g, n] => (Some(g.to_string()), Some(n.to_string()), None),
+                        _ => (None, Some(val.to_string()), None),
+                    };
+                    // compute line number
+                    if let Some(m) = caps.get(0) {
+                        let abs_start = start + m.start();
+                        let line = line_for_offset(content, abs_start as u32) as usize;
+                        out.push(GradleDependency {
+                            kind: GradleDepKind::External,
+                            notation: format!("{} {}", kind_txt, val),
+                            group,
+                            name,
+                            version,
+                            line,
+                        });
+                    }
+                }
+
+                // pattern 2: configuration(group: 'g', name: 'n', version: 'v')
+                for caps in regs.re_named.captures_iter(block) {
+                    if let Some(argbody) = caps.get(2) {
+                        let group = regs
+                            .re_group
+                            .captures(argbody.as_str())
+                            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                        let name = regs
+                            .re_name
+                            .captures(argbody.as_str())
+                            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                        let version = regs
+                            .re_version
+                            .captures(argbody.as_str())
+                            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                        let abs_start = start + caps.get(0).unwrap().start();
+                        let line = line_for_offset(content, abs_start as u32) as usize;
+                        out.push(GradleDependency {
+                            kind: GradleDepKind::External,
+                            notation: caps
+                                .get(0)
+                                .map(|m| m.as_str().to_string())
+                                .unwrap_or_default(),
+                            group,
+                            name,
+                            version,
+                            line,
+                        });
+                    }
+                }
+
+                // pattern 3: project(':sub') or project(':sub:child')
+                for caps in regs.re_project.captures_iter(block) {
+                    if let Some(sub) = caps.get(1) {
+                        let abs_start = start + caps.get(0).unwrap().start();
+                        let line = line_for_offset(content, abs_start as u32) as usize;
+                        out.push(GradleDependency {
+                            kind: GradleDepKind::Project,
+                            notation: format!("project:{}", sub.as_str()),
+                            group: None,
+                            name: Some(sub.as_str().to_string()),
+                            version: None,
+                            line,
+                        });
+                    }
+                }
+
+                // pattern 4: libs alias usages: implementation libs.foo.bar
+                for caps in regs.re_libs.captures_iter(block) {
+                    if let Some(alias) = caps.get(2) {
+                        let abs_start = start + caps.get(0).unwrap().start();
+                        let line = line_for_offset(content, abs_start as u32) as usize;
+                        out.push(GradleDependency {
+                            kind: GradleDepKind::Catalog,
+                            notation: format!("libs.{}", alias.as_str()),
+                            group: None,
+                            name: Some(alias.as_str().to_string()),
+                            version: None,
+                            line,
+                        });
+                    }
+                }
+
+                // advance index past this block
+                idx = end_pos + 1;
+                continue;
+            }
+        }
+        // if we couldn't find a brace or matching end, advance past the keyword to avoid infinite loop
+        idx = start + "dependencies".len();
+    }
+
+    out
+}
+
 // local helper: compute 0-based line index for a byte offset
 fn line_for_offset(content: &str, pos: u32) -> u32 {
     let bytes = content.as_bytes();
@@ -738,5 +936,60 @@ import x as x_alias, y
             out.contains(&("pkg.subpkg.a".to_string(), Some("a_alias".to_string()), 1))
                 || out.contains(&("pkg.subpkg.a".to_string(), Some("a_alias".to_string()), 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod gradle_tests {
+    use super::*;
+
+    #[test]
+    fn parse_literal_notation() {
+        let src = r#"
+dependencies {
+    implementation 'com.example:lib:1.2.3'
+    api "org.foo:bar:0.1"
+}
+"#;
+        let out = extract_gradle_dependencies_typesitter(src);
+        assert!(out.iter().any(|d| d.kind == GradleDepKind::External
+            && d.name.as_deref() == Some("lib")
+            && d.version.as_deref() == Some("1.2.3")));
+        assert!(out.iter().any(|d| d.kind == GradleDepKind::External
+            && d.name.as_deref() == Some("bar")
+            && d.version.as_deref() == Some("0.1")));
+    }
+
+    #[test]
+    fn parse_named_args() {
+        let src = r#"
+dependencies {
+    implementation(group: 'com.example', name: 'lib', version: '2.0')
+}
+"#;
+        let out = extract_gradle_dependencies_typesitter(src);
+        assert_eq!(out.len(), 1);
+        let d = &out[0];
+        assert_eq!(d.kind, GradleDepKind::External);
+        assert_eq!(d.group.as_deref(), Some("com.example"));
+        assert_eq!(d.name.as_deref(), Some("lib"));
+        assert_eq!(d.version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn parse_project_and_libs() {
+        let src = r#"
+dependencies {
+    implementation project(':sub')
+    implementation libs.foo.bar
+}
+"#;
+        let out = extract_gradle_dependencies_typesitter(src);
+        assert!(out
+            .iter()
+            .any(|d| d.kind == GradleDepKind::Project && d.name.as_deref() == Some("sub")));
+        assert!(out
+            .iter()
+            .any(|d| d.kind == GradleDepKind::Catalog && d.name.as_deref() == Some("foo.bar")));
     }
 }

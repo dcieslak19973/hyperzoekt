@@ -218,6 +218,18 @@ impl ToolHandler for DistributedSearchHandler {
                             .get("case_sensitive")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // Pagination params (cursor is offset)
+                        let start = args
+                            .get("cursor")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let limit = args
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(50)
+                            .clamp(1, 500);
 
                         tracing::info!("⚙️  Search configuration - max_results: {}, context: {}, case_sensitive: {}, include: {:?}, exclude: {:?}, repo: {:?}",
                             max_results, context, case_sensitive, include, exclude, repo);
@@ -256,33 +268,28 @@ impl ToolHandler for DistributedSearchHandler {
                                     search_duration
                                 );
 
-                                // Format the results for display
-                                let mut content = Vec::new();
+                                // Format the results for display and apply pagination
+                                let mut lines: Vec<String> = Vec::new();
 
-                                // Add summary
-                                content.push(ToolContent::text(format!(
+                                // Add summary as first line
+                                lines.push(format!(
                                     "Search completed: {} results found",
                                     results_count
-                                )));
+                                ));
 
-                                // Add actual search results
+                                // Add actual search results as serialized blocks
                                 for (i, result) in results.iter().enumerate() {
                                     if let Some(_summary) =
                                         result.get("summary").and_then(|s| s.as_str())
                                     {
-                                        // Skip the summary entry as we already added it
                                         continue;
                                     }
-
                                     if let Some(error) =
                                         result.get("error").and_then(|e| e.as_str())
                                     {
-                                        content
-                                            .push(ToolContent::text(format!("Error: {}", error)));
+                                        lines.push(format!("Error: {}", error));
                                         continue;
                                     }
-
-                                    // Format individual search result
                                     let file = result
                                         .get("path")
                                         .or_else(|| result.get("file"))
@@ -304,7 +311,6 @@ impl ToolHandler for DistributedSearchHandler {
                                         .get("node_id")
                                         .and_then(|n| n.as_str())
                                         .unwrap_or("unknown");
-
                                     let result_text = format!(
                                         "\n--- Result {} ---\nFile: {}\nLine: {}\nNode: {}\nContent:\n{}",
                                         i + 1,
@@ -313,8 +319,30 @@ impl ToolHandler for DistributedSearchHandler {
                                         node_id,
                                         content_match
                                     );
+                                    lines.push(result_text);
+                                }
 
-                                    content.push(ToolContent::text(result_text));
+                                // Apply pagination to lines
+                                let total = lines.len();
+                                let end = (start + limit).min(total);
+                                let next = if end < total {
+                                    Some(end.to_string())
+                                } else {
+                                    None
+                                };
+                                let mut content: Vec<ToolContent> = Vec::new();
+                                if start == 0 {
+                                    content.push(ToolContent::text(format!(
+                                        "total={} window={}..{}",
+                                        total, start, end
+                                    )));
+                                }
+                                for l in &lines[start..end] {
+                                    content.push(ToolContent::text(l.clone()));
+                                }
+                                if let Some(nc) = next {
+                                    content
+                                        .push(ToolContent::text(format!("__NEXT_CURSOR__:{nc}")));
                                 }
 
                                 let res = ToolResult {
@@ -899,11 +927,14 @@ async fn handle_tools_list_request(
                     "minimum": 0,
                     "maximum": 10
                 },
-                "case_sensitive": {
+                    "case_sensitive": {
                     "type": "boolean",
                     "description": "Case sensitive search",
                     "default": false
                 }
+                    ,
+                    "limit": { "type": "integer", "description": "Page size for results (client-side)", "default": 50 },
+                    "cursor": { "type": "string", "description": "Pagination cursor (offset)" }
             },
             "required": ["regex"],
             "additionalProperties": false
@@ -1002,10 +1033,24 @@ async fn handle_tools_call_request(
             };
 
             match handler.handle_tool_call(tool_call).await {
-                Ok(result) => {
+                Ok(mut result) => {
+                    // Inspect trailing content for sentinel and extract next_cursor
+                    let mut next_cursor: Option<String> = None;
+                    if let Some(ultrafast_mcp::ToolContent::Text { text }) = result.content.last() {
+                        if let Some(rest) = text.strip_prefix("__NEXT_CURSOR__:") {
+                            next_cursor = Some(rest.trim().to_string());
+                        }
+                    }
+                    if next_cursor.is_some() {
+                        result.content.pop();
+                    }
+                    let mut value = serde_json::to_value(&result).unwrap_or_default();
+                    if let Some(cursor) = next_cursor {
+                        value["next_cursor"] = serde_json::Value::String(cursor);
+                    }
                     let response = JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
-                        result: serde_json::to_value(result).unwrap(),
+                        result: value,
                         id: req.id,
                     };
                     let duration = start_time.elapsed();

@@ -412,8 +412,21 @@ impl EventProcessor {
                     event.repo_name,
                     event.branch
                 );
+                // previously printed to stderr; use structured logging instead
+                log::debug!(
+                    "Processing indexing_finished event (stderr->log) for repo {} (branch: {:?})",
+                    event.repo_name,
+                    event.branch
+                );
 
                 // Add prominent log when starting repository processing
+                log::info!(
+                    "🚀 Starting repository indexing for {} (branch: {:?}) from node {}",
+                    event.repo_name,
+                    event.branch,
+                    event.node_id
+                );
+                // also emit as structured log rather than stderr
                 log::info!(
                     "🚀 Starting repository indexing for {} (branch: {:?}) from node {}",
                     event.repo_name,
@@ -570,186 +583,121 @@ impl EventProcessor {
                         Some(lines[s..=e].join("\n"))
                     }
 
-                    let payloads: Vec<EntityPayload> = svc
-                        .entities
-                        .iter()
-                        .map(|ent| {
-                            let file = &svc.files[ent.file_id as usize];
-                            let mut imports: Vec<ImportItem> = Vec::new();
-                            let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
-                                    let mut calls: Vec<String> = Vec::new();
-                            if matches!(ent.kind, EntityKind::File) {
-                                if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
-                                    let lines = svc.import_lines.get(ent.id as usize);
-                                    for (i, &target_eid) in edge_list.iter().enumerate() {
-                                        if let Some(target_ent) =
-                                            svc.entities.get(target_eid as usize)
-                                        {
-                                            let target_file_idx = target_ent.file_id as usize;
-                                            if let Some(target_file) =
-                                                svc.files.get(target_file_idx)
-                                            {
-                                                let line_no = lines
-                                                    .and_then(|l| l.get(i))
-                                                    .cloned()
-                                                    .unwrap_or(0)
-                                                    .saturating_add(1);
-                                                let raw_path = target_file.path.clone();
-                                                let repo_rel = crate::repo_index::indexer::payload::compute_repo_relative(&raw_path, &repo_name);
-                                                imports.push(ImportItem {
-                                                    path: repo_rel,
-                                                    line: line_no,
-                                                });
-                                            }
+                    // Progress logging interval (entities) configurable via env; default 5000
+                    let progress_interval: usize = std::env::var("HZ_INDEX_PROGRESS_INTERVAL")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(5000);
+                    let total_entities = svc.entities.len();
+                    log::info!(
+                        "payload build starting: repo={} total_entities={} progress_interval={}",
+                        repo_name,
+                        total_entities,
+                        progress_interval
+                    );
+                    use std::collections::HashMap;
+                    let mut file_cache: HashMap<u32, String> = HashMap::new();
+                    let mut payloads: Vec<EntityPayload> = Vec::with_capacity(total_entities);
+                    for (idx, ent) in svc.entities.iter().enumerate() {
+                        let file = &svc.files[ent.file_id as usize];
+                        let mut imports: Vec<ImportItem> = Vec::new();
+                        let mut unresolved_imports: Vec<UnresolvedImport> = Vec::new();
+                        let mut calls: Vec<String> = Vec::new();
+                        if matches!(ent.kind, EntityKind::File) {
+                            if let Some(edge_list) = svc.import_edges.get(ent.id as usize) {
+                                let lines = svc.import_lines.get(ent.id as usize);
+                                for (i, &target_eid) in edge_list.iter().enumerate() {
+                                    if let Some(target_ent) = svc.entities.get(target_eid as usize) {
+                                        let target_file_idx = target_ent.file_id as usize;
+                                        if let Some(target_file) = svc.files.get(target_file_idx) {
+                                            let line_no = lines
+                                                .and_then(|l| l.get(i))
+                                                .cloned()
+                                                .unwrap_or(0)
+                                                .saturating_add(1);
+                                            let raw_path = target_file.path.clone();
+                                            let repo_rel = crate::repo_index::indexer::payload::compute_repo_relative(&raw_path, &repo_name);
+                                            imports.push(ImportItem { path: repo_rel, line: line_no });
                                         }
                                     }
                                 }
-                                if let Some(unres) =
-                                    svc.unresolved_imports.get(ent.file_id as usize)
-                                {
-                                    for (m, lineno) in unres {
-                                        unresolved_imports.push(UnresolvedImport {
-                                            module: m.clone(),
-                                            line: lineno.saturating_add(1),
-                                        });
-                                    }
+                            }
+                            if let Some(unres) = svc.unresolved_imports.get(ent.file_id as usize) {
+                                for (m, lineno) in unres {
+                                    unresolved_imports.push(UnresolvedImport { module: m.clone(), line: lineno.saturating_add(1) });
                                 }
                             }
-                            let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
-                                let has_imports = !imports.is_empty();
-                                let has_unresolved = !unresolved_imports.is_empty();
-                                if has_imports || has_unresolved {
-                                    (
-                                        Some(ent.start_line.saturating_add(1)),
-                                        Some(ent.end_line.saturating_add(1)),
-                                    )
-                                } else {
-                                    (None, None)
-                                }
+                        }
+                        let (start_field, end_field) = if matches!(ent.kind, EntityKind::File) {
+                            let has_imports = !imports.is_empty();
+                            let has_unresolved = !unresolved_imports.is_empty();
+                            if has_imports || has_unresolved {
+                                (Some(ent.start_line.saturating_add(1)), Some(ent.end_line.saturating_add(1)))
                             } else {
-                                (
-                                    Some(ent.start_line.saturating_add(1)),
-                                    Some(ent.end_line.saturating_add(1)),
-                                )
+                                (None, None)
+                            }
+                        } else {
+                            (Some(ent.start_line.saturating_add(1)), Some(ent.end_line.saturating_add(1)))
+                        };
+                        let project = std::env::var("SURREAL_PROJECT").unwrap_or_else(|_| "hyperzoekt-indexer".into());
+                        let repo = repo_name.clone();
+                        let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| { event.branch.clone().unwrap_or_else(|| "main".into()) });
+                        let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "unknown-commit".into());
+                        let stable_id = crate::utils::generate_stable_id(&project, &repo, &branch, &commit, &file.path, &ent.name, &ent.signature);
+                        let branch_ref = event.branch.clone().unwrap_or_else(|| "main".into());
+                        let source_base = normalize_git_url(&event.git_url);
+                        if let Some(ref g) = Some(event.git_url.clone()) {
+                            log::debug!("source_url_debug: git_url='{}' owner='{:?}' repo='{}' branch='{}'", g, owner_clone, repo_name, branch_ref);
+                        }
+                        if let Some(ref base) = source_base { log::debug!("source_url_debug: normalized_base='{}'", base); } else { log::debug!("source_url_debug: normalized_base is None; no source_url will be set"); }
+                        let computed_source = source_base.map(|base| {
+                            let rel_path = match std::path::Path::new(&file.path).strip_prefix(&temp_dir_clone) { Ok(p) => p.to_string_lossy().to_string(), Err(_) => file.path.trim_start_matches('/').to_string() };
+                            let rel = rel_path.trim_start_matches('/');
+                            let url = format!("{}/blob/{}/{}", base.trim_end_matches('/'), branch_ref, rel);
+                            log::debug!("source_url_debug: computed source_url='{}'", url);
+                            url
+                        });
+                        // caching: read file content once per file id for repeated line slicing
+                        fn cached_slice(file_cache: &mut std::collections::HashMap<u32, String>, file_id: u32, path: &str, start1: Option<u32>, end1: Option<u32>) -> Option<String> {
+                            use std::collections::hash_map::Entry;
+                            // Use the entry API to avoid a potential unwrap after insert.
+                            // If reading the file fails, keep behavior of returning None.
+                            let content_ref: &String = match file_cache.entry(file_id) {
+                                Entry::Occupied(o) => o.into_mut(),
+                                Entry::Vacant(v) => {
+                                    let s = std::fs::read_to_string(path).ok()?;
+                                    v.insert(s)
+                                }
                             };
-
-                            // Generate stable id for the entity
-                            let project = std::env::var("SURREAL_PROJECT")
-                                .unwrap_or_else(|_| "hyperzoekt-indexer".into());
-                            let repo = repo_name.clone();
-                            let branch = std::env::var("SURREAL_BRANCH").unwrap_or_else(|_| {
-                                event.branch.clone().unwrap_or_else(|| "main".into())
-                            });
-                            let commit = std::env::var("SURREAL_COMMIT")
-                                .unwrap_or_else(|_| "unknown-commit".into());
-                            let stable_id = crate::utils::generate_stable_id(
-                                &project,
-                                &repo,
-                                &branch,
-                                &commit,
-                                &file.path,
-                                &ent.name,
-                                &ent.signature,
-                            );
-
-                            // Build a source_url from the RepoEvent.git_url and branch, prefer event.branch
-                            let branch_ref = event.branch.clone().unwrap_or_else(|| "main".into());
-                            // Normalize the configured git URL and use it directly. Do NOT
-                            // fall back to owner+repo — if normalization fails, we will not
-                            // generate a source URL for this entity.
-                            let source_base = normalize_git_url(&event.git_url);
-
-                            // Log normalization and final URL decision for easier debugging in Docker logs
-                            if let Some(ref g) = Some(event.git_url.clone()) {
-                                log::debug!(
-                                    "source_url_debug: git_url='{}' owner='{:?}' repo='{}' branch='{}'",
-                                    g,
-                                    owner_clone,
-                                    repo_name,
-                                    branch_ref
-                                );
+                            let content = content_ref;
+                            if content.is_empty() { return Some(String::new()); }
+                            let lines: Vec<&str> = content.lines().collect();
+                            if lines.is_empty() { return Some(String::new()); }
+                            let s0 = start1.unwrap_or(0).saturating_sub(1) as usize;
+                            let e0 = end1.unwrap_or(0).saturating_sub(1) as usize;
+                            let s = s0.min(lines.len().saturating_sub(1));
+                            let e = e0.min(lines.len().saturating_sub(1));
+                            if s > e { return Some(String::new()); }
+                            Some(lines[s..=e].join("\n"))
+                        }
+                        let ent_source_content = if !matches!(ent.kind, EntityKind::File) { cached_slice(&mut file_cache, ent.file_id, &file.path, start_field, end_field) } else { None };
+                        let methods_with_src: Vec<crate::repo_index::indexer::payload::MethodItem> = ent.methods.iter().map(|mi| {
+                            let start1 = mi.start_line.map(|v| v.saturating_add(1));
+                            let end1 = mi.end_line.map(|v| v.saturating_add(1));
+                            let src_txt = cached_slice(&mut file_cache, ent.file_id, &file.path, start1, end1);
+                            crate::repo_index::indexer::payload::MethodItem { name: mi.name.clone(), visibility: mi.visibility.clone(), signature: mi.signature.clone(), start_line: mi.start_line, end_line: mi.end_line, source_content: src_txt }
+                        }).collect();
+                        if !matches!(ent.kind, EntityKind::File) {
+                            if let Some(edges) = svc.call_edges.get(ent.id as usize) {
+                                for &callee_eid in edges { if let Some(callee_ent) = svc.entities.get(callee_eid as usize) { calls.push(callee_ent.name.clone()); } }
                             }
-
-                            if let Some(ref base) = source_base {
-                                log::debug!("source_url_debug: normalized_base='{}'", base);
-                            } else {
-                                log::debug!(
-                                    "source_url_debug: normalized_base is None; no source_url will be set"
-                                );
-                            }
-
-                            let computed_source = source_base.map(|base| {
-                                // file.path may include the temporary clone root (eg /tmp/hyperzoekt-clones/xxx/<repo>/...)
-                                // Strip the temp_dir_clone prefix when possible to get a repo-relative path.
-                                let rel_path = match std::path::Path::new(&file.path)
-                                    .strip_prefix(&temp_dir_clone)
-                                {
-                                    Ok(p) => p.to_string_lossy().to_string(),
-                                    Err(_) => file.path.trim_start_matches('/').to_string(),
-                                };
-                                let rel = rel_path.trim_start_matches('/');
-                                let url = format!(
-                                    "{}/blob/{}/{}",
-                                    base.trim_end_matches('/'),
-                                    branch_ref,
-                                    rel
-                                );
-                                log::debug!("source_url_debug: computed source_url='{}'", url);
-                                url
-                            });
-
-                            // Compute full function text for embeddings: use non-file entities' spans
-                            let ent_source_content = if !matches!(ent.kind, EntityKind::File) {
-                                slice_file_lines(&file.path, start_field, end_field)
-                            } else {
-                                None
-                            };
-
-                            // Enrich methods with source_content based on their spans
-                            let methods_with_src: Vec<crate::repo_index::indexer::payload::MethodItem> = ent.methods.iter().map(|mi| {
-                                let start1 = mi.start_line.map(|v| v.saturating_add(1));
-                                let end1 = mi.end_line.map(|v| v.saturating_add(1));
-                                let src_txt = slice_file_lines(&file.path, start1, end1);
-                                crate::repo_index::indexer::payload::MethodItem {
-                                    name: mi.name.clone(),
-                                    visibility: mi.visibility.clone(),
-                                    signature: mi.signature.clone(),
-                                    start_line: mi.start_line,
-                                    end_line: mi.end_line,
-                                    source_content: src_txt,
-                                }
-                            }).collect();
-
-                            EntityPayload {
-                                language: file.language.clone(),
-                                kind: ent.kind.as_str().to_string(),
-                                name: ent.name.clone(),
-                                parent: ent.parent.clone(),
-                                signature: ent.signature.clone(),
-                                start_line: start_field,
-                                end_line: end_field,
-                                // calls array removed (edges now)
-                                doc: ent.doc.clone(),
-                                rank: Some(ent.rank),
-                                imports,
-                                unresolved_imports,
-                                methods: methods_with_src,
-                                stable_id,
-                                repo_name: repo_name.clone(),
-                                source_url: computed_source,
-                                source_display: None,
-                                        calls: {
-                                            if !matches!(ent.kind, EntityKind::File) {
-                                                for &callee_eid in svc.call_edges.get(ent.id as usize).unwrap_or(&Vec::new()) {
-                                                    if let Some(callee_ent) = svc.entities.get(callee_eid as usize) { calls.push(callee_ent.name.clone()); }
-                                                }
-                                            }
-                                            calls
-                                        },
-                                source_content: ent_source_content,
-                            }
-                        })
-                        .collect();
+                        }
+                        payloads.push(EntityPayload { language: file.language.clone(), kind: ent.kind.as_str().to_string(), name: ent.name.clone(), parent: ent.parent.clone(), signature: ent.signature.clone(), start_line: start_field, end_line: end_field, doc: ent.doc.clone(), rank: Some(ent.rank), imports, unresolved_imports, methods: methods_with_src, stable_id, repo_name: repo_name.clone(), source_url: computed_source, source_display: None, calls, source_content: ent_source_content });
+                        if progress_interval > 0 && (idx + 1) % progress_interval == 0 {
+                            log::info!("payload build progress: repo={} {}/{} ({:.2}%)", repo_name, idx + 1, total_entities, ((idx + 1) as f64 * 100.0 / total_entities as f64));
+                        }
+                    }
+                    log::info!("payload build complete: repo={} total_entities={}", repo_name, total_entities);
 
                     // Configure and spawn DB writer
                     let surreal_url = std::env::var("SURREALDB_URL").ok();
@@ -767,7 +715,7 @@ impl EventProcessor {
                         ..Default::default()
                     };
 
-                    let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg)?;
+                    let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg, None)?;
 
                     // Chunk payloads so writer processes multiple batches when large.
                     let chunk_size = 500; // keep in sync with default batch_capacity
@@ -822,16 +770,80 @@ impl EventProcessor {
                             "Successfully processed indexing_finished for {}",
                             event.repo_name
                         );
-                        // Optionally enqueue embedding jobs to Redis
-                        if Self::embed_jobs_enabled() {
-                            if let Err(e) = Self::enqueue_embedding_jobs(&event.repo_name, &payloads).await {
-                                log::warn!("Failed to enqueue embedding jobs: {}", e);
+                        // Emit a clear, always-on info line showing the embedding gate decision so
+                        // operators do not have to rely on a missing debug log to infer why jobs
+                        // were (not) enqueued. This avoids confusion when RUST_LOG excludes debug.
+                        let embed_env = std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default();
+                        let will_enqueue = Self::embed_jobs_enabled();
+                        log::info!(
+                            "embedding enqueue gate: repo={} HZ_ENABLE_EMBED_JOBS='{}' payloads={} will_enqueue={}",
+                            event.repo_name,
+                            embed_env,
+                            payloads.len(),
+                            will_enqueue
+                        );
+                        // Additional diagnostic summary for repository indexing results.
+                        // This helps operators quickly assess what was produced before optional embedding.
+                        if !payloads.is_empty() {
+                            use std::collections::HashMap;
+                            let mut by_kind: HashMap<&str, usize> = HashMap::new();
+                            let mut with_source = 0usize;
+                            let mut with_imports = 0usize;
+                            let mut with_methods = 0usize;
+                            for p in &payloads {
+                                *by_kind.entry(p.kind.as_str()).or_default() += 1;
+                                if p.source_content.as_ref().map(|s| !s.is_empty()).unwrap_or(false) { with_source += 1; }
+                                if !p.imports.is_empty() { with_imports += 1; }
+                                if !p.methods.is_empty() { with_methods += 1; }
                             }
+                            // Build compact kind summary like: func=120,class=33,file=10
+                            let mut kind_pairs: Vec<String> = by_kind.iter().map(|(k,v)| format!("{}={}", k, v)).collect();
+                            kind_pairs.sort();
+                            let kind_summary = kind_pairs.join(",");
+                            let sample: Vec<&str> = payloads.iter().take(5).map(|p| p.stable_id.as_str()).collect();
+                            log::info!(
+                                "Index summary repo={} total_entities={} kinds=[{}] with_source={} with_imports={} with_methods={} sample_stable_ids={:?}",
+                                event.repo_name,
+                                payloads.len(),
+                                kind_summary,
+                                with_source,
+                                with_imports,
+                                with_methods,
+                                sample
+                            );
+                            // Structured event to help attribute which indexer produced these entities
+                            log::info!(
+                                "event=HYPERZOEKT_INDEX_COMPLETE repo={} total_entities={} kinds={} with_source={} with_imports={} with_methods={} sample_stable_ids={:?}",
+                                event.repo_name,
+                                payloads.len(),
+                                kind_summary,
+                                with_source,
+                                with_imports,
+                                with_methods,
+                                sample
+                            );
                         } else {
-                            log::debug!("Embedding jobs disabled (HZ_ENABLE_EMBED_JOBS not set)");
+                            log::warn!("Index produced zero entities for repo={}; skipping embedding enqueue", event.repo_name);
                         }
+                        // Optionally enqueue embedding jobs to Redis
+                        // Legacy post-all enqueue removed: per-batch enqueue now handled in db_writer after each batch persistence.
+                        if Self::embed_jobs_enabled() { log::info!("per-batch embedding enqueue active (post-persist)"); } else { log::debug!("Embedding jobs disabled (HZ_ENABLE_EMBED_JOBS not set)"); }
+
+                        // Final completion marker (stderr + info) so operators can reliably detect end-of-repo lifecycle.
+                        log::info!(
+                            "INDEX_DONE repo={} total_entities={} ts={}",
+                            event.repo_name,
+                            payloads.len(),
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        );
+                        log::info!(
+                            "index_done repo={} total_entities={} (all batches persisted and embed jobs enqueued)",
+                            event.repo_name,
+                            payloads.len()
+                        );
                     }
                     Ok(Err(e)) => {
+                        log::error!("Indexer failed for {}: {}", event.repo_name, e);
                         log::error!("Indexer failed for {}: {}", event.repo_name, e);
                         // Clean up temp directory on error too
                         if let Err(cleanup_err) =
@@ -846,6 +858,7 @@ impl EventProcessor {
                     }
                     Err(e) => {
                         log::error!("Indexer task panicked for {}: {:?}", event.repo_name, e);
+                        log::error!("Indexer panicked for {}: {:?}", event.repo_name, e);
                         // Clean up temp directory on panic too
                         if let Err(cleanup_err) =
                             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&temp_dir))
@@ -1055,14 +1068,16 @@ impl EventProcessor {
         payloads: &[EntityPayload],
     ) -> Result<usize, anyhow::Error> {
         let pool_opt = zoekt_distributed::redis_adapter::create_redis_pool();
-        let pool = match pool_opt {
-            Some(p) => p,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
-                ))
-            }
-        };
+        if pool_opt.is_none() {
+            log::warn!(
+                "Redis pool not available when attempting to enqueue embedding jobs for repo={}; check REDIS_URL/credentials",
+                repo_name
+            );
+            return Err(anyhow::anyhow!(
+                "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
+            ));
+        }
+        let pool = pool_opt.unwrap();
 
         #[derive(serde::Serialize)]
         struct EmbeddingJob<'a> {
@@ -1087,6 +1102,7 @@ impl EventProcessor {
                 name: &p.name,
                 source_url: p.source_url.as_deref(),
             };
+            log::debug!("Enqueuing embed job for stable_id={}", p.stable_id);
             match serde_json::to_string(&job) {
                 Ok(s) => jobs.push(s),
                 Err(e) => {
@@ -1100,11 +1116,34 @@ impl EventProcessor {
         }
 
         let mut conn = pool.get().await?;
+        if jobs.is_empty() {
+            log::debug!(
+                "No embed jobs to enqueue for repo={}; nothing pushed to queue='{}'",
+                repo_name,
+                queue_key
+            );
+            log::debug!("Skipping enqueue: no jobs to push for repo={}", repo_name);
+            return Ok(0usize);
+        }
+
+        log::debug!(
+            "Attempting to enqueue {} embed jobs to queue='{}' for repo={}",
+            jobs.len(),
+            queue_key,
+            repo_name
+        );
+
         let mut total = 0usize;
         for chunk in jobs.chunks(500) {
             let _: () =
                 deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &queue_key, chunk).await?;
             total += chunk.len();
+            log::debug!(
+                "Pushed chunk of {} jobs to queue='{}' (repo={})",
+                chunk.len(),
+                queue_key,
+                repo_name
+            );
         }
         log::info!("Enqueued {} embedding jobs to '{}'", total, queue_key);
         Ok(total)

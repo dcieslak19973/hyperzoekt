@@ -857,12 +857,13 @@ async fn get_current_commit_sha(git_url: &str) -> Option<String> {
         }
     } else {
         // For remote repos, use git ls-remote to get the HEAD commit SHA
-        match tokio::process::Command::new("git")
+        // Run `git ls-remote` with a short timeout to avoid hanging tests when network is slow
+        let cmd = tokio::process::Command::new("git")
             .args(["ls-remote", git_url, "HEAD"])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
+            .output();
+        let timeout_dur = std::time::Duration::from_secs(3);
+        match tokio::time::timeout(timeout_dur, cmd).await {
+            Ok(Ok(output)) if output.status.success() => {
                 let output_str = String::from_utf8_lossy(&output.stdout);
                 // git ls-remote output format: <sha>\t<ref>
                 // We want the SHA from the first line
@@ -878,13 +879,17 @@ async fn get_current_commit_sha(git_url: &str) -> Option<String> {
                 tracing::debug!(repo=%git_url, "failed to parse SHA from git ls-remote output");
                 None
             }
-            Ok(output) => {
+            Ok(Ok(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 tracing::debug!(repo=%git_url, status=%output.status, stderr=%stderr, "git ls-remote failed");
                 None
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::debug!(repo=%git_url, error=%e, "failed to run git ls-remote");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(repo=%git_url, "git ls-remote timed out after {}s", timeout_dur.as_secs());
                 None
             }
         }

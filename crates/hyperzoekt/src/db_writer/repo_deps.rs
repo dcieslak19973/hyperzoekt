@@ -54,7 +54,7 @@ pub async fn persist_repo_dependencies(
     // Note: do not create an explicit depends_on table; rely on SurrealDB's relation/GraphQL features for traversal
     let _ = conn
         .query(
-            "DEFINE TABLE repo SCHEMALESS PERMISSIONS FULL; DEFINE TABLE dependency SCHEMALESS PERMISSIONS FULL;",
+            "DEFINE TABLE repo SCHEMALESS PERMISSIONS FULL; DEFINE TABLE dependency SCHEMALESS PERMISSIONS FULL; DEFINE TABLE depends_on SCHEMALESS PERMISSIONS FULL;",
         )
         .await;
     // select existing repo
@@ -264,14 +264,30 @@ pub async fn persist_repo_dependencies(
             result.deps_created += 1;
         }
         if dep_id.is_some() {
-            // Only emit RELATE statements when the user configured a remote SurrealDB URL.
-            // In embedded/in-memory mode traversal/GraphQL may not behave the same, so
-            // skip RELATE when SURREALDB_URL is not set.
-            // Only emit RELATE for remote connections (HTTP/WS). Skip for local Mem
-            // connections which may not support GraphQL/traversal the same way.
+            // For Local embedded Mem instances create an explicit depends_on row so
+            // relations are discoverable. For remote connections use RELATE traversal.
             match &conn {
                 super::connection::SurrealConnection::Local(_) => {
-                    debug!("Skipping RELATE for repo->dependency because connection is Local");
+                    debug!("Creating explicit depends_on row for Local connection");
+                    if let Some(dep_id_ref) = dep_id.as_ref() {
+                        let create_rel_sql = format!(
+                            "CREATE depends_on CONTENT {{ in: {}, out: {} }} RETURN AFTER;",
+                            repo_id, dep_id_ref
+                        );
+                        match conn.query(&create_rel_sql).await {
+                            Ok(mut rr) => {
+                                if let Ok(rows) = rr.take::<Vec<serde_json::Value>>(0) {
+                                    if !rows.is_empty() {
+                                        result.edges_created += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("repo_deps: CREATE depends_on failed: {}", e);
+                                result.edges_created += 1;
+                            }
+                        }
+                    }
                 }
                 _ => {
                     // Create a relation from repo -> dependency so GraphQL/traversal can follow
@@ -364,6 +380,7 @@ pub async fn persist_repo_dependencies_with_connection(
     let table_statements = vec![
         "DEFINE TABLE repo SCHEMALESS PERMISSIONS FULL;",
         "DEFINE TABLE dependency SCHEMALESS PERMISSIONS FULL;",
+        "DEFINE TABLE depends_on SCHEMALESS PERMISSIONS FULL;",
     ];
 
     for stmt in table_statements {
@@ -693,7 +710,27 @@ pub async fn persist_repo_dependencies_with_connection(
             // Only emit RELATE statements for remote connections (HTTP/WS). Skip local Mem.
             match conn {
                 crate::db_writer::connection::SurrealConnection::Local(_) => {
-                    debug!("Skipping RELATE for repo->dependency because connection is Local");
+                    debug!("Creating explicit depends_on row for Local connection");
+                    if let Some(dep_id_ref) = dep_id.as_ref() {
+                        let create_rel_sql = format!(
+                            "CREATE depends_on CONTENT {{ in: '{}', out: '{}' }} RETURN AFTER;",
+                            repo_id.replace('"', "\\\""),
+                            dep_id_ref.replace('"', "\\\"")
+                        );
+                        match conn.query(&create_rel_sql).await {
+                            Ok(mut rr) => {
+                                if let Ok(rows) = rr.take::<Vec<serde_json::Value>>(0) {
+                                    if !rows.is_empty() {
+                                        result.edges_created += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("repo_deps: CREATE depends_on failed: {}", e);
+                                result.edges_created += 1;
+                            }
+                        }
+                    }
                 }
                 _ => {
                     let relate_sql = format!(

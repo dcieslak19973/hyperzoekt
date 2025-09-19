@@ -411,8 +411,22 @@ impl Indexer for SimpleIndexer {
         } else {
             actual_repo_path.to_string_lossy().into_owned()
         };
+        // Summarize symbol counts for diagnostics
+        let mut total_symbols: usize = 0;
+        for i in 0..idx.doc_count() {
+            if let Some(meta) = idx.doc_meta(i) {
+                total_symbols += meta.symbols.len();
+            }
+        }
         self.store.write().insert(key.clone(), idx.clone());
-        tracing::info!(repo=%key, "index build complete and stored");
+        tracing::info!(
+            event="LEGACY_INDEXER_INDEX_COMPLETE",
+            repo=%key,
+            docs=idx.doc_count(),
+            total_symbols=total_symbols,
+            repo_root=%actual_repo_path.display().to_string(),
+            "legacy index build complete and stored"
+        );
         tracing::debug!(repo=%key, "repository indexing completed successfully");
         Ok(idx)
     }
@@ -474,6 +488,21 @@ struct SearchParams {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Early stderr marker for startup attribution (before tracing init)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        eprintln!(
+            "EARLY_START_MARKER_DZR_INDEXER ts={:.3} pid={} version={}",
+            ts,
+            std::process::id(),
+            env!("CARGO_PKG_VERSION")
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+    }
     // Initialize tracing using the RUST_LOG env var when present, default to `info`
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
