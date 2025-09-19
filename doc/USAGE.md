@@ -130,10 +130,10 @@ Quick verification:
 
 ```bash
 # Observe queue length grow after an indexing run
-docker compose exec redis redis-cli LLEN zoekt:embed_jobs
+docker compose --env-file docker/.env exec redis redis-cli LLEN zoekt:embed_jobs
 
 # Peek a few jobs (JSON lines)
-docker compose exec redis redis-cli LRANGE zoekt:embed_jobs 0 2
+docker compose --env-file docker/.env exec redis redis-cli LRANGE zoekt:embed_jobs 0 2
 ```
 
 Job schema (JSON): `{ stable_id, repo_name, language, kind, name, source_url? }`.

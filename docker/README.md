@@ -25,7 +25,7 @@ Notes and troubleshooting:
 
 ```bash
 # Build and start services
-docker compose up --build
+docker compose -f docker/docker-compose.yml --env-file docker/.env up --build
 
 # Check health
 curl -v http://localhost:9900/health

@@ -210,7 +210,7 @@ The project includes a Docker Compose setup that runs all components with Redis 
 
 1. **Start all services:**
 ```bash
-cd docker && docker-compose up --build
+cd docker && docker compose -f docker/docker-compose.yml --env-file docker/.env up --build
 ```
 
 This will start:
@@ -257,7 +257,7 @@ Use the Admin UI at http://localhost:7878 to add repositories for indexing, or t
 
 5. **Stop services:**
 ```bash
-cd docker && docker-compose down
+cd docker && docker compose -f docker/docker-compose.yml --env-file docker/.env down
 ```
 
 Running the full system locally
@@ -310,7 +310,7 @@ The development container image now bundles the `surreal` CLI. When the devconta
 export DISABLE_LOCAL_SURREAL=1
 ```
 
-If you rely on Docker Compose's `surrealdb` service instead (e.g. `docker compose up surrealdb`), you can leave the auto-start enabled; the port bind may fail if both try to listen, so in that case disable the auto instance.
+If you rely on Docker Compose's `surrealdb` service instead (e.g. `docker compose --env-file docker/.env up surrealdb`), you can leave the auto-start enabled; the port bind may fail if both try to listen, so in that case disable the auto instance.
 
 Environment variables (already defaults in many examples):
 
