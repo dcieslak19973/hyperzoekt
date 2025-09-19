@@ -14,7 +14,7 @@ Prerequisites
 For a quick development setup use the provided Docker Compose in `docker/` which starts Redis and SurrealDB for you:
 
 ```bash
-cd docker && docker-compose up --build
+cd docker && docker compose -f docker/docker-compose.yml --env-file docker/.env up --build
 ```
 
 Starting services locally (examples)
