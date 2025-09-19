@@ -107,15 +107,9 @@ Notes:
 - Use `SURREAL_EMBED_MODE=memory` for ephemeral runs (tests, CI) to avoid creating persistent files.
 - The repository's `.gitignore` should include `.data/` so DB files are not accidentally committed.
 
-## Embedding Jobs (optional)
-
-Embedding jobs are no longer part of the indexer runtime. The writer computes
-and persists embeddings synchronously when `HZ_EMBED_MODEL` is set. The
-similarity worker consumes persisted vectors to compute similarity relations.
-
 ## Similarity (embeddings)
 
-The similarity worker (previously called the "embed worker") can compute and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the similarity worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
+The similarity worker can compute and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the similarity worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
 
 Notes and requirements:
 
