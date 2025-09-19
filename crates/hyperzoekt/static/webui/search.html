@@ -6,7 +6,15 @@
     <form id="search-form">
         <input type="text" id="query" name="q" class="search-input"
             placeholder="Search for functions, classes, files..." required>
-        <input type="text" id="repo" name="repo" class="search-input" placeholder="Filter by repository (optional)">
+        <div id="repo-multiselect" class="search-input"
+            style="position:relative; padding:6px; background:var(--input-bg); border-radius:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-height:40px;">
+            <div id="repo-tags" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+            <input id="repo-input" placeholder="Type to search repositories..."
+                style="border:none; background:transparent; outline:none; flex:1; min-width:160px; padding:6px;">
+            <div id="repo-options"
+                style="position:absolute; left:6px; right:6px; top:46px; max-height:220px; overflow:auto; background:var(--panel); border:1px solid var(--input-border); border-radius:6px; display:none; z-index:50;">
+            </div>
+        </div>
         <button type="submit" class="btn">Search</button>
     </form>
 </div>
@@ -23,106 +31,78 @@
     </div>
 </div>
 
-<script>
-    // Function to get CSS class based on entity kind
+<script type="module">
+    import { createMultiselect } from '/static/common/multiselect.js';
+
+    // Helper: kind -> class
     function getKindClass(kind) {
-        if (kind.includes('function') || kind.includes('method')) {
-            return 'entity-function';
-        } else if (kind.includes('class') || kind.includes('struct') || kind.includes('interface') || kind.includes('trait')) {
-            return 'entity-class';
-        } else if (kind.includes('enum')) {
-            return 'entity-enum';
-        } else if (kind.includes('module') || kind.includes('namespace')) {
-            return 'entity-module';
-        } else if (kind.includes('variable') || kind.includes('constant') || kind.includes('field')) {
-            return 'entity-variable';
-        } else if (kind.includes('macro')) {
-            return 'entity-macro';
-        } else {
-            return 'entity-other';
-        }
+        if (!kind) return 'entity-other';
+        if (kind.includes('function') || kind.includes('method')) return 'entity-function';
+        if (kind.includes('class') || kind.includes('struct') || kind.includes('interface') || kind.includes('trait')) return 'entity-class';
+        if (kind.includes('enum')) return 'entity-enum';
+        if (kind.includes('module') || kind.includes('namespace')) return 'entity-module';
+        if (kind.includes('variable') || kind.includes('constant') || kind.includes('field')) return 'entity-variable';
+        if (kind.includes('macro')) return 'entity-macro';
+        return 'entity-other';
     }
 
-    // Function to get CSS class based on programming language
     function getLanguageClass(language) {
+        if (!language) return 'lang-other';
         const lang = language.toLowerCase();
-        if (lang === 'rust' || lang === 'rs') {
-            return 'lang-rust';
-        } else if (lang === 'python' || lang === 'py') {
-            return 'lang-python';
-        } else if (lang === 'javascript' || lang === 'js') {
-            return 'lang-javascript';
-        } else if (lang === 'typescript' || lang === 'ts') {
-            return 'lang-typescript';
-        } else if (lang === 'go') {
-            return 'lang-go';
-        } else if (lang === 'java') {
-            return 'lang-java';
-        } else if (lang === 'cpp' || lang === 'c++') {
-            return 'lang-cpp';
-        } else if (lang === 'c') {
-            return 'lang-c';
-        } else if (lang === 'csharp' || lang === 'c#') {
-            return 'lang-csharp';
-        } else if (lang === 'swift') {
-            return 'lang-swift';
-        } else if (lang === 'kotlin') {
-            return 'lang-kotlin';
-        } else if (lang === 'scala') {
-            return 'lang-scala';
-        } else if (lang === 'ruby') {
-            return 'lang-ruby';
-        } else if (lang === 'php') {
-            return 'lang-php';
-        } else if (lang === 'html') {
-            return 'lang-html';
-        } else if (lang === 'css') {
-            return 'lang-css';
-        } else {
-            return 'lang-other';
-        }
+        if (lang === 'rust' || lang === 'rs') return 'lang-rust';
+        if (lang === 'python' || lang === 'py') return 'lang-python';
+        if (lang === 'javascript' || lang === 'js') return 'lang-javascript';
+        if (lang === 'typescript' || lang === 'ts') return 'lang-typescript';
+        if (lang === 'go') return 'lang-go';
+        if (lang === 'java') return 'lang-java';
+        if (lang === 'cpp' || lang === 'c++') return 'lang-cpp';
+        if (lang === 'c') return 'lang-c';
+        if (lang === 'csharp' || lang === 'c#') return 'lang-csharp';
+        if (lang === 'swift') return 'lang-swift';
+        if (lang === 'kotlin') return 'lang-kotlin';
+        if (lang === 'scala') return 'lang-scala';
+        if (lang === 'ruby') return 'lang-ruby';
+        if (lang === 'php') return 'lang-php';
+        if (lang === 'html') return 'lang-html';
+        if (lang === 'css') return 'lang-css';
+        return 'lang-other';
     }
 
-    // Function to create a GitHub link from file path
     function createFileLink(filePath, startLine) {
-        // Extract repository name from file path (first part before /)
-        const pathParts = filePath.split('/');
-        const repoName = pathParts[0];
+        const pathParts = (filePath || '').split('/');
+        const repoName = pathParts[0] || '';
         const fileName = pathParts.slice(1).join('/');
-
-        // Create GitHub URL with proper URL encoding to prevent XSS
         const encodedRepoName = encodeURIComponent(repoName);
         const encodedFileName = encodeURIComponent(fileName);
         const githubUrl = `https://github.com/${encodedRepoName}/${encodedFileName}`;
         const urlWithLine = startLine ? `${githubUrl}#L${startLine}` : githubUrl;
-
-        // Return HTML link
         return `<a href="${urlWithLine}" target="_blank" style="color: #0366d6; text-decoration: none;">${filePath}${startLine ? ':' + startLine : ''}</a>`;
     }
 
+    // Instantiate shared multiselect
+    const searchMultiselect = createMultiselect({ inputId: 'repo-input', tagsId: 'repo-tags', optionsContainerId: 'repo-options', storageKey: 'hz_recent_repos' });
+    window.searchMultiselect = searchMultiselect;
+
+    // Submit handler uses the multiselect instance
     document.getElementById('search-form').addEventListener('submit', async (e) => {
         e.preventDefault();
-
         const queryEl = document.getElementById('query');
         const query = queryEl.value;
-        // Basic client-side validation: ensure user entered a non-empty search term
         if (!query || query.trim().length === 0) {
-            // show a simple inline validation message
             queryEl.classList.add('input-error');
             alert('Please enter a search term.');
             return;
         }
-        const repo = document.getElementById('repo').value;
-
-        const params = new URLSearchParams({ q: query });
-        if (repo) {
-            params.append('repo', repo);
+        const selected = (searchMultiselect && typeof searchMultiselect.getSelected === 'function') ? searchMultiselect.getSelected() : [];
+        const params = new URLSearchParams();
+        params.append('q', query);
+        if (selected && selected.length) {
+            for (const r of selected) params.append('repo', r);
+            localStorage.setItem('hz_recent_repos', JSON.stringify(selected));
         }
-
         try {
-            const response = await fetch(`/api/search?${params}`);
+            const response = await fetch(`/api/search?${params.toString()}`);
             const data = await response.json();
-            // Support both new shape { results: [...], elapsed_ms } and legacy direct array
             const results = Array.isArray(data) ? data : (data.results || []);
             const elapsedMs = (data && typeof data === 'object' && 'elapsed_ms' in data) ? data.elapsed_ms : null;
 
@@ -136,36 +116,30 @@
             results.forEach(entity => {
                 const li = document.createElement('li');
                 li.className = 'entity-item';
-
-                // Add kind-specific CSS class for background coloring
                 const kindClass = getKindClass(entity.kind);
-                if (kindClass) {
-                    li.classList.add(kindClass);
-                }
-
-                // Prefer DB-provided source_url when available so we display the repo/web URL
+                if (kindClass) { li.classList.add(kindClass); }
                 const filePathForDisplay = entity.source_display ? entity.source_display : (entity.file || '');
                 const fileLinkHtml = entity.source_url
                     ? `<a href="${entity.source_url}${entity.start_line ? '#L' + entity.start_line : ''}" target="_blank" style="color: #0366d6; text-decoration: none;">${filePathForDisplay}${entity.start_line ? ':' + entity.start_line : ''}</a>`
                     : createFileLink(filePathForDisplay, entity.start_line);
 
                 li.innerHTML = `
-                <div class="entity-name">
-                    <a href="/entity/${entity.stable_id}" style="color: #333; text-decoration: none;">
-                        ${entity.name}
-                    </a>
-                    <span class="badge badge-${getKindClass(entity.kind)}">${entity.kind}</span>
-                    <span class="badge ${getLanguageClass(entity.language)}">${entity.language}</span>
-                </div>
-                <div class="entity-meta">
-                    📄 ${fileLinkHtml}
-                    ${entity.end_line && entity.start_line ? `-${entity.end_line}` : ''}
-                    ${entity.parent ? ` • 📦 ${entity.parent}` : ''}
-                </div>
-                ${entity.signature ? `<div class="entity-signature"><code>${entity.signature}</code></div>` : ''}
-                ${entity.calls && entity.calls.length > 0 ? `<div class="entity-calls">📞 Calls: ${entity.calls.slice(0, 3).join(', ')}${entity.calls.length > 3 ? ` +${entity.calls.length - 3} more` : ''}</div>` : ''}
-                ${entity.doc ? `<div class="entity-doc">${entity.doc.substring(0, 150)}${entity.doc.length > 150 ? '...' : ''}</div>` : ''}
-            `;
+                    <div class="entity-name">
+                        <a href="/entity/${entity.stable_id}" style="color: #333; text-decoration: none;">
+                            ${entity.name}
+                        </a>
+                        <span class="badge badge-${getKindClass(entity.kind)}">${entity.kind}</span>
+                        <span class="badge ${getLanguageClass(entity.language)}">${entity.language}</span>
+                    </div>
+                    <div class="entity-meta">
+                        📄 ${fileLinkHtml}
+                        ${entity.end_line && entity.start_line ? `-${entity.end_line}` : ''}
+                        ${entity.parent ? ` • 📦 ${entity.parent}` : ''}
+                    </div>
+                    ${entity.signature ? `<div class="entity-signature"><code>${entity.signature}</code></div>` : ''}
+                    ${entity.calls && entity.calls.length > 0 ? `<div class="entity-calls">📞 Calls: ${entity.calls.slice(0, 3).join(', ')}${entity.calls.length > 3 ? ` +${entity.calls.length - 3} more` : ''}</div>` : ''}
+                    ${entity.doc ? `<div class="entity-doc">${entity.doc.substring(0, 150)}${entity.doc.length > 150 ? '...' : ''}</div>` : ''}
+                `;
 
                 resultsList.appendChild(li);
             });

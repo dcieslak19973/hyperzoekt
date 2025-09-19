@@ -875,44 +875,34 @@ async fn ensure_embedding_schema(
         // embedding array
         "DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
         "REMOVE FIELD embedding ON entity; DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
-        "ALTER TABLE entity CREATE FIELD embedding TYPE array;",
         // embedding_len
         "DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
         "REMOVE FIELD embedding_len ON entity; DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
-        "ALTER TABLE entity CREATE FIELD embedding_len TYPE int;",
         // embedding_model
         "DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
         "REMOVE FIELD embedding_model ON entity; DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
-        "ALTER TABLE entity CREATE FIELD embedding_model TYPE string;",
         // embedding_dim
         "DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
         "REMOVE FIELD embedding_dim ON entity; DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
-        "ALTER TABLE entity CREATE FIELD embedding_dim TYPE int;",
         // embedding_created_at
         "DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
         "REMOVE FIELD embedding_created_at ON entity; DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
-        "ALTER TABLE entity CREATE FIELD embedding_created_at TYPE datetime;",
-    // source_content (full text used for embeddings)
-    "DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
-    "REMOVE FIELD source_content ON entity; DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
-    "ALTER TABLE entity CREATE FIELD source_content TYPE string;",
-    // similarity relations and metadata (score)
-    "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
-    "DEFINE TABLE similar_same_repo TYPE RELATION;",
-    "CREATE TABLE similar_same_repo;",
-    "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
-    "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
-    "DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
-    "REMOVE FIELD score ON similar_same_repo; DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
-    "ALTER TABLE similar_same_repo CREATE FIELD score TYPE number;",
-    "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
-    "DEFINE TABLE similar_external_repo TYPE RELATION;",
-    "CREATE TABLE similar_external_repo;",
-    "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
-    "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
-    "DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
-    "REMOVE FIELD score ON similar_external_repo; DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
-    "ALTER TABLE similar_external_repo CREATE FIELD score TYPE number;",
+        // source_content (full text used for embeddings)
+        "DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
+        "REMOVE FIELD source_content ON entity; DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
+        // similarity relations and metadata (score)
+        "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
+        "DEFINE TABLE similar_same_repo TYPE RELATION;",
+        "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
+        "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
+        "DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
+        "REMOVE FIELD score ON similar_same_repo; DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
+        "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
+        "DEFINE TABLE similar_external_repo TYPE RELATION;",
+        "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
+        "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
+        "DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
+        "REMOVE FIELD score ON similar_external_repo; DEFINE FIELD score ON similar_external_repo TYPE number DEFAULT 0;",
     ];
     for s in stmts {
         match db.query(s).await {
@@ -1045,18 +1035,17 @@ async fn compute_similarity_arrays(
 
     // Server-side cosine similarity query for same-repo candidates
     // Exclude self (stable_id) and require minimum source length to avoid trivial matches
-    let same_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC LIMIT $lim;";
+    let same_q = format!(
+        "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC START AT 0 LIMIT {}",
+        params.max_same
+    );
     let same_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
-            same_q,
+            &same_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
                 ("sid", serde_json::Value::String(stable_id.to_string())),
                 ("vec", serde_json::Value::Array(vec_param.clone())),
-                (
-                    "lim",
-                    serde_json::Value::Number((params.max_same as i64).into()),
-                ),
                 ("dim", serde_json::Value::Number(dim.into())),
                 (
                     "min_chars",
@@ -1090,18 +1079,18 @@ async fn compute_similarity_arrays(
     }
 
     // Server-side cosine similarity query for external-repo candidates
-    let ext_q = "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC LIMIT $lim;";
+    let ext_q = format!(
+        "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC START AT 0 LIMIT {}",
+        params.max_external
+    );
     let ext_rows: Vec<serde_json::Value> = match db
         .query_with_binds(
-            ext_q,
+            &ext_q,
             vec![
                 ("r", serde_json::Value::String(repo_name.to_string())),
                 ("sid", serde_json::Value::String(stable_id.to_string())),
                 ("vec", serde_json::Value::Array(vec_param)),
-                (
-                    "lim",
-                    serde_json::Value::Number((params.max_external as i64).into()),
-                ),
+                // limit interpolated into SQL
                 ("dim", serde_json::Value::Number(dim.into())),
                 (
                     "min_chars",

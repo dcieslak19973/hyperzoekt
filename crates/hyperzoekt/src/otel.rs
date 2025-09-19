@@ -20,8 +20,9 @@ pub fn init_otel_from_env() {
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let fmt_layer = tracing_subscriber::fmt::layer();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default: app info; quiet noisy deps and ignore crate
-        "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,ignore=warn".into()
+        // Default: app info; quiet noisy deps, tracing internals, and ignore crate
+        // Add `tracing=warn` to silence internal tracing::span debug messages.
+        "info,hyper_util=warn,hyper=warn,h2=warn,reqwest=warn,tower_http=warn,tracing=warn,ignore=warn".into()
     });
     tracing_subscriber::registry()
         .with(filter)

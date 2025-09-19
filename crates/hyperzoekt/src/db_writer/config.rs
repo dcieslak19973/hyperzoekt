@@ -13,12 +13,25 @@
 // limitations under the License.
 use crate::repo_index::indexer::payload::EntityPayload;
 use std::sync::mpsc::SyncSender;
+
+#[derive(Clone, Debug)]
+pub struct PersistedEntityMeta {
+    pub stable_id: String,
+    pub repo_name: String,
+    pub language: String,
+    pub kind: String,
+    pub name: String,
+    pub source_url: Option<String>,
+}
 use std::thread;
 
 pub type SpawnResult = anyhow::Result<(
     SyncSender<Vec<EntityPayload>>,
     thread::JoinHandle<anyhow::Result<()>>,
 )>;
+
+// New type for ack channel when streaming post-persist actions (embedding enqueue)
+pub type PersistAckSender = SyncSender<Vec<PersistedEntityMeta>>;
 
 #[derive(Clone, Debug)]
 pub struct DbWriterConfig {

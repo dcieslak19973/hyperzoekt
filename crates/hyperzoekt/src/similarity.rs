@@ -98,6 +98,24 @@ pub async fn similarity_with_conn(
     query_text: &str,
     repo_filter: Option<&str>,
 ) -> Result<Vec<EntityPayload>> {
+    // Backwards-compatible wrapper: convert single repo string into a one-element
+    // slice and delegate to the multi-repo implementation.
+    if let Some(rf) = repo_filter {
+        let v = vec![rf.to_string()];
+        return similarity_with_conn_multi(conn, query_text, Some(&v)).await;
+    }
+    similarity_with_conn_multi(conn, query_text, None).await
+}
+
+/// Multi-repo variant of similarity search. Accepts an optional slice of repo
+/// names to filter embeddings sampling. If `repo_filters` is None, search across
+/// all repos. Filters which look like paths (start with '/') are ignored for the
+/// embedding sampling stage.
+pub async fn similarity_with_conn_multi(
+    conn: &SurrealConnection,
+    query_text: &str,
+    repo_filters: Option<&[String]>,
+) -> Result<Vec<EntityPayload>> {
     let top_k: usize = std::env::var("HZ_SIMSEARCH_TOPK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -113,19 +131,51 @@ pub async fn similarity_with_conn(
         stable_id: String,
         embedding: Vec<f32>,
     }
-    let (sql, binds): (&str, Vec<(&'static str, serde_json::Value)>) = if let Some(rf) = repo_filter
+
+    // Build SQL for sampling candidate embeddings. If repo_filters contains
+    // at least one repo name, use `repo_name IN $repos` bind. Otherwise sample
+    // across all entities with embeddings.
+    let (sql, binds): (String, Vec<(&'static str, serde_json::Value)>) = if let Some(rfs) =
+        repo_filters
     {
-        (
-            "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 AND repo_name = $repo LIMIT $lim",
-            vec![("repo", serde_json::Value::String(rf.to_string())), ("lim", serde_json::Value::from(sample as i64))],
-        )
+        let names: Vec<String> = rfs
+            .iter()
+            .filter(|s| !s.starts_with('/'))
+            .cloned()
+            .collect();
+        if !names.is_empty() {
+            let bind_arr = serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            );
+            (
+                format!(
+                    "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 AND repo_name IN $repos START AT 0 LIMIT {}",
+                    sample
+                ),
+                vec![("repos", bind_arr)],
+            )
+        } else {
+            (
+                format!(
+                    "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
+                    sample
+                ),
+                vec![],
+            )
+        }
     } else {
         (
-            "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 LIMIT $lim",
-            vec![("lim", serde_json::Value::from(sample as i64))],
+            format!(
+                "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
+                sample
+            ),
+            vec![],
         )
     };
-    let mut resp = conn.query_with_binds(sql, binds).await?;
+    let mut resp = conn.query_with_binds(&sql, binds).await?;
     let cands: Vec<Cand> = resp.take(0)?;
     if cands.is_empty() {
         return Ok(vec![]);

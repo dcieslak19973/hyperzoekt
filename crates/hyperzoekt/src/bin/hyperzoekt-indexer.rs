@@ -59,6 +59,16 @@ impl AppConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    // Fallback early marker (stderr) so we can distinguish binary start even if logger output is buffered or filtered.
+    eprintln!(
+        "EARLY_START_MARKER_HYPERZOEKT_INDEXER ts={} pid={} version={}",
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    );
+    // Attempt immediate flush
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
     let args = Args::parse();
 
     // Initialize OpenTelemetry/tracing if enabled via env and feature compiled.
@@ -82,6 +92,28 @@ async fn main() -> Result<(), anyhow::Error> {
     builder.init();
     let (app_cfg, cfg_path) = AppConfig::load(args.config.as_ref())?;
     info!("Loaded config from {}", cfg_path.display());
+
+    // Emit a concise startup diagnostic line so operators can confirm the active binary build.
+    info!(
+        "startup diagnostic: version={} otel_feature_compiled={} otel_env_enabled={} embed_jobs_env={} RUST_LOG={} pid={}",
+        env!("CARGO_PKG_VERSION"),
+        cfg!(feature = "otel"),
+        enable_otel,
+        std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default(),
+        std::env::var("RUST_LOG").unwrap_or_default(),
+        std::process::id()
+    );
+    if !enable_otel {
+        info!("otel disabled: set HZ_ENABLE_OTEL=1 to activate tracing subscriber + OTLP export");
+    }
+    eprintln!("startup diagnostic: version={} otel_feature_compiled={} otel_env_enabled={} embed_jobs_env={} RUST_LOG={} pid={}",
+        env!("CARGO_PKG_VERSION"),
+        cfg!(feature = "otel"),
+        enable_otel,
+        std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default(),
+        std::env::var("RUST_LOG").unwrap_or_default(),
+        std::process::id()
+    );
 
     // Determine effective repo root for finding repositories
     let repo_root = args

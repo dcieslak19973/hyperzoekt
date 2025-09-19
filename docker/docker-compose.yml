@@ -12,6 +12,7 @@ services:
 
   surrealdb:
     image: surrealdb/surrealdb:latest
+    pull_policy: always
     ports:
       - "8001:8001"
     command: start --bind 0.0.0.0:8001 --user root --pass root memory
@@ -36,6 +37,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7200:7200"
     environment:
@@ -62,6 +64,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7201:7201"
     environment:
@@ -86,6 +89,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     environment:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
@@ -120,6 +124,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7203:7203"
     environment:
@@ -143,6 +148,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7204:7204"
     environment:
@@ -166,9 +172,12 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7205:7205"
     environment:
+      # Enqueue embedding jobs after indexing (default ON for local dev)
+      - HZ_ENABLE_EMBED_JOBS=1
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
       - SURREALDB_URL=http://surrealdb:8001
@@ -176,10 +185,6 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      # Enqueue embedding jobs after indexing (default ON for local dev)
-      - HZ_ENABLE_EMBED_JOBS=1
-      # Optional: override the embed jobs queue key (default: zoekt:embed_jobs)
-      # - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
     command: [ "/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7205" ]
     restart: unless-stopped
     depends_on:
@@ -194,9 +199,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7206:7206"
     environment:
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=debug
       - SURREALDB_URL=http://surrealdb:8001
@@ -216,6 +223,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     ports:
       - "7207:7207"
     environment:
@@ -244,7 +252,16 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
     environment:
+      - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+      - HZ_EMBED_PROCESSING_TTL_SECONDS=300
+      # Model id used for embeddings (required)
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      - HZ_ENABLE_EMBED_SIMILARITY=1
+      # Debugging toggles - enable to log SQL and verify DB updates
+      - HZ_EMBED_DEBUG_SQL=1
+      - HZ_EMBED_DEBUG_DB=1
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=info
       - SURREALDB_URL=http://surrealdb:8001
@@ -252,14 +269,6 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
-      - HZ_EMBED_PROCESSING_TTL_SECONDS=300
-      # Model id used for embeddings (required)
-      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
-      - HZ_ENABLE_EMBED_SIMILARITY=1
-      # Debugging toggles - enable to log SQL and verify DB updates
-      # - HZ_EMBED_DEBUG_SQL=1
-      # - HZ_EMBED_DEBUG_DB=1
     command: [ "/app/hyperzoekt-embed-worker", "--host", "0.0.0.0", "--port", "7208" ]
     restart: unless-stopped
     depends_on:

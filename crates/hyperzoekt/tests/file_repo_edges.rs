@@ -155,7 +155,7 @@ async fn file_repo_edges_created_bidirectionally() {
     ];
 
     // Start writer and send batch.
-    let (tx, handle) = match spawn_db_writer(vec![], cfg) {
+    let (tx, handle) = match spawn_db_writer(vec![], cfg, None) {
         Ok(h) => h,
         Err(e) => {
             log::info!(

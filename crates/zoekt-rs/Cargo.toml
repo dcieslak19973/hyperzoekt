@@ -39,6 +39,7 @@ tree-sitter-swift = { version = "0.6", package = "tree-sitter-swift" }
 tree-sitter-verilog = "1.0"
 tree-sitter-ocaml = "0.23.2"
 tree-sitter-ocamllex = "0.20.2"
+tree-sitter-groovy = { version = "0.1.2", package = "tree-sitter-groovy" }
 regex-syntax = "0.6"
 memchr = "2"
 tempfile = "3"
