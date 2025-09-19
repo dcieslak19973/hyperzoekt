@@ -63,7 +63,7 @@ url = "2"
 
 # For timestamps used when creating repo records
 chrono = { version = "0.4", features = ["serde"] }
-pulldown-cmark = "0.9"
+pulldown-cmark = "0.13"
 ammonia = "3.1"
 
 # Optional: tracing + OpenTelemetry for performance instrumentation
