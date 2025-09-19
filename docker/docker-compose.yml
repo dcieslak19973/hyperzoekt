@@ -99,6 +99,8 @@ services:
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
       - ZOEKTD_POLL_INTERVAL_SECONDS=30
+      # Bind internal metrics/health server to the same port we map on the host
+      - ZOEKT_POLLER_METRICS_PORT=7202
     ports:
       - "7202:7202"
     command: [ "/app/dzr-admin-poller", "--host", "0.0.0.0", "--port", "7202" ]
