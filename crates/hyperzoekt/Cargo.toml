@@ -13,7 +13,7 @@ serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tree-sitter = "0.23"
 tree-sitter-rust = "0.23"
-tree-sitter-python = { version = "0.23", package = "tree-sitter-python" }
+tree-sitter-python = { version = "0.25", package = "tree-sitter-python" }
 tree-sitter-javascript = { version = "0.23", package = "tree-sitter-javascript" }
 tree-sitter-typescript = { version = "0.23", package = "tree-sitter-typescript" }
 tree-sitter-cpp = "0.23"
