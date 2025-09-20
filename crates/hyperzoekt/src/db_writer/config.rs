@@ -46,6 +46,9 @@ pub struct DbWriterConfig {
     pub surreal_db: String,
     pub initial_batch: bool,
     pub auto_create_missing_repos_for_file_edges: bool,
+    // Optional snapshot context used to populate entity_snapshot mapping rows.
+    pub snapshot_id: Option<String>,
+    pub commit_id: Option<String>,
 }
 
 impl Default for DbWriterConfig {
@@ -62,6 +65,8 @@ impl Default for DbWriterConfig {
             surreal_db: "repos".into(),
             initial_batch: false,
             auto_create_missing_repos_for_file_edges: true,
+            snapshot_id: None,
+            commit_id: None,
         }
     }
 }

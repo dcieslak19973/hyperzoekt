@@ -1,8 +1,10 @@
 use anyhow::Result;
 use deadpool_redis::redis::AsyncCommands;
 use hyperzoekt::db_writer::connection::{connect, SurrealConnection};
+use hyperzoekt::db_writer::{upsert_content_if_missing, write_content_embedding};
 use log::{error, info, warn};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 #[allow(dead_code)]
@@ -591,6 +593,32 @@ async fn main() -> Result<()> {
                                     } else {
                                         (Vec::new(), Vec::new())
                                     };
+
+                                // Also persist embedding into the deduplicated content table (Option C).
+                                // Compute content_id from full source_content and upsert content row.
+                                let content_text = w.source_content.clone();
+                                let mut ch = Sha256::new();
+                                ch.update(content_text.as_bytes());
+                                let cdig = ch.finalize();
+                                let content_id = format!("{:x}", cdig);
+                                if let Err(e) =
+                                    upsert_content_if_missing(&db, &content_id, &content_text).await
+                                {
+                                    warn!(
+                                        "upsert_content_if_missing failed for {}: {}",
+                                        content_id, e
+                                    );
+                                } else {
+                                    // write embedding for content_id
+                                    if let Err(e) =
+                                        write_content_embedding(&db, &content_id, v.clone()).await
+                                    {
+                                        warn!(
+                                            "write_content_embedding failed for {}: {}",
+                                            content_id, e
+                                        );
+                                    }
+                                }
 
                                 match &db {
                                     SurrealConnection::Local(db_conn) => {

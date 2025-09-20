@@ -16,13 +16,20 @@
 
 mod config;
 pub mod connection;
+mod content;
 mod helpers;
+mod refs;
 mod repo_deps;
 mod writer;
 
 pub use config::{DbWriterConfig, SpawnResult};
 pub use connection::SHARED_MEM; // keep backward compatibility
+pub use content::{
+    upsert_content_if_missing, upsert_entity_snapshot, write_content_embedding,
+    EntitySnapshotUpsert,
+};
 pub use helpers::{init_call_edge_capture, CALL_EDGE_CAPTURE};
+pub use refs::{create_branch, create_commit, create_snapshot_meta, create_tag, move_branch};
 pub use repo_deps::{
     persist_repo_dependencies, persist_repo_dependencies_with_connection,
     RepoDependencyPersistResult,

@@ -202,6 +202,230 @@ impl Database {
         Ok(Self { db: Arc::new(conn) })
     }
 
+    /// Resolve a human ref name (e.g. "main" or "refs/heads/main") to a commit id
+    /// and attempt to find a matching `snapshot_meta` row. Returns (commit_id, snapshot_id_opt)
+    /// if a ref was found, otherwise returns `Ok(None)`.
+    pub async fn resolve_ref_to_snapshot(
+        &self,
+        repo: &str,
+        raw: &str,
+    ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct RefRow {
+            name: String,
+            target: String,
+        }
+
+        let candidates = [
+            raw.to_string(),
+            format!("refs/heads/{}", raw),
+            format!("refs/tags/{}", raw),
+        ];
+        // Query refs by repo and candidate names
+        let sql = format!(
+            "SELECT name, target FROM refs WHERE repo = $repo AND name IN [{}]",
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("$n{}", i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let mut res = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut q = db_conn.query(&sql);
+                q = q.bind(("repo", repo.to_string()));
+                for (i, v) in candidates.iter().enumerate() {
+                    q = q.bind((format!("n{}", i), v.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut q = db_conn.query(&sql);
+                q = q.bind(("repo", repo.to_string()));
+                for (i, v) in candidates.iter().enumerate() {
+                    q = q.bind((format!("n{}", i), v.to_string()));
+                }
+                q.await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut q = db_conn.query(&sql);
+                q = q.bind(("repo", repo.to_string()));
+                for (i, v) in candidates.iter().enumerate() {
+                    q = q.bind((format!("n{}", i), v.to_string()));
+                }
+                q.await?
+            }
+        };
+        let rows: Vec<RefRow> = res.take(0)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        // prefer exact, then heads, then tags
+        if let Some(r) = rows.iter().find(|r| r.name == raw) {
+            let commit = r.target.clone();
+            // lookup snapshot_meta
+            let snap_sql =
+                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
+            let mut r2 = match &*self.db {
+                SurrealConnection::Local(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+            };
+            #[derive(Deserialize)]
+            struct SnapRow {
+                id: Option<String>,
+            }
+            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
+                if let Some(s) = rows2.into_iter().next() {
+                    return Ok(Some((commit, s.id)));
+                }
+            }
+            return Ok(Some((commit, None)));
+        }
+        if let Some(r) = rows
+            .iter()
+            .find(|r| r.name == format!("refs/heads/{}", raw))
+        {
+            let commit = r.target.clone();
+            let snap_sql =
+                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
+            let mut r2 = match &*self.db {
+                SurrealConnection::Local(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+            };
+            #[derive(Deserialize)]
+            struct SnapRow {
+                id: Option<String>,
+            }
+            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
+                if let Some(s) = rows2.into_iter().next() {
+                    return Ok(Some((commit, s.id)));
+                }
+            }
+            return Ok(Some((commit, None)));
+        }
+        if let Some(r) = rows.iter().find(|r| r.name == format!("refs/tags/{}", raw)) {
+            let commit = r.target.clone();
+            let snap_sql =
+                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
+            let mut r2 = match &*self.db {
+                SurrealConnection::Local(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    let mut q2 = db_conn.query(snap_sql);
+                    q2 = q2
+                        .bind(("repo", repo.to_string()))
+                        .bind(("commit", commit.clone()));
+                    q2.await?
+                }
+            };
+            #[derive(Deserialize)]
+            struct SnapRow {
+                id: Option<String>,
+            }
+            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
+                if let Some(s) = rows2.into_iter().next() {
+                    return Ok(Some((commit, s.id)));
+                }
+            }
+            return Ok(Some((commit, None)));
+        }
+
+        Ok(None)
+    }
+
+    /// Return the repo's configured default branch, falling back to `SOURCE_BRANCH` env or `main`.
+    pub async fn get_repo_default_branch(
+        &self,
+        repo_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct BranchRow {
+            branch: Option<String>,
+        }
+
+        let sql = "SELECT branch FROM repo WHERE name = $name LIMIT 1";
+        let mut res = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
+                q.await?
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
+                q.await?
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
+                q.await?
+            }
+        };
+        if let Ok(rows) = res.take::<Vec<BranchRow>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                if let Some(b) = r.branch {
+                    return Ok(b);
+                }
+            }
+        }
+
+        // Fallbacks
+        if let Ok(envb) = std::env::var("SOURCE_BRANCH") {
+            return Ok(envb);
+        }
+        Ok("main".to_string())
+    }
+
     pub async fn get_repo_summaries(&self) -> Result<Vec<RepoSummary>, Box<dyn std::error::Error>> {
         // Use the stored repo_name field instead of parsing from file paths
         // Handle cases where repo_name might be null for existing data
@@ -2507,8 +2731,47 @@ async fn search_api_handler(
         Some(RepoParam::Multi(v)) => Some(v.clone()),
         None => None,
     };
+
+    // If any repo filters include an explicit ref using `repo@ref` syntax, resolve
+    // the ref to a commit and optional snapshot. Build a cleaned repo list for
+    // passing into similarity/text search and a map of resolved refs to enrich
+    // results returned to callers.
+    let mut resolved_refs: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+    let mut cleaned_repo_vec: Option<Vec<String>> = None;
+    if let Some(rv) = &repo_vec_opt {
+        let mut cleaned: Vec<String> = Vec::with_capacity(rv.len());
+        for r in rv.iter() {
+            if let Some(idx) = r.find('@') {
+                let repo_name = r[..idx].to_string();
+                let raw_ref = &r[idx + 1..];
+                // attempt to resolve provided ref; on success record mapping
+                match state.db.resolve_ref_to_snapshot(&repo_name, raw_ref).await {
+                    Ok(Some((commit, snap_opt))) => {
+                        resolved_refs.insert(repo_name.clone(), (commit, snap_opt));
+                    }
+                    Ok(None) => {
+                        // no ref found; proceed without resolved mapping
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "search_api_handler: failed to resolve ref for {}@{}: {}",
+                            repo_name,
+                            raw_ref,
+                            e
+                        );
+                    }
+                }
+                cleaned.push(repo_name);
+            } else {
+                cleaned.push(r.clone());
+            }
+        }
+        cleaned_repo_vec = Some(cleaned);
+    }
+
     // Convert to Option<&[String]> for the similarity function
-    let repo_slice_opt: Option<&[String]> = repo_vec_opt.as_deref();
+    let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
     // Determine maximum results per page (env overrides default)
     let max_results: usize = std::env::var("HYPERZOEKT_MAX_SEARCH_RESULTS")
         .ok()
@@ -2528,7 +2791,27 @@ async fn search_api_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    match similarity::similarity_with_conn_multi(&state.db.db, &query.q, repo_slice_opt).await {
+    // If repo filters resolved to a single snapshot, use that snapshot id to scope similarity.
+    let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
+        // take the single map entry's snapshot option if present
+        let mut iter = resolved_refs.values();
+        if let Some((_, snap_opt)) = iter.next() {
+            snap_opt.as_deref()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match similarity::similarity_with_conn_multi(
+        &state.db.db,
+        &query.q,
+        repo_slice_opt,
+        snapshot_id_opt,
+    )
+    .await
+    {
         Ok(mut results) => {
             // Enrich links
             for entity in &mut results {
@@ -2568,11 +2851,36 @@ async fn search_api_handler(
             } else {
                 vec![]
             };
+            // Serialize and enrich each returned entity JSON with resolved ref
+            let mut results_value =
+                serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
+            if let serde_json::Value::Array(ref mut arr) = results_value {
+                for v in arr.iter_mut() {
+                    if let serde_json::Value::Object(ref mut m) = v {
+                        if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
+                            if let Some((commit, snap)) = resolved_refs.get(repo_name) {
+                                m.insert(
+                                    "resolved_commit".to_string(),
+                                    serde_json::Value::String(commit.clone()),
+                                );
+                                if let Some(sid) = snap {
+                                    m.insert(
+                                        "resolved_snapshot".to_string(),
+                                        serde_json::Value::String(sid.clone()),
+                                    );
+                                } else {
+                                    m.insert(
+                                        "resolved_snapshot".to_string(),
+                                        serde_json::Value::Null,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut obj = serde_json::Map::new();
-            obj.insert(
-                "results".to_string(),
-                serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![])),
-            );
+            obj.insert("results".to_string(), results_value);
             obj.insert(
                 "elapsed_ms".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
@@ -2591,7 +2899,7 @@ async fn search_api_handler(
     }
 
     // Fallback: legacy text search. Prefer multi-repo-aware search if provided.
-    let results = if let Some(ref repos) = repo_vec_opt {
+    let results = if let Some(repos) = cleaned_repo_vec.as_ref().or(repo_vec_opt.as_ref()) {
         state
             .db
             .search_entities_multi(&query.q, Some(repos.as_slice()), limit, start)
@@ -2624,11 +2932,33 @@ async fn search_api_handler(
         vec![]
     };
     let elapsed_ms = started.elapsed().as_millis();
+    // Enrich fallback results with resolved ref info when possible
+    let mut results_value =
+        serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
+    if let serde_json::Value::Array(ref mut arr) = results_value {
+        for v in arr.iter_mut() {
+            if let serde_json::Value::Object(ref mut m) = v {
+                if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
+                    if let Some((commit, snap)) = resolved_refs.get(repo_name) {
+                        m.insert(
+                            "resolved_commit".to_string(),
+                            serde_json::Value::String(commit.clone()),
+                        );
+                        if let Some(sid) = snap {
+                            m.insert(
+                                "resolved_snapshot".to_string(),
+                                serde_json::Value::String(sid.clone()),
+                            );
+                        } else {
+                            m.insert("resolved_snapshot".to_string(), serde_json::Value::Null);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut obj = serde_json::Map::new();
-    obj.insert(
-        "results".to_string(),
-        serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![])),
-    );
+    obj.insert("results".to_string(), results_value);
     obj.insert(
         "elapsed_ms".to_string(),
         serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
@@ -2724,14 +3054,68 @@ async fn multi_dependencies_api_handler(
     let mut out_map = serde_json::Map::new();
     if let Some(repos) = q.repo {
         for repo in repos.into_iter() {
-            match state.db.get_dependencies_for_repo(&repo, branch).await {
-                Ok(deps) => {
-                    out_map.insert(repo, serde_json::Value::Array(deps));
+            // Determine per-repo branch to try: explicit param or repo default
+            let branch_to_try: Option<String> = if let Some(br) = branch {
+                Some(br.to_string())
+            } else {
+                match state.db.get_repo_default_branch(&repo).await {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        log::warn!("Failed to determine default branch for {}: {}", repo, e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    log::warn!("multi_dependencies_api_handler: error for {}: {}", repo, e);
-                    out_map.insert(repo, serde_json::Value::Array(vec![]));
+            };
+
+            if let Some(br) = branch_to_try.as_deref() {
+                match state.db.resolve_ref_to_snapshot(&repo, br).await {
+                    Ok(Some((commit_id, snapshot_opt))) => {
+                        log::debug!(
+                            "Resolved ref '{}' for repo '{}' -> commit {} (snapshot={:?})",
+                            br,
+                            repo,
+                            commit_id,
+                            snapshot_opt
+                        );
+                        if let Ok(deps) = state
+                            .db
+                            .get_dependencies_for_repo(&repo, Some(&commit_id))
+                            .await
+                        {
+                            out_map.insert(repo, serde_json::Value::Array(deps));
+                        } else {
+                            log::warn!("multi_dependencies_api_handler: error for {}", repo);
+                            out_map.insert(repo, serde_json::Value::Array(vec![]));
+                        }
+                    }
+                    Ok(None) => {
+                        // No ref found; fall back to original behavior using branch_to_try
+                        if let Ok(deps) = state
+                            .db
+                            .get_dependencies_for_repo(&repo, branch_to_try.as_deref())
+                            .await
+                        {
+                            out_map.insert(repo, serde_json::Value::Array(deps));
+                        } else {
+                            log::warn!("multi_dependencies_api_handler: error for {}", repo);
+                            out_map.insert(repo, serde_json::Value::Array(vec![]));
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "multi_dependencies_api_handler: ref lookup failed for {}@{}: {}",
+                            repo,
+                            br,
+                            e
+                        );
+                        out_map.insert(repo, serde_json::Value::Array(vec![]));
+                    }
                 }
+            } else if let Ok(deps) = state.db.get_dependencies_for_repo(&repo, None).await {
+                out_map.insert(repo, serde_json::Value::Array(deps));
+            } else {
+                log::warn!("multi_dependencies_api_handler: error for {}", repo);
+                out_map.insert(repo, serde_json::Value::Array(vec![]));
             }
         }
     }
@@ -2810,23 +3194,88 @@ async fn repo_dependencies_api_handler(
     axum::extract::Path(repo_name): axum::extract::Path<String>,
     Query(q): Query<RepoDepsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let branch = q.r#ref.as_deref();
-    match state.db.get_dependencies_for_repo(&repo_name, branch).await {
-        Ok(deps) => Ok(Json(
-            serde_json::json!({"repo": repo_name, "ref": branch, "dependencies": deps}),
-        )),
-        Err(e) => {
-            // Do not return HTTP 500 for transient/missing DB schema; treat as empty dependencies.
-            log::warn!(
-                "repo_dependencies_api_handler: DB error for {} - returning empty list: {}",
-                repo_name,
-                e
-            );
-            Ok(Json(serde_json::json!({
-                "repo": repo_name,
-                "ref": branch,
-                "dependencies": []
-            })))
+    // Determine branch to use: provided ref or repo default
+    let branch_param = q.r#ref.as_deref();
+    let branch_to_try: Option<String> = if let Some(b) = branch_param {
+        Some(b.to_string())
+    } else {
+        match state.db.get_repo_default_branch(&repo_name).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log::warn!(
+                    "Failed to determine default branch for {}: {}",
+                    repo_name,
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    if let Some(br) = branch_to_try.as_deref() {
+        match state.db.resolve_ref_to_snapshot(&repo_name, br).await {
+            Ok(Some((commit_id, _snapshot_opt))) => {
+                match state
+                    .db
+                    .get_dependencies_for_repo(&repo_name, Some(&commit_id))
+                    .await
+                {
+                    Ok(deps) => Ok(Json(
+                        serde_json::json!({"repo": repo_name, "ref": Some(commit_id), "dependencies": deps}),
+                    )),
+                    Err(e) => {
+                        log::warn!("repo_dependencies_api_handler: DB error for {} - returning empty list: {}", repo_name, e);
+                        Ok(Json(
+                            serde_json::json!({"repo": repo_name, "ref": Some(commit_id), "dependencies": []}),
+                        ))
+                    }
+                }
+            }
+            Ok(None) => {
+                // ref not found - fall back to searching with whatever branch_to_try was
+                match state
+                    .db
+                    .get_dependencies_for_repo(&repo_name, branch_to_try.as_deref())
+                    .await
+                {
+                    Ok(deps) => Ok(Json(
+                        serde_json::json!({"repo": repo_name, "ref": branch_to_try, "dependencies": deps}),
+                    )),
+                    Err(e) => {
+                        log::warn!("repo_dependencies_api_handler: DB error for {} - returning empty list: {}", repo_name, e);
+                        Ok(Json(
+                            serde_json::json!({"repo": repo_name, "ref": branch_to_try, "dependencies": []}),
+                        ))
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "repo_dependencies_api_handler: ref lookup failed for {}@{}: {}",
+                    repo_name,
+                    br,
+                    e
+                );
+                Ok(Json(
+                    serde_json::json!({"repo": repo_name, "ref": branch_param, "dependencies": []}),
+                ))
+            }
+        }
+    } else {
+        match state.db.get_dependencies_for_repo(&repo_name, None).await {
+            Ok(deps) => Ok(Json(
+                serde_json::json!({"repo": repo_name, "ref": None::<String>, "dependencies": deps}),
+            )),
+            Err(e) => {
+                log::warn!(
+                    "repo_dependencies_api_handler: DB error for {} - returning empty list: {}",
+                    repo_name,
+                    e
+                );
+                Ok(Json(
+                    serde_json::json!({"repo": repo_name, "ref": None::<String>, "dependencies": []}),
+                ))
+            }
         }
     }
 }

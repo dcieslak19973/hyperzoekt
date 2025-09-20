@@ -40,7 +40,11 @@ pub async fn embed_query(query_text: &str) -> Result<Vec<f32>> {
         .send()
         .await?;
     if !resp.status().is_success() {
-        return Err(anyhow::anyhow!(format!("TEI error: {}", resp.status())));
+        return Err(anyhow::anyhow!(format!(
+            "TEI embedding request to '{}' failed with status: {}",
+            tei_endpoint,
+            resp.status()
+        )));
     }
     let bytes = resp.bytes().await?;
     if let Ok(t) = serde_json::from_slice::<TeiOut>(&bytes) {
@@ -97,14 +101,15 @@ pub async fn similarity_with_conn(
     conn: &SurrealConnection,
     query_text: &str,
     repo_filter: Option<&str>,
+    snapshot_id: Option<&str>,
 ) -> Result<Vec<EntityPayload>> {
     // Backwards-compatible wrapper: convert single repo string into a one-element
     // slice and delegate to the multi-repo implementation.
     if let Some(rf) = repo_filter {
         let v = vec![rf.to_string()];
-        return similarity_with_conn_multi(conn, query_text, Some(&v)).await;
+        return similarity_with_conn_multi(conn, query_text, Some(&v), snapshot_id).await;
     }
-    similarity_with_conn_multi(conn, query_text, None).await
+    similarity_with_conn_multi(conn, query_text, None, snapshot_id).await
 }
 
 /// Multi-repo variant of similarity search. Accepts an optional slice of repo
@@ -115,6 +120,7 @@ pub async fn similarity_with_conn_multi(
     conn: &SurrealConnection,
     query_text: &str,
     repo_filters: Option<&[String]>,
+    snapshot_id: Option<&str>,
 ) -> Result<Vec<EntityPayload>> {
     let top_k: usize = std::env::var("HZ_SIMSEARCH_TOPK")
         .ok()
@@ -132,31 +138,113 @@ pub async fn similarity_with_conn_multi(
         embedding: Vec<f32>,
     }
 
-    // Build SQL for sampling candidate embeddings. If repo_filters contains
-    // at least one repo name, use `repo_name IN $repos` bind. Otherwise sample
-    // across all entities with embeddings.
-    let (sql, binds): (String, Vec<(&'static str, serde_json::Value)>) = if let Some(rfs) =
-        repo_filters
-    {
-        let names: Vec<String> = rfs
-            .iter()
-            .filter(|s| !s.starts_with('/'))
-            .cloned()
-            .collect();
-        if !names.is_empty() {
-            let bind_arr = serde_json::Value::Array(
-                names
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect(),
-            );
-            (
-                format!(
-                    "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 AND repo_name IN $repos START AT 0 LIMIT {}",
-                    sample
-                ),
-                vec![("repos", bind_arr)],
+    // If a snapshot_id is provided, sample candidate entity -> content mappings
+    // from `entity_snapshot` for that snapshot, then fetch embeddings from
+    // `content_embedding` for the sampled content_ids. This ensures similarity
+    // sampling is scoped to a specific snapshot's contents.
+    let scored = if let Some(sid) = snapshot_id {
+        #[derive(serde::Deserialize)]
+        struct EsRow {
+            stable_id: String,
+            content_id: String,
+        }
+
+        let sql_es = format!(
+            "SELECT stable_id, content_id FROM entity_snapshot WHERE snapshot_id = $sid START AT 0 LIMIT {}",
+            sample
+        );
+        let mut resp_es = conn
+            .query_with_binds(
+                &sql_es,
+                vec![("sid", serde_json::Value::String(sid.to_string()))],
             )
+            .await?;
+        let es_rows: Vec<EsRow> = resp_es.take(0)?;
+        if es_rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Collect unique content_ids and map stable_id -> content_id
+        use std::collections::{HashMap, HashSet};
+        let mut content_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut unique_ids: Vec<serde_json::Value> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for r in es_rows.iter() {
+            content_map
+                .entry(r.content_id.clone())
+                .or_default()
+                .push(r.stable_id.clone());
+            if seen.insert(r.content_id.clone()) {
+                unique_ids.push(serde_json::Value::String(r.content_id.clone()));
+            }
+        }
+
+        // Fetch embeddings for the sampled content_ids
+        let sql_ce = "SELECT id AS content_id, embedding FROM content_embedding WHERE id IN $ids AND embedding_len > 0".to_string();
+        let mut resp_ce = conn
+            .query_with_binds(&sql_ce, vec![("ids", serde_json::Value::Array(unique_ids))])
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct CeRow {
+            content_id: String,
+            embedding: Vec<f32>,
+        }
+        let ce_rows: Vec<CeRow> = resp_ce.take(0)?;
+        if ce_rows.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut emb_map: HashMap<String, Vec<f32>> = HashMap::new();
+        for c in ce_rows.into_iter() {
+            emb_map.insert(c.content_id.clone(), c.embedding.clone());
+        }
+
+        // Build candidate list mapping a stable_id to the content embedding (if available)
+        let mut candidates: Vec<(String, Vec<f32>)> = Vec::new();
+        for r in es_rows.into_iter() {
+            if let Some(e) = emb_map.get(&r.content_id) {
+                candidates.push((r.stable_id.clone(), e.clone()));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        score_top_k(&query_embedding, &candidates, top_k)
+    } else {
+        // Backwards-compatible sampling across entity embeddings (legacy path)
+        // Build SQL for sampling candidate embeddings. If repo_filters contains
+        // at least one repo name, use `repo_name IN $repos` bind. Otherwise sample
+        // across all entities with embeddings.
+        let (sql, binds): (String, Vec<(&'static str, serde_json::Value)>) = if let Some(rfs) =
+            repo_filters
+        {
+            let names: Vec<String> = rfs
+                .iter()
+                .filter(|s| !s.starts_with('/'))
+                .cloned()
+                .collect();
+            if !names.is_empty() {
+                let bind_arr = serde_json::Value::Array(
+                    names
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                );
+                (
+                    format!(
+                        "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 AND repo_name IN $repos START AT 0 LIMIT {}",
+                        sample
+                    ),
+                    vec![("repos", bind_arr)],
+                )
+            } else {
+                (
+                    format!(
+                        "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
+                        sample
+                    ),
+                    vec![],
+                )
+            }
         } else {
             (
                 format!(
@@ -165,29 +253,21 @@ pub async fn similarity_with_conn_multi(
                 ),
                 vec![],
             )
+        };
+        let mut resp = conn.query_with_binds(&sql, binds).await?;
+        let cands: Vec<Cand> = resp.take(0)?;
+        if cands.is_empty() {
+            return Ok(vec![]);
         }
-    } else {
-        (
-            format!(
-                "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
-                sample
-            ),
-            vec![],
+        score_top_k(
+            &query_embedding,
+            &cands
+                .iter()
+                .map(|c| (c.stable_id.clone(), c.embedding.clone()))
+                .collect::<Vec<_>>(),
+            top_k,
         )
     };
-    let mut resp = conn.query_with_binds(&sql, binds).await?;
-    let cands: Vec<Cand> = resp.take(0)?;
-    if cands.is_empty() {
-        return Ok(vec![]);
-    }
-    let scored = score_top_k(
-        &query_embedding,
-        &cands
-            .iter()
-            .map(|c| (c.stable_id.clone(), c.embedding.clone()))
-            .collect::<Vec<_>>(),
-        top_k,
-    );
     if scored.is_empty() {
         return Ok(vec![]);
     }
