@@ -14,6 +14,7 @@
 use super::config::{DbWriterConfig, PersistAckSender, PersistedEntityMeta, SpawnResult};
 use super::connection::{connect, SurrealConnection};
 use super::helpers::CALL_EDGE_CAPTURE;
+use crate::db_writer::{upsert_content_if_missing, upsert_entity_snapshot};
 use crate::repo_index::indexer::payload::EntityPayload;
 use anyhow::Result;
 use log::{debug, info, trace, warn};
@@ -97,7 +98,7 @@ pub fn spawn_db_writer(
                     if std::env::var("HZ_DUMP_SQL_STATEMENTS").ok().as_deref() == Some("1") {
                         // Print to stdout so test harness captures the full statements.
                         println!("DUMPING RAW STATEMENTS ({} total):", statements_raw.len());
-                        for (i, s) in statements_raw.iter().enumerate() {
+                        for (i, (s, _)) in statements_raw.iter().enumerate() {
                             println!("STMT[{}]: {}", i, s);
                         }
                     }
@@ -112,21 +113,33 @@ pub fn spawn_db_writer(
                     // duplicate-edge errors without aborting the main transactional writes.
                     // Additionally, split CREATE entity statements into their own chunks so
                     // duplicate-create errors don't abort other updates in the same transaction.
-                    let mut create_entities: Vec<String> = Vec::new();
-                    let mut non_create: Vec<String> = Vec::new();
-                    let mut relates: Vec<String> = Vec::new();
-                    for s in statements_raw.iter() {
-                        let ts = s.trim_start();
+                                    type StmtBinds = Vec<(&'static str, serde_json::Value)>;
+                                    type SqlStmt = (String, Option<StmtBinds>);
+                                    let mut create_entities: Vec<SqlStmt> = Vec::new();
+                                    let mut non_create: Vec<SqlStmt> = Vec::new();
+                                    let mut relates: Vec<SqlStmt> = Vec::new();
+                    for (sql, binds) in statements_raw.iter() {
+                        let ts = sql.trim_start();
                         if ts.to_uppercase().starts_with("RELATE ") {
-                            relates.push(s.clone());
+                            relates.push((sql.clone(), binds.clone()));
                         } else if ts.starts_with("CREATE entity:") || ts.starts_with("CREATE repo:") {
-                            create_entities.push(s.clone());
+                            create_entities.push((sql.clone(), binds.clone()));
                         } else {
-                            non_create.push(s.clone());
+                            non_create.push((sql.clone(), binds.clone()));
                         }
                     }
-                    let create_statements = group_statements(&create_entities, group_size);
-                    let statements = group_statements(&non_create, group_size);
+                    // For grouping, only group non-create statements that have no binds.
+                    let create_statements = Vec::<String>::new();
+                    let mut non_create_no_binds: Vec<String> = Vec::new();
+                    let mut non_create_with_binds: Vec<(String, StmtBinds)> = Vec::new();
+                    for (s, b) in non_create.iter() {
+                        if let Some(binds) = b {
+                            non_create_with_binds.push((s.clone(), binds.clone()));
+                        } else {
+                            non_create_no_binds.push(s.clone());
+                        }
+                    }
+                    let statements = group_statements(&non_create_no_binds, group_size);
                     if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
                         let total_len: usize = statements.iter().map(|s| s.len()).sum();
                         info!("BATCH SQL ({} grouped chunks, original {} stmts non-create={} relate={}) total_len={} chars", statements.len(), statements_raw.len(), non_create.len(), relates.len(), total_len);
@@ -137,12 +150,17 @@ pub fn spawn_db_writer(
                         create_statements.len(), statements.len(), create_entities.len(), non_create.len(), relates.len());
                     // Execute CREATE entity statements individually so we can detect which
                     // specific ids failed and issue a targeted UPDATE for that entity only.
-                    for s in &create_entities {
-                        let q = format!("BEGIN; {} COMMIT;", s);
+                    for (s_sql, s_binds) in &create_entities {
+                        let q = format!("BEGIN; {} COMMIT;", s_sql);
                         if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
                             println!("EXECUTING CREATE-ENTITY (len={}): {}", q.len(), q);
                         }
-                        match db.query(&q).await {
+                        let exec_result = if let Some(binds) = s_binds {
+                            db.query_with_binds(&q, binds.clone()).await
+                        } else {
+                            db.query(&q).await
+                        };
+                        match exec_result {
                             Ok(resp) => {
                                 let resp_str = format!("{:?}", resp);
                                 if resp_str.contains("Err(Api(Query") {
@@ -151,7 +169,7 @@ pub fn spawn_db_writer(
                                         // Parse id and json from the original CREATE statement and run UPDATE fallback.
                                         // Support both entity and repo CREATE forms.
                                         let mut handled = false;
-                                        if let Some(rest) = s.strip_prefix("CREATE entity:") {
+                                        if let Some(rest) = s_sql.strip_prefix("CREATE entity:") {
                                             if let Some((id_part, json_part)) = rest.split_once(" CONTENT ") {
                                                 let id = id_part.trim();
                                                 let mut json = json_part.trim();
@@ -177,7 +195,7 @@ pub fn spawn_db_writer(
                                             }
                                         }
                                         if !handled {
-                                            if let Some(rest) = s.strip_prefix("CREATE repo:") {
+                                            if let Some(rest) = s_sql.strip_prefix("CREATE repo:") {
                                                 if let Some((id_part, json_part)) = rest.split_once(" CONTENT ") {
                                                     let id = id_part.trim();
                                                     let mut json = json_part.trim();
@@ -220,6 +238,28 @@ pub fn spawn_db_writer(
                             }
                         }
                     }
+                    // Execute non-create statements that have binds (each as its own transaction).
+                    for (s_sql, binds) in &non_create_with_binds {
+                        let q = format!("BEGIN; {} COMMIT;", s_sql);
+                        if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
+                            println!("EXECUTING NON-CREATE WITH BINDS: {}", q);
+                        }
+                        match db.query_with_binds(&q, binds.clone()).await {
+                            Ok(resp) => {
+                                let resp_str = format!("{:?}", resp);
+                                if resp_str.contains("Err(Api(Query") {
+                                    warn!("non-create with-binds response contained errors: {}", resp_str);
+                                    exec_error = Some(resp_str);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("non-create with-binds failed: {} err:{}", q, e);
+                                exec_error = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
                     // Execute primary non-RELATE transactional chunks next. Failures here abort the batch.
                     for chunk in &statements {
                         // Debug: show full transactional chunk being executed
@@ -250,8 +290,8 @@ pub fn spawn_db_writer(
                         // proceed to retry handling below
                     } else {
                         // Now execute RELATE statements individually and tolerate duplicate/index errors.
-                        for rel in &relates {
-                            let q = format!("BEGIN; {} COMMIT;", rel);
+                        for (rel_sql, _rel_binds) in &relates {
+                            let q = format!("BEGIN; {} COMMIT;", rel_sql);
                             if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
                                 println!("EXECUTING RELATE CHUNK: {}", q);
                             }
@@ -271,7 +311,7 @@ pub fn spawn_db_writer(
                                 }
                                 Err(e) => {
                                     // Network/other error on RELATE; log and continue
-                                    warn!("relate query failed: {} err:{}", rel, e);
+                                    warn!("relate query failed: {} err:{}", rel_sql, e);
                                     continue;
                                 }
                             }
@@ -288,14 +328,14 @@ pub fn spawn_db_writer(
                         if attempt < max_retries && e.contains("Database record") && e.contains("already exists") {
                             info!("batch failure looks like 'already exists'; transforming CREATE -> UPDATE for deterministic ids and retrying");
                             // Transform CREATE repo:... and CREATE entity:... into UPDATE to handle races
-                            for s in statements_raw.iter_mut() {
-                                let ts = s.trim_start();
-                                if ts.starts_with("CREATE repo:") {
-                                    *s = s.replacen("CREATE repo:", "UPDATE repo:", 1);
-                                } else if ts.starts_with("CREATE entity:") {
-                                    *s = s.replacen("CREATE entity:", "UPDATE entity:", 1);
+                                for s in statements_raw.iter_mut() {
+                                    let ts = s.0.trim_start();
+                                    if ts.starts_with("CREATE repo:") {
+                                        s.0 = s.0.replacen("CREATE repo:", "UPDATE repo:", 1);
+                                    } else if ts.starts_with("CREATE entity:") {
+                                        s.0 = s.0.replacen("CREATE entity:", "UPDATE entity:", 1);
+                                    }
                                 }
-                            }
                             total_retries += 1;
                             std::thread::sleep(Duration::from_millis(100 * (1 << (attempt - 1)).min(8)));
                             continue;
@@ -341,7 +381,10 @@ pub fn spawn_db_writer(
                                 let mut job_buf: Vec<String> = Vec::with_capacity(acc.len());
                                 for e in &acc {
                                     let job = EmbeddingJob { stable_id: &e.stable_id, repo_name: &e.repo_name, language: &e.language, kind: &e.kind, name: &e.name, source_url: e.source_url.as_deref() };
-                                    match serde_json::to_string(&job) { Ok(js) => job_buf.push(js), Err(err) => { warn!("serialize embed job failed stable_id={} err={}", e.stable_id, err); } }
+                                    match serde_json::to_string(&job) {
+                                        Ok(js) => job_buf.push(js),
+                                        Err(err) => { warn!("serialize embed job failed stable_id={} err={}", e.stable_id, err); }
+                                    }
                                 }
                                 if !job_buf.is_empty() {
                                     match pool.get().await { Ok(mut conn) => {
@@ -376,6 +419,46 @@ pub fn spawn_db_writer(
                         if let Err(e) = sender.send(metas) { log::warn!("persist ack send failed: {}", e); }
                     }
                     info!("batch success size {} attempt {} ms {}", entity_count, attempt, dur);
+                    // If the writer was provided a `snapshot_id`, record per-entity
+                    // content dedup and snapshot mapping rows so searches can be
+                    // scoped to snapshots (Option C storage model).
+                    if let Some(snap_id) = cfg_clone.snapshot_id.as_ref() {
+                        for e in &acc {
+                            // Determine content text to dedupe on: prefer source_content
+                            let content_text = if let Some(sc) = &e.source_content {
+                                if !sc.is_empty() { sc.clone() } else { format!("{}\n{}\n{}", e.name, e.signature, e.doc.clone().unwrap_or_default()) }
+                            } else {
+                                format!("{}\n{}\n{}", e.name, e.signature, e.doc.clone().unwrap_or_default())
+                            };
+                            // Compute content_id as hex sha256
+                            let mut hasher = Sha256::new();
+                            hasher.update(content_text.as_bytes());
+                            let digest = hasher.finalize();
+                            let content_id = format!("{:x}", digest);
+                            // Upsert content row (idempotent)
+                            if let Err(err) = upsert_content_if_missing(&db, &content_id, &content_text).await {
+                                warn!("upsert_content_if_missing failed for {}: {}", content_id, err);
+                                continue;
+                            }
+                            // Upsert entity_snapshot mapping (idempotent) if stable_id present
+                            let file_opt = None::<&str>; // we could extract file path from entity but writer stores file separately
+                            let start_opt = e.start_line.map(|v| v as u64);
+                            let end_opt = e.end_line.map(|v| v as u64);
+                            let up = crate::db_writer::EntitySnapshotUpsert {
+                                snapshot_id: snap_id,
+                                stable_id: &e.stable_id,
+                                content_id: &content_id,
+                                file: file_opt,
+                                start_line: start_opt,
+                                end_line: end_opt,
+                                name: Some(&e.name),
+                            };
+                            if let Err(err) = upsert_entity_snapshot(&db, &up).await {
+                                warn!("upsert_entity_snapshot failed for {}@{}: {}", e.stable_id, snap_id, err);
+                                continue;
+                            }
+                        }
+                    }
                     // Separate count queries to avoid multi-statement response shape ambiguity
                     let repo_count = if let Ok(mut r) = db.query("SELECT count() FROM repo GROUP ALL;").await {
                         let rows: Vec<serde_json::Value> = r.take(0).unwrap_or_default();
@@ -430,22 +513,31 @@ async fn initial_batch_insert(
         }
     }
     for ch in vals.chunks(chunk.clamp(1, 5000)) {
-        let mut parts = Vec::new();
-        for it in ch {
-            parts.push(format!("CREATE entity CONTENT {};", it));
-        }
-        let q = format!("BEGIN; {} COMMIT;", parts.join(" "));
+        // For safety, insert each entity in the chunk using parameterized binds
+        // instead of embedding serialized JSON into SQL strings. This keeps
+        // Surreal tokens and JSON content from being accidentally quoted or
+        // interpolated and keeps initial-batch logic simple and correct.
+        let mut success_count = 0usize;
         let st = std::time::Instant::now();
-        match db.query(&q).await {
-            Ok(_) => {
-                info!(
-                    "chunk inserted size={} ms={}",
-                    ch.len(),
-                    st.elapsed().as_millis()
-                );
+        for it in ch {
+            let val = it.clone();
+            // Ensure string fields are sanitized already.
+            let sql = "BEGIN; CREATE entity CONTENT $e; COMMIT;";
+            match db.query_with_binds(sql, vec![("e", val)]).await {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    warn!("entity insert failed err={}", e);
+                }
             }
-            Err(e) => warn!("chunk insert failed size={} err={}", ch.len(), e),
         }
+        info!(
+            "chunk inserted size={} succeeded={} ms={}",
+            ch.len(),
+            success_count,
+            st.elapsed().as_millis()
+        );
     }
     Ok(())
 }
@@ -638,11 +730,15 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
     let _ = SCHEMA_INIT_ONCE.set(());
 }
 
-fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
-    // Return pre-separated statements to avoid later naive semicolon splitting that
-    // corrupts JSON (e.g., signatures containing ';'). This eliminates parse warnings
-    // seen previously and reduces string concatenation overhead.
-    let mut statements: Vec<String> = Vec::new();
+type BatchStatements = Vec<(String, Option<Vec<(&'static str, serde_json::Value)>>)>;
+#[allow(clippy::type_complexity)]
+fn build_batch_sql(acc: &[EntityPayload]) -> (BatchStatements, usize) {
+    // Return pre-separated statements as tuples of (sql, optional binds).
+    // Using binds for JSON payloads prevents manual JSON embedding while
+    // allowing deterministic ids to remain interpolated (they're sanitized).
+    type StmtBinds = Vec<(&'static str, serde_json::Value)>;
+    type SqlStmt = (String, Option<StmtBinds>);
+    let mut statements: Vec<SqlStmt> = Vec::new();
     use std::collections::HashMap;
     fn sanitize_id(raw: &str) -> String {
         let mut out = String::with_capacity(raw.len());
@@ -735,25 +831,25 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
             FILE_IDS_CREATED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
         let mut guard = created_set.lock().unwrap();
         for (path, lang) in file_list.iter() {
-            let p_lit = serde_json::to_string(path).unwrap();
-            let l_lit = serde_json::to_string(lang).unwrap();
             let fid = sanitize_id(path);
             if guard.insert(fid.clone()) {
-                // First time we've seen this file in-process: create the row.
-                statements.push(format!(
-                    "CREATE file:{fid} CONTENT {{\"path\": {p}, \"language\": {l}}};",
-                    fid = fid,
-                    p = p_lit,
-                    l = l_lit
-                ));
+                // First time we've seen this file in-process: create the row with binds
+                let mut map = serde_json::Map::new();
+                map.insert("path".to_string(), serde_json::Value::String(path.clone()));
+                map.insert(
+                    "language".to_string(),
+                    serde_json::Value::String(lang.to_string()),
+                );
+                let sql = format!("CREATE file:{fid} CONTENT $f;", fid = fid);
+                statements.push((sql, Some(vec![("f", serde_json::Value::Object(map))])));
             } else {
                 // Subsequent occurrences: update the existing row.
-                statements.push(format!(
-                    "UPDATE file:{fid} SET path = {p}, language = {l};",
-                    fid = fid,
-                    p = p_lit,
-                    l = l_lit
-                ));
+                let binds = vec![
+                    ("p", serde_json::Value::String(path.clone())),
+                    ("l", serde_json::Value::String(lang.to_string())),
+                ];
+                let sql = format!("UPDATE file:{fid} SET path = $p, language = $l;", fid = fid);
+                statements.push((sql, Some(binds)));
             }
         }
         // guard dropped here
@@ -809,15 +905,9 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
                 // Replace embedded NUL bytes in any string fields to satisfy Surreal's JSON rules
                 sanitize_json_strings(&mut v);
                 let eid = sanitize_id(&p.stable_id);
-                let e_json = v.to_string();
-                // Use CREATE for deterministic entity ids so the row is actually created
-                // when it doesn't yet exist. Duplicate-create errors are tolerated later
-                // when executing chunks (they show up as 'already exists').
-                statements.push(format!(
-                    "CREATE entity:{eid} CONTENT {e};",
-                    eid = eid,
-                    e = e_json
-                ));
+                let e_json = v;
+                let sql = format!("CREATE entity:{eid} CONTENT $e;", eid = eid);
+                statements.push((sql, Some(vec![("e", e_json)])));
                 // Emit any method items as their own entity rows and relate them to the parent
                 for mi in p.methods.iter() {
                     // Create a deterministic id for the method entity based on parent stable id
@@ -871,18 +961,16 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
                         "repo_name".to_string(),
                         serde_json::Value::String(p.repo_name.clone()),
                     );
-                    let m_json = serde_json::Value::Object(m_obj).to_string();
-                    statements.push(format!(
-                        "CREATE entity:{mid} CONTENT {mj};",
-                        mid = mid,
-                        mj = m_json
-                    ));
+                    let m_val = serde_json::Value::Object(m_obj.clone());
+                    let sql = format!("CREATE entity:{mid} CONTENT $m;", mid = mid);
+                    statements.push((sql, Some(vec![("m", m_val)])));
                     // RELATE parent entity -> has_method -> method entity
-                    statements.push(format!(
+                    let rel = format!(
                         "RELATE entity:{eid}->has_method->entity:{mid};",
                         eid = eid,
                         mid = mid
-                    ));
+                    );
+                    statements.push((rel, None));
                 }
             }
         }
@@ -903,21 +991,34 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
             REPO_IDS_CREATED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
         let mut repo_guard = created_repos.lock().unwrap();
         for rn in repo_names.iter() {
-            let rn_lit = serde_json::to_string(rn).unwrap();
             let rid = sanitize_id(rn);
             if repo_guard.insert(rid.clone()) {
                 // Create deterministic repo ids so writer creates the repo rows when missing.
-                statements.push(format!(
-                    "CREATE repo:{rid} CONTENT {{\"name\": {n}, \"git_url\": \"\", \"visibility\": \"public\", \"allowed_users\": []}};",
-                    rid = rid,
-                    n = rn_lit
-                ));
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(rn.to_string()),
+                );
+                map.insert(
+                    "git_url".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+                map.insert(
+                    "visibility".to_string(),
+                    serde_json::Value::String("public".to_string()),
+                );
+                map.insert(
+                    "allowed_users".to_string(),
+                    serde_json::Value::Array(vec![]),
+                );
+                let sql = format!("CREATE repo:{rid} CONTENT $r;", rid = rid);
+                statements.push((sql, Some(vec![("r", serde_json::Value::Object(map))])));
             } else {
                 // Fallback to UPDATE if we've already recorded creation in this process.
-                statements.push(format!(
-                    "UPDATE repo:{rid} SET name={n}, git_url='', visibility='public', allowed_users=[];",
-                    rid = rid,
-                    n = rn_lit
+                let sql = format!("UPDATE repo:{rid} SET name=$n, git_url='', visibility='public', allowed_users=[];", rid = rid);
+                statements.push((
+                    sql,
+                    Some(vec![("n", serde_json::Value::String(rn.to_string()))]),
                 ));
             }
         }
@@ -938,16 +1039,18 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
                 if !ent.repo_name.is_empty() {
                     let rid = sanitize_id(ent.repo_name.as_str());
                     if guard.insert((fid.clone(), rid.clone())) {
-                        statements.push(format!(
+                        let r1 = format!(
                             "RELATE file:{fid}->in_repo->repo:{rid};",
                             fid = fid,
                             rid = rid
-                        ));
-                        statements.push(format!(
+                        );
+                        let r2 = format!(
                             "RELATE repo:{rid}->has_file->file:{fid};",
                             rid = rid,
                             fid = fid
-                        ));
+                        );
+                        statements.push((r1, None));
+                        statements.push((r2, None));
                     }
                 }
             }
@@ -972,10 +1075,13 @@ fn build_batch_sql(acc: &[EntityPayload]) -> (Vec<String>, usize) {
                             src_eid, dst_eid, callee_name
                         );
                     }
-                    statements.push(format!(
-                        "RELATE entity:{src}->calls->entity:{dst};",
-                        src = src_eid,
-                        dst = dst_eid
+                    statements.push((
+                        format!(
+                            "RELATE entity:{src}->calls->entity:{dst};",
+                            src = src_eid,
+                            dst = dst_eid
+                        ),
+                        None,
                     ));
                 }
             }
