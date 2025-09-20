@@ -270,11 +270,17 @@ pub async fn persist_repo_dependencies(
                 super::connection::SurrealConnection::Local(_) => {
                     debug!("Creating explicit depends_on row for Local connection");
                     if let Some(dep_id_ref) = dep_id.as_ref() {
-                        let create_rel_sql = format!(
-                            "CREATE depends_on CONTENT {{ in: {}, out: {} }} RETURN AFTER;",
-                            repo_id, dep_id_ref
-                        );
-                        match conn.query(&create_rel_sql).await {
+                        let create_rel_sql = "CREATE depends_on CONTENT { in: type::thing($in), out: type::thing($out) } RETURN AFTER;";
+                        match conn
+                            .query_with_binds(
+                                create_rel_sql,
+                                vec![
+                                    ("in", repo_id.clone().into()),
+                                    ("out", dep_id_ref.clone().into()),
+                                ],
+                            )
+                            .await
+                        {
                             Ok(mut rr) => {
                                 if let Ok(rows) = rr.take::<Vec<serde_json::Value>>(0) {
                                     if !rows.is_empty() {
@@ -712,12 +718,17 @@ pub async fn persist_repo_dependencies_with_connection(
                 crate::db_writer::connection::SurrealConnection::Local(_) => {
                     debug!("Creating explicit depends_on row for Local connection");
                     if let Some(dep_id_ref) = dep_id.as_ref() {
-                        let create_rel_sql = format!(
-                            "CREATE depends_on CONTENT {{ in: '{}', out: '{}' }} RETURN AFTER;",
-                            repo_id.replace('"', "\\\""),
-                            dep_id_ref.replace('"', "\\\"")
-                        );
-                        match conn.query(&create_rel_sql).await {
+                        let create_rel_sql = "CREATE depends_on CONTENT { in: type::thing($in), out: type::thing($out) } RETURN AFTER;";
+                        match conn
+                            .query_with_binds(
+                                create_rel_sql,
+                                vec![
+                                    ("in", repo_id.clone().into()),
+                                    ("out", dep_id_ref.clone().into()),
+                                ],
+                            )
+                            .await
+                        {
                             Ok(mut rr) => {
                                 if let Ok(rows) = rr.take::<Vec<serde_json::Value>>(0) {
                                     if !rows.is_empty() {

@@ -37,7 +37,33 @@ fn test_event_processor() -> EventProcessor {
 
 #[tokio::test]
 async fn indexing_finished_event_end_to_end() {
-    // Reduce noise in test logs
+    // Gate long-running test behind an env var so CI can skip it by default.
+    if std::env::var("LONG_RUNNING_INTEGRATION_TESTS").is_err() {
+        eprintln!(
+            "Skipping indexing_finished_event_end_to_end: set LONG_RUNNING_INTEGRATION_TESTS=1 to run"
+        );
+        return;
+    }
+
+    // Spawn a periodic progress logger that prints every 30 seconds while the
+    // test is running to reassure long-running CI runners that the test is alive.
+    let progress_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            eprintln!("indexing_finished_event_end_to_end: still running...");
+        }
+    });
+
+    // We'll abort the progress logger when the test scope ends by dropping the
+    // handle (we'll explicitly abort it near the end of the test).
+    // Reduce noise in test logs; default includes silence for the hyper_util pool module.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var(
+            "RUST_LOG",
+            "info,hyper_util::client::legacy::pool=warn,hyper_util=warn",
+        );
+    }
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true)
         .try_init();
@@ -263,4 +289,7 @@ async fn indexing_finished_event_end_to_end() {
             );
         }
     }
+
+    // Stop the progress logger now that the test finished.
+    progress_handle.abort();
 }
