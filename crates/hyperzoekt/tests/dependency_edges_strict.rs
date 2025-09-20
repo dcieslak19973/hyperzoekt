@@ -24,9 +24,12 @@ use std::env;
 async fn dependency_and_edge_created() {
     // Initialize logging for this test (no-op if already initialized)
     // Ensure test logs are visible in CI/local runs by defaulting to debug when
-    // RUST_LOG is not set.
+    // RUST_LOG is not set. Default to a quieter level for noisy deps.
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "debug");
+        env::set_var(
+            "RUST_LOG",
+            "debug,hyper_util::client::legacy::pool=warn,hyper_util=warn",
+        );
     }
     let _ = env_logger::builder().is_test(true).try_init();
 

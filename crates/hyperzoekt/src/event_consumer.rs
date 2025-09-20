@@ -33,6 +33,70 @@ pub struct EventConsumer {
     event_tx: UnboundedSender<RepoEvent>,
 }
 
+/// Metadata computed for a repository snapshot.
+#[derive(Debug)]
+pub struct RepoSnapshotMetadata {
+    pub commit_id: String,
+    pub parents: Vec<String>,
+    pub tree: Option<String>,
+    pub author: Option<String>,
+    pub message: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// Compute snapshot metadata from a cloned repository directory.
+fn compute_repo_snapshot_metadata(
+    clone_dir: &std::path::PathBuf,
+    prefer_commit: Option<&str>,
+) -> Result<RepoSnapshotMetadata, anyhow::Error> {
+    // Try to open the repo using git2
+    let repo = git2::Repository::open(clone_dir)?;
+    // Determine commit id: prefer provided commit sha (if present and exists), otherwise HEAD
+    let commit_obj = if let Some(pr) = prefer_commit {
+        if let Ok(oid) = git2::Oid::from_str(pr) {
+            repo.find_commit(oid)?
+        } else {
+            repo.head()?.peel_to_commit()?
+        }
+    } else {
+        repo.head()?.peel_to_commit()?
+    };
+    let commit_id = commit_obj.id().to_string();
+    // Parents
+    let mut parents: Vec<String> = Vec::new();
+    for p in commit_obj.parents() {
+        parents.push(p.id().to_string());
+    }
+    // Tree id
+    let tree_id = commit_obj.tree_id().to_string();
+    let tree = Some(tree_id);
+    // Author
+    let author = commit_obj.author();
+    let author_name = author.name().map(|s| s.to_string());
+    // Message
+    let message = commit_obj.message().map(|s| s.to_string());
+    // Size: sum file sizes under clone_dir
+    let mut total: u64 = 0;
+    for entry in walkdir::WalkDir::new(clone_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(RepoSnapshotMetadata {
+        commit_id,
+        parents,
+        tree,
+        author: author_name,
+        message,
+        size_bytes: total,
+    })
+}
+
 impl EventConsumer {
     /// Create a new event consumer
     pub fn new(event_tx: UnboundedSender<RepoEvent>) -> Self {
@@ -699,14 +763,28 @@ impl EventProcessor {
                     }
                     log::info!("payload build complete: repo={} total_entities={}", repo_name, total_entities);
 
-                    // Configure and spawn DB writer
+                    // Compute commit/snapshot metadata early so the DB writer can
+                    // populate `entity_snapshot` mapping rows while persisting entities.
+                    let mut maybe_commit: Option<String> = None;
+                    let mut maybe_snapshot_id: Option<String> = None;
+                    match compute_repo_snapshot_metadata(&temp_dir_clone, event.last_commit_sha.as_deref()) {
+                        Ok(meta) => {
+                            maybe_commit = Some(meta.commit_id.clone());
+                            maybe_snapshot_id = Some(format!("snapshot:{}:{}", repo_name, meta.commit_id));
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to compute repo snapshot metadata before DB write for {}: {}", repo_name, e);
+                        }
+                    }
+
+                    // Configure and spawn DB writer, providing snapshot context when available
                     let surreal_url = std::env::var("SURREALDB_URL").ok();
                     let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
                     let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
                     let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
                     let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
 
-                    let db_cfg = db_writer::DbWriterConfig {
+                    let mut db_cfg = db_writer::DbWriterConfig {
                         surreal_url,
                         surreal_username,
                         surreal_password,
@@ -714,6 +792,8 @@ impl EventProcessor {
                         surreal_db,
                         ..Default::default()
                     };
+                    db_cfg.snapshot_id = maybe_snapshot_id.clone();
+                    db_cfg.commit_id = maybe_commit.clone();
 
                     let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg, None)?;
 
@@ -738,6 +818,59 @@ impl EventProcessor {
                                 stats.entities_indexed,
                                 repo_name
                             );
+                            // After persistence, record a commit and snapshot metadata in SurrealDB.
+                            // Use the existing db_writer connection helpers.
+                            let surreal_url = std::env::var("SURREALDB_URL").ok();
+                            let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
+                            let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
+                            let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
+                            let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
+                            // We are in a blocking thread — create a small Tokio runtime to perform async SurrealDB calls.
+                            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                                Ok(rt2) => {
+                                    let snapshot_dir = temp_dir_clone.clone();
+                                    let res = rt2.block_on(async move {
+                                        match db_writer::connection::connect(&surreal_url, &surreal_username, &surreal_password, &surreal_ns, &surreal_db).await {
+                                            Ok(conn) => {
+                                                // Compute git-derived metadata (commit id, parents, tree, author, message, size)
+                                                match compute_repo_snapshot_metadata(&snapshot_dir, event.last_commit_sha.as_deref()) {
+                                                    Ok(meta) => {
+                                                        // Convert parents Vec<String> -> Vec<&str> for call
+                                                        let parents_refs: Vec<&str> = meta.parents.iter().map(|s| s.as_str()).collect();
+                                                        if let Err(e) = db_writer::create_commit(&conn, &meta.commit_id, &repo_name, &parents_refs, meta.tree.as_deref(), meta.author.as_deref(), meta.message.as_deref()).await {
+                                                            log::warn!("Failed to record commit {} for repo {}: {}", meta.commit_id, repo_name, e);
+                                                        } else {
+                                                            log::info!("Recorded commit {} for repo {}", meta.commit_id, repo_name);
+                                                        }
+                                                        // Create snapshot metadata pointing to the snapshot id.
+                                                        let snapshot_id = format!("snapshot:{}:{}", repo_name, meta.commit_id);
+                                                        let size_opt = Some(meta.size_bytes);
+                                                        if let Err(e) = db_writer::create_snapshot_meta(&conn, &repo_name, &meta.commit_id, &snapshot_id, size_opt).await {
+                                                            log::warn!("Failed to create snapshot_meta {} for repo {} commit {}: {}", snapshot_id, repo_name, meta.commit_id, e);
+                                                        } else {
+                                                            log::info!("Created snapshot_meta {} -> commit {}", snapshot_id, meta.commit_id);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!("Failed to compute repo snapshot metadata for {}: {}", repo_name, e);
+                                                    }
+                                                }
+                                                Ok(())
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to connect to SurrealDB to persist commit/snapshot metadata: {}", e);
+                                                Err(e)
+                                            }
+                                        }
+                                    });
+                                    if let Err(e) = res {
+                                        log::debug!("commit/snapshot metadata runtime error: {:?}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to create temp runtime to persist commit/snapshot metadata: {}", e);
+                                }
+                            }
                         }
                         Ok(Err(e)) => {
                             log::error!("DB writer failed for {}: {}", repo_name, e);
@@ -1305,5 +1438,38 @@ mod tests {
         assert!(got3.contains("host:7000") && got3.contains("z"));
 
         clear_env();
+    }
+
+    #[test]
+    fn compute_repo_snapshot_metadata_smoke() {
+        // Create a temporary directory and init a git repo with one file and a commit
+        let td = tempfile::tempdir().expect("tempdir");
+        let repo_path = td.path().to_path_buf();
+        // Init repo
+        let repo = git2::Repository::init(&repo_path).expect("init repo");
+        // Create a file
+        let file_path = repo_path.join("README.md");
+        std::fs::write(&file_path, "hello world\n").expect("write file");
+        // Add and commit
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("add");
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let sig = git2::Signature::now("Test User", "test@example.com").expect("sig");
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+            .expect("commit");
+        // Call helper
+        let meta =
+            compute_repo_snapshot_metadata(&repo_path, Some(&oid.to_string())).expect("compute");
+        assert_eq!(meta.commit_id, oid.to_string());
+        assert!(meta.parents.is_empty());
+        assert!(meta.tree.is_some());
+        assert!(meta.author.is_some());
+        assert_eq!(meta.message.unwrap_or_default(), "initial commit");
+        assert!(meta.size_bytes > 0);
     }
 }

@@ -45,6 +45,12 @@ fn make_entity(file: &str, name: &str, repo: &str, stable_suffix: &str) -> Entit
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn file_repo_edges_created_bidirectionally() {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var(
+            "RUST_LOG",
+            "info,hyper_util::client::legacy::pool=warn,hyper_util=warn",
+        );
+    }
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true)
         .try_init();

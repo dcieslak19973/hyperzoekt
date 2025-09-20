@@ -58,6 +58,7 @@ fn paginate(total: usize, start: usize, limit: usize) -> (usize, usize, Option<S
 
 #[async_trait]
 impl ToolHandler for HZHandler {
+    #[allow(unused_assignments)]
     async fn handle_tool_call(&self, call: ToolCall) -> MCPResult<ToolResult> {
         match call.name.as_str() {
             "similarity_search" => {
@@ -78,10 +79,354 @@ impl ToolHandler for HZHandler {
                     .map(|v| v as usize)
                     .unwrap_or(50)
                     .clamp(1, 500);
-                let results: Vec<EntityPayload> =
-                    similarity::similarity_with_conn(&self.state.db, q, repo)
-                        .await
-                        .map_err(|e| MCPError::internal_error(e.to_string()))?;
+                // If repo param contains an explicit ref `repo@ref`, resolve it to
+                // a commit and attempt to lookup a matching snapshot id. Pass the
+                // cleaned repo name and the optional snapshot id into similarity
+                // so sampling can be snapshot-scoped.
+                let mut repo_filter_to_pass: Option<String> = None;
+                let mut snapshot_id_to_pass: Option<String> = None;
+                if let Some(r) = repo {
+                    // default cleaned repo filter is the repo name portion before any `@`
+                    let _default_repo_name = r.split('@').next().unwrap_or(r).to_string();
+                    if let Some(idx) = r.find('@') {
+                        let repo_name = r[..idx].to_string();
+                        let raw_ref = &r[idx + 1..];
+                        // attempt to resolve provided ref; on success record mapping
+                        // Query refs table similarly to webui::Database::resolve_ref_to_snapshot
+                        #[derive(serde::Deserialize)]
+                        struct RefRow {
+                            name: String,
+                            target: String,
+                        }
+                        let candidates = [
+                            raw_ref.to_string(),
+                            format!("refs/heads/{}", raw_ref),
+                            format!("refs/tags/{}", raw_ref),
+                        ];
+                        let sql = format!(
+                            "SELECT name, target FROM refs WHERE repo = $repo AND name IN [{}]",
+                            candidates
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| format!("$n{}", i))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        let resp_opt = match &*self.state.db {
+                            SurrealConnection::Local(db_conn) => {
+                                let mut q = db_conn.query(&sql);
+                                q = q.bind(("repo", repo_name.clone()));
+                                for (i, v) in candidates.iter().enumerate() {
+                                    q = q.bind((format!("n{}", i), v.to_string()));
+                                }
+                                q.await.ok()
+                            }
+                            SurrealConnection::RemoteHttp(db_conn) => {
+                                let mut q = db_conn.query(&sql);
+                                q = q.bind(("repo", repo_name.clone()));
+                                for (i, v) in candidates.iter().enumerate() {
+                                    q = q.bind((format!("n{}", i), v.to_string()));
+                                }
+                                q.await.ok()
+                            }
+                            SurrealConnection::RemoteWs(db_conn) => {
+                                let mut q = db_conn.query(&sql);
+                                q = q.bind(("repo", repo_name.clone()));
+                                for (i, v) in candidates.iter().enumerate() {
+                                    q = q.bind((format!("n{}", i), v.to_string()));
+                                }
+                                q.await.ok()
+                            }
+                        };
+                        let rows: Vec<RefRow> = if let Some(mut resp) = resp_opt {
+                            resp.take(0).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        if !rows.is_empty() {
+                            // prefer exact, then heads, then tags
+                            let chosen = if let Some(rw) = rows.iter().find(|r| r.name == raw_ref) {
+                                rw.target.clone()
+                            } else if let Some(rw) = rows
+                                .iter()
+                                .find(|r| r.name == format!("refs/heads/{}", raw_ref))
+                            {
+                                rw.target.clone()
+                            } else if let Some(rw) = rows
+                                .iter()
+                                .find(|r| r.name == format!("refs/tags/{}", raw_ref))
+                            {
+                                rw.target.clone()
+                            } else {
+                                String::new()
+                            };
+                            if !chosen.is_empty() {
+                                // lookup snapshot_meta
+                                let snap_sql =
+                                        "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
+                                let resp2_opt = match &*self.state.db {
+                                    SurrealConnection::Local(db_conn) => {
+                                        let mut q2 = db_conn.query(snap_sql);
+                                        q2 = q2
+                                            .bind(("repo", repo_name.clone()))
+                                            .bind(("commit", chosen.clone()));
+                                        match q2.await {
+                                            Ok(r) => Some(r),
+                                            Err(e) => {
+                                                log::warn!(
+                                                        "mcp: failed to query snapshot_meta for {}@{}: {}",
+                                                        repo_name,
+                                                        raw_ref,
+                                                        e
+                                                    );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    SurrealConnection::RemoteHttp(db_conn) => {
+                                        let mut q2 = db_conn.query(snap_sql);
+                                        q2 = q2
+                                            .bind(("repo", repo_name.clone()))
+                                            .bind(("commit", chosen.clone()));
+                                        match q2.await {
+                                            Ok(r) => Some(r),
+                                            Err(e) => {
+                                                log::warn!(
+                                                        "mcp: failed to query snapshot_meta for {}@{}: {}",
+                                                        repo_name,
+                                                        raw_ref,
+                                                        e
+                                                    );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    SurrealConnection::RemoteWs(db_conn) => {
+                                        let mut q2 = db_conn.query(snap_sql);
+                                        q2 = q2
+                                            .bind(("repo", repo_name.clone()))
+                                            .bind(("commit", chosen.clone()));
+                                        match q2.await {
+                                            Ok(r) => Some(r),
+                                            Err(e) => {
+                                                log::warn!(
+                                                        "mcp: failed to query snapshot_meta for {}@{}: {}",
+                                                        repo_name,
+                                                        raw_ref,
+                                                        e
+                                                    );
+                                                None
+                                            }
+                                        }
+                                    }
+                                };
+                                #[derive(serde::Deserialize)]
+                                struct SnapRow {
+                                    id: Option<String>,
+                                }
+                                if let Some(mut resp2) = resp2_opt {
+                                    if let Ok(rows2) = resp2.take::<Vec<SnapRow>>(0) {
+                                        if let Some(s) = rows2.into_iter().next() {
+                                            if let Some(sid) = s.id {
+                                                snapshot_id_to_pass = Some(sid);
+                                            }
+                                        }
+                                    }
+                                }
+                                repo_filter_to_pass = Some(repo_name.clone());
+                            } else {
+                                // fallback to using repo name only
+                                repo_filter_to_pass = Some(repo_name.clone());
+                            }
+                        } else {
+                            // no ref rows found; fallback to repo name only
+                            repo_filter_to_pass = Some(repo_name.clone());
+                        }
+                    } else {
+                        repo_filter_to_pass = Some(r.to_string());
+                    }
+                }
+
+                // If repo provided but no explicit ref was given, attempt to find the
+                // repository's configured default branch and resolve that to a snapshot
+                // so MCP callers get a sensible default when they supply minimal input.
+                if snapshot_id_to_pass.is_none() {
+                    if let Some(repo_name) = repo_filter_to_pass.clone() {
+                        #[derive(serde::Deserialize)]
+                        struct BranchRow {
+                            branch: Option<String>,
+                        }
+                        let sql = "SELECT branch FROM repo WHERE name = $name LIMIT 1";
+                        let resp_opt = match &*self.state.db {
+                            SurrealConnection::Local(db_conn) => {
+                                let q = db_conn.query(sql).bind(("name", repo_name.clone()));
+                                match q.await {
+                                    Ok(r) => Some(r),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "mcp: failed to query repo branch for {}: {}",
+                                            repo_name,
+                                            e
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            SurrealConnection::RemoteHttp(db_conn) => {
+                                let q = db_conn.query(sql).bind(("name", repo_name.clone()));
+                                match q.await {
+                                    Ok(r) => Some(r),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "mcp: failed to query repo branch for {}: {}",
+                                            repo_name,
+                                            e
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            SurrealConnection::RemoteWs(db_conn) => {
+                                let q = db_conn.query(sql).bind(("name", repo_name.clone()));
+                                match q.await {
+                                    Ok(r) => Some(r),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "mcp: failed to query repo branch for {}: {}",
+                                            repo_name,
+                                            e
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(mut res) = resp_opt {
+                            if let Ok(rows) = res.take::<Vec<BranchRow>>(0) {
+                                if let Some(br) = rows.into_iter().next().and_then(|r| r.branch) {
+                                    // Try resolving this branch name to a commit/snapshot
+                                    #[derive(serde::Deserialize)]
+                                    struct RefRow2 {
+                                        name: String,
+                                        target: String,
+                                    }
+                                    let candidates2 = [
+                                        br.clone(),
+                                        format!("refs/heads/{}", br),
+                                        format!("refs/tags/{}", br),
+                                    ];
+                                    let sql2 = format!(
+                                        "SELECT name, target FROM refs WHERE repo = $repo AND name IN [{}]",
+                                        candidates2
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, _)| format!("$m{}", i))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    );
+                                    let resp3_opt = match &*self.state.db {
+                                        SurrealConnection::Local(db_conn) => {
+                                            let mut q = db_conn.query(&sql2);
+                                            q = q.bind(("repo", repo_name.clone()));
+                                            for (i, v) in candidates2.iter().enumerate() {
+                                                q = q.bind((format!("m{}", i), v.to_string()));
+                                            }
+                                            q.await.ok()
+                                        }
+                                        SurrealConnection::RemoteHttp(db_conn) => {
+                                            let mut q = db_conn.query(&sql2);
+                                            q = q.bind(("repo", repo_name.clone()));
+                                            for (i, v) in candidates2.iter().enumerate() {
+                                                q = q.bind((format!("m{}", i), v.to_string()));
+                                            }
+                                            q.await.ok()
+                                        }
+                                        SurrealConnection::RemoteWs(db_conn) => {
+                                            let mut q = db_conn.query(&sql2);
+                                            q = q.bind(("repo", repo_name.clone()));
+                                            for (i, v) in candidates2.iter().enumerate() {
+                                                q = q.bind((format!("m{}", i), v.to_string()));
+                                            }
+                                            q.await.ok()
+                                        }
+                                    };
+                                    if let Some(mut resp3) = resp3_opt {
+                                        let rr: Vec<RefRow2> = resp3.take(0).unwrap_or_default();
+                                        if !rr.is_empty() {
+                                            let chosen = if let Some(rw) =
+                                                rr.iter().find(|r| r.name == br)
+                                            {
+                                                rw.target.clone()
+                                            } else if let Some(rw) = rr
+                                                .iter()
+                                                .find(|r| r.name == format!("refs/heads/{}", br))
+                                            {
+                                                rw.target.clone()
+                                            } else if let Some(rw) = rr
+                                                .iter()
+                                                .find(|r| r.name == format!("refs/tags/{}", br))
+                                            {
+                                                rw.target.clone()
+                                            } else {
+                                                String::new()
+                                            };
+                                            if !chosen.is_empty() {
+                                                let snap_sql2 = "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
+                                                let resp4_opt = match &*self.state.db {
+                                                    SurrealConnection::Local(db_conn) => {
+                                                        let mut q4 = db_conn.query(snap_sql2);
+                                                        q4 = q4
+                                                            .bind(("repo", repo_name.clone()))
+                                                            .bind(("commit", chosen.clone()));
+                                                        q4.await.ok()
+                                                    }
+                                                    SurrealConnection::RemoteHttp(db_conn) => {
+                                                        let mut q4 = db_conn.query(snap_sql2);
+                                                        q4 = q4
+                                                            .bind(("repo", repo_name.clone()))
+                                                            .bind(("commit", chosen.clone()));
+                                                        q4.await.ok()
+                                                    }
+                                                    SurrealConnection::RemoteWs(db_conn) => {
+                                                        let mut q4 = db_conn.query(snap_sql2);
+                                                        q4 = q4
+                                                            .bind(("repo", repo_name.clone()))
+                                                            .bind(("commit", chosen.clone()));
+                                                        q4.await.ok()
+                                                    }
+                                                };
+                                                #[derive(serde::Deserialize)]
+                                                struct SnapRow2 {
+                                                    id: Option<String>,
+                                                }
+                                                if let Some(mut resp4) = resp4_opt {
+                                                    if let Ok(rows4) =
+                                                        resp4.take::<Vec<SnapRow2>>(0)
+                                                    {
+                                                        if let Some(s) = rows4.into_iter().next() {
+                                                            if let Some(sid) = s.id {
+                                                                snapshot_id_to_pass = Some(sid);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let results: Vec<EntityPayload> = similarity::similarity_with_conn(
+                    &self.state.db,
+                    q,
+                    repo_filter_to_pass.as_deref(),
+                    snapshot_id_to_pass.as_deref(),
+                )
+                .await
+                .map_err(|e| MCPError::internal_error(e.to_string()))?;
                 let (s, e, next) = paginate(results.len(), start, limit);
                 let mut content = Vec::new();
                 if s == 0 {
