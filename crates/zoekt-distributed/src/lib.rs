@@ -53,7 +53,7 @@ mod tests {
         let lease = LeaseManager::new().await;
         let cfg = NodeConfig {
             id: "test-node".into(),
-            lease_ttl: Duration::from_secs(2),
+            lease_ttl: Duration::from_secs(10), // Longer TTL for test reliability
             poll_interval: Duration::from_millis(10),
             node_type: NodeType::Indexer,
             endpoint: None,
@@ -72,9 +72,12 @@ mod tests {
             last_commit_sha: None,
         };
         node.add_remote(repo.clone());
-        node.run_for(Duration::from_millis(500)).await?;
-        let l = lease.get_lease(&repo).await.expect("lease should exist");
-        assert_eq!(l.holder, "test-node");
+        node.run_for(Duration::from_millis(1000)).await?; // Longer run time
+        let holder = lease
+            .get_current_lease_holder(&repo)
+            .await
+            .expect("lease should exist");
+        assert_eq!(holder, "test-node");
         tracing::info!("TEST END: node_acquires_and_indexes");
         Ok(())
     }

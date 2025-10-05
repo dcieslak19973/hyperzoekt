@@ -330,6 +330,22 @@ impl LeaseManager {
                 }
             }
         }
+        // If Redis is not configured (e.g., in local dev or tests), allow an
+        // environment variable to provide indexer endpoints for integration checks.
+        // Format: ZOEKTD_INDEXER_ENDPOINTS="node-1=http://host:7200,node-2=http://host2:7200"
+        if result.is_empty() {
+            if let Ok(s) = std::env::var("ZOEKTD_INDEXER_ENDPOINTS") {
+                for part in s.split(',') {
+                    if let Some((node, url)) = part.split_once('=') {
+                        let node_id = node.trim().to_string();
+                        let endpoint = url.trim().to_string();
+                        if !node_id.is_empty() && !endpoint.is_empty() {
+                            result.insert(node_id, endpoint);
+                        }
+                    }
+                }
+            }
+        }
         result
     }
 
@@ -877,7 +893,13 @@ impl LeaseManager {
     }
 
     /// Publish a repo event to Redis queue (not pub/sub) for reliable consumption
-    pub async fn publish_repo_event(&self, event_type: &str, repo: &RemoteRepo, node_id: &str) {
+    pub async fn publish_repo_event(
+        &self,
+        event_type: &str,
+        repo: &RemoteRepo,
+        node_id: &str,
+        last_commit_sha: Option<&str>,
+    ) {
         if let Some(pool) = &self.redis_pool {
             if let Ok(mut conn) = pool.get().await {
                 let event = json!({
@@ -886,6 +908,7 @@ impl LeaseManager {
                     "git_url": repo.git_url,
                     "branch": repo.branch,
                     "node_id": node_id,
+                    "last_commit_sha": last_commit_sha,
                     "timestamp": chrono::Utc::now().timestamp_millis()
                 });
                 let queue_key = "zoekt:repo_events_queue";

@@ -19,6 +19,7 @@
 -- LET $branch_name = "refs/heads/main";
 -- LET $target_commit = $commit_id;
 -- INSERT INTO refs (id, repo, name, kind, target, created_at, updated_at) VALUES ($branch_id, $repo, $branch_name, "branch", $target_commit, time::now(), time::now());
+-- RELATE $branch_id->points_to->$target_commit;
 
 
 -- 3) Move a branch (atomic update)
@@ -29,6 +30,8 @@
 -- LET $existing = (SELECT * FROM refs WHERE id = $branch_id AND kind = "branch");
 -- IF (len($existing) == 1) {
 --   UPDATE refs SET target = $new_commit, updated_at = time::now() WHERE id = $branch_id;
+--   DELETE $branch_id->points_to WHERE out = $old_commit;
+--   RELATE $branch_id->points_to->$new_commit;
 -- } ELSE {
 --   -- branch not found or not a branch: create or error as appropriate
 --   RAISE "branch-not-found";
@@ -46,6 +49,7 @@
 -- LET $found = (SELECT * FROM refs WHERE id = $tag_id);
 -- IF (len($found) == 0) {
 --   INSERT INTO refs (id, repo, name, kind, target, created_at) VALUES ($tag_id, $repo, $tag_name, "tag", $tag_target, time::now());
+--   RELATE $tag_id->points_to->$tag_target;
 -- } ELSE {
 --   RAISE "tag-already-exists";
 -- }
@@ -59,7 +63,7 @@
 --
 -- LET $raw = "main"; -- or "refs/heads/main" or "refs/tags/v1.0.0"
 -- LET $candidates = [ $raw, "refs/heads/" + $raw, "refs/tags/" + $raw ];
--- LET $rows = (SELECT * FROM refs WHERE repo = $repo AND name IN $candidates);
+-- LET $rows = (SELECT *, ->points_to->commits AS commit FROM refs WHERE repo = $repo AND name IN $candidates);
 -- -- Service should apply disambiguation rules: prefer exact match, then branch, then tag
 -- -- Example selection logic (simplified):
 -- LET $exact = (SELECT * FROM $rows WHERE name = $raw);
@@ -70,7 +74,7 @@
 --     IF (len($tag_match) > 0) { LET $ref = $tag_match[0]; } ELSE { RAISE "ref-not-found"; }
 --   }
 -- }
--- -- finally, $ref.target holds the commit id
+-- -- finally, $ref.commit contains the commit record, or use $ref.target for the commit id
 
 
 -- 6) Lookup snapshot metadata for a commit
@@ -95,7 +99,8 @@
 
 -- Notes & Recommendations:
 -- - Enforce tag immutability in the service layer: check existence before creating.
--- - Use transactions for branch moves to avoid races.
+-- - Use transactions for branch moves to avoid races and maintain relation consistency.
 -- - Keep commit objects immutable; do not update commits.
 -- - Keep index metadata small and authoritative for mapping commit -> index.
+-- - The points_to relation provides graph traversal capabilities between refs and commits.
 -- - Consider adding SurrealDB indexes on `refs(repo, name)` and `snapshot_meta(repo, commit)` for fast lookup.

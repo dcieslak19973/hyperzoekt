@@ -30,6 +30,8 @@ pub struct DistributedSearchTool {
     pub exclude: Option<String>,
     /// Repository to search in (optional, searches all if not specified)
     pub repo: Option<String>,
+    /// Branch or commit to search in (optional). Can be a comma-separated list.
+    pub branch: Option<String>,
     /// Maximum number of results to return (optional, default 100)
     pub max_results: Option<usize>,
     /// Number of context lines around matches (optional, default 2)
@@ -189,13 +191,23 @@ impl DistributedSearchService {
         let query = query_parts.join(" ");
 
         // Build the search URL
+        // Use provided repo filter if present, otherwise search all repos with '*'
+        let repo_param = params.repo.as_deref().unwrap_or("*");
         let mut url = format!(
             "{}/search?q={}&context_lines={}&repo={}",
             endpoint,
             urlencoding::encode(&query),
             context_lines,
-            urlencoding::encode("*") // Use wildcard to search all repos
+            urlencoding::encode(repo_param)
         );
+
+        // If branch is provided, append it. Accept comma-separated lists and URL-encode.
+        if let Some(branches) = params.branch.as_deref() {
+            if !branches.is_empty() {
+                url.push_str("&branch=");
+                url.push_str(&urlencoding::encode(branches));
+            }
+        }
 
         // Add case sensitivity
         if params.case_sensitive.unwrap_or(false) {
@@ -255,5 +267,137 @@ impl DistributedSearchService {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper used only in tests to build the indexer URL the same way
+    // search_single_indexer constructs it. Keeping this in the test module
+    // avoids exporting internal helper functions while still allowing
+    // deterministic assertions about URL encoding and parameter placement.
+    fn build_indexer_url_for_test(
+        params: &DistributedSearchTool,
+        endpoint: &str,
+        context_lines: usize,
+    ) -> String {
+        let mut query_parts = vec![params.regex.clone()];
+        if let Some(include) = &params.include {
+            query_parts.push(format!("file:{}", include));
+        }
+        if let Some(exclude) = &params.exclude {
+            query_parts.push(format!("-file:{}", exclude));
+        }
+        let query = query_parts.join(" ");
+
+        let repo_param = params.repo.as_deref().unwrap_or("*");
+        let mut url = format!(
+            "{}/search?q={}&context_lines={}&repo={}",
+            endpoint,
+            urlencoding::encode(&query),
+            context_lines,
+            urlencoding::encode(repo_param)
+        );
+
+        if let Some(branches) = params.branch.as_deref() {
+            if !branches.is_empty() {
+                url.push_str("&branch=");
+                url.push_str(&urlencoding::encode(branches));
+            }
+        }
+
+        if params.case_sensitive.unwrap_or(false) {
+            url.push_str("&case=yes");
+        }
+
+        url
+    }
+
+    #[test]
+    fn url_builder_no_repo_no_branch_uses_wildcard() {
+        let params = DistributedSearchTool {
+            regex: "openai".into(),
+            include: None,
+            exclude: None,
+            repo: None,
+            branch: None,
+            max_results: None,
+            context: None,
+            case_sensitive: None,
+            github_username: None,
+            github_token: None,
+            gitlab_username: None,
+            gitlab_token: None,
+            bitbucket_username: None,
+            bitbucket_token: None,
+        };
+        let url = build_indexer_url_for_test(&params, "http://idx.local:7200", 2);
+        // repo should default to '*' and be URL-encoded
+        assert!(url.contains("repo=%2A"), "got url: {}", url);
+        // no branch param present
+        assert!(!url.contains("&branch="), "got url: {}", url);
+    }
+
+    #[test]
+    fn url_builder_single_and_multi_repo_variants() {
+        let mut params = DistributedSearchTool {
+            regex: "r".into(),
+            include: None,
+            exclude: None,
+            repo: Some("owner/repo1".into()),
+            branch: None,
+            max_results: None,
+            context: None,
+            case_sensitive: None,
+            github_username: None,
+            github_token: None,
+            gitlab_username: None,
+            gitlab_token: None,
+            bitbucket_username: None,
+            bitbucket_token: None,
+        };
+        let url_single = build_indexer_url_for_test(&params, "http://idx:7200", 2);
+        assert!(
+            url_single.contains("repo=owner%2Frepo1"),
+            "got url: {}",
+            url_single
+        );
+
+        params.repo = Some("owner/repo1,owner/repo2".into());
+        let url_multi = build_indexer_url_for_test(&params, "http://idx:7200", 2);
+        // comma should be encoded as %2C and slashes encoded
+        assert!(
+            url_multi.contains("repo=owner%2Frepo1%2Cowner%2Frepo2"),
+            "got url: {}",
+            url_multi
+        );
+    }
+
+    #[test]
+    fn url_builder_branch_encoding_single_and_multi() {
+        let mut params = DistributedSearchTool {
+            regex: "x".into(),
+            include: None,
+            exclude: None,
+            repo: Some("owner/repo".into()),
+            branch: Some("main".into()),
+            max_results: None,
+            context: None,
+            case_sensitive: None,
+            github_username: None,
+            github_token: None,
+            gitlab_username: None,
+            gitlab_token: None,
+            bitbucket_username: None,
+            bitbucket_token: None,
+        };
+        let url = build_indexer_url_for_test(&params, "http://idx:7200", 3);
+        assert!(url.contains("&branch=main"), "got url: {}", url);
+
+        params.branch = Some("main,dev".into());
+        let url2 = build_indexer_url_for_test(&params, "http://idx:7200", 3);
+        assert!(url2.contains("&branch=main%2Cdev"), "got url: {}", url2);
     }
 }

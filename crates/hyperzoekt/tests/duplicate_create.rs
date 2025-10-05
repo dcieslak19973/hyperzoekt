@@ -18,7 +18,7 @@ use serde_json::json;
 async fn duplicate_create_updates() {
     // Start embedded SurrealDB (or remote when configured). If a remote SURREALDB_URL
     // is configured but unreachable, skip the test to avoid flakiness in CI.
-    use hyperzoekt::db_writer::connection::connect;
+    use hyperzoekt::db::connection::connect;
     let db = match connect(&None, &None, &None, "testns", "testdb").await {
         Ok(d) => d,
         Err(e) => {

@@ -1,7 +1,7 @@
 // Copyright 2025 HyperZoekt Project
 
-use hyperzoekt::db_writer::connection::connect as hz_connect;
-use hyperzoekt::db_writer::connection::SurrealConnection;
+use hyperzoekt::db::connection::connect as hz_connect;
+use hyperzoekt::db::connection::SurrealConnection;
 use std::sync::Arc;
 
 #[derive(Clone)]

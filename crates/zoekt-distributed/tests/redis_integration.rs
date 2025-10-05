@@ -209,7 +209,7 @@ async fn redis_publish_repo_event_integration() {
 
     // Test that publishing completes without panicking
     lease_mgr
-        .publish_repo_event("indexing_started", &test_repo, "test-node")
+        .publish_repo_event("indexing_started", &test_repo, "test-node", None)
         .await;
 
     // If we get here, the publish completed without error

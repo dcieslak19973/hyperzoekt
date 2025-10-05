@@ -31,6 +31,7 @@ async fn render_entity_template_with_call_graph() {
 
     // Sample entity payload
     let entity = EntityPayload {
+        id: "stable123".to_string(),
         language: "rust".to_string(),
         kind: "function".to_string(),
         name: "do_work".to_string(),
@@ -51,6 +52,7 @@ async fn render_entity_template_with_call_graph() {
         }],
         stable_id: "stable123".to_string(),
         repo_name: "repo".to_string(),
+        file: Some("file.rs".to_string()),
         source_url: Some("https://example.com/repo/file.rs".to_string()),
         source_display: Some("repo/file.rs".to_string()),
         source_content: None,
@@ -98,6 +100,7 @@ async fn render_entity_template_with_empty_relations() {
     env.add_template("entity", &entity_t).unwrap();
 
     let entity = EntityPayload {
+        id: "s0".to_string(),
         language: "rs".to_string(),
         kind: "function".to_string(),
         name: "empty_rel".to_string(),
@@ -112,6 +115,7 @@ async fn render_entity_template_with_empty_relations() {
         unresolved_imports: vec![],
         stable_id: "s0".to_string(),
         repo_name: "r".to_string(),
+        file: Some("empty.rs".to_string()),
         source_url: None,
         source_display: None,
         source_content: None,
@@ -171,6 +175,7 @@ async fn render_entity_template_with_large_relations() {
     }
 
     let entity = EntityPayload {
+        id: "sbig".to_string(),
         language: "rs".to_string(),
         kind: "function".to_string(),
         name: "big_rel".to_string(),
@@ -185,6 +190,7 @@ async fn render_entity_template_with_large_relations() {
         unresolved_imports: vec![],
         stable_id: "sbig".to_string(),
         repo_name: "r".to_string(),
+        file: Some("big.rs".to_string()),
         source_url: None,
         source_display: None,
         source_content: None,

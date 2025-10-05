@@ -433,7 +433,7 @@ impl<I: Indexer> Node<I> {
 
                     if should_emit_repo_events() {
                         self.lease_mgr
-                            .publish_repo_event("indexing_started", &repo, &self.config.id)
+                            .publish_repo_event("indexing_started", &repo, &self.config.id, None)
                             .await;
                     }
 
@@ -452,9 +452,17 @@ impl<I: Indexer> Node<I> {
                         Ok(index) => {
                             tracing::info!(repo = %repo.name, docs = index.doc_count(), "indexed");
 
+                            // Get current commit SHA for local repository
+                            let current_sha = get_current_commit_sha(&repo.git_url).await;
+
                             if should_emit_repo_events() {
                                 self.lease_mgr
-                                    .publish_repo_event("indexing_finished", &repo, &self.config.id)
+                                    .publish_repo_event(
+                                        "indexing_finished",
+                                        &repo,
+                                        &self.config.id,
+                                        current_sha.as_deref(),
+                                    )
                                     .await;
                             }
                             let dur = index_started.elapsed();
@@ -529,7 +537,12 @@ impl<I: Indexer> Node<I> {
 
                         if should_emit_repo_events() {
                             lease_mgr
-                                .publish_repo_event("indexing_started", &repo, &self.config.id)
+                                .publish_repo_event(
+                                    "indexing_started",
+                                    &repo,
+                                    &self.config.id,
+                                    None,
+                                )
                                 .await;
                         }
 
@@ -574,6 +587,7 @@ impl<I: Indexer> Node<I> {
                                             "indexing_finished",
                                             &repo,
                                             &self.config.id,
+                                            current_sha.as_deref(),
                                         )
                                         .await;
                                 }
@@ -650,7 +664,7 @@ impl<I: Indexer> Node<I> {
 
                     if should_emit_repo_events() {
                         lease_mgr
-                            .publish_repo_event("indexing_started", &repo, &self.config.id)
+                            .publish_repo_event("indexing_started", &repo, &self.config.id, None)
                             .await;
                     }
 
@@ -691,7 +705,12 @@ impl<I: Indexer> Node<I> {
 
                             if should_emit_repo_events() {
                                 lease_mgr
-                                    .publish_repo_event("indexing_finished", &repo, &self.config.id)
+                                    .publish_repo_event(
+                                        "indexing_finished",
+                                        &repo,
+                                        &self.config.id,
+                                        current_sha.as_deref(),
+                                    )
                                     .await;
                             }
 
