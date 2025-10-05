@@ -147,12 +147,9 @@ async fn file_repo_edges_created_bidirectionally() {
         // Commit records
         "DELETE commits:test_commit_123;",
         // File + repo records (only those we will recreate)
-        "DELETE file:repo_one_no_commit_src_file1_rs;",
-        "DELETE file:repo_one_no_commit_src_file2_rs;",
-        "DELETE file:repo_two_no_commit_lib_file3_rs;",
-        "DELETE file WHERE path='src/file1.rs';",
-        "DELETE file WHERE path='src/file2.rs';",
-        "DELETE file WHERE path='lib/file3.rs';",
+        "DELETE file:src_file1_rs;",
+        "DELETE file:src_file2_rs;",
+        "DELETE file:lib_file3_rs;",
         "DELETE repo:repo_one;",
         "DELETE repo:repo_two;",
         // Entities by stable ids (deterministic sanitize with underscores)
@@ -267,11 +264,11 @@ async fn file_repo_edges_created_bidirectionally() {
     let relations = vec![
         // repo_one files
         "RELATE commits:test_commit_repo_one->in_repo->repo:repo_one;",
-        "RELATE commits:test_commit_repo_one->has_file->file:repo_one_no_commit_src_file1_rs;",
-        "RELATE commits:test_commit_repo_one->has_file->file:repo_one_no_commit_src_file2_rs;",
+        "RELATE commits:test_commit_repo_one->has_file->file:src_file1_rs;",
+        "RELATE commits:test_commit_repo_one->has_file->file:src_file2_rs;",
         // repo_two files
         "RELATE commits:test_commit_repo_two->in_repo->repo:repo_two;",
-        "RELATE commits:test_commit_repo_two->has_file->file:repo_two_no_commit_lib_file3_rs;",
+        "RELATE commits:test_commit_repo_two->has_file->file:lib_file3_rs;",
     ];
     for rel in relations {
         if let Err(e) = db.query(rel).await {

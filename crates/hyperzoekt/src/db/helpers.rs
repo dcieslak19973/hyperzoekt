@@ -136,83 +136,11 @@ pub fn normalize_git_url(input: &str) -> String {
     format!("https://{}", raw)
 }
 
-/// Redact sensitive or large fields (embeddings, centroid arrays, long source_content)
-/// This is a shared helper used by modules that log SurrealDB responses so we
-/// avoid printing full embedding vectors or huge source blobs in logs.
-pub fn redact_for_log(mut v: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match &mut v {
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                let _ = redact_for_log(item.clone());
-            }
-            if arr.len() > 10 {
-                let prefix = arr.drain(0..10).collect::<Vec<_>>();
-                let mut new = Vec::new();
-                for p in prefix.into_iter() {
-                    new.push(redact_for_log(p));
-                }
-                new.push(Value::String(format!("... {} more items ...", arr.len())));
-                return Value::Array(new);
-            }
-        }
-        Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for k in keys.into_iter() {
-                if let Some(val) = map.get_mut(&k) {
-                    if (k.to_lowercase().contains("embedding")
-                        || k.to_lowercase().contains("centroid"))
-                        && val.is_array()
-                    {
-                        if let Some(arr) = val.as_array() {
-                            let mut summary = Vec::new();
-                            for (i, item) in arr.iter().enumerate() {
-                                if i >= 3 {
-                                    break;
-                                }
-                                if let Some(n) = item.as_f64() {
-                                    summary.push(Value::Number(
-                                        serde_json::Number::from_f64(n)
-                                            .unwrap_or(serde_json::Number::from(0)),
-                                    ));
-                                } else {
-                                    summary.push(item.clone());
-                                }
-                            }
-                            let s = serde_json::json!({"type":"redacted_vector","len":arr.len(),"sample":summary});
-                            *val = s;
-                            continue;
-                        }
-                    }
-                    if val.is_string() {
-                        if let Some(s) = val.as_str() {
-                            if s.len() > 200 {
-                                let truncated = format!("{}... ({} bytes)", &s[..200], s.len());
-                                *val = Value::String(truncated);
-                                continue;
-                            }
-                        }
-                    }
-                    let red = redact_for_log(val.clone());
-                    *val = red;
-                }
-            }
-        }
-        _ => {}
-    }
-    v
-}
-
 fn sql_value_to_json(v: &surrealdb::sql::Value) -> serde_json::Value {
     use surrealdb::sql::Value;
     match v {
         Value::Thing(_) => serde_json::Value::String(v.to_string()),
-        Value::Strand(s) => {
-            // Use the inner string value for Strands instead of the Display
-            // representation which may include quotes in some client outputs.
-            let sref: &str = s.as_ref();
-            serde_json::Value::String(sref.to_string())
-        }
+        Value::Strand(_) => serde_json::Value::String(v.to_string()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Number(n) => {
             // Use the Display representation; try to parse as integer then float.
@@ -330,126 +258,6 @@ pub async fn relate_and_collect_ids(
         }
     }
     Ok(ids)
-}
-
-/// Fetch a short snippet for an entity by stable_id. Returns None when not found.
-/// Now queries entity_snapshot.source_content directly since content has been denormalized.
-pub async fn get_snippet_for_entity(
-    conn: &crate::db::connection::SurrealConnection,
-    stable_id: &str,
-) -> Result<Option<String>, surrealdb::Error> {
-    #[derive(serde::Deserialize)]
-    struct ERow {
-        source_content: Option<String>,
-    }
-    let q = format!(
-        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut r) = conn.query(&q).await {
-        if let Ok(rows) = r.take::<Vec<ERow>>(0) {
-            if let Some(row) = rows.into_iter().next() {
-                if let Some(s) = row.source_content {
-                    // Filter out empty strings
-                    if !s.trim().is_empty() {
-                        return Ok(Some(s));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Try to fetch the embedding vector for a given entity stable_id by looking
-/// up the corresponding `entity_snapshot` record (preferred). This returns
-/// None when no embedding is found. This helper centralizes the snapshot
-/// lookup and keeps callers migration-friendly.
-pub async fn get_embedding_for_entity(
-    conn: &crate::db::connection::SurrealConnection,
-    stable_id: &str,
-) -> Result<Option<Vec<f32>>, surrealdb::Error> {
-    #[derive(serde::Deserialize)]
-    struct Row {
-        embedding: Option<Vec<f32>>,
-    }
-    // Try snapshot-scoped lookup first (entity_snapshot with matching stable_id)
-    let q = format!(
-        "SELECT embedding FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q).await {
-        if let Ok(rows) = resp.take::<Vec<Row>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                return Ok(r.embedding);
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Fetch a short snippet for an entity by stable_id from entity_snapshot.source_content.
-/// This is the preferred method since content has been denormalized to entity_snapshot.
-pub async fn get_snippet_for_entity_snapshot(
-    conn: &crate::db::connection::SurrealConnection,
-    stable_id: &str,
-) -> Result<Option<String>, surrealdb::Error> {
-    #[derive(serde::Deserialize)]
-    struct SRow {
-        source_content: Option<String>,
-    }
-    let q = format!(
-        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q).await {
-        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                if let Some(s) = r.source_content {
-                    // Filter out empty strings
-                    if !s.trim().is_empty() {
-                        return Ok(Some(s));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Extract repo provenance for a given entity stable_id. Returns a deduped Vec of repo strings.
-/// Queries entity_snapshot.repo_name directly since content has been denormalized.
-pub async fn get_repos_for_entity(
-    conn: &crate::db::connection::SurrealConnection,
-    stable_id: &str,
-) -> Result<Vec<String>, surrealdb::Error> {
-    use std::collections::HashSet;
-    #[derive(serde::Deserialize)]
-    struct SRow {
-        repo_name: Option<String>,
-    }
-    let mut repos_set: HashSet<String> = HashSet::new();
-
-    let q_snap = format!(
-        "SELECT repo_name FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q_snap).await {
-        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                if let Some(rn) = r.repo_name {
-                    let n = normalize_git_url(&rn);
-                    if !n.is_empty() {
-                        repos_set.insert(n);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut list: Vec<String> = repos_set.into_iter().collect();
-    list.sort();
-    Ok(list)
 }
 
 /// Convert a `surrealdb::Response` into a `serde_json::Value` when possible.
@@ -692,91 +500,58 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
     }
     // Diagnostic: when all probes fail, attempt to capture several typed takes
     // and log them to help triage mysterious serialization errors observed
-    // in integration tests. These logs are at debug level.
+    // in integration tests. These logs are intentionally at warn level so they
+    // appear when tests fail but are quieter during normal runs.
     for slot in 0usize..10usize {
         // try serde_json variants
         if let Ok(Some(v)) = resp.take::<Option<serde_json::Value>>(slot) {
-            let red = redact_for_log(v.clone());
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Option<serde_json::Value> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Option<serde_json::Value> = {:?}",
                 slot,
-                red
+                v
             );
         }
         if let Ok(vs) = resp.take::<Option<Vec<serde_json::Value>>>(slot) {
-            let red = redact_for_log(serde_json::Value::Array(vs.clone().unwrap_or_default()));
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Option<Vec<serde_json::Value>> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Option<Vec<serde_json::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs2) = resp.take::<Vec<Vec<serde_json::Value>>>(slot) {
-            // Flatten one level and redact
-            let mut flat = Vec::new();
-            for inner in vs2.iter() {
-                for item in inner.iter() {
-                    flat.push(item.clone());
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(flat));
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<Vec<serde_json::Value>> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Vec<Vec<serde_json::Value>> = {:?}",
                 slot,
-                red
+                vs2
             );
         }
         // try surreal sql::Value variants
         if let Ok(vs) = resp.take::<Option<surrealdb::sql::Value>>(slot) {
-            let j = vs
-                .as_ref()
-                .map(sql_value_to_json)
-                .unwrap_or(serde_json::Value::Null);
-            let red = redact_for_log(j);
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Option<sql::Value> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Option<sql::Value> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Option<Vec<surrealdb::sql::Value>>>(slot) {
-            let mut arr = Vec::new();
-            if let Some(vs2) = vs.as_ref() {
-                for v in vs2.iter() {
-                    arr.push(sql_value_to_json(v));
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(arr));
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Option<Vec<sql::Value>> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Option<Vec<sql::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
-            let mut flat = Vec::new();
-            for inner in vs.iter() {
-                for v in inner.iter() {
-                    flat.push(sql_value_to_json(v));
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(flat));
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<Vec<sql::Value>> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Vec<Vec<sql::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Vec<surrealdb::sql::Value>>(slot) {
-            let mut arr = Vec::new();
-            for v in vs.iter() {
-                arr.push(sql_value_to_json(v));
-            }
-            let red = redact_for_log(serde_json::Value::Array(arr));
-            log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<sql::Value> = {}",
+            log::warn!(
+                "response_to_json diagnostics: slot={} took Vec<sql::Value> = {:?}",
                 slot,
-                red
+                vs
             );
         }
     }
@@ -852,19 +627,5 @@ mod tests {
         // The helper should not error; returned ids may be empty depending on client
         // response shape. Accept either outcome but assert the call completed.
         assert!(ids.iter().all(|s| s.contains(':') || s.is_empty()));
-    }
-
-    #[test]
-    fn sql_value_to_json_array_shape() {
-        use surrealdb::sql::{Array, Value};
-
-        // Construct a simple sql::Value::Array containing a Strand which mirrors
-        // a typed client response slot. Ensure conversion to serde_json works.
-        let arr = Array::from(vec![Value::Strand("s1".into())]);
-        let v = Value::Array(arr);
-        let j = sql_value_to_json(&v);
-        // Expect the strand's raw content without surrounding quotes.
-        let expected = serde_json::Value::Array(vec![serde_json::Value::String("s1".to_string())]);
-        assert_eq!(j, expected);
     }
 }

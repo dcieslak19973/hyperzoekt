@@ -20,14 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::signal;
-use zoekt_distributed::redis_adapter::{DynRedis, RealRedis};
-
-/// Shared state for the HTTP server
-#[derive(Clone)]
-struct AppState {
-    metrics: Arc<IndexerMetrics>,
-    redis: Option<Arc<RealRedis>>,
-}
+use zoekt_distributed::redis_adapter::{create_redis_pool, DynRedis, RealRedis};
 
 /// Metrics for the indexer
 #[derive(Debug)]
@@ -62,42 +55,28 @@ struct IndexerMetricsSnapshot {
     last_event_unix: u64,
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let build_timestamp = option_env!("BUILD_TIMESTAMP").unwrap_or("unknown");
-    let build_id = option_env!("HYPERZOEKT_BUILD_ID").unwrap_or("unknown");
-
-    // Use the pre-created redis pool and ping it
-    match &state.redis {
-        Some(r) => match r.ping().await {
-            Ok(_) => (
-                axum::http::StatusCode::OK,
-                format!(
-                    "OK\nBUILD_TIMESTAMP: {}\nBUILD_ID: {}\nVERSION: {}",
-                    build_timestamp,
-                    build_id,
-                    env!("CARGO_PKG_VERSION")
+async fn health_handler() -> impl IntoResponse {
+    // Try to create a redis pool and ping it
+    match create_redis_pool() {
+        Some(p) => {
+            let r = RealRedis { pool: p };
+            match r.ping().await {
+                Ok(_) => (axum::http::StatusCode::OK, "OK".to_string()),
+                Err(e) => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("ERR: {}", e),
                 ),
-            ),
-            Err(e) => (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "ERR: {}\nBUILD_TIMESTAMP: {}\nBUILD_ID: {}",
-                    e, build_timestamp, build_id
-                ),
-            ),
-        },
+            }
+        }
         None => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "no redis\nBUILD_TIMESTAMP: {}\nBUILD_ID: {}",
-                build_timestamp, build_id
-            ),
+            "no redis".to_string(),
         ),
     }
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let s = state.metrics.snapshot();
+async fn metrics_handler(State(metrics): State<Arc<IndexerMetrics>>) -> impl IntoResponse {
+    let s = metrics.snapshot();
     let body = format!("# HELP hyperzoekt_indexer_events_processed_total Total events processed\n# TYPE hyperzoekt_indexer_events_processed_total counter\nhyperzoekt_indexer_events_processed_total {}\n# HELP hyperzoekt_indexer_events_failed_total Events that failed processing\n# TYPE hyperzoekt_indexer_events_failed_total counter\nhyperzoekt_indexer_events_failed_total {}\n# HELP hyperzoekt_indexer_last_event_unix_seconds Last event time (unix seconds)\n# TYPE hyperzoekt_indexer_last_event_unix_seconds gauge\nhyperzoekt_indexer_last_event_unix_seconds {}\n", s.events_processed, s.events_failed, s.last_event_unix);
     (
         axum::http::StatusCode::OK,
@@ -184,22 +163,22 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Emit a concise startup diagnostic line so operators can confirm the active binary build.
     info!(
-        "🚀🚀🚀 INDEXER_BUILD_WITH_BRANCH_LOGGING_v2 🚀🚀🚀 version={} otel_feature_compiled={} otel_env_enabled={} RUST_LOG={} pid={} SIMILARITY_ALWAYS_ENABLED=true",
+        "startup diagnostic: version={} otel_feature_compiled={} otel_env_enabled={} embed_jobs_env={} RUST_LOG={} pid={}",
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "otel"),
         enable_otel,
+        std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default(),
         std::env::var("RUST_LOG").unwrap_or_default(),
         std::process::id()
     );
     if !enable_otel {
         info!("otel disabled: set HZ_ENABLE_OTEL=1 to activate tracing subscriber + OTLP export");
     }
-    info!("🔍 Similarity jobs: ALWAYS ENABLED (no env var required)");
-    info!("📌 Branch ref creation: ENABLED with enhanced logging");
-    eprintln!("🚀🚀🚀 INDEXER_BUILD_WITH_BRANCH_LOGGING_v2 🚀🚀🚀 version={} otel_feature_compiled={} otel_env_enabled={} RUST_LOG={} pid={} SIMILARITY_ALWAYS_ENABLED=true",
+    eprintln!("startup diagnostic: version={} otel_feature_compiled={} otel_env_enabled={} embed_jobs_env={} RUST_LOG={} pid={}",
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "otel"),
         enable_otel,
+        std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default(),
         std::env::var("RUST_LOG").unwrap_or_default(),
         std::process::id()
     );
@@ -229,25 +208,12 @@ async fn main() -> Result<(), anyhow::Error> {
     // Initialize metrics
     let metrics = Arc::new(IndexerMetrics::new());
 
-    // Create Redis pool once at startup (not in health handler loop!)
-    let redis = zoekt_distributed::redis_adapter::create_redis_pool()
-        .map(|pool| Arc::new(RealRedis { pool }));
-    if redis.is_some() {
-        info!("Redis pool created successfully for health checks");
-    } else {
-        info!("No Redis pool available (in-memory fallback mode)");
-    }
-
     // Start HTTP server for health/metrics
-    let app_state = AppState {
-        metrics: Arc::clone(&metrics),
-        redis,
-    };
+    let metrics_for_server = Arc::clone(&metrics);
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/healthz", get(health_handler)) // Kubernetes-style alias
         .route("/metrics", get(metrics_handler))
-        .with_state(app_state);
+        .with_state(metrics_for_server);
 
     let addr = format!("{}:{}", args.host, args.port)
         .parse::<std::net::SocketAddr>()

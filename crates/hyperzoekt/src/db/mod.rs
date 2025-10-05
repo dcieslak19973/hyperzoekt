@@ -15,7 +15,6 @@
 // Consolidated database layer for HyperZoekt
 // Combines connection logic, query operations, data models, and writing operations
 
-pub mod branch;
 pub mod config;
 pub mod connection;
 pub mod content;
@@ -25,11 +24,12 @@ pub mod queries;
 pub mod refs;
 pub mod writer;
 
-pub use branch::{resolve_commit_branch, resolve_default_branch, DefaultBranchInfo};
 pub use config::{DbWriterConfig, SpawnResult};
 pub use connection::{connect, SurrealConnection, SHARED_MEM};
-// content module exists for internal use but functions are not re-exported since
-// embeddings and snapshot storage now happen during indexing via entity_snapshot.
+pub use content::{
+    create_entity_snapshot, upsert_content_if_missing, upsert_entity_snapshot,
+    write_content_embedding, EntitySnapshotUpsert,
+};
 pub use helpers::normalize_git_url;
 pub use helpers::normalize_sql_value_id;
 pub use helpers::response_to_json;

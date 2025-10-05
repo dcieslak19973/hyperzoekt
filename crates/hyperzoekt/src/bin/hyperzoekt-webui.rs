@@ -73,15 +73,12 @@ const BASE_TEMPLATE: &str = include_str!("../../static/webui/base.html");
 const INDEX_TEMPLATE: &str = include_str!("../../static/webui/index.html");
 const REPO_TEMPLATE: &str = include_str!("../../static/webui/repo.html");
 const ENTITY_TEMPLATE: &str = include_str!("../../static/webui/entity.html");
-// Use per-snapshot page rank value stored on the snapshot record. No fallback to entity-level fields.
-const ENTITY_FIELDS: &str = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+const ENTITY_FIELDS: &str = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 const SEARCH_TEMPLATE: &str = include_str!("../../static/webui/search.html");
 const PAGERANK_TEMPLATE: &str = include_str!("../../static/webui/pagerank.html");
 const DUPES_TEMPLATE: &str = include_str!("../../static/webui/dupes.html");
 const DEPENDENCIES_TEMPLATE: &str = include_str!("../../static/webui/dependencies.html");
 const SBOM_TEMPLATE: &str = include_str!("../../static/webui/sbom.html");
-const HIRAG_TEMPLATE: &str = include_str!("../../static/webui/hirag.html");
-const HIRAG_MINDMAP_TEMPLATE: &str = include_str!("../../static/webui/hirag-mindmap.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -816,8 +813,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("dupes", DUPES_TEMPLATE)?;
     templates.add_template("dependencies", DEPENDENCIES_TEMPLATE)?;
     templates.add_template("sbom", SBOM_TEMPLATE)?;
-    templates.add_template("hirag", HIRAG_TEMPLATE)?;
-    templates.add_template("hirag-mindmap", HIRAG_MINDMAP_TEMPLATE)?;
     // Reuse repo template with dupes section via route-driven render
     log::info!("Templates loaded successfully");
 
@@ -874,13 +869,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/repo/{repo_name}/dupes", get(repo_dupes_page_handler))
         .route("/dupes", get(dupes_index_handler))
         .route("/entity/{stable_id}", get(entity_handler))
-        .route("/hirag", get(hirag_page_handler))
-        .route("/hirag-mindmap", get(hirag_mindmap_handler))
-        .route("/api/hirag", get(hirag_api_handler))
-        .route(
-            "/api/hirag/{stable_id}/members",
-            get(hirag_members_api_handler),
-        )
         .route("/search", get(search_handler))
         .route("/pagerank", get(pagerank_handler))
         .nest_service("/static", ServeDir::new("../../static"))
@@ -1121,7 +1109,7 @@ async fn entity_handler(
     log::debug!("clean_repo_name: {}", clean_repo_name);
 
     // If entity.file still contains a leading repo directory with a UUID suffix
-    // (for example: "foo-bar-<uuid>/my_path/something.py"), normalize it to
+    // (for example: "gpt-researcher-<uuid>/gpt_researcher/agent.py"), normalize it to
     // remove the UUID so later URL construction uses the clean repo name.
     // This mirrors the UUID-detection used above (strip dashes before hex check).
     if let Some(slash_pos) = file_hint.find('/') {
@@ -1382,7 +1370,7 @@ async fn search_api_handler(
     }
 
     // Convert to Option<&[String]> for the similarity function
-    let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
+    // let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
     // Determine maximum results per page (env overrides default)
     let max_results: usize = std::env::var("HYPERZOEKT_MAX_SEARCH_RESULTS")
         .ok()
@@ -1403,114 +1391,112 @@ async fn search_api_handler(
         .unwrap_or(0);
 
     // If repo filters resolved to a single snapshot, use that snapshot id to scope similarity.
-    let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
-        // take the single map entry's snapshot option if present
-        let mut iter = resolved_refs.values();
-        if let Some((_, snap_opt)) = iter.next() {
-            snap_opt.as_deref()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
+    //     // take the single map entry's snapshot option if present
+    //     let mut iter = resolved_refs.values();
+    //     if let Some((_, snap_opt)) = iter.next() {
+    //         snap_opt.as_deref()
+    //     } else {
+    //         None
+    //     }
+    // } else {
+    //     None
+    // };
 
-    // Always attempt similarity-first search. If the similarity
-    // call fails we fall back to the legacy text-search path below.
-    log::info!("search_api_handler: attempting similarity search (always enabled)");
-    match hyperzoekt::similarity::similarity_with_conn_multi(
-        state.db.connection().as_ref(),
-        &query.q,
-        repo_slice_opt,
-        snapshot_id_opt,
-    )
-    .await
-    {
-        Ok(mut results) => {
-            // Enrich links
-            for entity in &mut results {
-                if entity.rank.is_none() {
-                    entity.rank = Some(0.0);
-                }
-                let raw_file_hint = file_hint_for_entity(entity);
-                let file_hint = clean_file_path(&raw_file_hint);
-                if entity.source_url.is_none() {
-                    if let Some(url) =
-                        construct_source_url(&state, &entity.repo_name, &file_hint, None).await
-                    {
-                        entity.source_url = Some(url.clone());
-                        if entity.source_display.is_none() {
-                            entity.source_display =
-                                Some(short_display_from_source_url(&url, &entity.repo_name));
-                        }
-                    }
-                } else if entity.source_display.is_none() {
-                    if let Some(ref url) = entity.source_url {
-                        entity.source_display =
-                            Some(short_display_from_source_url(url, &entity.repo_name));
-                    }
-                }
-            }
-            let elapsed_ms = started.elapsed().as_millis();
-            // Support cursor/limit pagination: request a larger set and slice
-            let total = results.len();
-            let end = (start + limit).min(total);
-            let next_cursor = if end < total {
-                Some(end.to_string())
-            } else {
-                None
-            };
-            let page_results = if start < total {
-                results[start..end].to_vec()
-            } else {
-                vec![]
-            };
-            // Serialize and enrich each returned entity JSON with resolved ref
-            let mut results_value =
-                serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
-            if let serde_json::Value::Array(ref mut arr) = results_value {
-                for v in arr.iter_mut() {
-                    if let serde_json::Value::Object(ref mut m) = v {
-                        if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
-                            if let Some((commit, snap)) = resolved_refs.get(repo_name) {
-                                m.insert(
-                                    "resolved_commit".to_string(),
-                                    serde_json::Value::String(commit.clone()),
-                                );
-                                if let Some(sid) = snap {
-                                    m.insert(
-                                        "resolved_snapshot".to_string(),
-                                        serde_json::Value::String(sid.clone()),
-                                    );
-                                } else {
-                                    m.insert(
-                                        "resolved_snapshot".to_string(),
-                                        serde_json::Value::Null,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut obj = serde_json::Map::new();
-            obj.insert("results".to_string(), results_value);
-            obj.insert(
-                "elapsed_ms".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
-            );
-            if let Some(nc) = next_cursor {
-                obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
-            }
-            return Ok(Json(serde_json::Value::Object(obj)));
-        }
-        Err(e) => {
-            log::warn!(
-                "similarity_search failed; falling back to text search: {}",
-                e
-            );
-        }
-    }
+    // Temporarily skip similarity search to test text search fallback
+    // match similarity::similarity_with_conn_multi(
+    //     &state.db.db,
+    //     &query.q,
+    //     repo_slice_opt,
+    //     snapshot_id_opt,
+    // )
+    // .await
+    // {
+    //     Ok(mut results) => {
+    //         // Enrich links
+    //         for entity in &mut results {
+    //             if entity.rank.is_none() {
+    //                 entity.rank = Some(0.0);
+    //             }
+    //             let raw_file_hint = file_hint_for_entity(entity);
+    //             let file_hint = clean_file_path(&raw_file_hint);
+    //             if entity.source_url.is_none() {
+    //                 if let Some(url) =
+    //                     construct_source_url(&state, &entity.repo_name, &file_hint, None).await
+    //                 {
+    //                     entity.source_url = Some(url.clone());
+    //                     if entity.source_display.is_none() {
+    //                         entity.source_display =
+    //                             Some(short_display_from_source_url(&url, &entity.repo_name));
+    //                     }
+    //                 }
+    //             } else if entity.source_display.is_none() {
+    //                 if let Some(ref url) = entity.source_url {
+    //                     entity.source_display =
+    //                         Some(short_display_from_source_url(url, &entity.repo_name));
+    //                 }
+    //             }
+    //         }
+    //         let elapsed_ms = started.elapsed().as_millis();
+    //         // Support cursor/limit pagination: request a larger set and slice
+    //         let total = results.len();
+    //         let end = (start + limit).min(total);
+    //         let next_cursor = if end < total {
+    //             Some(end.to_string())
+    //         } else {
+    //             None
+    //         };
+    //         let page_results = if start < total {
+    //             results[start..end].to_vec()
+    //         } else {
+    //             vec![]
+    //         };
+    //         // Serialize and enrich each returned entity JSON with resolved ref
+    //         let mut results_value =
+    //             serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
+    //         if let serde_json::Value::Array(ref mut arr) = results_value {
+    //             for v in arr.iter_mut() {
+    //                 if let serde_json::Value::Object(ref mut m) = v {
+    //                     if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
+    //                         if let Some((commit, snap)) = resolved_refs.get(repo_name) {
+    //                             m.insert(
+    //                                 "resolved_commit".to_string(),
+    //                                 serde_json::Value::String(commit.clone()),
+    //                             );
+    //                             if let Some(sid) = snap {
+    //                                 m.insert(
+    //                                     "resolved_snapshot".to_string(),
+    //                                     serde_json::Value::String(sid.clone()),
+    //                                 );
+    //                             } else {
+    //                                 m.insert(
+    //                                     "resolved_snapshot".to_string(),
+    //                                     serde_json::Value::Null,
+    //                                 );
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         let mut obj = serde_json::Map::new();
+    //         obj.insert("results".to_string(), results_value);
+    //         obj.insert(
+    //             "elapsed_ms".to_string(),
+    //             serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
+    //         );
+    //         if let Some(nc) = next_cursor {
+    //             obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
+    //         }
+    //         return Ok(Json(serde_json::Value::Object(obj)));
+    //     }
+    //     Err(e) => {
+    //         log::warn!(
+    //             "similarity_search failed; falling back to text search: {}",
+    //             e
+    //         );
+    //     }
+    // }
 
     // Fallback: legacy text search. Prefer multi-repo-aware search if provided.
     // If the request resolved exactly one repo -> snapshot mapping, prefer the
@@ -1667,151 +1653,6 @@ async fn entity_graph_api_handler(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
-}
-
-async fn hirag_page_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    let template = state.templates.get_template("hirag").unwrap();
-    let html = template
-        .render(context! { title => "HiRAG Clusters" })
-        .map_err(|e| {
-            log::error!("Failed to render hirag template: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(Html(html))
-}
-
-async fn hirag_mindmap_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    let template = state.templates.get_template("hirag-mindmap").unwrap();
-    let html = template
-        .render(context! { title => "HiRAG Mindmap" })
-        .map_err(|e| {
-            log::error!("Failed to render hirag-mindmap template: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(Html(html))
-}
-
-// Simple API to return hirag clusters. Returns an object { clusters: [..] }
-async fn hirag_api_handler(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Query a conservative set of fields to keep payload small
-    let fields = "stable_id, label, summary, members, centroid_len, member_repos";
-    let sql = format!("SELECT {} FROM hirag_cluster START AT 0 LIMIT 1000", fields);
-    let mut resp = match state.db.connection().as_ref() {
-        SurrealConnection::Local(db_conn) => db_conn.query(&sql).await,
-        SurrealConnection::RemoteHttp(db_conn) => db_conn.query(&sql).await,
-        SurrealConnection::RemoteWs(db_conn) => db_conn.query(&sql).await,
-    };
-
-    let mut clusters: Vec<serde_json::Value> = Vec::new();
-    match &mut resp {
-        Ok(r) => {
-            if let Ok(vals) = r.take::<Vec<serde_json::Value>>(0) {
-                clusters = vals;
-            }
-        }
-        Err(e) => {
-            log::error!("hirag_api_handler: query failed: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
-
-    Ok(Json(serde_json::json!({ "clusters": clusters })))
-}
-
-// API to return expanded members for a given hirag cluster stable_id.
-// Returns { stable_id: ..., members: [ { id: ..., type: 'cluster'|'entity', details: {...} } ] }
-async fn hirag_members_api_handler(
-    State(state): State<AppState>,
-    axum::extract::Path(stable_id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Fetch the cluster row
-    let sel = "SELECT stable_id, members FROM hirag_cluster WHERE stable_id = $sid LIMIT 1";
-    let resp = match state.db.connection().as_ref() {
-        SurrealConnection::Local(db_conn) => db_conn
-            .query(sel)
-            .bind(("sid", stable_id.clone()))
-            .await
-            .ok(),
-        SurrealConnection::RemoteHttp(db_conn) => db_conn
-            .query(sel)
-            .bind(("sid", stable_id.clone()))
-            .await
-            .ok(),
-        SurrealConnection::RemoteWs(db_conn) => db_conn
-            .query(sel)
-            .bind(("sid", stable_id.clone()))
-            .await
-            .ok(),
-    };
-
-    let mut members_out: Vec<serde_json::Value> = Vec::new();
-    if let Some(mut r) = resp {
-        if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
-            if let Some(first) = rows.into_iter().next() {
-                if let Some(arr) = first.get("members").and_then(|v| v.as_array()) {
-                    for m in arr.iter() {
-                        if let Some(ms) = m.as_str() {
-                            if ms.starts_with("hirag::") {
-                                // return minimal cluster info
-                                let mut cinfo = serde_json::json!({ "id": ms, "type": "cluster" });
-                                // try to fetch cluster summary
-                                let q = "SELECT stable_id, label, summary, member_repos FROM hirag_cluster WHERE stable_id = $sid LIMIT 1";
-                                let resp2 = match state.db.connection().as_ref() {
-                                    SurrealConnection::Local(db_conn) => {
-                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
-                                    }
-                                    SurrealConnection::RemoteHttp(db_conn) => {
-                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
-                                    }
-                                    SurrealConnection::RemoteWs(db_conn) => {
-                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
-                                    }
-                                };
-                                if let Some(mut r2) = resp2 {
-                                    if let Ok(rows2) = r2.take::<Vec<serde_json::Value>>(0) {
-                                        if let Some(rr) = rows2.into_iter().next() {
-                                            cinfo = serde_json::json!({ "id": ms, "type": "cluster", "details": rr });
-                                        }
-                                    }
-                                }
-                                members_out.push(cinfo);
-                                continue;
-                            }
-                            // Otherwise, assume entity stable_id -> fetch snapshot/entity info
-                            let q2 = "SELECT id, stable_id, repo_name, sourcecontrol_commit FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
-                            let resp3 = match state.db.connection().as_ref() {
-                                SurrealConnection::Local(db_conn) => {
-                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
-                                }
-                                SurrealConnection::RemoteHttp(db_conn) => {
-                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
-                                }
-                                SurrealConnection::RemoteWs(db_conn) => {
-                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
-                                }
-                            };
-                            if let Some(mut r3) = resp3 {
-                                if let Ok(rows3) = r3.take::<Vec<serde_json::Value>>(0) {
-                                    if let Some(rr) = rows3.into_iter().next() {
-                                        members_out.push(serde_json::json!({ "id": ms, "type": "entity", "details": rr }));
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Fallback: return only id
-                            members_out.push(serde_json::json!({ "id": ms, "type": "unknown" }));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(Json(
-        serde_json::json!({ "stable_id": stable_id, "members": members_out }),
-    ))
 }
 
 #[derive(Deserialize)]
@@ -2276,18 +2117,12 @@ async fn pagerank_api_handler(
     let limit = query.limit.unwrap_or(500usize);
 
     // Fetch entities with a limit via a new lightweight query path to avoid pulling everything.
-    // The UI expects a `rank` field on the returned objects. `ENTITY_FIELDS` includes
-    // `snapshot.page_rank_value AS page_rank_value`; for this API we alias it to `rank`
-    // so deserialization into `EntityPayload { rank: Option<f32>, ... }` succeeds.
-    let entity_fields = ENTITY_FIELDS.replace(
-        "snapshot.page_rank_value AS page_rank_value",
-        "snapshot.page_rank_value AS rank",
-    );
+    let entity_fields = ENTITY_FIELDS;
     let mut response = match state.db.connection().as_ref() {
         SurrealConnection::Local(db_conn) => {
-                db_conn
+            db_conn
                 .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY snapshot.page_rank_value DESC LIMIT $limit",
+                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
                     entity_fields
                 ))
                 .bind(("repo", query.repo.clone()))
@@ -2295,9 +2130,9 @@ async fn pagerank_api_handler(
                 .await
         }
         SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
+            db_conn
                 .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY snapshot.page_rank_value DESC LIMIT $limit",
+                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
                     entity_fields
                 ))
                 .bind(("repo", query.repo.clone()))
@@ -2305,9 +2140,9 @@ async fn pagerank_api_handler(
                 .await
         }
         SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
+            db_conn
                 .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY snapshot.page_rank_value DESC LIMIT $limit",
+                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
                     entity_fields
                 ))
                 .bind(("repo", query.repo.clone()))
@@ -2327,13 +2162,6 @@ async fn pagerank_api_handler(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-
-    // Ensure rank is present for templates/JS consumers: map None -> 0.0
-    for ent in &mut entities {
-        if ent.rank.is_none() {
-            ent.rank = Some(0.0);
-        }
-    }
 
     log::debug!(
         "pagerank_api_handler: fetched {} entities (limit={}) for repo={}",

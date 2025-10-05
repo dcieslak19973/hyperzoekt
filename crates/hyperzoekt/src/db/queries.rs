@@ -201,9 +201,7 @@ impl DatabaseQueries {
         // Prefer filtering on the explicit `repo_name` field (safer and more direct).
         // Fall back to matching file path prefixes for older/imported records that
         // don't have `repo_name` populated.
-        // Use the per-snapshot page rank value stored under snapshot.page_rank_value.
-        // We no longer fall back to a top-level entity field; page_rank is snapshot-scoped.
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql = format!(
             "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -233,7 +231,7 @@ impl DatabaseQueries {
 
         // Fallback: look for file paths that start with the provided repo_name.
         // Use a parameterized query to avoid injection.
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql2 = format!(
             "SELECT {} FROM entity WHERE string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -251,7 +249,7 @@ impl DatabaseQueries {
     }
 
     pub async fn get_all_entities(&self) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let query_sql = format!(
             "SELECT {} FROM entity ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -275,7 +273,7 @@ impl DatabaseQueries {
         &self,
         stable_id: &str,
     ) -> Result<Option<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql = format!(
             "SELECT {} FROM entity WHERE stable_id = $stable_id",
             entity_fields
@@ -466,13 +464,7 @@ impl DatabaseQueries {
         let mut out_same: Vec<serde_json::Value> = Vec::new();
         let mut out_external: Vec<serde_json::Value> = Vec::new();
         for e in same_repo.into_iter() {
-            // Convert entity_snapshot ID to entity ID for map lookup
-            let target_id = if e.target.to_string().starts_with("entity_snapshot:") {
-                e.target.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.target.to_string()
-            };
-            if let Some(er) = ent_map.get(&target_id) {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
                 out_same.push(serde_json::json!({
                     "stable_id": er.stable_id,
                     "name": er.name,
@@ -487,13 +479,7 @@ impl DatabaseQueries {
             }
         }
         for e in external_repo.into_iter() {
-            // Convert entity_snapshot ID to entity ID for map lookup
-            let target_id = if e.target.to_string().starts_with("entity_snapshot:") {
-                e.target.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.target.to_string()
-            };
-            if let Some(er) = ent_map.get(&target_id) {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
                 out_external.push(serde_json::json!({
                     "stable_id": er.stable_id,
                     "name": er.name,
@@ -632,18 +618,7 @@ impl DatabaseQueries {
         let lang_lc = language.map(|s| s.to_lowercase());
         let kind_lc = kind.map(|s| s.to_lowercase());
         for e in edge_rows.into_iter() {
-            // Convert entity_snapshot IDs to entity IDs for map lookup
-            let a_id = if e.a.to_string().starts_with("entity_snapshot:") {
-                e.a.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.a.to_string()
-            };
-            let b_id = if e.b.to_string().starts_with("entity_snapshot:") {
-                e.b.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.b.to_string()
-            };
-            if let (Some(ae), Some(be)) = (map.get(&a_id), map.get(&b_id)) {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
                 if ae.repo_name == repo_name && be.repo_name == repo_name {
                     if let Some(ms) = min_score {
                         if e.score < ms {
@@ -800,18 +775,7 @@ impl DatabaseQueries {
 
         let mut out: Vec<serde_json::Value> = Vec::new();
         for e in edge_rows.into_iter() {
-            // Convert entity_snapshot IDs to entity IDs for map lookup
-            let a_id = if e.a.to_string().starts_with("entity_snapshot:") {
-                e.a.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.a.to_string()
-            };
-            let b_id = if e.b.to_string().starts_with("entity_snapshot:") {
-                e.b.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.b.to_string()
-            };
-            if let (Some(ae), Some(be)) = (map.get(&a_id), map.get(&b_id)) {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
                 if ae.repo_name == repo_name && be.repo_name != repo_name {
                     if let Some(ms) = min_score {
                         if e.score < ms {
@@ -1807,7 +1771,7 @@ impl DatabaseQueries {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let fields = "<string>id AS id, language, kind, name, rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 
         // If we have repo_filters, split into repo_names (for repo_name IN) and
         // path_prefixes (for string::starts_with on file)
@@ -1831,13 +1795,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1859,13 +1823,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1879,13 +1843,13 @@ impl DatabaseQueries {
                 } else {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1901,13 +1865,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1929,13 +1893,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1949,13 +1913,13 @@ impl DatabaseQueries {
                 } else {
                     let q0 = if offset == 0 {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         ))
                     } else {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1968,13 +1932,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1996,13 +1960,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2016,13 +1980,13 @@ impl DatabaseQueries {
                 } else {
                     let q0 = if offset == 0 {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         ))
                     } else {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2060,7 +2024,7 @@ impl DatabaseQueries {
         snapshot_id: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
         // Fields for entity_snapshot are top-level (not under `snapshot.`)
-        let fields = "<string>id AS id, language, kind, name, page_rank_value, repo_name, signature, stable_id, file AS file, parent AS parent, start_line AS start_line, end_line AS end_line, doc AS doc, imports AS imports, unresolved_imports AS unresolved_imports, methods AS methods, source_url AS source_url, source_display AS source_display, calls AS calls, source_content AS source_content";
+        let fields = "<string>id AS id, language, kind, name, rank, repo_name, signature, stable_id, file AS file, parent AS parent, start_line AS start_line, end_line AS end_line, doc AS doc, imports AS imports, unresolved_imports AS unresolved_imports, methods AS methods, source_url AS source_url, source_display AS source_display, calls AS calls, source_content AS source_content";
 
         // Split repo_filters into repo_names and path_prefixes as in the non-snapshot variant
         let mut repo_names: Vec<String> = Vec::new();
@@ -2080,13 +2044,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2109,13 +2073,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2130,13 +2094,13 @@ impl DatabaseQueries {
                 } else {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
