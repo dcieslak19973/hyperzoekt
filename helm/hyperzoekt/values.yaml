@@ -432,9 +432,57 @@ hyperzoektEmbedWorker:
   tolerations: []
   affinity: {}
 
-# Optional local TEI service
+# HyperZoekt SBOM worker
+hyperzoektSbomWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  service:
+    port: 7210
+  # Exposure configuration (service or ingress)
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      host: sbom.hyperzoekt.local
+      path: /
+      pathType: Prefix
+  # Environment variables specific to the SBOM worker
+  env:
+    - name: HZ_SBOM_JOBS_QUEUE
+      value: "zoekt:sbom_jobs"
+    - name: HZ_SBOM_PROCESSING_TTL_SECONDS
+      value: "300"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Make indexer publish SBOM jobs by default (parity with docker-compose)
+hyperzoektIndexer:
+  enableSbomJobs: true
+  # Additional environment variables (kept empty by default; set locally if needed)
+  extraEnvVars: []
+
+# Local TEI service (Bring Your Own Embedder)
+# TEI provides a local inference service used by the embed worker. It is
+# enabled by default for local development. For production or custom
+# environments, you can disable this and point `HZ_TEI_BASE` to your external
+# embedder service (BYOE - Bring Your Own Embedder).
 tei:
-  enabled: false
+  enabled: true
   annotations: {}
   image:
     registry: ghcr.io

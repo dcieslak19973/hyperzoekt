@@ -44,6 +44,8 @@ struct SearchQuery {
     exclude: Option<String>,
     /// Repository to search in (optional, searches all if not specified)
     repo: Option<String>,
+    /// Branch or commit to search in (optional, supports comma-separated list)
+    branch: Option<String>,
     /// Maximum number of results to return (optional, default 100)
     max_results: Option<usize>,
     /// Number of context lines around matches (optional, default 2)
@@ -80,6 +82,7 @@ async fn search_handler(
         include: query.include,
         exclude: query.exclude,
         repo: query.repo,
+        branch: query.branch,
         max_results: query.max_results,
         context: query.context,
         case_sensitive: query.case,

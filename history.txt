@@ -1,0 +1,16 @@
+#V2
+DELETE entity WHERE stable_id IN ['A', 'B']; DELETE entity_snapshot WHERE stable_id IN ['A', 'B']; DEFINE TABLE calls TYPE RELATION FROM entity_snapshot TO entity_snapshot; DEFINE TABLE imports TYPE RELATION FROM entity_snapshot TO entity_snapshot; CREATE entity:`A` SET stable_id='A', name='FnA', file='r/f.rs', language='rust', kind='function', start_line=1, end_line=2, imports=[], unresolved_imports=[], repo_name='r'; CREATE entity_snapshot:`A` SET stable_id='A', name='FnA', file='r/f.rs', language='rust', kind='function', start_line=1, end_line=2, imports=[], unresolved_imports=[], repo_name='r'; CREATE entity:`B` SET stable_id='B', name='FnB', file='r/f.rs', language='rust', kind='function', start_line=3, end_line=4, imports=[], unresolved_imports=[], repo_name='r'; CREATE entity_snapshot:`B` SET stable_id='B', name='FnB', file='r/f.rs', language='rust', kind='function', start_line=3, end_line=4, imports=[], unresolved_imports=[], repo_name='r'; RELATE entity_snapshot:A -> calls -> entity_snapshot:B; RELATE entity_snapshot:A -> imports -> entity_snapshot:B;
+SELECT * FROM calls;
+SELECT out FROM calls WHERE in = type::thing('entity_snapshot:A');
+SELECT out.stable_id FROM calls WHERE in = type::thing('entity_snapshot:A');
+SELECT out.name, out.stable_id FROM calls WHERE in = type::thing('entity_snapshot:A') FETCH out;
+SELECT * FROM entity_snapshot:B;
+INFO FOR TABLE entity_snapshot;
+SELECT * FROM entity_snapshot WHERE id = type::thing('entity_snapshot:B');
+SELECT * FROM entity_snapshot LIMIT 5;
+SELECT * FROM entity_snapshot WHERE stable_id IN ['A','B'];
+INFO FOR TABLE entity;
+SELECT * FROM entity_snapshot WHERE id = type::thing('entity_snapshot:A');
+SELECT out FROM calls WHERE in = type::thing('entity_snapshot:A');
+SELECT * FROM entity WHERE stable_id IN ['A','B'];
+CREATE entity_snapshot:`A` SET stable_id="A";

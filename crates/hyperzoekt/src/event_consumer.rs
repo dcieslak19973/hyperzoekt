@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db_writer;
+use crate::db;
 use crate::repo_index::deps;
 use crate::repo_index::indexer::payload::{EntityPayload, ImportItem, UnresolvedImport};
 use crate::repo_index::indexer::EntityKind;
@@ -34,7 +34,7 @@ pub struct EventConsumer {
 }
 
 /// Metadata computed for a repository snapshot.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RepoSnapshotMetadata {
     pub commit_id: String,
     pub parents: Vec<String>,
@@ -95,6 +95,88 @@ fn compute_repo_snapshot_metadata(
         message,
         size_bytes: total,
     })
+}
+
+/// Try to detect the default branch for a local repository path using git2.
+/// This is best-effort and returns `None` on any error.
+async fn detect_default_branch_from_path(path: &std::path::Path) -> Option<String> {
+    let p = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Option<String> {
+        let repo = git2::Repository::open(&p).ok()?;
+
+        // 1) Try HEAD shorthand (if HEAD is a symbolic ref to a branch)
+        if let Ok(head) = repo.head() {
+            if let Some(sh) = head.shorthand() {
+                // shorthand often returns 'main' or 'master'
+                return Some(sh.to_string());
+            }
+        }
+
+        // 2) Try remote origin HEAD symbolic ref: refs/remotes/origin/HEAD -> refs/remotes/origin/<branch>
+        if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD") {
+            if let Some(target) = r.symbolic_target() {
+                // target like "refs/remotes/origin/main" -> strip prefix
+                if let Some(stripped) = target.strip_prefix("refs/remotes/origin/") {
+                    return Some(stripped.to_string());
+                }
+                // also handle refs/heads/<branch>
+                if let Some(s2) = target.strip_prefix("refs/heads/") {
+                    return Some(s2.to_string());
+                }
+            }
+        }
+
+        // 3) Fallback: check common branch names locally
+        for b in &["main", "master", "trunk"] {
+            if repo.find_branch(b, git2::BranchType::Local).is_ok() {
+                return Some(b.to_string());
+            }
+        }
+
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Try to detect the default branch by querying the remote without performing a full
+/// clone. This uses git2 to create an anonymous remote and list refs. Returns the
+/// branch name (without refs/heads/) when found. Best-effort; returns None on error.
+async fn detect_default_branch_remote(git_url: &str) -> Option<String> {
+    let url = git_url.to_string();
+    tokio::task::spawn_blocking(move || -> Option<String> {
+        // Use git CLI to query remote HEAD symref without cloning.
+        // `git ls-remote --symref <url> HEAD` prints a line like:
+        // "ref: refs/heads/main	HEAD" on success.
+        let output = std::process::Command::new("git")
+            .args(["ls-remote", "--symref", &url, "HEAD"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Look for lines starting with "ref: refs/heads/...\tHEAD"
+            if line.starts_with("ref:") && line.contains("\tHEAD") {
+                // line like: "ref: refs/heads/main	HEAD"
+                if let Some(rest) = line.strip_prefix("ref:") {
+                    if let Some((refname, _)) = rest.split_once('\t') {
+                        let refname = refname.trim();
+                        if let Some(branch) = refname.strip_prefix("refs/heads/") {
+                            return Some(branch.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 impl EventConsumer {
@@ -522,10 +604,158 @@ impl EventProcessor {
                     }
                 };
 
+                // Best-effort: detect the repository default branch from the cloned repo
+                // and persist it to SurrealDB so runtime services can read an authoritative
+                // default branch instead of guessing. This runs in background and is
+                // non-fatal on errors.
+                // Normalize git_url so persisted repo rows use a consistent form.
+                let git_url_for_meta = crate::db::normalize_git_url(&event.git_url);
+                let repo_name_for_meta = event.repo_name.clone();
+                let temp_dir_for_meta = temp_dir.clone();
+                let event_branch_for_meta = event.branch.clone();
+                tokio::spawn(async move {
+                    let ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
+                    let db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
+                    // Prefer remote store when creds present
+                    let store_res: Result<
+                        zoekt_distributed::surreal_repo_store::SurrealRepoStore,
+                        anyhow::Error,
+                    > = if let Ok(url) = std::env::var("SURREALDB_URL") {
+                        // Try remote init with optional auth (useful for token/anonymous setups)
+                        let username = std::env::var("SURREALDB_USERNAME").ok();
+                        let password = std::env::var("SURREALDB_PASSWORD").ok();
+                        match zoekt_distributed::surreal_repo_store::SurrealRepoStore::new_remote_optional_auth(url, username, password, ns.clone(), db.clone()).await {
+                            Ok(s) => Ok(s),
+                            Err(e) => Err(anyhow::anyhow!(e)),
+                        }
+                    } else {
+                        // Fallback to local in-memory store
+                        match zoekt_distributed::surreal_repo_store::SurrealRepoStore::new(
+                            None,
+                            ns.clone(),
+                            db.clone(),
+                        )
+                        .await
+                        {
+                            Ok(s) => Ok(s),
+                            Err(e) => Err(anyhow::anyhow!(e)),
+                        }
+                    };
+
+                    let store = match store_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::debug!(
+                                "Could not initialize SurrealRepoStore for branch persistence: {}",
+                                e
+                            );
+                            return;
+                        }
+                    };
+
+                    // Try remote detection first (no clone required), then fall back to
+                    // detecting from the local clone. Both are best-effort.
+                    let mut detected_branch: Option<String> = None;
+                    if let Some(rb) = detect_default_branch_remote(&git_url_for_meta).await {
+                        log::debug!(
+                            "Remote detection found default branch='{}' for {}",
+                            rb,
+                            git_url_for_meta
+                        );
+                        detected_branch = Some(rb);
+                    } else if let Some(lb) =
+                        detect_default_branch_from_path(&temp_dir_for_meta).await
+                    {
+                        log::debug!(
+                            "Local detection found default branch='{}' for {}",
+                            lb,
+                            git_url_for_meta
+                        );
+                        detected_branch = Some(lb);
+                    } else if let Some(evb) = event_branch_for_meta.clone() {
+                        log::debug!(
+                            "Using event-provided branch='{}' for {}",
+                            evb,
+                            git_url_for_meta
+                        );
+                        detected_branch = Some(evb);
+                    } else {
+                        log::debug!(
+                            "No default branch detected (remote/local/event) for {}",
+                            git_url_for_meta
+                        );
+                    }
+
+                    if let Some(branch) = detected_branch {
+                        // Respect persistence policy: HZ_PERSIST_BRANCH_POLICY
+                        // values: "if-empty" (default), "if-different", "always"
+                        let policy = std::env::var("HZ_PERSIST_BRANCH_POLICY")
+                            .unwrap_or_else(|_| "if-empty".into());
+                        let should_write = match policy.as_str() {
+                            "always" => true,
+                            "if-different" => {
+                                match store.get_repo_metadata(&git_url_for_meta).await {
+                                    Ok(Some(existing)) => {
+                                        existing.branch.as_deref() != Some(branch.as_str())
+                                    }
+                                    Ok(None) => true,
+                                    Err(_) => true,
+                                }
+                            }
+                            _ => {
+                                // if-empty
+                                match store.get_repo_metadata(&git_url_for_meta).await {
+                                    Ok(Some(existing)) => existing.branch.is_none(),
+                                    Ok(None) => true,
+                                    Err(_) => true,
+                                }
+                            }
+                        };
+
+                        if should_write {
+                            let now = chrono::Utc::now();
+                            let id = format!("repo:{}", git_url_for_meta.replace(['/', ':'], "_"));
+                            let metadata = zoekt_distributed::surreal_repo_store::RepoMetadata {
+                                id,
+                                name: repo_name_for_meta.clone(),
+                                git_url: git_url_for_meta.clone(),
+                                branch: Some(branch.clone()),
+                                visibility: zoekt_rs::types::RepoVisibility::Public,
+                                owner: None,
+                                allowed_users: Vec::new(),
+                                last_commit_sha: None,
+                                last_indexed_at: Some(now),
+                                created_at: now,
+                                updated_at: now,
+                            };
+                            if let Err(e) = store.upsert_repo_metadata(metadata).await {
+                                log::warn!(
+                                    "Failed to persist detected branch for {}: {}",
+                                    git_url_for_meta,
+                                    e
+                                );
+                            } else {
+                                log::info!(
+                                    "Persisted detected default branch='{}' for repo={}",
+                                    branch,
+                                    git_url_for_meta
+                                );
+                            }
+                        } else {
+                            log::info!("Skipping branch persistence for {} per policy='{}' (detected='{}')", git_url_for_meta, policy, branch);
+                        }
+                    }
+                });
+
                 let repo_name = event.repo_name.clone();
                 let temp_dir_clone = temp_dir.clone();
                 // capture owner for use inside blocking closure
                 let owner_clone = owner.clone();
+                // Prepare SBOM-related clones early so they remain available after moving `event` into closures
+                let sbom_repo_prepared = repo_name.clone();
+                let sbom_git_url_prepared = event.git_url.clone();
+                let sbom_branch_prepared = event.branch.clone();
+                let sbom_commit_prepared = event.last_commit_sha.clone();
 
                 // Collect dependencies in a blocking way before spawning the main blocking indexer
                 let deps_temp_dir = temp_dir.clone();
@@ -560,34 +790,129 @@ impl EventProcessor {
                     );
                 }
 
-                // Persist dependencies using the db_writer helper (normalized schema + idempotent upsert)
-                let surreal_url = std::env::var("SURREALDB_URL").ok();
-                let cfg = db_writer::DbWriterConfig {
-                    surreal_url,
-                    surreal_username: std::env::var("SURREALDB_USERNAME").ok(),
-                    surreal_password: std::env::var("SURREALDB_PASSWORD").ok(),
-                    surreal_ns: std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into()),
-                    surreal_db: std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into()),
-                    ..Default::default()
-                };
+                // Before running the blocking index build, compute commit/snapshot metadata
+                // on a blocking thread and perform any necessary SurrealDB writes in the
+                // async context so we avoid creating nested Tokio runtimes.
+                let mut maybe_commit: Option<String> = None;
+                let mut maybe_snapshot_id: Option<String> = None;
+                let mut maybe_meta: Option<RepoSnapshotMetadata> = None;
 
-                // Best-effort: persist using the db writer helper
-                if let Err(e) = db_writer::persist_repo_dependencies(
-                    &cfg,
-                    &repo_name,
-                    &event.git_url,
-                    owner.as_deref(),
-                    event.branch.as_deref(),
-                    event.last_commit_sha.as_deref(),
-                    event.last_indexed_at,
-                    &deps_found,
-                )
+                // Prepare clones for blocking compute
+                let temp_dir_for_meta = temp_dir.clone();
+                let last_commit_sha_for_meta = event.last_commit_sha.clone();
+                let repo_name_for_meta = repo_name.clone();
+                log::info!(
+                    "About to compute repo snapshot metadata for repo={} last_commit_sha={:?}",
+                    repo_name_for_meta,
+                    last_commit_sha_for_meta
+                );
+
+                match tokio::task::spawn_blocking(move || {
+                    compute_repo_snapshot_metadata(
+                        &temp_dir_for_meta,
+                        last_commit_sha_for_meta.as_deref(),
+                    )
+                })
                 .await
                 {
-                    log::warn!(
-                        "Failed to persist normalized dependencies via db_writer: {}",
-                        e
-                    );
+                    Ok(Ok(meta)) => {
+                        log::info!("Successfully computed repo snapshot metadata for repo={} commit_id={} parents={:?} tree={:?} author={:?}",
+                            repo_name_for_meta, meta.commit_id, meta.parents, meta.tree.is_some(), meta.author.is_some());
+
+                        // Perform SurrealDB writes on the current async runtime
+                        let surreal_url = std::env::var("SURREALDB_URL").ok();
+                        let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
+                        let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
+                        let surreal_ns =
+                            std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
+                        let surreal_db =
+                            std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
+
+                        match db::connection::connect(
+                            &surreal_url,
+                            &surreal_username,
+                            &surreal_password,
+                            &surreal_ns,
+                            &surreal_db,
+                        )
+                        .await
+                        {
+                            Ok(conn) => {
+                                let parents_refs: Vec<&str> =
+                                    meta.parents.iter().map(|s| s.as_str()).collect();
+                                if let Err(e) = db::create_commit(
+                                    &conn,
+                                    &meta.commit_id,
+                                    &repo_name_for_meta,
+                                    &parents_refs,
+                                    meta.tree.as_deref(),
+                                    meta.author.as_deref(),
+                                    meta.message.as_deref(),
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "Failed to record commit {} for repo {}: {}",
+                                        meta.commit_id,
+                                        repo_name_for_meta,
+                                        e
+                                    );
+                                } else {
+                                    log::info!(
+                                        "Recorded commit {} for repo {}",
+                                        meta.commit_id,
+                                        repo_name_for_meta
+                                    );
+                                }
+
+                                if let Some(branch) = event.branch.as_ref() {
+                                    if let Err(e) = db::create_branch(
+                                        &conn,
+                                        &repo_name_for_meta,
+                                        branch,
+                                        &meta.commit_id,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "Failed to create branch ref {} -> {} for repo {}: {}",
+                                            branch,
+                                            meta.commit_id,
+                                            repo_name_for_meta,
+                                            e
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "Created branch ref {} -> {} for repo {}",
+                                            branch,
+                                            meta.commit_id,
+                                            repo_name_for_meta
+                                        );
+                                    }
+                                }
+
+                                maybe_commit = Some(meta.commit_id.clone());
+                                maybe_snapshot_id = Some(format!(
+                                    "snapshot:{}:{}",
+                                    repo_name_for_meta, meta.commit_id
+                                ));
+                                maybe_meta = Some(meta);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to connect to SurrealDB to create commit for repo {}: {}", repo_name_for_meta, e);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("Failed to compute repo snapshot metadata for {}: {} (last_commit_sha={:?})", repo_name, e, event.last_commit_sha);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to join blocking task computing repo metadata for {}: {:?}",
+                            repo_name,
+                            e
+                        );
+                    }
                 }
 
                 // Run blocking index build off the tokio runtime
@@ -603,32 +928,6 @@ impl EventProcessor {
                         stats.entities_indexed
                     );
 
-                    // Helper: normalize git_url to an https base (strip .git, convert ssh forms)
-                    fn normalize_git_url(git_url: &str) -> Option<String> {
-                        if git_url.is_empty() {
-                            return None;
-                        }
-                        // Handle SSH style: git@github.com:owner/repo.git -> https://github.com/owner/repo
-                        if git_url.starts_with("git@") {
-                            // git@host:owner/repo.git
-                            if let Some(colon) = git_url.find(':') {
-                                let host = &git_url[4..colon];
-                                let rest = &git_url[colon + 1..];
-                                let rest = rest.strip_suffix(".git").unwrap_or(rest);
-                                return Some(format!("https://{}/{}", host, rest));
-                            }
-                        }
-
-                        // Handle http/https
-                        if git_url.starts_with("http://") || git_url.starts_with("https://") {
-                            let s = git_url.trim_end_matches(".git");
-                            return Some(s.to_string());
-                        }
-
-                        // Fallback: try to treat as path-like and prefix https://
-                        let s = git_url.trim_end_matches(".git");
-                        Some(format!("https://{}", s))
-                    }
 
                     // Extract EntityPayload from the service for persistence
                     // Helper: extract full text for a span from a file (1-based inclusive line numbers)
@@ -709,7 +1008,14 @@ impl EventProcessor {
                         let commit = std::env::var("SURREAL_COMMIT").unwrap_or_else(|_| "unknown-commit".into());
                         let stable_id = crate::utils::generate_stable_id(&project, &repo, &branch, &commit, &file.path, &ent.name, &ent.signature);
                         let branch_ref = event.branch.clone().unwrap_or_else(|| "main".into());
-                        let source_base = normalize_git_url(&event.git_url);
+                        let source_base = {
+                            let s = crate::db::normalize_git_url(&event.git_url);
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s)
+                            }
+                        };
                         if let Some(ref g) = Some(event.git_url.clone()) {
                             log::debug!("source_url_debug: git_url='{}' owner='{:?}' repo='{}' branch='{}'", g, owner_clone, repo_name, branch_ref);
                         }
@@ -756,26 +1062,13 @@ impl EventProcessor {
                                 for &callee_eid in edges { if let Some(callee_ent) = svc.entities.get(callee_eid as usize) { calls.push(callee_ent.name.clone()); } }
                             }
                         }
-                        payloads.push(EntityPayload { language: file.language.clone(), kind: ent.kind.as_str().to_string(), name: ent.name.clone(), parent: ent.parent.clone(), signature: ent.signature.clone(), start_line: start_field, end_line: end_field, doc: ent.doc.clone(), rank: Some(ent.rank), imports, unresolved_imports, methods: methods_with_src, stable_id, repo_name: repo_name.clone(), source_url: computed_source, source_display: None, calls, source_content: ent_source_content });
+                        payloads.push(EntityPayload { id: stable_id.clone(), language: file.language.clone(), kind: ent.kind.as_str().to_string(), name: ent.name.clone(), parent: ent.parent.clone(), signature: ent.signature.clone(), start_line: start_field, end_line: end_field, doc: ent.doc.clone(), rank: Some(ent.rank), imports, unresolved_imports, methods: methods_with_src, stable_id, repo_name: repo_name.clone(), file: Some(crate::repo_index::indexer::payload::compute_repo_relative(&file.path, &repo_name)), source_url: computed_source, source_display: None, calls, source_content: ent_source_content });
                         if progress_interval > 0 && (idx + 1) % progress_interval == 0 {
                             log::info!("payload build progress: repo={} {}/{} ({:.2}%)", repo_name, idx + 1, total_entities, ((idx + 1) as f64 * 100.0 / total_entities as f64));
                         }
                     }
                     log::info!("payload build complete: repo={} total_entities={}", repo_name, total_entities);
-
-                    // Compute commit/snapshot metadata early so the DB writer can
-                    // populate `entity_snapshot` mapping rows while persisting entities.
-                    let mut maybe_commit: Option<String> = None;
-                    let mut maybe_snapshot_id: Option<String> = None;
-                    match compute_repo_snapshot_metadata(&temp_dir_clone, event.last_commit_sha.as_deref()) {
-                        Ok(meta) => {
-                            maybe_commit = Some(meta.commit_id.clone());
-                            maybe_snapshot_id = Some(format!("snapshot:{}:{}", repo_name, meta.commit_id));
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to compute repo snapshot metadata before DB write for {}: {}", repo_name, e);
-                        }
-                    }
+                    log::debug!("metadata (maybe) precomputed: commit={:?} snapshot_id={:?}", maybe_commit, maybe_snapshot_id);
 
                     // Configure and spawn DB writer, providing snapshot context when available
                     let surreal_url = std::env::var("SURREALDB_URL").ok();
@@ -784,7 +1077,7 @@ impl EventProcessor {
                     let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
                     let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
 
-                    let mut db_cfg = db_writer::DbWriterConfig {
+                    let mut db_cfg = db::DbWriterConfig {
                         surreal_url,
                         surreal_username,
                         surreal_password,
@@ -794,8 +1087,27 @@ impl EventProcessor {
                     };
                     db_cfg.snapshot_id = maybe_snapshot_id.clone();
                     db_cfg.commit_id = maybe_commit.clone();
+                    // Convert local RepoSnapshotMetadata to the DB writer's RepoSnapshotMetadata type
+                    if let Some(m) = maybe_meta.clone() {
+                        db_cfg.commit_meta = Some(db::config::RepoSnapshotMetadata {
+                            commit_id: m.commit_id,
+                            parents: m.parents,
+                            tree: m.tree,
+                            author: m.author,
+                            message: m.message,
+                            size_bytes: m.size_bytes,
+                        });
+                    }
+                    // Provide the writer with the authoritative repo name and git URL
+                    // so it can populate the repo row correctly without fabricating
+                    // a URL from the bare repo name.
+                    db_cfg.repo_name = repo_name.clone();
+                    let normalized_git = crate::db::normalize_git_url(&event.git_url);
+                    if !normalized_git.is_empty() {
+                        db_cfg.repo_git_url = Some(normalized_git);
+                    }
 
-                    let (tx, db_join) = db_writer::spawn_db_writer(payloads.clone(), db_cfg, None)?;
+                    let (tx, db_join) = db::spawn_db_writer(payloads.clone(), db_cfg, None)?;
 
                     // Chunk payloads so writer processes multiple batches when large.
                     let chunk_size = 500; // keep in sync with default batch_capacity
@@ -818,59 +1130,8 @@ impl EventProcessor {
                                 stats.entities_indexed,
                                 repo_name
                             );
-                            // After persistence, record a commit and snapshot metadata in SurrealDB.
-                            // Use the existing db_writer connection helpers.
-                            let surreal_url = std::env::var("SURREALDB_URL").ok();
-                            let surreal_username = std::env::var("SURREALDB_USERNAME").ok();
-                            let surreal_password = std::env::var("SURREALDB_PASSWORD").ok();
-                            let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
-                            let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
-                            // We are in a blocking thread — create a small Tokio runtime to perform async SurrealDB calls.
-                            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                                Ok(rt2) => {
-                                    let snapshot_dir = temp_dir_clone.clone();
-                                    let res = rt2.block_on(async move {
-                                        match db_writer::connection::connect(&surreal_url, &surreal_username, &surreal_password, &surreal_ns, &surreal_db).await {
-                                            Ok(conn) => {
-                                                // Compute git-derived metadata (commit id, parents, tree, author, message, size)
-                                                match compute_repo_snapshot_metadata(&snapshot_dir, event.last_commit_sha.as_deref()) {
-                                                    Ok(meta) => {
-                                                        // Convert parents Vec<String> -> Vec<&str> for call
-                                                        let parents_refs: Vec<&str> = meta.parents.iter().map(|s| s.as_str()).collect();
-                                                        if let Err(e) = db_writer::create_commit(&conn, &meta.commit_id, &repo_name, &parents_refs, meta.tree.as_deref(), meta.author.as_deref(), meta.message.as_deref()).await {
-                                                            log::warn!("Failed to record commit {} for repo {}: {}", meta.commit_id, repo_name, e);
-                                                        } else {
-                                                            log::info!("Recorded commit {} for repo {}", meta.commit_id, repo_name);
-                                                        }
-                                                        // Create snapshot metadata pointing to the snapshot id.
-                                                        let snapshot_id = format!("snapshot:{}:{}", repo_name, meta.commit_id);
-                                                        let size_opt = Some(meta.size_bytes);
-                                                        if let Err(e) = db_writer::create_snapshot_meta(&conn, &repo_name, &meta.commit_id, &snapshot_id, size_opt).await {
-                                                            log::warn!("Failed to create snapshot_meta {} for repo {} commit {}: {}", snapshot_id, repo_name, meta.commit_id, e);
-                                                        } else {
-                                                            log::info!("Created snapshot_meta {} -> commit {}", snapshot_id, meta.commit_id);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!("Failed to compute repo snapshot metadata for {}: {}", repo_name, e);
-                                                    }
-                                                }
-                                                Ok(())
-                                            }
-                                            Err(e) => {
-                                                log::warn!("Failed to connect to SurrealDB to persist commit/snapshot metadata: {}", e);
-                                                Err(e)
-                                            }
-                                        }
-                                    });
-                                    if let Err(e) = res {
-                                        log::debug!("commit/snapshot metadata runtime error: {:?}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to create temp runtime to persist commit/snapshot metadata: {}", e);
-                                }
-                            }
+                            // Note: snapshot metadata creation is performed by the async
+                            // context after this blocking task returns to avoid nested runtimes.
                         }
                         Ok(Err(e)) => {
                             log::error!("DB writer failed for {}: {}", repo_name, e);
@@ -903,6 +1164,24 @@ impl EventProcessor {
                             "Successfully processed indexing_finished for {}",
                             event.repo_name
                         );
+                        // Optionally enqueue SBOM job for this repo
+                        if Self::sbom_jobs_enabled() {
+                            tokio::spawn(async move {
+                                match Self::enqueue_sbom_job(
+                                    &sbom_repo_prepared,
+                                    &sbom_git_url_prepared,
+                                    sbom_branch_prepared.as_deref(),
+                                    sbom_commit_prepared.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(_) => log::info!("SBOM job enqueued for repo={}", sbom_repo_prepared),
+                                    Err(e) => log::warn!("Failed to enqueue SBOM job for {}: {}", sbom_repo_prepared, e),
+                                }
+                            });
+                        } else {
+                            log::debug!("SBOM jobs disabled (HZ_ENABLE_SBOM_JOBS not set)");
+                        }
                         // Emit a clear, always-on info line showing the embedding gate decision so
                         // operators do not have to rely on a missing debug log to infer why jobs
                         // were (not) enqueued. This avoids confusion when RUST_LOG excludes debug.
@@ -1194,6 +1473,59 @@ impl EventProcessor {
     fn embed_jobs_enabled() -> bool {
         let v = std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default();
         matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+    }
+
+    fn sbom_jobs_enabled() -> bool {
+        let v = std::env::var("HZ_ENABLE_SBOM_JOBS").unwrap_or_default();
+        matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+    }
+
+    async fn enqueue_sbom_job(
+        repo_name: &str,
+        git_url: &str,
+        branch: Option<&str>,
+        last_commit_sha: Option<&str>,
+    ) -> Result<usize, anyhow::Error> {
+        let pool_opt = zoekt_distributed::redis_adapter::create_redis_pool();
+        if pool_opt.is_none() {
+            log::warn!(
+                "Redis pool not available when attempting to enqueue sbom job for repo={}; check REDIS_URL/credentials",
+                repo_name
+            );
+            return Err(anyhow::anyhow!(
+                "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
+            ));
+        }
+        let pool = pool_opt.unwrap();
+
+        #[derive(serde::Serialize)]
+        struct SbomJob<'a> {
+            repo_name: &'a str,
+            git_url: &'a str,
+            branch: Option<&'a str>,
+            last_commit_sha: Option<&'a str>,
+        }
+
+        let queue_key =
+            std::env::var("HZ_SBOM_JOBS_QUEUE").unwrap_or_else(|_| "zoekt:sbom_jobs".to_string());
+
+        let job = SbomJob {
+            repo_name,
+            git_url,
+            branch,
+            last_commit_sha,
+        };
+
+        let s = serde_json::to_string(&job)?;
+
+        let mut conn = pool.get().await?;
+        let _: () = deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &queue_key, &s).await?;
+        log::info!(
+            "Enqueued sbom job for repo={} to queue={}",
+            repo_name,
+            queue_key
+        );
+        Ok(1usize)
     }
 
     async fn enqueue_embedding_jobs(

@@ -34,6 +34,16 @@ pub type SpawnResult = anyhow::Result<(
 pub type PersistAckSender = SyncSender<Vec<PersistedEntityMeta>>;
 
 #[derive(Clone, Debug)]
+pub struct RepoSnapshotMetadata {
+    pub commit_id: String,
+    pub parents: Vec<String>,
+    pub tree: Option<String>,
+    pub author: Option<String>,
+    pub message: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct DbWriterConfig {
     pub channel_capacity: usize,
     pub batch_capacity: Option<usize>,
@@ -49,6 +59,13 @@ pub struct DbWriterConfig {
     // Optional snapshot context used to populate entity_snapshot mapping rows.
     pub snapshot_id: Option<String>,
     pub commit_id: Option<String>,
+    /// Optional authoritative git URL for the primary repo being indexed. When
+    /// present, the DB writer will use this value when creating/updating the
+    /// repo row that matches `repo_name` to avoid fabricating a URL from the
+    /// repo name.
+    pub repo_git_url: Option<String>,
+    pub repo_name: String,
+    pub commit_meta: Option<RepoSnapshotMetadata>,
 }
 
 impl Default for DbWriterConfig {
@@ -67,6 +84,9 @@ impl Default for DbWriterConfig {
             auto_create_missing_repos_for_file_edges: true,
             snapshot_id: None,
             commit_id: None,
+            repo_git_url: None,
+            repo_name: String::new(),
+            commit_meta: None,
         }
     }
 }

@@ -115,6 +115,7 @@ pub fn index_single_file(
         }
 
         payloads.push(EntityPayload {
+            id: stable_id.clone(),
             language: file.language.clone(),
             kind: ent.kind.as_str().to_string(),
             name: ent.name.clone(),
@@ -131,6 +132,9 @@ pub fn index_single_file(
             methods: Vec::new(),
             stable_id,
             repo_name: repo.clone(),
+            file: Some(crate::repo_index::indexer::payload::compute_repo_relative(
+                &file.path, &repo,
+            )),
             source_url: None,
             source_display: None,
             calls,
