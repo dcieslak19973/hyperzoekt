@@ -2,7 +2,7 @@
 
 #[tokio::test]
 async fn persist_and_query_has_method_relation() -> Result<(), Box<dyn std::error::Error>> {
-    use hyperzoekt::db_writer::connection::connect;
+    use hyperzoekt::db::connection::connect;
     use serde_json::json;
 
     // Connect directly (fallback in-memory). If a remote SURREALDB_URL is present but

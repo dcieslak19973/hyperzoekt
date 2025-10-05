@@ -16,7 +16,7 @@ use sha2::Digest;
 #[tokio::test]
 async fn surreal_initial_batch_inserts_entities() -> Result<(), Box<dyn std::error::Error>> {
     // Start an embedded Mem surreal instance
-    use hyperzoekt::db_writer::connection::connect;
+    use hyperzoekt::db::connection::connect;
     let db = match connect(&None, &None, &None, "testns", "testdb").await {
         Ok(d) => d,
         Err(e) => {

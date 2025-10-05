@@ -11,13 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use hyperzoekt::db_writer::{spawn_db_writer, DbWriterConfig};
+use hyperzoekt::db::{spawn_db_writer, DbWriterConfig};
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
 
 #[tokio::test]
 async fn test_call_edges_created() {
     // Prepare two entities where one calls the other
     let ent_a = EntityPayload {
+        id: "callee_fn_id".into(),
         language: "rust".into(),
         kind: "function".into(),
         name: "callee_fn".into(),
@@ -31,6 +32,7 @@ async fn test_call_edges_created() {
         unresolved_imports: vec![],
         stable_id: "callee_fn_id".into(),
         repo_name: "repo".into(),
+        file: Some("callee.rs".into()),
         source_url: None,
         source_display: None,
         source_content: None,
@@ -38,6 +40,7 @@ async fn test_call_edges_created() {
         methods: vec![],
     };
     let ent_b = EntityPayload {
+        id: "caller_fn_id".into(),
         language: "rust".into(),
         kind: "function".into(),
         name: "caller_fn".into(),
@@ -51,6 +54,7 @@ async fn test_call_edges_created() {
         unresolved_imports: vec![],
         stable_id: "caller_fn_id".into(),
         repo_name: "repo".into(),
+        file: Some("caller.rs".into()),
         source_url: None,
         source_display: None,
         source_content: None,
@@ -82,7 +86,7 @@ async fn test_call_edges_created() {
         ..Default::default()
     };
 
-    hyperzoekt::db_writer::init_call_edge_capture();
+    hyperzoekt::db::init_call_edge_capture();
     let (tx, handle) = spawn_db_writer(vec![], cfg.clone(), None).expect("spawn writer");
     tx.send(vec![ent_a.clone(), ent_b.clone()])
         .expect("send batch");
@@ -90,7 +94,7 @@ async fn test_call_edges_created() {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     drop(tx);
     handle.join().expect("join").expect("writer ok");
-    let cap = hyperzoekt::db_writer::CALL_EDGE_CAPTURE
+    let cap = hyperzoekt::db::CALL_EDGE_CAPTURE
         .get()
         .expect("capture store")
         .lock()

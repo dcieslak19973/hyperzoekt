@@ -48,9 +48,9 @@ ARG HELM_VERSION=v3.15.3
 RUN set -eux; \
   arch="$(uname -m)"; \
   case "$arch" in \
-    x86_64|amd64) helm_arch=amd64 ;; \
-    aarch64|arm64) helm_arch=arm64 ;; \
-    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  x86_64|amd64) helm_arch=amd64 ;; \
+  aarch64|arm64) helm_arch=arm64 ;; \
+  *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
   esac; \
   curl -L "https://get.helm.sh/helm-${HELM_VERSION}-linux-${helm_arch}.tar.gz" -o /tmp/helm.tgz; \
   tar -xzf /tmp/helm.tgz -C /tmp; \
@@ -75,15 +75,39 @@ ARG SURREALDB_VERSION=v2.3.7
 RUN set -eux; \
   arch="$(uname -m)"; \
   case "$arch" in \
-    x86_64|amd64) surreal_arch=amd64 ;; \
-    aarch64|arm64) surreal_arch=arm64 ;; \
-    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  x86_64|amd64) surreal_arch=amd64 ;; \
+  aarch64|arm64) surreal_arch=arm64 ;; \
+  *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
   esac; \
   curl -L "https://github.com/surrealdb/surrealdb/releases/download/${SURREALDB_VERSION}/surreal-${SURREALDB_VERSION}.linux-${surreal_arch}.tgz" -o /tmp/surreal.tgz; \
   tar -xzf /tmp/surreal.tgz -C /usr/local/bin surreal; \
   rm /tmp/surreal.tgz; \
   chmod +x /usr/local/bin/surreal; \
   /usr/local/bin/surreal version || true
+
+ARG DEP_SCAN_VERSION=v5.5.0
+ARG DEPSCAN_ALL=0
+RUN set -eux; \
+  apt-get update; \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    nodejs npm default-jre-headless curl ca-certificates python3-venv python3-pip \
+    build-essential libssl-dev libffi-dev python3-dev || true; \
+  rm -rf /var/lib/apt/lists/*; \
+  # Ensure npm globals install to /usr/local so binaries are system-wide
+  export NPM_CONFIG_PREFIX=/usr/local; \
+  npm set progress=false; npm config set loglevel silent; \
+  npm install -g @cyclonedx/cdxgen || true; \
+  if command -v cdxgen >/dev/null 2>&1; then cdxgen --version >/dev/null 2>&1 || true; fi; \
+  # Install owasp-depscan into a system virtualenv to avoid pip/pipx user-path issues
+  VENV_DIR=/opt/owasp-depscan; \
+  python3 -m venv "$VENV_DIR"; \
+  "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true; \
+  if [ "${DEPSCAN_ALL:-0}" = "1" ]; then \
+    "$VENV_DIR/bin/pip" install --no-cache-dir "owasp-depscan[all]" >/dev/null 2>&1 || true; \
+  else \
+    "$VENV_DIR/bin/pip" install --no-cache-dir owasp-depscan >/dev/null 2>&1 || true; \
+  fi; \
+  if [ -x "$VENV_DIR/bin/depscan" ]; then ln -sf "$VENV_DIR/bin/depscan" /usr/local/bin/dep-scan || true; fi
 
 # Create workspace dir
 WORKDIR /workspaces/hyperzoekt

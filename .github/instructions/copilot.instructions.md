@@ -32,4 +32,16 @@ Questions to ask the repo owner (if unclear)
 
 Done — update this file if the workspace layout changes.
 
+## Quick verification commands for SBOM tools
+
+Run these commands inside the devcontainer to get clean, non-interactive output that avoids interactive shell hooks and PATH warnings:
+
+```bash
+# show which binary will be used and print a minimal version string
+bash --noprofile --norc -c 'command -v cdxgen && env TERM=dumb cdxgen --version'
+bash --noprofile --norc -c 'command -v depscan || command -v dep-scan && env TERM=dumb depscan --version || env TERM=dumb dep-scan --version'
+```
+
+If `depscan` is installed by `pipx` into a user-local location, ensure the Dockerfiles symlink it into `/usr/local/bin` so the wrappers can find `dep-scan` reliably.
+
 We don't need to worry about backwards compatibility and we don't intend for interoperability with the upstream version of zoekt.

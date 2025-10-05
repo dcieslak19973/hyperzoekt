@@ -21,15 +21,50 @@ use axum::{
 };
 use clap::Parser;
 use minijinja::{context, Environment};
-use pulldown_cmark::{Options as MdOptions, Parser as MdParser};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
+use axum::body::Body;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use hyperzoekt::db::connection::SurrealConnection;
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
-use hyperzoekt::similarity;
+use hyperzoekt::utils;
+use hyperzoekt::utils::*;
+use surrealdb::Value as DbValue;
+
+// Helper to safely convert SurrealDB response to JSON
+#[allow(dead_code)]
+fn db_value_to_json(db_val: DbValue) -> Option<serde_json::Value> {
+    match serde_json::to_value(&db_val) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            log::warn!("Failed to convert DbValue to JSON: {}", e);
+            None
+        }
+    }
+}
+
+// Sort a Vec<serde_json::Value> of dependency objects by their `name` field (case-insensitive).
+fn sort_deps_alphabetical(mut deps: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    deps.sort_by(|a, b| {
+        let a_name = a
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let b_name = b
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        a_name.cmp(&b_name)
+    });
+    deps
+}
 
 // Minimal helper to normalize Surreal id field (string or object with tb/id)
 
@@ -38,10 +73,12 @@ const BASE_TEMPLATE: &str = include_str!("../../static/webui/base.html");
 const INDEX_TEMPLATE: &str = include_str!("../../static/webui/index.html");
 const REPO_TEMPLATE: &str = include_str!("../../static/webui/repo.html");
 const ENTITY_TEMPLATE: &str = include_str!("../../static/webui/entity.html");
+const ENTITY_FIELDS: &str = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 const SEARCH_TEMPLATE: &str = include_str!("../../static/webui/search.html");
 const PAGERANK_TEMPLATE: &str = include_str!("../../static/webui/pagerank.html");
 const DUPES_TEMPLATE: &str = include_str!("../../static/webui/dupes.html");
 const DEPENDENCIES_TEMPLATE: &str = include_str!("../../static/webui/dependencies.html");
+const SBOM_TEMPLATE: &str = include_str!("../../static/webui/sbom.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -124,6 +161,9 @@ struct Config {
 
 impl Config {
     fn from_args(args: Args) -> Self {
+        let raw_log_level = args.log_level.unwrap_or_else(|| {
+            std::env::var("HYPERZOEKT_LOG_LEVEL").unwrap_or_else(|_| "info".to_string())
+        });
         Self {
             host: args.host.unwrap_or_else(|| {
                 std::env::var("HYPERZOEKT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
@@ -152,9 +192,7 @@ impl Config {
             surreal_db: args.surreal_db.unwrap_or_else(|| {
                 std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".to_string())
             }),
-            log_level: args.log_level.unwrap_or_else(|| {
-                std::env::var("HYPERZOEKT_LOG_LEVEL").unwrap_or_else(|_| "info".to_string())
-            }),
+            log_level: raw_log_level,
             cors_all: args.cors_all
                 || std::env::var("HYPERZOEKT_CORS_ALL")
                     .map(|v| v == "true" || v == "1")
@@ -164,31 +202,49 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoSummary {
-    pub name: String,
-    pub entity_count: u64,
-    pub file_count: u64,
-    pub languages: Vec<String>,
-}
+/// Normalize the requested log level into an env_logger filter string while ensuring
+/// chatty dependencies stay quiet unless explicitly requested.
+fn sanitize_log_spec(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = if trimmed.is_empty() {
+        "info".to_string()
+    } else if trimmed.contains('=') || trimmed.contains(',') {
+        trimmed.to_string()
+    } else {
+        format!("hyperzoekt={}", trimmed)
+    };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RepoSummaryQueryResult {
-    pub repo_name: String,
-    pub entity_count: u64,
-    // SurrealDB arrays may contain nulls if some entities have missing file/language.
-    // Accept Option<String> here and filter out None values when constructing
-    // the public `RepoSummary` to avoid deserialization errors like
-    // "expected a string, found None".
-    pub files: Vec<Option<String>>,
-    pub languages: Vec<Option<String>>,
-}
+    let mut parts: Vec<String> = base
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
 
-use hyperzoekt::db_writer::connection::SurrealConnection;
+    let mut ensure_module = |module: &str, level: &str| {
+        if !parts.iter().any(|p| p.starts_with(&format!("{}=", module))) {
+            parts.push(format!("{}={}", module, level));
+        }
+    };
+
+    for module in [
+        "html5ever",
+        "hyper",
+        "hyper_util",
+        "h2",
+        "reqwest",
+        "tower_http",
+        "axum::rejection",
+    ] {
+        ensure_module(module, "warn");
+    }
+
+    parts.join(",")
+}
 
 #[derive(Clone)]
 pub struct Database {
-    db: Arc<SurrealConnection>,
+    queries: hyperzoekt::db::DatabaseQueries,
 }
 
 impl Database {
@@ -197,9 +253,10 @@ impl Database {
         ns: &str,
         db_name: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use hyperzoekt::db_writer::connection::connect as hz_connect;
+        use hyperzoekt::db::connection::connect as hz_connect;
         let conn = hz_connect(&url.map(|s| s.to_string()), &None, &None, ns, db_name).await?;
-        Ok(Self { db: Arc::new(conn) })
+        let queries = hyperzoekt::db::DatabaseQueries::new(std::sync::Arc::new(conn));
+        Ok(Self { queries })
     }
 
     /// Resolve a human ref name (e.g. "main" or "refs/heads/main") to a commit id
@@ -210,180 +267,7 @@ impl Database {
         repo: &str,
         raw: &str,
     ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
-        #[derive(Deserialize)]
-        struct RefRow {
-            name: String,
-            target: String,
-        }
-
-        let candidates = [
-            raw.to_string(),
-            format!("refs/heads/{}", raw),
-            format!("refs/tags/{}", raw),
-        ];
-        // Query refs by repo and candidate names
-        let sql = format!(
-            "SELECT name, target FROM refs WHERE repo = $repo AND name IN [{}]",
-            candidates
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("$n{}", i))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        let mut res = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut q = db_conn.query(&sql);
-                q = q.bind(("repo", repo.to_string()));
-                for (i, v) in candidates.iter().enumerate() {
-                    q = q.bind((format!("n{}", i), v.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut q = db_conn.query(&sql);
-                q = q.bind(("repo", repo.to_string()));
-                for (i, v) in candidates.iter().enumerate() {
-                    q = q.bind((format!("n{}", i), v.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut q = db_conn.query(&sql);
-                q = q.bind(("repo", repo.to_string()));
-                for (i, v) in candidates.iter().enumerate() {
-                    q = q.bind((format!("n{}", i), v.to_string()));
-                }
-                q.await?
-            }
-        };
-        let rows: Vec<RefRow> = res.take(0)?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        // prefer exact, then heads, then tags
-        if let Some(r) = rows.iter().find(|r| r.name == raw) {
-            let commit = r.target.clone();
-            // lookup snapshot_meta
-            let snap_sql =
-                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
-            let mut r2 = match &*self.db {
-                SurrealConnection::Local(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteHttp(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteWs(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-            };
-            #[derive(Deserialize)]
-            struct SnapRow {
-                id: Option<String>,
-            }
-            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
-                if let Some(s) = rows2.into_iter().next() {
-                    return Ok(Some((commit, s.id)));
-                }
-            }
-            return Ok(Some((commit, None)));
-        }
-        if let Some(r) = rows
-            .iter()
-            .find(|r| r.name == format!("refs/heads/{}", raw))
-        {
-            let commit = r.target.clone();
-            let snap_sql =
-                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
-            let mut r2 = match &*self.db {
-                SurrealConnection::Local(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteHttp(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteWs(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-            };
-            #[derive(Deserialize)]
-            struct SnapRow {
-                id: Option<String>,
-            }
-            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
-                if let Some(s) = rows2.into_iter().next() {
-                    return Ok(Some((commit, s.id)));
-                }
-            }
-            return Ok(Some((commit, None)));
-        }
-        if let Some(r) = rows.iter().find(|r| r.name == format!("refs/tags/{}", raw)) {
-            let commit = r.target.clone();
-            let snap_sql =
-                "SELECT id FROM snapshot_meta WHERE repo = $repo AND commit = $commit LIMIT 1";
-            let mut r2 = match &*self.db {
-                SurrealConnection::Local(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteHttp(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-                SurrealConnection::RemoteWs(db_conn) => {
-                    let mut q2 = db_conn.query(snap_sql);
-                    q2 = q2
-                        .bind(("repo", repo.to_string()))
-                        .bind(("commit", commit.clone()));
-                    q2.await?
-                }
-            };
-            #[derive(Deserialize)]
-            struct SnapRow {
-                id: Option<String>,
-            }
-            if let Ok(rows2) = r2.take::<Vec<SnapRow>>(0) {
-                if let Some(s) = rows2.into_iter().next() {
-                    return Ok(Some((commit, s.id)));
-                }
-            }
-            return Ok(Some((commit, None)));
-        }
-
-        Ok(None)
+        self.queries.resolve_ref_to_snapshot(repo, raw).await
     }
 
     /// Return the repo's configured default branch, falling back to `SOURCE_BRANCH` env or `main`.
@@ -391,172 +275,29 @@ impl Database {
         &self,
         repo_name: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        #[derive(Deserialize)]
-        struct BranchRow {
-            branch: Option<String>,
-        }
-
-        let sql = "SELECT branch FROM repo WHERE name = $name LIMIT 1";
-        let mut res = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
-            }
-        };
-        if let Ok(rows) = res.take::<Vec<BranchRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                if let Some(b) = r.branch {
-                    return Ok(b);
-                }
-            }
-        }
-
-        // Fallbacks
-        if let Ok(envb) = std::env::var("SOURCE_BRANCH") {
-            return Ok(envb);
-        }
-        Ok("main".to_string())
+        self.queries.get_repo_default_branch(repo_name).await
     }
 
     pub async fn get_repo_summaries(&self) -> Result<Vec<RepoSummary>, Box<dyn std::error::Error>> {
-        // Use the stored repo_name field instead of parsing from file paths
-        // Handle cases where repo_name might be null for existing data
-        let query = r#"
-            SELECT
-                repo_name ?? 'unknown' as repo_name,
-                count() as entity_count,
-                array::distinct(file) as files,
-                array::distinct(language) as languages
-            FROM entity
-            GROUP BY repo_name
-            ORDER BY entity_count DESC
-        "#;
-
-        let mut response = self.db.query(query).await?;
-        let query_results: Vec<RepoSummaryQueryResult> = response.take(0)?;
-
-        Ok(query_results
-            .into_iter()
-            .map(|s| {
-                // Filter out any nulls returned by the DB and produce stable Vec<String> types
-                let files: Vec<String> = s.files.into_iter().flatten().collect();
-                let languages: Vec<String> = s.languages.into_iter().flatten().collect();
-                let file_count = files.len() as u64; // Count distinct files
-                RepoSummary {
-                    name: s.repo_name,
-                    entity_count: s.entity_count,
-                    file_count,
-                    languages,
-                }
-            })
-            .collect())
+        self.queries.get_repo_summaries().await
     }
 
     pub async fn get_entities_for_repo(
         &self,
         repo_name: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        // Prefer filtering on the explicit `repo_name` field (safer and more direct).
-        // Fall back to matching file path prefixes for older/imported records that
-        // don't have `repo_name` populated.
-        let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let sql = format!(
-            "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY file, start_line",
-            entity_fields
-        );
-        let mut resp = self
-            .db
-            .query_with_binds(
-                &sql,
-                vec![("repo", serde_json::Value::String(repo_name.to_string()))],
-            )
-            .await?;
-        let entities: Vec<EntityPayload> = match resp.take::<Vec<EntityPayload>>(0) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!(
-                    "get_entities_for_repo: failed to deserialize response for repo='{}': {}",
-                    repo_name,
-                    e
-                );
-                return Err(Box::new(e));
-            }
-        };
-
-        if !entities.is_empty() {
-            return Ok(entities);
-        }
-
-        // Fallback: look for file paths that start with the provided repo_name.
-        // Use a parameterized query to avoid injection.
-        let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let sql2 = format!(
-            "SELECT {} FROM entity WHERE string::starts_with(file ?? '', $repo) ORDER BY file, start_line",
-            entity_fields
-        );
-        let mut resp2 = self
-            .db
-            .query_with_binds(
-                &sql2,
-                vec![("repo", serde_json::Value::String(repo_name.to_string()))],
-            )
-            .await?;
-        let entities2: Vec<EntityPayload> = resp2.take(0)?;
-
-        Ok(entities2)
+        self.queries.get_entities_for_repo(repo_name).await
     }
 
     pub async fn get_all_entities(&self) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let query_sql = format!(
-            "SELECT {} FROM entity ORDER BY file, start_line",
-            entity_fields
-        );
-        let mut response = self.db.query(&query_sql).await?;
-        // Defensive deserialization with logging to help debug malformed DB rows
-        match response.take::<Vec<EntityPayload>>(0) {
-            Ok(ents) => Ok(ents),
-            Err(e) => {
-                log::error!(
-                    "get_all_entities: failed to deserialize response for query='{}': {}",
-                    query_sql,
-                    e
-                );
-                Err(Box::new(e))
-            }
-        }
+        self.queries.get_all_entities().await
     }
 
     pub async fn get_entity_by_id(
         &self,
         stable_id: &str,
     ) -> Result<Option<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-        let sql = format!(
-            "SELECT {} FROM entity WHERE stable_id = $stable_id",
-            entity_fields
-        );
-        let mut response = self
-            .db
-            .query_with_binds(
-                &sql,
-                vec![(
-                    "stable_id",
-                    serde_json::Value::String(stable_id.to_string()),
-                )],
-            )
-            .await?;
-        let entities: Vec<EntityPayload> = response.take(0)?;
-
-        Ok(entities.into_iter().next())
+        self.queries.get_entity_by_id(stable_id).await
     }
 
     /// Fetch similar entities for a given entity stable_id using relation tables with score.
@@ -566,191 +307,7 @@ impl Database {
         stable_id: &str,
         limit: usize,
     ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
-        // Resolve the entity Thing id from stable_id first
-        #[derive(Deserialize)]
-        struct IdRow {
-            id: surrealdb::sql::Thing,
-        }
-
-        let rows: Vec<IdRow> = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut r = db_conn
-                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
-                    .bind(("sid", stable_id.to_string()))
-                    .await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut r = db_conn
-                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
-                    .bind(("sid", stable_id.to_string()))
-                    .await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut r = db_conn
-                    .query("SELECT id FROM entity WHERE stable_id = $sid LIMIT 1")
-                    .bind(("sid", stable_id.to_string()))
-                    .await?;
-                r.take(0)?
-            }
-        };
-        if rows.is_empty() {
-            return Ok((vec![], vec![]));
-        }
-        let ent_id_raw = rows[0].id.to_string();
-
-        // Query edges and target entity minimal fields with scores for both relation tables
-        let sql = r#"
-            SELECT array::slice((SELECT out AS target, score FROM type::thing($id)->similar_same_repo ORDER BY score DESC), 0, $lim) AS same_repo,
-                   array::slice((SELECT out AS target, score FROM type::thing($id)->similar_external_repo ORDER BY score DESC), 0, $lim) AS external_repo;
-        "#;
-        let mut resp2 = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(sql)
-                    .bind(("id", ent_id_raw.clone()))
-                    .bind(("lim", limit as i64))
-                    .await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(sql)
-                    .bind(("id", ent_id_raw.clone()))
-                    .bind(("lim", limit as i64))
-                    .await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(sql)
-                    .bind(("id", ent_id_raw.clone()))
-                    .bind(("lim", limit as i64))
-                    .await?
-            }
-        };
-
-        #[derive(Deserialize)]
-        struct EdgeRow {
-            target: surrealdb::sql::Thing,
-            score: f64,
-        }
-
-        #[derive(Deserialize)]
-        struct RelRows {
-            same_repo: Option<Vec<EdgeRow>>,
-            external_repo: Option<Vec<EdgeRow>>,
-        }
-
-        let rels: Vec<RelRows> = resp2.take(0)?;
-        let (same_repo, external_repo): (Vec<EdgeRow>, Vec<EdgeRow>) =
-            if let Some(r) = rels.into_iter().next() {
-                (
-                    r.same_repo.unwrap_or_default(),
-                    r.external_repo.unwrap_or_default(),
-                )
-            } else {
-                (vec![], vec![])
-            };
-
-        // Gather unique target ids and fetch minimal entity data in one query
-        let mut targets: Vec<String> = Vec::new();
-        for e in same_repo.iter().chain(external_repo.iter()) {
-            let s = e.target.to_string();
-            if !targets.contains(&s) {
-                targets.push(s);
-            }
-        }
-        if targets.is_empty() {
-            return Ok((vec![], vec![]));
-        }
-
-        // Build a parameterized query using array::concat of type::thing
-        let mut thing_exprs: Vec<String> = Vec::with_capacity(targets.len());
-        for (i, _) in targets.iter().enumerate() {
-            thing_exprs.push(format!("type::thing($t{})", i));
-        }
-        let sql2 = format!(
-            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
-            thing_exprs.join(", ")
-        );
-        let mut resp3 = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in targets.iter().enumerate() {
-                    q = q.bind((format!("t{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in targets.iter().enumerate() {
-                    q = q.bind((format!("t{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in targets.iter().enumerate() {
-                    q = q.bind((format!("t{}", i), t.to_string()));
-                }
-                q.await?
-            }
-        };
-
-        #[derive(Deserialize)]
-        struct EntRow {
-            id: surrealdb::sql::Thing,
-            stable_id: String,
-            name: String,
-            file: Option<String>,
-            repo_name: String,
-            language: String,
-            kind: String,
-            source_url: Option<String>,
-            source_display: Option<String>,
-        }
-
-        let ents: Vec<EntRow> = resp3.take(0)?;
-        use std::collections::HashMap;
-        let mut ent_map: HashMap<String, EntRow> = HashMap::new();
-        for e in ents {
-            ent_map.insert(e.id.to_string(), e);
-        }
-
-        let mut out_same: Vec<serde_json::Value> = Vec::new();
-        let mut out_external: Vec<serde_json::Value> = Vec::new();
-        for e in same_repo.into_iter() {
-            if let Some(er) = ent_map.get(&e.target.to_string()) {
-                out_same.push(serde_json::json!({
-                    "stable_id": er.stable_id,
-                    "name": er.name,
-                    "file": er.file,
-                    "repo_name": er.repo_name,
-                    "language": er.language,
-                    "kind": er.kind,
-                    "source_url": er.source_url,
-                    "source_display": er.source_display,
-                    "score": e.score,
-                }));
-            }
-        }
-        for e in external_repo.into_iter() {
-            if let Some(er) = ent_map.get(&e.target.to_string()) {
-                out_external.push(serde_json::json!({
-                    "stable_id": er.stable_id,
-                    "name": er.name,
-                    "file": er.file,
-                    "repo_name": er.repo_name,
-                    "language": er.language,
-                    "kind": er.kind,
-                    "source_url": er.source_url,
-                    "source_display": er.source_display,
-                    "score": e.score,
-                }));
-            }
-        }
-
-        Ok((out_same, out_external))
+        self.queries.get_similar_for_entity(stable_id, limit).await
     }
 
     /// Fetch top duplicate-like pairs within a repository based on similar_same_repo edges.
@@ -764,157 +321,9 @@ impl Database {
         language: Option<&str>,
         kind: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-        // Find edges where both endpoints are in the same repo.
-        // We perform pagination at the relation-edge level using LIMIT/OFFSET
-        // to avoid fetching the entire table into memory.
-        // Use START AT/ LIMIT form to be accepted by SurrealDB and interpolate
-        // numeric offset/limit values directly (they are validated integers).
-        let edge_sql = format!(
-            "SELECT in AS a, out AS b, score FROM similar_same_repo ORDER BY score DESC START AT {} LIMIT {}",
-            (offset as i64) * 4,
-            (limit as i64) * 4
-        );
-
-        #[derive(Deserialize)]
-        struct EdgeRowMin {
-            a: surrealdb::sql::Thing,
-            b: surrealdb::sql::Thing,
-            score: f64,
-        }
-
-        let edge_rows: Vec<EdgeRowMin> = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-        };
-
-        if edge_rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Gather unique ids referenced and bulk load entity rows to filter by repo
-        use std::collections::{HashMap, HashSet};
-        let mut ids: Vec<String> = Vec::new();
-        let mut seen = HashSet::new();
-        for e in &edge_rows {
-            for tid in [e.a.to_string(), e.b.to_string()] {
-                if seen.insert(tid.clone()) {
-                    ids.push(tid);
-                }
-            }
-        }
-        let mut thing_exprs: Vec<String> = Vec::with_capacity(ids.len());
-        for (i, _) in ids.iter().enumerate() {
-            thing_exprs.push(format!("type::thing($x{})", i));
-        }
-        let sql2 = format!(
-            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
-            thing_exprs.join(", ")
-        );
-        let mut resp2 = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-        };
-
-        #[derive(Deserialize, Clone)]
-        struct EntMin {
-            id: surrealdb::sql::Thing,
-            stable_id: String,
-            name: String,
-            file: Option<String>,
-            repo_name: String,
-            language: String,
-            kind: String,
-            source_url: Option<String>,
-            source_display: Option<String>,
-        }
-
-        let ents: Vec<EntMin> = resp2.take(0)?;
-        let mut map: HashMap<String, EntMin> = HashMap::new();
-        for e in ents.into_iter() {
-            map.insert(e.id.to_string(), e);
-        }
-
-        // Build output for pairs where both entities belong to repo_name
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        let lang_lc = language.map(|s| s.to_lowercase());
-        let kind_lc = kind.map(|s| s.to_lowercase());
-        for e in edge_rows.into_iter() {
-            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
-                if ae.repo_name == repo_name && be.repo_name == repo_name {
-                    if let Some(ms) = min_score {
-                        if e.score < ms {
-                            continue;
-                        }
-                    }
-                    if let Some(ref ll) = lang_lc {
-                        if ae.language.to_lowercase() != *ll || be.language.to_lowercase() != *ll {
-                            continue;
-                        }
-                    }
-                    if let Some(ref kk) = kind_lc {
-                        if ae.kind.to_lowercase() != *kk || be.kind.to_lowercase() != *kk {
-                            continue;
-                        }
-                    }
-                    out.push(serde_json::json!({
-                        "score": e.score,
-                        "a": {
-                            "stable_id": ae.stable_id,
-                            "name": ae.name,
-                            "file": ae.file,
-                            "repo_name": ae.repo_name,
-                            "language": ae.language,
-                            "kind": ae.kind,
-                            "source_url": ae.source_url,
-                            "source_display": ae.source_display,
-                        },
-                        "b": {
-                            "stable_id": be.stable_id,
-                            "name": be.name,
-                            "file": be.file,
-                            "repo_name": be.repo_name,
-                            "language": be.language,
-                            "kind": be.kind,
-                            "source_url": be.source_url,
-                            "source_display": be.source_display,
-                        }
-                    }));
-                }
-            }
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        self.queries
+            .get_dupes_for_repo(repo_name, limit, offset, min_score, language, kind)
+            .await
     }
 
     /// Fetch cross-repo duplicate-like pairs where `a` belongs to `repo_name` and `b` belongs to another repo.
@@ -927,129 +336,9 @@ impl Database {
         language: Option<&str>,
         kind: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-        let edge_sql = format!(
-            "SELECT in AS a, out AS b, score FROM similar_external_repo ORDER BY score DESC START AT {} LIMIT {}",
-            (offset as i64) * 4,
-            (limit as i64) * 4
-        );
-
-        #[derive(Deserialize)]
-        struct EdgeRowMin {
-            a: surrealdb::sql::Thing,
-            b: surrealdb::sql::Thing,
-            score: f64,
-        }
-
-        let edge_rows: Vec<EdgeRowMin> = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut r = db_conn.query(&edge_sql).await?;
-                r.take(0)?
-            }
-        };
-        if edge_rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        use std::collections::{HashMap, HashSet};
-        let mut ids: Vec<String> = Vec::new();
-        let mut seen = HashSet::new();
-        for e in &edge_rows {
-            for tid in [e.a.to_string(), e.b.to_string()] {
-                if seen.insert(tid.clone()) {
-                    ids.push(tid);
-                }
-            }
-        }
-        let mut thing_exprs: Vec<String> = Vec::with_capacity(ids.len());
-        for (i, _) in ids.iter().enumerate() {
-            thing_exprs.push(format!("type::thing($x{})", i));
-        }
-        let sql2 = format!(
-            "SELECT id, stable_id, name, file, repo_name, language, kind, source_url, source_display FROM entity WHERE id IN [{}]",
-            thing_exprs.join(", ")
-        );
-        let mut resp2 = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let mut q = db_conn.query(&sql2);
-                for (i, t) in ids.iter().enumerate() {
-                    q = q.bind((format!("x{}", i), t.to_string()));
-                }
-                q.await?
-            }
-        };
-        #[derive(Deserialize, Clone)]
-        struct EntMin {
-            id: surrealdb::sql::Thing,
-            stable_id: String,
-            name: String,
-            file: Option<String>,
-            repo_name: String,
-            language: String,
-            kind: String,
-            source_url: Option<String>,
-            source_display: Option<String>,
-        }
-        let ents: Vec<EntMin> = resp2.take(0)?;
-        let mut map: HashMap<String, EntMin> = HashMap::new();
-        for e in ents.into_iter() {
-            map.insert(e.id.to_string(), e);
-        }
-
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        let lang_lc = language.map(|s| s.to_lowercase());
-        let kind_lc = kind.map(|s| s.to_lowercase());
-        for e in edge_rows.into_iter() {
-            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
-                if ae.repo_name == repo_name && be.repo_name != repo_name {
-                    if let Some(ms) = min_score {
-                        if e.score < ms {
-                            continue;
-                        }
-                    }
-                    if let Some(ref ll) = lang_lc {
-                        if ae.language.to_lowercase() != *ll || be.language.to_lowercase() != *ll {
-                            continue;
-                        }
-                    }
-                    if let Some(ref kk) = kind_lc {
-                        if ae.kind.to_lowercase() != *kk || be.kind.to_lowercase() != *kk {
-                            continue;
-                        }
-                    }
-                    out.push(serde_json::json!({
-                        "score": e.score,
-                        "a": {"stable_id": ae.stable_id, "name": ae.name, "file": ae.file, "repo_name": ae.repo_name, "language": ae.language, "kind": ae.kind, "source_url": ae.source_url, "source_display": ae.source_display},
-                        "b": {"stable_id": be.stable_id, "name": be.name, "file": be.file, "repo_name": be.repo_name, "language": be.language, "kind": be.kind, "source_url": be.source_url, "source_display": be.source_display}
-                    }));
-                }
-            }
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        self.queries
+            .get_external_dupes_for_repo(repo_name, limit, offset, min_score, language, kind)
+            .await
     }
 
     /// Fetch methods for a given class/struct/interface/trait entity by matching on parent name within the same repo.
@@ -1059,43 +348,9 @@ impl Database {
         repo_name: &str,
         parent_name: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-
-        let mut response = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo AND kind = 'function' AND parent = $parent ORDER BY start_line, name",
-                        fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .bind(("parent", parent_name.to_string()))
-                    .await?
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo AND kind = 'function' AND parent = $parent ORDER BY start_line, name",
-                        fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .bind(("parent", parent_name.to_string()))
-                    .await?
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(format!(
-                        "SELECT {} FROM entity WHERE repo_name = $repo AND kind = 'function' AND parent = $parent ORDER BY start_line, name",
-                        fields
-                    ))
-                    .bind(("repo", repo_name.to_string()))
-                    .bind(("parent", parent_name.to_string()))
-                    .await?
-            }
-        };
-
-        let methods: Vec<EntityPayload> = response.take(0)?;
-        Ok(methods)
+        self.queries
+            .get_methods_for_parent(repo_name, parent_name)
+            .await
     }
 
     pub async fn get_dependencies_for_repo(
@@ -1103,306 +358,23 @@ impl Database {
         repo_name: &str,
         branch: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-        // We expect dependency rows to exist in `dependency` table and relations from repo -> depends_on -> dependency
-        // We'll try to resolve by repo name and optional branch by looking up the repo Thing first
-        #[derive(Deserialize)]
-        struct RepoRow {
-            id: surrealdb::sql::Thing,
-        }
-
-        // Find repo id by exact name or sanitized variants
-        let mut repo_id: Option<String> = None;
-        let select_repo = "SELECT id FROM repo WHERE name = $name LIMIT 1";
-        if let Ok(mut r) = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(select_repo)
-                    .bind(("name", repo_name.to_string()))
-                    .await
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(select_repo)
-                    .bind(("name", repo_name.to_string()))
-                    .await
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(select_repo)
-                    .bind(("name", repo_name.to_string()))
-                    .await
-            }
-        } {
-            if let Ok(rows) = r.take::<Vec<RepoRow>>(0) {
-                if let Some(rr) = rows.into_iter().next() {
-                    repo_id = Some(rr.id.to_string());
-                }
-            }
-        }
-
-        // If branch provided, try to match repo by name and branch
-        if repo_id.is_none() {
-            if let Some(br) = branch {
-                let select_repo_b =
-                    "SELECT id FROM repo WHERE name = $name AND branch = $branch LIMIT 1";
-                if let Ok(mut r) = match &*self.db {
-                    SurrealConnection::Local(db_conn) => {
-                        db_conn
-                            .query(select_repo_b)
-                            .bind(("name", repo_name.to_string()))
-                            .bind(("branch", br.to_string()))
-                            .await
-                    }
-                    SurrealConnection::RemoteHttp(db_conn) => {
-                        db_conn
-                            .query(select_repo_b)
-                            .bind(("name", repo_name.to_string()))
-                            .bind(("branch", br.to_string()))
-                            .await
-                    }
-                    SurrealConnection::RemoteWs(db_conn) => {
-                        db_conn
-                            .query(select_repo_b)
-                            .bind(("name", repo_name.to_string()))
-                            .bind(("branch", br.to_string()))
-                            .await
-                    }
-                } {
-                    if let Ok(rows) = r.take::<Vec<RepoRow>>(0) {
-                        if let Some(rr) = rows.into_iter().next() {
-                            repo_id = Some(rr.id.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // If still none, we will attempt to lookup by repo record id heuristic of repo:<sanitized>
-        if repo_id.is_none() {
-            let explicit = format!(
-                "repo:{}",
-                repo_name.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-            );
-            repo_id = Some(explicit);
-        }
-
-        let repo_id = repo_id.unwrap();
-
-        // Query related dependencies using traversal if supported, otherwise fallback to selecting dependency by relation
-        // Try traversal: SELECT array::distinct((SELECT out FROM type::thing($id)->depends_on)) AS deps
-        let traversal_sql =
-            "SELECT array::distinct((SELECT out FROM type::thing($id)->depends_on)) AS deps";
-        if let Ok(mut r) = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(traversal_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(traversal_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(traversal_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-        } {
-            #[derive(Deserialize)]
-            struct DepsRow {
-                deps: Option<Vec<surrealdb::sql::Thing>>,
-            }
-            if let Ok(rows) = r.take::<Vec<DepsRow>>(0) {
-                if let Some(first) = rows.into_iter().next() {
-                    let mut out: Vec<serde_json::Value> = Vec::new();
-                    if let Some(dep_things) = first.deps {
-                        // Bulk fetch dependency records by id
-                        if dep_things.is_empty() {
-                            return Ok(vec![]);
-                        }
-                        let mut exprs: Vec<String> = Vec::new();
-                        for (i, _) in dep_things.iter().enumerate() {
-                            exprs.push(format!("type::thing($d{})", i));
-                        }
-                        let sql2 = format!(
-                            "SELECT name, language, version FROM dependency WHERE id IN [{}]",
-                            exprs.join(", ")
-                        );
-                        if let Ok(mut r2) = match &*self.db {
-                            SurrealConnection::Local(db_conn) => {
-                                let mut q = db_conn.query(&sql2);
-                                for (i, t) in dep_things.iter().enumerate() {
-                                    q = q.bind((format!("d{}", i), t.to_string()));
-                                }
-                                q.await
-                            }
-                            SurrealConnection::RemoteHttp(db_conn) => {
-                                let mut q = db_conn.query(&sql2);
-                                for (i, t) in dep_things.iter().enumerate() {
-                                    q = q.bind((format!("d{}", i), t.to_string()));
-                                }
-                                q.await
-                            }
-                            SurrealConnection::RemoteWs(db_conn) => {
-                                let mut q = db_conn.query(&sql2);
-                                for (i, t) in dep_things.iter().enumerate() {
-                                    q = q.bind((format!("d{}", i), t.to_string()));
-                                }
-                                q.await
-                            }
-                        } {
-                            if let Ok(rows2) = r2.take::<Vec<serde_json::Value>>(0) {
-                                for dep in rows2.into_iter() {
-                                    out.push(dep);
-                                }
-                            }
-                        }
-                    }
-                    return Ok(out);
-                }
-            }
-        }
-
-        // Fallback: explicitly query relation table for depends_on edges, then bulk fetch dependencies
-        // Compare using `type::thing($id)` so binding the string id (e.g. "repo:kafka") matches Thing columns.
-        let rel_sql =
-            "SELECT out FROM relation WHERE in = type::thing($id) AND rname = 'depends_on'";
-        #[derive(Deserialize)]
-        struct RelOutRow {
-            out: surrealdb::sql::Thing,
-        }
-        if let Ok(mut r) = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn.query(rel_sql).bind(("id", repo_id.clone())).await
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn.query(rel_sql).bind(("id", repo_id.clone())).await
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn.query(rel_sql).bind(("id", repo_id.clone())).await
-            }
-        } {
-            if let Ok(rel_rows) = r.take::<Vec<RelOutRow>>(0) {
-                let outs: Vec<surrealdb::sql::Thing> =
-                    rel_rows.into_iter().map(|r| r.out).collect();
-                if !outs.is_empty() {
-                    // Build parameterized thing list for IN query
-                    let mut exprs: Vec<String> = Vec::new();
-                    for (i, _) in outs.iter().enumerate() {
-                        exprs.push(format!("type::thing($o{})", i));
-                    }
-                    let sql2 = format!(
-                        "SELECT name, language, version FROM dependency WHERE id IN [{}]",
-                        exprs.join(", ")
-                    );
-                    if let Ok(mut r2) = match &*self.db {
-                        SurrealConnection::Local(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                        SurrealConnection::RemoteHttp(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                        SurrealConnection::RemoteWs(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                    } {
-                        if let Ok(rows2) = r2.take::<Vec<serde_json::Value>>(0) {
-                            return Ok(rows2);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Final fallback: some environments persist explicit `depends_on` rows
-        // (table named `depends_on`) instead of using SurrealDB relation graph.
-        // Compare using `type::thing($id)` so binding the string id (e.g. "repo:kafka") matches Thing columns.
-        let dep_table_sql = "SELECT out FROM depends_on WHERE in = type::thing($id)";
-        #[derive(Deserialize)]
-        struct DepOutRow {
-            out: surrealdb::sql::Thing,
-        }
-        if let Ok(mut r) = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                db_conn
-                    .query(dep_table_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                db_conn
-                    .query(dep_table_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                db_conn
-                    .query(dep_table_sql)
-                    .bind(("id", repo_id.clone()))
-                    .await
-            }
-        } {
-            if let Ok(dep_rows) = r.take::<Vec<DepOutRow>>(0) {
-                let outs: Vec<surrealdb::sql::Thing> =
-                    dep_rows.into_iter().map(|r| r.out).collect();
-                if !outs.is_empty() {
-                    let mut exprs: Vec<String> = Vec::new();
-                    for (i, _) in outs.iter().enumerate() {
-                        exprs.push(format!("type::thing($o{})", i));
-                    }
-                    let sql2 = format!(
-                        "SELECT name, language, version FROM dependency WHERE id IN [{}]",
-                        exprs.join(", ")
-                    );
-                    if let Ok(mut r2) = match &*self.db {
-                        SurrealConnection::Local(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                        SurrealConnection::RemoteHttp(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                        SurrealConnection::RemoteWs(db_conn) => {
-                            let mut q = db_conn.query(&sql2);
-                            for (i, t) in outs.iter().enumerate() {
-                                q = q.bind((format!("o{}", i), t.to_string()));
-                            }
-                            q.await
-                        }
-                    } {
-                        if let Ok(rows2) = r2.take::<Vec<serde_json::Value>>(0) {
-                            return Ok(rows2);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(vec![])
+        self.queries
+            .get_dependencies_for_repo(repo_name, branch)
+            .await
     }
+
+    /// Get SBOM dependencies for a specific repository, optionally scoped to a commit.
+    /// Returns a vector of JSON objects with name, language, version fields.
+    pub async fn get_sbom_dependencies_for_repo(
+        &self,
+        repo_name: &str,
+        commit: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        self.queries
+            .get_sbom_dependencies_for_repo(repo_name, commit)
+            .await
+    }
+
     // Graph-based entity relation fetch using calls/imports edges.
     pub async fn fetch_entity_graph(
         &self,
@@ -1416,37 +388,7 @@ impl Database {
         ),
         Box<dyn std::error::Error>,
     > {
-        // Delegate to the shared graph API which already handles SurrealDB Thing/enum
-        // forms and falls back to tolerant raw JSON parsing when needed.
-        let cfg = hyperzoekt::graph_api::GraphDbConfig::from_env();
-        match hyperzoekt::graph_api::fetch_entity_graph(&cfg, stable_id, limit).await {
-            Ok(g) => {
-                let callers = g
-                    .callers
-                    .into_iter()
-                    .map(|r| (r.name, r.stable_id))
-                    .collect::<Vec<(String, String)>>();
-                let callees = g
-                    .callees
-                    .into_iter()
-                    .map(|r| (r.name, r.stable_id))
-                    .collect::<Vec<(String, String)>>();
-                let imports = g
-                    .imports
-                    .into_iter()
-                    .map(|r| (r.name, r.stable_id))
-                    .collect::<Vec<(String, String)>>();
-                Ok((callers, callees, imports))
-            }
-            Err(e) => {
-                log::error!(
-                    "fetch_entity_graph: delegated graph fetch failed for {}: {}",
-                    stable_id,
-                    e
-                );
-                Err(Box::<dyn std::error::Error>::from(e))
-            }
-        }
+        self.queries.fetch_entity_graph(stable_id, limit).await
     }
 
     pub async fn search_entities(
@@ -1455,110 +397,11 @@ impl Database {
         repo_filter: Option<&str>,
         limit: usize,
         offset: usize,
+        fields: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        // Use a fixed set of fields and parameterized binds to avoid SQL injection and SELECT *
-        let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-
-        let mut response = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                // Interpolate numeric LIMIT/OFFSET directly into SQL to avoid SurrealDB
-                // rejecting parameter placeholders in those positions.
-                let sql = format!(
-                    // Coalesce NULLs to empty string before applying string functions so
-                    // SurrealDB doesn't error when fields are missing.
-                    "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC START AT {} LIMIT {}",
-                    fields,
-                    offset,
-                    limit
-                );
-                if let Some(repo) = repo_filter {
-                    // append repo filter by building a new query with starts_with
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
-                        fields,
-                        offset,
-                        limit
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", repo.to_string()))
-                        .await?
-                } else {
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .await?
-                }
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                let sql = format!(
-                    "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC LIMIT {}, {}",
-                    fields,
-                    offset,
-                    limit
-                );
-                if let Some(repo) = repo_filter {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT {}, {}",
-                        fields,
-                        offset,
-                        limit
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", repo.to_string()))
-                        .await?
-                } else {
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .await?
-                }
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                let sql = format!(
-                    "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC LIMIT {} OFFSET {}",
-                    fields,
-                    limit,
-                    offset
-                );
-                if let Some(repo) = repo_filter {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT {} OFFSET {}",
-                        fields,
-                        limit,
-                        offset
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", repo.to_string()))
-                        .await?
-                } else {
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .await?
-                }
-            }
-        };
-
-        let entities: Vec<EntityPayload> = match response.take::<Vec<EntityPayload>>(0) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!(
-                    "search_entities: failed to deserialize response for q='{}' repo={:?}: {}",
-                    query,
-                    repo_filter,
-                    e
-                );
-                return Err(Box::new(e));
-            }
-        };
-
-        Ok(entities)
+        self.queries
+            .search_entities(query, repo_filter, limit, offset, fields)
+            .await
     }
 
     /// Search entities allowing multiple repo filters. Each repo filter may be
@@ -1573,613 +416,313 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
+        self.queries
+            .search_entities_multi(query, repo_filters, limit, offset)
+            .await
+    }
 
-        // If we have repo_filters, split into repo_names (for repo_name IN) and
-        // path_prefixes (for string::starts_with on file)
-        let mut repo_names: Vec<String> = Vec::new();
-        let mut path_prefixes: Vec<String> = Vec::new();
-        if let Some(rfs) = repo_filters {
-            for r in rfs.iter() {
-                if r.starts_with('/') || r.contains('/') {
-                    path_prefixes.push(r.clone());
-                } else {
-                    repo_names.push(r.clone());
-                }
-            }
-        }
+    /// Snapshot-scoped wrapper that forwards to the DB layer's snapshot-aware
+    /// multi-repo search. `snapshot_id` should be the snapshot identifier (or
+    /// commit id) to scope results to.
+    pub async fn search_entities_multi_snapshot(
+        &self,
+        query: &str,
+        repo_filters: Option<&[String]>,
+        limit: usize,
+        offset: usize,
+        snapshot_id: &str,
+    ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
+        self.queries
+            .search_entities_multi_snapshot(query, repo_filters, limit, offset, snapshot_id)
+            .await
+    }
 
-        // Prefer repo_name IN when we have at least one repo_name; otherwise,
-        // if there are path_prefixes, use a starts_with filter for the first one
-        // (legacy behavior).
-        let mut response = match &*self.db {
-            SurrealConnection::Local(db_conn) => {
-                if !repo_names.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
-                        fields,
-                        offset,
-                        limit
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind((
-                            "repos",
-                            serde_json::Value::Array(
-                                repo_names
-                                    .iter()
-                                    .map(|s| serde_json::Value::String(s.clone()))
-                                    .collect(),
-                            ),
-                        ))
-                        .await?
-                } else if !path_prefixes.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
-                        fields,
-                        offset,
-                        limit
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", path_prefixes[0].clone()))
-                        .await?
-                } else {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC START AT {} LIMIT {}",
-                        fields,
-                        offset,
-                        limit
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .await?
-                }
-            }
-            SurrealConnection::RemoteHttp(db_conn) => {
-                if !repo_names.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND repo_name IN $repos ORDER BY rank DESC LIMIT 100",
-                        fields
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind((
-                            "repos",
-                            serde_json::Value::Array(
-                                repo_names
-                                    .iter()
-                                    .map(|s| serde_json::Value::String(s.clone()))
-                                    .collect(),
-                            ),
-                        ))
-                        .await?
-                } else if !path_prefixes.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT 100",
-                        fields
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", path_prefixes[0].clone()))
-                        .await?
-                } else {
-                    let q0 = db_conn.query(format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC LIMIT 100",
-                        fields
-                    ));
-                    q0.bind(("q", query.to_lowercase())).await?
-                }
-            }
-            SurrealConnection::RemoteWs(db_conn) => {
-                if !repo_names.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND repo_name IN $repos ORDER BY rank DESC LIMIT 100",
-                        fields
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind((
-                            "repos",
-                            serde_json::Value::Array(
-                                repo_names
-                                    .iter()
-                                    .map(|s| serde_json::Value::String(s.clone()))
-                                    .collect(),
-                            ),
-                        ))
-                        .await?
-                } else if !path_prefixes.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT 100",
-                        fields
-                    );
-                    db_conn
-                        .query(&sql)
-                        .bind(("q", query.to_lowercase()))
-                        .bind(("repo", path_prefixes[0].clone()))
-                        .await?
-                } else {
-                    let q0 = db_conn.query(format!(
-                        "SELECT {} FROM entity WHERE (string::matches(string::lowercase(name ?? ''), $q) OR string::matches(string::lowercase(signature ?? ''), $q) OR string::matches(string::lowercase(file ?? ''), $q)) ORDER BY rank DESC LIMIT 100",
-                        fields
-                    ));
-                    q0.bind(("q", query.to_lowercase())).await?
-                }
-            }
-        };
+    // For testing purposes - expose the underlying connection
+    pub fn connection(&self) -> &std::sync::Arc<hyperzoekt::db::connection::SurrealConnection> {
+        &self.queries.db
+    }
+}
 
-        let entities: Vec<EntityPayload> = match response.take::<Vec<EntityPayload>>(0) {
-            Ok(v) => v,
+/// Determine branch candidates to try for a repo when resolving refs.
+/// If an explicit `provided` ref is given, return it as the single candidate.
+/// Otherwise attempt to use the repo's configured default branch, and if
+/// that lookup fails, fall back to the conventional candidates in order:
+/// "main", "master", "trunk".
+async fn branch_candidates_for_repo(
+    state: &AppState,
+    repo_name: &str,
+    provided: Option<&str>,
+) -> Vec<String> {
+    // Fetch repo-configured default branch (db helper provides fallbacks)
+    let repo_default = match state.db.get_repo_default_branch(repo_name).await {
+        Ok(b) if !b.is_empty() => Some(b),
+        _ => None,
+    };
+    compute_branch_candidates(provided, repo_default.as_deref())
+}
+
+/// Try branch candidates and fetch dependencies for a repo. Returns sorted Vec of dependency JSON objects.
+async fn fetch_dependencies_for_repo_with_candidates(
+    state: &AppState,
+    repo_name: &str,
+    provided_ref: Option<&str>,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    let candidates = branch_candidates_for_repo(state, repo_name, provided_ref).await;
+    for cand in candidates.iter() {
+        match state.db.resolve_ref_to_snapshot(repo_name, cand).await {
+            Ok(Some((commit_id, _snap_opt))) => {
+                if let Ok(deps) = state
+                    .db
+                    .get_dependencies_for_repo(repo_name, Some(&commit_id))
+                    .await
+                {
+                    return (sort_deps_alphabetical(deps), Some(commit_id));
+                } else {
+                    log::warn!(
+                        "fetch_dependencies_for_repo_with_candidates: DB error for {}@{}",
+                        repo_name,
+                        cand
+                    );
+                }
+            }
+            Ok(None) => {
+                if let Ok(deps) = state
+                    .db
+                    .get_dependencies_for_repo(repo_name, Some(cand.as_str()))
+                    .await
+                {
+                    return (sort_deps_alphabetical(deps), Some(cand.clone()));
+                }
+            }
             Err(e) => {
-                log::error!(
-                    "search_entities_multi: failed to deserialize response for q='{}' repo_filters={:?}: {}",
-                    query,
-                    repo_filters,
+                log::warn!(
+                    "fetch_dependencies_for_repo_with_candidates: ref lookup failed for {}@{}: {}",
+                    repo_name,
+                    cand,
                     e
                 );
-                return Err(Box::new(e));
-            }
-        };
-        Ok(entities)
-    }
-}
-
-/// Render markdown to sanitized HTML using pulldown-cmark -> ammonia.
-fn render_markdown_to_html(md: &str) -> String {
-    if md.is_empty() {
-        return String::new();
-    }
-    let mut opts = MdOptions::empty();
-    opts.insert(MdOptions::ENABLE_STRIKETHROUGH);
-    opts.insert(MdOptions::ENABLE_TABLES);
-    opts.insert(MdOptions::ENABLE_FOOTNOTES);
-    let parser = MdParser::new_ext(md, opts);
-    let mut html_out = String::new();
-    pulldown_cmark::html::push_html(&mut html_out, parser);
-
-    // Sanitize the generated HTML to avoid XSS
-    ammonia::Builder::default().clean(&html_out).to_string()
-}
-
-#[derive(Clone)]
-struct AppState {
-    db: Database,
-    templates: Environment<'static>,
-}
-
-/// Clean up file paths to show repository-relative paths instead of absolute filesystem paths
-/// Converts paths like "/tmp/hyperzoekt-clones/repo-uuid/path/to/file.rs" to "repo/path/to/file.rs"
-fn clean_file_path(file_path: &str) -> String {
-    // Robust cleaning of file paths to handle many variants. Strategy:
-    //  - Split into path segments
-    //  - Remove any embedded /tmp/hyperzoekt-clones/<uuid>/ sequences
-    //  - For any segment that ends with a UUID-like suffix (repo-name-<uuid>), strip the suffix
-    //  - Rejoin segments
-    let mut parts: Vec<String> = file_path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-
-    // Remove sequences like tmp -> hyperzoekt-clones -> <uuid>
-    let mut i = 0;
-    while i + 2 < parts.len() {
-        if parts[i] == "tmp" && parts[i + 1] == "hyperzoekt-clones" {
-            // Remove tmp and hyperzoekt-clones and the following uuid-like segment
-            parts.drain(i..=i + 2);
-            // continue without incrementing i
-            continue;
-        }
-        i += 1;
-    }
-
-    // Also handle the variant where only "hyperzoekt-clones" appears
-    let mut j = 0;
-    while j < parts.len() {
-        if parts[j] == "hyperzoekt-clones" {
-            // remove the hyperzoekt-clones and possibly next uuid segment
-            if j + 1 < parts.len() {
-                parts.drain(j..=j + 1);
-            } else {
-                parts.remove(j);
-            }
-            continue;
-        }
-        j += 1;
-    }
-
-    // Strip UUID suffixes from any segment like name-8e9834cb-6abb-...-deadbeef
-    for seg in parts.iter_mut() {
-        if let Some(last_dash) = seg.rfind('-') {
-            let potential_uuid = &seg[last_dash + 1..];
-            let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
-            if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-                *seg = seg[..last_dash].to_string();
             }
         }
     }
 
-    // Reconstruct path
-    if parts.is_empty() {
-        return file_path.to_string();
-    }
-    parts.join("/")
-}
-
-/// Remove a trailing UUID-style suffix from names like "repo-name-8e9834cb-6abb-4381-90f4-deadbeefdead"
-fn remove_uuid_suffix(name: &str) -> String {
-    let parts: Vec<&str> = name.split('-').collect();
-    if parts.len() >= 6 {
-        let tail = &parts[parts.len() - 5..];
-        let lens: [usize; 5] = [8, 4, 4, 4, 12];
-        let mut ok = true;
-        for (i, seg) in tail.iter().enumerate() {
-            if seg.len() != lens[i] || !seg.chars().all(|c| c.is_ascii_hexdigit()) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            return parts[..parts.len() - 5].join("-");
+    // final fallback: no ref or no candidate matched — query without ref
+    match state.db.get_dependencies_for_repo(repo_name, None).await {
+        Ok(deps) => (sort_deps_alphabetical(deps), None),
+        Err(e) => {
+            log::warn!(
+                "fetch_dependencies_for_repo_with_candidates: final fallback DB error for {}: {}",
+                repo_name,
+                e
+            );
+            (vec![], None)
         }
     }
-    name.to_string()
 }
 
-/// Extract the repo name with UUID suffix from a file path
-/// E.g., "/tmp/hyperzoekt-clones/repo-uuid/file" -> "repo-uuid"
-fn extract_uuid_repo_name(file_path: &str) -> Option<String> {
-    let parts: Vec<&str> = file_path.split('/').filter(|s| !s.is_empty()).collect();
-    for (i, part) in parts.iter().enumerate() {
-        if *part == "hyperzoekt-clones" && i + 1 < parts.len() {
-            let next = parts[i + 1];
-            // Check if it looks like name-uuid
-            if let Some(last_dash) = next.rfind('-') {
-                let potential_uuid = &next[last_dash + 1..];
-                let cleaned: String = potential_uuid.chars().filter(|c| *c != '-').collect();
-                if cleaned.len() >= 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(next.to_string());
+/// Pure helper that computes branch candidates from an optional provided ref and
+/// an optional repo default branch. This is separated for easier unit testing.
+fn compute_branch_candidates(provided: Option<&str>, repo_default: Option<&str>) -> Vec<String> {
+    if let Some(p) = provided {
+        return vec![p.to_string()];
+    }
+    if let Some(d) = repo_default {
+        if !d.is_empty() {
+            return vec![d.to_string()];
+        }
+    }
+    vec![
+        "main".to_string(),
+        "master".to_string(),
+        "trunk".to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod compute_branch_tests {
+    use super::compute_branch_candidates;
+
+    #[test]
+    fn provided_ref_wins() {
+        let got = compute_branch_candidates(Some("feature"), Some("dev"));
+        assert_eq!(got, vec!["feature".to_string()]);
+    }
+
+    #[test]
+    fn repo_default_used() {
+        let got = compute_branch_candidates(None, Some("dev"));
+        assert_eq!(got, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn fallback_list() {
+        let got = compute_branch_candidates(None, None);
+        assert_eq!(
+            got,
+            vec![
+                "main".to_string(),
+                "master".to_string(),
+                "trunk".to_string()
+            ]
+        );
+    }
+}
+
+/// Try branch candidates and fetch SBOM dependencies for a repo. Returns sorted Vec of dependency JSON objects.
+async fn fetch_sbom_deps_for_repo_with_candidates(
+    state: &AppState,
+    repo_name: &str,
+    provided_ref: Option<&str>,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    let candidates = branch_candidates_for_repo(state, repo_name, provided_ref).await;
+    for cand in candidates.iter() {
+        match state.db.resolve_ref_to_snapshot(repo_name, cand).await {
+            Ok(Some((commit_id, _snap_opt))) => {
+                if let Ok(deps) = state
+                    .db
+                    .get_sbom_dependencies_for_repo(repo_name, Some(&commit_id))
+                    .await
+                {
+                    return (sort_deps_alphabetical(deps), Some(commit_id));
+                } else {
+                    log::warn!(
+                        "fetch_sbom_deps_for_repo_with_candidates: DB error for {}@{}",
+                        repo_name,
+                        cand
+                    );
                 }
             }
+            Ok(None) => {
+                // Try the candidate as a branch/ref first (parity with dependencies path).
+                // If that yields SBOM deps, return it and record the candidate as the resolved ref.
+                if let Ok(deps) = state
+                    .db
+                    .get_sbom_dependencies_for_repo(repo_name, Some(cand.as_str()))
+                    .await
+                {
+                    return (sort_deps_alphabetical(deps), Some(cand.clone()));
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "fetch_sbom_deps_for_repo_with_candidates: ref lookup failed for {}@{}: {}",
+                    repo_name,
+                    cand,
+                    e
+                );
+            }
         }
     }
+
+    // final fallback: no ref matched — try repo-level SBOMs
+    match state
+        .db
+        .get_sbom_dependencies_for_repo(repo_name, None)
+        .await
+    {
+        Ok(deps) => (sort_deps_alphabetical(deps), None),
+        Err(e) => {
+            log::warn!(
+                "fetch_sbom_deps_for_repo_with_candidates: final fallback DB error for {}: {}",
+                repo_name,
+                e
+            );
+            (vec![], None)
+        }
+    }
+}
+
+/// Try branch candidates to locate a SBOM blob row. Returns Option<SbomRow> where SbomRow is a small struct.
+async fn fetch_sbom_blob_row_for_repo_with_candidates(
+    state: &AppState,
+    repo_name: &str,
+    provided_ref: Option<&str>,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct SbomRow {
+        sbom_blob: Option<String>,
+        sbom_encoding: Option<String>,
+    }
+
+    let candidates = branch_candidates_for_repo(state, repo_name, provided_ref).await;
+    for cand in candidates.iter() {
+        match state.db.resolve_ref_to_snapshot(repo_name, cand).await {
+            Ok(Some((commit, _snap))) => {
+                let sql = "SELECT sbom_blob, sbom_encoding FROM sboms WHERE repo = $repo AND commit = $commit LIMIT 1";
+                let resp = match state.db.connection().as_ref() {
+                    SurrealConnection::Local(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .bind(("commit", commit.to_string()))
+                        .await
+                        .ok(),
+                    SurrealConnection::RemoteHttp(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .bind(("commit", commit.to_string()))
+                        .await
+                        .ok(),
+                    SurrealConnection::RemoteWs(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .bind(("commit", commit.to_string()))
+                        .await
+                        .ok(),
+                };
+                if let Some(mut r) = resp {
+                    if let Ok(mut rows) = r.take::<Vec<SbomRow>>(0) {
+                        if let Some(row) = rows.pop() {
+                            return Some((row.sbom_blob, row.sbom_encoding, Some(commit)));
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // try repo-level SBOMs (no commit)
+                let sql = "SELECT sbom_blob, sbom_encoding FROM sboms WHERE repo = $repo LIMIT 1";
+                let resp = match state.db.connection().as_ref() {
+                    SurrealConnection::Local(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .await
+                        .ok(),
+                    SurrealConnection::RemoteHttp(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .await
+                        .ok(),
+                    SurrealConnection::RemoteWs(db_conn) => db_conn
+                        .query(sql)
+                        .bind(("repo", repo_name.to_string()))
+                        .await
+                        .ok(),
+                };
+                if let Some(mut r) = resp {
+                    if let Ok(mut rows) = r.take::<Vec<SbomRow>>(0) {
+                        if let Some(row) = rows.pop() {
+                            return Some((row.sbom_blob, row.sbom_encoding, None));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "fetch_sbom_blob_row_for_repo_with_candidates: ref lookup failed for {}@{}: {}",
+                    repo_name,
+                    cand,
+                    e
+                );
+            }
+        }
+    }
+
+    // no matching SBOM found
     None
 }
 
-/// Compute a repository-relative path from a (cleaned) file path and a clean repo name.
-/// Attempts to find the repo-name segment and return the remaining path. If not found,
-/// strips known clone roots and returns a reasonable relative path.
-fn repo_relative_from_file(file_path: &str, clean_repo_name: &str) -> String {
-    let normalized = clean_file_path(file_path);
-    let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
-
-    // Try to find a segment that equals the repo name or a variant
-    for (i, p) in parts.iter().enumerate() {
-        if *p == clean_repo_name
-            || p.starts_with(&format!("{}-", clean_repo_name))
-            || *p == clean_repo_name.replace('-', "_")
-        {
-            if i + 1 < parts.len() {
-                return parts[i + 1..].join("/");
-            } else {
-                return String::new();
-            }
-        }
-    }
-
-    // If the path begins with known clone roots, strip them
-    let mut start = 0usize;
-    while start < parts.len() {
-        let p = parts[start];
-        if p == "tmp" || p == "hyperzoekt-clones" {
-            start += 1;
-            continue;
-        }
-        // UUID-like segment (hex groups)
-        if p.len() >= 8 && p.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-            start += 1;
-            continue;
-        }
-        break;
-    }
-
-    if start < parts.len() {
-        return parts[start..].join("/");
-    }
-
-    // Fallback: if more than one segment, drop the first and return the rest
-    if parts.len() > 1 {
-        return parts[1..].join("/");
-    }
-
-    normalized
-}
-
-/// Construct a proper source URL using repository metadata from the database
-async fn construct_source_url(
-    state: &AppState,
-    repo_name: &str,
-    file_path: &str,
-    uuid_repo_name: Option<&str>,
-) -> Option<String> {
-    // Clean the repo_name to remove UUID suffix if present
-    let clean_repo_name = remove_uuid_suffix(repo_name);
-
-    log::debug!(
-        "construct_source_url: repo_name='{}', clean_repo_name='{}', uuid_repo_name='{:?}', file_path='{}'",
-        repo_name,
-        clean_repo_name,
-        uuid_repo_name,
-        file_path
-    );
-
-    // Query the repo table for the git_url and branch
-    #[derive(Deserialize)]
-    struct RepoRow {
-        git_url: String,
-        branch: Option<String>,
-    }
-
-    let mut query_parts = vec!["SELECT git_url, branch FROM repo WHERE".to_string()];
-    let mut bindings = vec![];
-
-    // Always include clean_name
-    query_parts.push("name = $clean_name".to_string());
-    bindings.push(("clean_name", clean_repo_name.clone()));
-
-    // Include original_name if different
-    if repo_name != clean_repo_name {
-        query_parts.push("OR name = $original_name".to_string());
-        bindings.push(("original_name", repo_name.to_string()));
-    }
-
-    // Include uuid_repo_name if provided
-    if let Some(uuid_name) = uuid_repo_name {
-        query_parts.push("OR name = $uuid_name".to_string());
-        bindings.push(("uuid_name", uuid_name.to_string()));
-    }
-
-    query_parts.push("LIMIT 1".to_string());
-    let query_sql = query_parts.join(" ");
-
-    if let Ok(mut res) = match &*state.db.db {
-        SurrealConnection::Local(db_conn) => {
-            let mut query = db_conn.query(&query_sql);
-            for (key, value) in bindings {
-                query = query.bind((key, value));
-            }
-            query.await
-        }
-        SurrealConnection::RemoteHttp(db_conn) => {
-            let mut query = db_conn.query(&query_sql);
-            for (key, value) in bindings {
-                query = query.bind((key, value));
-            }
-            query.await
-        }
-        SurrealConnection::RemoteWs(db_conn) => {
-            let mut query = db_conn.query(&query_sql);
-            for (key, value) in bindings {
-                query = query.bind((key, value));
-            }
-            query.await
-        }
-    } {
-        if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                log::debug!(
-                    "construct_source_url: Found repo row: git_url='{}', branch='{:?}'",
-                    r.git_url,
-                    r.branch
-                );
-                if let Some(normalized_base) = normalize_git_url(&r.git_url) {
-                    log::debug!(
-                        "construct_source_url: Normalized git_url to '{}'",
-                        normalized_base
-                    );
-                    let branch = r
-                        .branch
-                        .or_else(|| std::env::var("SOURCE_BRANCH").ok())
-                        .unwrap_or_else(|| "main".to_string());
-
-                    // Use helper to compute repo-relative path
-                    let repo_relative = repo_relative_from_file(file_path, &clean_repo_name);
-                    log::debug!(
-                        "construct_source_url: Repo-relative path: '{}'",
-                        repo_relative
-                    );
-
-                    let base = normalized_base.trim_end_matches('/');
-                    let url = if base.ends_with(&format!("/{}", clean_repo_name)) {
-                        // normalized_base already includes the repo path (owner/repo),
-                        // avoid appending the repo name again.
-                        format!("{}/blob/{}/{}", base, branch, repo_relative)
-                    } else {
-                        format!(
-                            "{}/{}/blob/{}/{}",
-                            base, clean_repo_name, branch, repo_relative
-                        )
-                    };
-                    log::debug!("construct_source_url: Constructed URL: '{}'", url);
-                    return Some(url);
-                } else {
-                    log::warn!(
-                        "construct_source_url: Failed to normalize git_url '{}'",
-                        r.git_url
-                    );
-                }
-            } else {
-                log::warn!(
-                    "construct_source_url: No repo row found for query: {}",
-                    query_sql
-                );
-            }
-        } else {
-            log::error!("construct_source_url: Failed to parse repo query result");
-        }
-    } else {
-        log::error!("construct_source_url: Repo query failed");
-    }
-
-    // Fallback to default values (no env vars for base URL to avoid issues with multiple repos)
-    log::warn!(
-        "construct_source_url: Using fallback for repo '{}',",
-        clean_repo_name
-    );
-    let source_base = "https://github.com".to_string();
-    let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
-
-    // Clean and compute repo-relative path similar to the DB-backed branch above
-    let normalized_file = clean_file_path(file_path);
-    let parts: Vec<&str> = normalized_file
-        .split('/')
-        .filter(|p| !p.is_empty())
-        .collect();
-    let mut repo_relative = if parts.len() > 1 {
-        parts[1..].join("/")
-    } else {
-        normalized_file.clone()
-    };
-    for (i, p) in parts.iter().enumerate() {
-        if *p == clean_repo_name || p.starts_with(&format!("{}-", clean_repo_name)) {
-            repo_relative = if i + 1 < parts.len() {
-                parts[i + 1..].join("/")
-            } else {
-                String::new()
-            };
-            break;
-        }
-    }
-
-    let url = format!(
-        "{}/{}/blob/{}/{}",
-        source_base.trim_end_matches('/'),
-        clean_repo_name,
-        source_branch,
-        repo_relative
-    );
-    log::debug!("construct_source_url: Fallback URL: '{}'", url);
-    Some(url)
-}
-
-/// Normalize various git URL forms into an https base URL without a trailing `.git`.
-/// Examples:
-/// - git@github.com:owner/repo.git -> https://github.com/owner/repo
-/// - https://github.com/owner/repo.git -> https://github.com/owner/repo
-/// - http://... -> http://...
-///   Returns None for local paths (file:// or absolute filesystem paths) where a web URL
-///   cannot be constructed.
-fn normalize_git_url(git_url: &str) -> Option<String> {
-    if git_url.is_empty() {
-        return None;
-    }
-
-    // Local paths are not convertible to web URLs
-    if git_url.starts_with("file://") || std::path::Path::new(git_url).is_absolute() {
-        return None;
-    }
-
-    // SSH style: git@host:owner/repo.git -> https://host/owner/repo
-    if git_url.starts_with("git@") {
-        if let Some(colon) = git_url.find(':') {
-            let host = &git_url[4..colon]; // strip "git@"
-            let rest = &git_url[colon + 1..];
-            let s = format!("https://{}/{}", host, rest.trim_end_matches(".git"));
-            return Some(s);
-        }
-    }
-
-    // HTTP/HTTPS style: strip trailing .git
-    if git_url.starts_with("http://") || git_url.starts_with("https://") {
-        return Some(git_url.trim_end_matches(".git").to_string());
-    }
-
-    // Fallback: try to treat as https host/path
-    Some(git_url.trim_end_matches(".git").to_string())
-}
-
-/// Derive a short display string like "owner/repo/path/to/file" from a full source URL
-fn short_display_from_source_url(source_url: &str, repo_name: &str) -> String {
-    // Expected forms:
-    //  - https://github.com/owner/repo/blob/branch/path/to/file
-    //  - https://gitlab.com/owner/repo/-/blob/branch/path/to/file
-    // Fallback: if we can't parse, return repo_name + "/" + trailing path from source_url
-    if source_url.is_empty() {
-        return repo_name.to_string();
-    }
-
-    if let Ok(u) = url::Url::parse(source_url) {
-        let segments: Vec<String> = u
-            .path()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        // Look for 'blob' or '-/blob' markers and take the pieces after branch
-        if let Some(pos) = segments.iter().position(|s| s == "blob") {
-            // segments: owner, repo, blob, branch, rest... (GitHub style)
-            // Avoid matching the GitLab variant where the segment before 'blob' is '-' (owner/repo/-/blob/...)
-            if pos >= 2 && segments[pos - 1] != "-" {
-                let owner = &segments[pos - 2];
-                let repo = &segments[pos - 1];
-                let rest = if pos + 2 <= segments.len() - 1 {
-                    segments[pos + 2..].join("/")
-                } else {
-                    String::new()
-                };
-                if rest.is_empty() {
-                    return format!("{}/{}", owner, repo);
-                }
-                return format!("{}/{}/{}", owner, repo, rest);
-            }
-        }
-        // GitLab variant: owner/repo/-/blob/branch/path
-        if let Some(pos) = segments.iter().position(|s| s == "-") {
-            if pos + 2 < segments.len() && segments[pos + 1] == "blob" && pos >= 2 {
-                let owner = &segments[pos - 2];
-                let repo = &segments[pos - 1];
-                let rest = segments[pos + 3..].join("/");
-                return format!("{}/{}/{}", owner, repo, rest);
-            }
-        }
-    }
-
-    // fallback: try to strip the repo_name from the path
-    if let Some(pos) = source_url.find(repo_name) {
-        let tail = &source_url[pos + repo_name.len()..];
-        let tail = tail.trim_start_matches('/');
-        if tail.is_empty() {
-            return repo_name.to_string();
-        }
-        return format!("{}/{}", repo_name, tail);
-    }
-
-    // last resort: return the hostname + path
-    source_url.to_string()
-}
-
-/// Compute a file-like hint for an entity. Prefer `source_display`, fall back to
-/// deriving from `source_url`, otherwise return empty string.
-fn file_hint_for_entity(entity: &EntityPayload) -> String {
-    if let Some(sd) = &entity.source_display {
-        if !sd.is_empty() {
-            return sd.clone();
-        }
-    }
-    if let Some(url) = &entity.source_url {
-        let short = short_display_from_source_url(url, &entity.repo_name);
-        if !short.is_empty() {
-            return short;
-        }
-    }
-    String::new()
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Database,
+    pub templates: Environment<'static>,
 }
 
 #[tokio::main]
@@ -2196,17 +739,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hyperzoekt::otel::init_otel_from_env();
     }
 
-    // Initialize logging with the configured level
-    std::env::set_var("RUST_LOG", &config.log_level);
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
+    // Initialize logging with the configured level (inject sane defaults for noisy crates)
+    let log_spec = sanitize_log_spec(&config.log_level);
+    std::env::set_var("RUST_LOG", &log_spec);
+    let env = env_logger::Env::default();
+    let mut builder = env_logger::Builder::from_env(env);
     builder
+        .format(|buf, record| {
+            let ts = buf.timestamp_millis();
+            writeln!(
+                buf,
+                "[{} {} {}] {}",
+                ts,
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .filter_level(log::LevelFilter::Info)
         .filter_module("hyper_util", log::LevelFilter::Warn)
         .filter_module("hyper", log::LevelFilter::Warn)
         .filter_module("h2", log::LevelFilter::Warn)
         .filter_module("reqwest", log::LevelFilter::Warn)
-        .filter_module("tower_http", log::LevelFilter::Warn);
+        .filter_module("tower_http", log::LevelFilter::Warn)
+        .filter_module("html5ever", log::LevelFilter::Warn);
     builder.init();
 
+    log::info!("*** NEW CODE IS RUNNING: HyperZoekt WebUI starting up!");
     log::info!("Starting HyperZoekt WebUI with configuration:");
     log::info!("  Host: {}", config.host);
     log::info!("  Port: {}", config.port);
@@ -2220,7 +779,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     log::info!("  SurrealDB Namespace: {}", config.surreal_ns);
     log::info!("  SurrealDB Database: {}", config.surreal_db);
-    log::info!("  Log Level: {}", config.log_level);
+    log::info!("  Requested Log Level: {}", config.log_level);
+    log::info!("  Effective Log Filter: {}", log_spec);
     log::info!("  CORS All: {}", config.cors_all);
     log::info!("  Max Search Results: {}", config.max_search_results);
 
@@ -2252,6 +812,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("pagerank", PAGERANK_TEMPLATE)?;
     templates.add_template("dupes", DUPES_TEMPLATE)?;
     templates.add_template("dependencies", DEPENDENCIES_TEMPLATE)?;
+    templates.add_template("sbom", SBOM_TEMPLATE)?;
     // Reuse repo template with dupes section via route-driven render
     log::info!("Templates loaded successfully");
 
@@ -2279,9 +840,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/repo/{repo_name}/dependencies",
             get(repo_dependencies_api_handler),
         )
+        .route(
+            "/api/repo/{repo_name}/sbom",
+            get(repo_sbom_dependencies_api_handler),
+        )
+        .route(
+            "/api/repo/{repo_name}/sbom/blob",
+            get(repo_sbom_blob_api_handler),
+        )
         .route("/api/dependencies", get(multi_dependencies_api_handler))
+        .route("/api/sbom", get(multi_sbom_dependencies_api_handler))
         // Top-level dependencies browser
         .route("/dependencies", get(dependencies_page_handler))
+        .route("/sbom", get(sbom_page_handler))
         .route(
             "/api/repo/{repo_name}/external_dupes",
             get(repo_external_dupes_api_handler),
@@ -2339,9 +910,19 @@ async fn index_handler(State(state): State<AppState>) -> Result<Html<String>, St
 
 async fn health_handler() -> Result<Json<serde_json::Value>, StatusCode> {
     log::debug!("Health check requested");
+    // Provide build/version info so container health checks can verify the deployed code
+    let version = env!("CARGO_PKG_VERSION");
+    let build_id = std::env::var("HYPERZOEKT_BUILD_ID").ok();
+    let message = if let Some(b) = build_id.as_deref() {
+        format!("HyperZoekt WebUI v{} (build={}) is running", version, b)
+    } else {
+        format!("HyperZoekt WebUI v{} is running", version)
+    };
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "message": "HyperZoekt WebUI is running"
+        "version": version,
+        "build_id": build_id,
+        "message": message
     })))
 }
 
@@ -2427,7 +1008,10 @@ async fn repo_handler(
         // each EntityPayload to a JSON value in the response generation step below.
         if let Some(obj) = v.as_object_mut() {
             obj.insert("file".to_string(), serde_json::Value::String(file_hint));
-            let doc_html = entity.doc.as_ref().map(|d| render_markdown_to_html(d));
+            let doc_html = entity
+                .doc
+                .as_ref()
+                .map(|d| utils::render_markdown_to_html(d));
             obj.insert(
                 "doc_html".to_string(),
                 match doc_html {
@@ -2463,6 +1047,18 @@ async fn dependencies_page_handler(
         .render(context! { title => "Repository Dependencies" })
         .map_err(|e| {
             log::error!("Failed to render dependencies template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Html(html))
+}
+
+async fn sbom_page_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    log::debug!("sbom_page_handler: rendering sbom page");
+    let template = state.templates.get_template("sbom").unwrap();
+    let html = template
+        .render(context! { title => "SBOMs" })
+        .map_err(|e| {
+            log::error!("Failed to render sbom template: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Html(html))
@@ -2650,7 +1246,10 @@ async fn entity_handler(
     let mut entity_json = serde_json::to_value(&entity).unwrap_or(serde_json::json!({}));
     if let Some(obj) = entity_json.as_object_mut() {
         obj.insert("file".to_string(), serde_json::Value::String(file_hint));
-        let doc_html = entity.doc.as_ref().map(|d| render_markdown_to_html(d));
+        let doc_html = entity
+            .doc
+            .as_ref()
+            .map(|d| utils::render_markdown_to_html(d));
         obj.insert(
             "doc_html".to_string(),
             match doc_html {
@@ -2771,7 +1370,7 @@ async fn search_api_handler(
     }
 
     // Convert to Option<&[String]> for the similarity function
-    let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
+    // let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
     // Determine maximum results per page (env overrides default)
     let max_results: usize = std::env::var("HYPERZOEKT_MAX_SEARCH_RESULTS")
         .ok()
@@ -2792,126 +1391,188 @@ async fn search_api_handler(
         .unwrap_or(0);
 
     // If repo filters resolved to a single snapshot, use that snapshot id to scope similarity.
-    let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
-        // take the single map entry's snapshot option if present
-        let mut iter = resolved_refs.values();
-        if let Some((_, snap_opt)) = iter.next() {
-            snap_opt.as_deref()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
+    //     // take the single map entry's snapshot option if present
+    //     let mut iter = resolved_refs.values();
+    //     if let Some((_, snap_opt)) = iter.next() {
+    //         snap_opt.as_deref()
+    //     } else {
+    //         None
+    //     }
+    // } else {
+    //     None
+    // };
 
-    match similarity::similarity_with_conn_multi(
-        &state.db.db,
-        &query.q,
-        repo_slice_opt,
-        snapshot_id_opt,
-    )
-    .await
-    {
-        Ok(mut results) => {
-            // Enrich links
-            for entity in &mut results {
-                if entity.rank.is_none() {
-                    entity.rank = Some(0.0);
-                }
-                let raw_file_hint = file_hint_for_entity(entity);
-                let file_hint = clean_file_path(&raw_file_hint);
-                if entity.source_url.is_none() {
-                    if let Some(url) =
-                        construct_source_url(&state, &entity.repo_name, &file_hint, None).await
-                    {
-                        entity.source_url = Some(url.clone());
-                        if entity.source_display.is_none() {
-                            entity.source_display =
-                                Some(short_display_from_source_url(&url, &entity.repo_name));
-                        }
-                    }
-                } else if entity.source_display.is_none() {
-                    if let Some(ref url) = entity.source_url {
-                        entity.source_display =
-                            Some(short_display_from_source_url(url, &entity.repo_name));
-                    }
-                }
-            }
-            let elapsed_ms = started.elapsed().as_millis();
-            // Support cursor/limit pagination: request a larger set and slice
-            let total = results.len();
-            let end = (start + limit).min(total);
-            let next_cursor = if end < total {
-                Some(end.to_string())
-            } else {
-                None
-            };
-            let page_results = if start < total {
-                results[start..end].to_vec()
-            } else {
-                vec![]
-            };
-            // Serialize and enrich each returned entity JSON with resolved ref
-            let mut results_value =
-                serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
-            if let serde_json::Value::Array(ref mut arr) = results_value {
-                for v in arr.iter_mut() {
-                    if let serde_json::Value::Object(ref mut m) = v {
-                        if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
-                            if let Some((commit, snap)) = resolved_refs.get(repo_name) {
-                                m.insert(
-                                    "resolved_commit".to_string(),
-                                    serde_json::Value::String(commit.clone()),
-                                );
-                                if let Some(sid) = snap {
-                                    m.insert(
-                                        "resolved_snapshot".to_string(),
-                                        serde_json::Value::String(sid.clone()),
-                                    );
-                                } else {
-                                    m.insert(
-                                        "resolved_snapshot".to_string(),
-                                        serde_json::Value::Null,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut obj = serde_json::Map::new();
-            obj.insert("results".to_string(), results_value);
-            obj.insert(
-                "elapsed_ms".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
-            );
-            if let Some(nc) = next_cursor {
-                obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
-            }
-            return Ok(Json(serde_json::Value::Object(obj)));
-        }
-        Err(e) => {
-            log::warn!(
-                "similarity_search failed; falling back to text search: {}",
-                e
-            );
-        }
-    }
+    // Temporarily skip similarity search to test text search fallback
+    // match similarity::similarity_with_conn_multi(
+    //     &state.db.db,
+    //     &query.q,
+    //     repo_slice_opt,
+    //     snapshot_id_opt,
+    // )
+    // .await
+    // {
+    //     Ok(mut results) => {
+    //         // Enrich links
+    //         for entity in &mut results {
+    //             if entity.rank.is_none() {
+    //                 entity.rank = Some(0.0);
+    //             }
+    //             let raw_file_hint = file_hint_for_entity(entity);
+    //             let file_hint = clean_file_path(&raw_file_hint);
+    //             if entity.source_url.is_none() {
+    //                 if let Some(url) =
+    //                     construct_source_url(&state, &entity.repo_name, &file_hint, None).await
+    //                 {
+    //                     entity.source_url = Some(url.clone());
+    //                     if entity.source_display.is_none() {
+    //                         entity.source_display =
+    //                             Some(short_display_from_source_url(&url, &entity.repo_name));
+    //                     }
+    //                 }
+    //             } else if entity.source_display.is_none() {
+    //                 if let Some(ref url) = entity.source_url {
+    //                     entity.source_display =
+    //                         Some(short_display_from_source_url(url, &entity.repo_name));
+    //                 }
+    //             }
+    //         }
+    //         let elapsed_ms = started.elapsed().as_millis();
+    //         // Support cursor/limit pagination: request a larger set and slice
+    //         let total = results.len();
+    //         let end = (start + limit).min(total);
+    //         let next_cursor = if end < total {
+    //             Some(end.to_string())
+    //         } else {
+    //             None
+    //         };
+    //         let page_results = if start < total {
+    //             results[start..end].to_vec()
+    //         } else {
+    //             vec![]
+    //         };
+    //         // Serialize and enrich each returned entity JSON with resolved ref
+    //         let mut results_value =
+    //             serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
+    //         if let serde_json::Value::Array(ref mut arr) = results_value {
+    //             for v in arr.iter_mut() {
+    //                 if let serde_json::Value::Object(ref mut m) = v {
+    //                     if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
+    //                         if let Some((commit, snap)) = resolved_refs.get(repo_name) {
+    //                             m.insert(
+    //                                 "resolved_commit".to_string(),
+    //                                 serde_json::Value::String(commit.clone()),
+    //                             );
+    //                             if let Some(sid) = snap {
+    //                                 m.insert(
+    //                                     "resolved_snapshot".to_string(),
+    //                                     serde_json::Value::String(sid.clone()),
+    //                                 );
+    //                             } else {
+    //                                 m.insert(
+    //                                     "resolved_snapshot".to_string(),
+    //                                     serde_json::Value::Null,
+    //                                 );
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         let mut obj = serde_json::Map::new();
+    //         obj.insert("results".to_string(), results_value);
+    //         obj.insert(
+    //             "elapsed_ms".to_string(),
+    //             serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
+    //         );
+    //         if let Some(nc) = next_cursor {
+    //             obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
+    //         }
+    //         return Ok(Json(serde_json::Value::Object(obj)));
+    //     }
+    //     Err(e) => {
+    //         log::warn!(
+    //             "similarity_search failed; falling back to text search: {}",
+    //             e
+    //         );
+    //     }
+    // }
 
     // Fallback: legacy text search. Prefer multi-repo-aware search if provided.
+    // If the request resolved exactly one repo -> snapshot mapping, prefer the
+    // snapshot-scoped search function so results are sourced from the
+    // `entity_snapshot` table and are commit-aware.
     let results = if let Some(repos) = cleaned_repo_vec.as_ref().or(repo_vec_opt.as_ref()) {
-        state
-            .db
-            .search_entities_multi(&query.q, Some(repos.as_slice()), limit, start)
-            .await
-            .map_err(|e| {
-                log::error!("search_entities failed for q='{}': {}", query.q, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
+        // If we resolved a single repo->(commit, snapshot_opt) mapping, use the
+        // snapshot-scoped search to scope results to that commit/snapshot.
+        if resolved_refs.len() == 1 {
+            if let Some((_repo_name, (commit, snap_opt))) = resolved_refs.iter().next() {
+                // Prefer snapshot id when available; otherwise use commit id as snapshot selector
+                if let Some(sid) = snap_opt.as_deref() {
+                    state
+                        .db
+                        .search_entities_multi_snapshot(
+                            &query.q,
+                            Some(repos.as_slice()),
+                            limit,
+                            start,
+                            sid,
+                        )
+                        .await
+                        .map_err(|e| {
+                            log::error!(
+                                "search_entities_multi_snapshot failed for q='{}': {}",
+                                query.q,
+                                e
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?
+                } else {
+                    // Fallback: use commit id as the selector (many snapshots are keyed by commit)
+                    state
+                        .db
+                        .search_entities_multi_snapshot(
+                            &query.q,
+                            Some(repos.as_slice()),
+                            limit,
+                            start,
+                            commit,
+                        )
+                        .await
+                        .map_err(|e| {
+                            log::error!(
+                                "search_entities_multi_snapshot failed for q='{}': {}",
+                                query.q,
+                                e
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?
+                }
+            } else {
+                // defensive fallback to non-snapshot search
+                state
+                    .db
+                    .search_entities_multi(&query.q, Some(repos.as_slice()), limit, start)
+                    .await
+                    .map_err(|e| {
+                        log::error!("search_entities failed for q='{}': {}", query.q, e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+            }
+        } else {
+            state
+                .db
+                .search_entities_multi(&query.q, Some(repos.as_slice()), limit, start)
+                .await
+                .map_err(|e| {
+                    log::error!("search_entities failed for q='{}': {}", query.q, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        }
     } else {
         state
             .db
-            .search_entities(&query.q, None, limit, start)
+            .search_entities(&query.q, None, limit, start, "*")
             .await
             .map_err(|e| {
                 log::error!("search_entities failed for q='{}': {}", query.q, e);
@@ -3054,69 +1715,28 @@ async fn multi_dependencies_api_handler(
     let mut out_map = serde_json::Map::new();
     if let Some(repos) = q.repo {
         for repo in repos.into_iter() {
-            // Determine per-repo branch to try: explicit param or repo default
-            let branch_to_try: Option<String> = if let Some(br) = branch {
-                Some(br.to_string())
-            } else {
-                match state.db.get_repo_default_branch(&repo).await {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        log::warn!("Failed to determine default branch for {}: {}", repo, e);
-                        None
-                    }
-                }
-            };
+            let (deps, _resolved_ref) =
+                fetch_dependencies_for_repo_with_candidates(&state, &repo, branch).await;
+            out_map.insert(repo.clone(), serde_json::Value::Array(deps));
+        }
+    }
+    Ok(Json(
+        serde_json::json!({ "repos": serde_json::Value::Object(out_map) }),
+    ))
+}
 
-            if let Some(br) = branch_to_try.as_deref() {
-                match state.db.resolve_ref_to_snapshot(&repo, br).await {
-                    Ok(Some((commit_id, snapshot_opt))) => {
-                        log::debug!(
-                            "Resolved ref '{}' for repo '{}' -> commit {} (snapshot={:?})",
-                            br,
-                            repo,
-                            commit_id,
-                            snapshot_opt
-                        );
-                        if let Ok(deps) = state
-                            .db
-                            .get_dependencies_for_repo(&repo, Some(&commit_id))
-                            .await
-                        {
-                            out_map.insert(repo, serde_json::Value::Array(deps));
-                        } else {
-                            log::warn!("multi_dependencies_api_handler: error for {}", repo);
-                            out_map.insert(repo, serde_json::Value::Array(vec![]));
-                        }
-                    }
-                    Ok(None) => {
-                        // No ref found; fall back to original behavior using branch_to_try
-                        if let Ok(deps) = state
-                            .db
-                            .get_dependencies_for_repo(&repo, branch_to_try.as_deref())
-                            .await
-                        {
-                            out_map.insert(repo, serde_json::Value::Array(deps));
-                        } else {
-                            log::warn!("multi_dependencies_api_handler: error for {}", repo);
-                            out_map.insert(repo, serde_json::Value::Array(vec![]));
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "multi_dependencies_api_handler: ref lookup failed for {}@{}: {}",
-                            repo,
-                            br,
-                            e
-                        );
-                        out_map.insert(repo, serde_json::Value::Array(vec![]));
-                    }
-                }
-            } else if let Ok(deps) = state.db.get_dependencies_for_repo(&repo, None).await {
-                out_map.insert(repo, serde_json::Value::Array(deps));
-            } else {
-                log::warn!("multi_dependencies_api_handler: error for {}", repo);
-                out_map.insert(repo, serde_json::Value::Array(vec![]));
-            }
+/// Top-level API returning SBOM dependencies for multiple repos. Query params: `repo` repeated and optional `ref`.
+async fn multi_sbom_dependencies_api_handler(
+    State(state): State<AppState>,
+    Query(q): Query<MultiDepsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let branch = q.r#ref.as_deref();
+    let mut out_map = serde_json::Map::new();
+    if let Some(repos) = q.repo {
+        for repo in repos.into_iter() {
+            let (deps, _resolved_ref) =
+                fetch_sbom_deps_for_repo_with_candidates(&state, &repo, branch).await;
+            out_map.insert(repo.clone(), serde_json::Value::Array(deps));
         }
     }
     Ok(Json(
@@ -3194,89 +1814,106 @@ async fn repo_dependencies_api_handler(
     axum::extract::Path(repo_name): axum::extract::Path<String>,
     Query(q): Query<RepoDepsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Determine branch to use: provided ref or repo default
+    // Determine branch candidates to use: provided ref, repo default, then main/master/trunk
     let branch_param = q.r#ref.as_deref();
-    let branch_to_try: Option<String> = if let Some(b) = branch_param {
-        Some(b.to_string())
-    } else {
-        match state.db.get_repo_default_branch(&repo_name).await {
-            Ok(b) => Some(b),
-            Err(e) => {
-                log::warn!(
-                    "Failed to determine default branch for {}: {}",
-                    repo_name,
-                    e
-                );
-                None
-            }
-        }
-    };
+    log::info!(
+        "repo_dependencies_api_handler: request for repo='{}' ref_param={:?}",
+        repo_name,
+        branch_param
+    );
+    // Use consolidated helper to fetch deps and resolved ref when available
+    let (deps, resolved_ref) =
+        fetch_dependencies_for_repo_with_candidates(&state, &repo_name, branch_param).await;
+    Ok(Json(
+        serde_json::json!({"repo": repo_name, "ref": resolved_ref, "dependencies": deps}),
+    ))
+}
 
-    if let Some(br) = branch_to_try.as_deref() {
-        match state.db.resolve_ref_to_snapshot(&repo_name, br).await {
-            Ok(Some((commit_id, _snapshot_opt))) => {
-                match state
-                    .db
-                    .get_dependencies_for_repo(&repo_name, Some(&commit_id))
-                    .await
-                {
-                    Ok(deps) => Ok(Json(
-                        serde_json::json!({"repo": repo_name, "ref": Some(commit_id), "dependencies": deps}),
-                    )),
+/// JSON API returning SBOM dependencies for a repository. Accepts optional `ref` query parameter
+/// to indicate branch or tag to scope the lookup.
+async fn repo_sbom_dependencies_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(repo_name): axum::extract::Path<String>,
+    Query(q): Query<RepoDepsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let branch_param = q.r#ref.as_deref();
+    log::info!(
+        "repo_sbom_dependencies_api_handler: request for repo='{}' ref_param={:?}",
+        repo_name,
+        branch_param
+    );
+
+    let (deps, resolved_ref) =
+        fetch_sbom_deps_for_repo_with_candidates(&state, &repo_name, branch_param).await;
+    Ok(Json(
+        serde_json::json!({"repo": repo_name, "ref": resolved_ref, "dependencies": deps}),
+    ))
+}
+
+/// Return the decoded SBOM blob (plain text) for a repository and optional `ref` query
+async fn repo_sbom_blob_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(repo_name): axum::extract::Path<String>,
+    Query(q): Query<RepoDepsQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    // Determine branch param (explicit ref) if provided
+    let branch_param = q.r#ref.as_deref();
+
+    // Determine branch candidates and attempt to resolve a commit or query repo-level SBOMs
+    #[derive(serde::Deserialize)]
+    struct SbomRow {
+        sbom_blob: Option<String>,
+        sbom_encoding: Option<String>,
+    }
+
+    let row_opt_triplet =
+        fetch_sbom_blob_row_for_repo_with_candidates(&state, &repo_name, branch_param).await;
+    let row_opt = row_opt_triplet.map(|(blob, encoding, _resolved_commit)| SbomRow {
+        sbom_blob: blob,
+        sbom_encoding: encoding,
+    });
+
+    if let Some(row) = row_opt {
+        if let Some(blob) = row.sbom_blob {
+            let encoding = row.sbom_encoding.unwrap_or_else(|| "base64".into());
+            if encoding.eq_ignore_ascii_case("base64") {
+                match BASE64_STANDARD.decode(blob.as_bytes()) {
+                    Ok(decoded) => match String::from_utf8(decoded) {
+                        Ok(s) => Ok(axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain; charset=utf-8")
+                            .body(Body::from(s))
+                            .unwrap()),
+                        Err(e) => {
+                            log::warn!("SBOM UTF-8 decode error for {}: {}", repo_name, e);
+                            Err(StatusCode::INTERNAL_SERVER_ERROR)
+                        }
+                    },
                     Err(e) => {
-                        log::warn!("repo_dependencies_api_handler: DB error for {} - returning empty list: {}", repo_name, e);
-                        Ok(Json(
-                            serde_json::json!({"repo": repo_name, "ref": Some(commit_id), "dependencies": []}),
-                        ))
+                        log::warn!("Base64 decode error for {}: {}", repo_name, e);
+                        Err(StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 }
+            } else {
+                Ok(axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .body(Body::from(blob))
+                    .unwrap())
             }
-            Ok(None) => {
-                // ref not found - fall back to searching with whatever branch_to_try was
-                match state
-                    .db
-                    .get_dependencies_for_repo(&repo_name, branch_to_try.as_deref())
-                    .await
-                {
-                    Ok(deps) => Ok(Json(
-                        serde_json::json!({"repo": repo_name, "ref": branch_to_try, "dependencies": deps}),
-                    )),
-                    Err(e) => {
-                        log::warn!("repo_dependencies_api_handler: DB error for {} - returning empty list: {}", repo_name, e);
-                        Ok(Json(
-                            serde_json::json!({"repo": repo_name, "ref": branch_to_try, "dependencies": []}),
-                        ))
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "repo_dependencies_api_handler: ref lookup failed for {}@{}: {}",
-                    repo_name,
-                    br,
-                    e
-                );
-                Ok(Json(
-                    serde_json::json!({"repo": repo_name, "ref": branch_param, "dependencies": []}),
-                ))
-            }
+        } else {
+            Ok(axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from("No SBOM blob found"))
+                .unwrap())
         }
     } else {
-        match state.db.get_dependencies_for_repo(&repo_name, None).await {
-            Ok(deps) => Ok(Json(
-                serde_json::json!({"repo": repo_name, "ref": None::<String>, "dependencies": deps}),
-            )),
-            Err(e) => {
-                log::warn!(
-                    "repo_dependencies_api_handler: DB error for {} - returning empty list: {}",
-                    repo_name,
-                    e
-                );
-                Ok(Json(
-                    serde_json::json!({"repo": repo_name, "ref": None::<String>, "dependencies": []}),
-                ))
-            }
-        }
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("No SBOM found"))
+            .unwrap())
     }
 }
 
@@ -3426,7 +2063,7 @@ async fn entities_api_handler(
             let raw_file_hint = file_hint_for_entity(&ent);
             let file_hint = clean_file_path(&raw_file_hint);
             obj.insert("file".to_string(), serde_json::Value::String(file_hint));
-            let doc_html = ent.doc.as_ref().map(|d| render_markdown_to_html(d));
+            let doc_html = ent.doc.as_ref().map(|d| utils::render_markdown_to_html(d));
             obj.insert(
                 "doc_html".to_string(),
                 match doc_html {
@@ -3480,8 +2117,8 @@ async fn pagerank_api_handler(
     let limit = query.limit.unwrap_or(500usize);
 
     // Fetch entities with a limit via a new lightweight query path to avoid pulling everything.
-    let entity_fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
-    let mut response = match &*state.db.db {
+    let entity_fields = ENTITY_FIELDS;
+    let mut response = match state.db.connection().as_ref() {
         SurrealConnection::Local(db_conn) => {
             db_conn
                 .query(format!(
@@ -3564,7 +2201,7 @@ async fn pagerank_api_handler(
     query_parts.push("LIMIT 1".to_string());
     let repo_q = query_parts.join(" ");
 
-    let repo_row: Option<RepoRow> = match &*state.db.db {
+    let repo_row: Option<RepoRow> = match state.db.connection().as_ref() {
         SurrealConnection::Local(db_conn) => {
             let mut q = db_conn.query(&repo_q);
             for (k, v) in &bindings {
@@ -3603,8 +2240,8 @@ async fn pagerank_api_handler(
             .branch
             .or_else(|| std::env::var("SOURCE_BRANCH").ok())
             .unwrap_or_else(|| "main".to_string());
-        if let Some(norm) = normalize_git_url(&r.git_url) {
-            (Some(norm), branch)
+        if let Some(normalized_base) = utils::normalize_git_url(&r.git_url) {
+            (Some(normalized_base), branch)
         } else {
             (None, branch)
         }
@@ -3639,7 +2276,7 @@ async fn pagerank_api_handler(
                 "{}/{}/blob/{}/{}",
                 source_base.trim_end_matches('/'),
                 clean_repo_name,
-                &source_branch,
+                source_branch,
                 repo_relative
             );
             entity.source_url = Some(url.clone());
@@ -3655,7 +2292,7 @@ async fn pagerank_api_handler(
             let raw_file_hint = file_hint_for_entity(&ent);
             let file_hint = clean_file_path(&raw_file_hint);
             obj.insert("file".to_string(), serde_json::Value::String(file_hint));
-            let doc_html = ent.doc.as_ref().map(|d| render_markdown_to_html(d));
+            let doc_html = ent.doc.as_ref().map(|d| utils::render_markdown_to_html(d));
             obj.insert(
                 "doc_html".to_string(),
                 match doc_html {
@@ -3668,6 +2305,171 @@ async fn pagerank_api_handler(
     }
 
     Ok(Json(out))
+}
+
+async fn construct_source_url(
+    state: &AppState,
+    repo_name: &str,
+    file_path: &str,
+    uuid_repo_name: Option<&str>,
+) -> Option<String> {
+    // Clean the repo_name to remove UUID suffix if present
+    let clean_repo_name = utils::remove_uuid_suffix(repo_name);
+
+    log::debug!(
+        "construct_source_url: repo_name='{}', clean_repo_name='{}', uuid_repo_name='{:?}', file_path='{}'",
+        repo_name,
+        clean_repo_name,
+        uuid_repo_name,
+        file_path
+    );
+
+    // Query the repo table for the git_url and branch
+    #[derive(Deserialize)]
+    struct RepoRow {
+        git_url: String,
+        branch: Option<String>,
+    }
+
+    let mut query_parts = vec!["SELECT git_url, branch FROM repo WHERE".to_string()];
+    let mut bindings = vec![];
+
+    // Always include clean_name
+    query_parts.push("name = $clean_name".to_string());
+    bindings.push(("clean_name", clean_repo_name.clone()));
+
+    // Include original_name if different
+    if repo_name != clean_repo_name {
+        query_parts.push("OR name = $original_name".to_string());
+        bindings.push(("original_name", repo_name.to_string()));
+    }
+
+    // Include uuid_repo_name if provided
+    if let Some(uuid_name) = uuid_repo_name {
+        query_parts.push("OR name = $uuid_name".to_string());
+        bindings.push(("uuid_name", uuid_name.to_string()));
+    }
+
+    query_parts.push("LIMIT 1".to_string());
+    let query_sql = query_parts.join(" ");
+
+    if let Ok(mut res) = match state.db.connection().as_ref() {
+        SurrealConnection::Local(db_conn) => {
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
+        }
+        SurrealConnection::RemoteHttp(db_conn) => {
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
+        }
+        SurrealConnection::RemoteWs(db_conn) => {
+            let mut query = db_conn.query(&query_sql);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
+            }
+            query.await
+        }
+    } {
+        if let Ok(rows) = res.take::<Vec<RepoRow>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                log::debug!(
+                    "construct_source_url: Found repo row: git_url='{}', branch='{:?}'",
+                    r.git_url,
+                    r.branch
+                );
+                if let Some(normalized_base) = utils::normalize_git_url(&r.git_url) {
+                    log::debug!(
+                        "construct_source_url: Normalized git_url to '{}'",
+                        normalized_base
+                    );
+                    let branch = r
+                        .branch
+                        .or_else(|| std::env::var("SOURCE_BRANCH").ok())
+                        .unwrap_or_else(|| "main".to_string());
+
+                    // Use helper to compute repo-relative path
+                    let repo_relative = utils::repo_relative_from_file(file_path, &clean_repo_name);
+                    log::debug!(
+                        "construct_source_url: Repo-relative path: '{}'",
+                        repo_relative
+                    );
+
+                    let base = normalized_base.trim_end_matches('/');
+                    let url = if base.ends_with(&format!("/{}", clean_repo_name)) {
+                        // normalized_base already includes the repo path (owner/repo),
+                        // avoid appending the repo name again.
+                        format!("{}/blob/{}/{}", base, branch, repo_relative)
+                    } else {
+                        format!(
+                            "{}/{}/blob/{}/{}",
+                            base, clean_repo_name, branch, repo_relative
+                        )
+                    };
+                    log::debug!("construct_source_url: Constructed URL: '{}'", url);
+                    return Some(url);
+                } else {
+                    log::warn!(
+                        "construct_source_url: Failed to normalize git_url '{}'",
+                        r.git_url
+                    );
+                }
+            } else {
+                log::warn!(
+                    "construct_source_url: No repo row found for query: {}",
+                    query_sql
+                );
+            }
+        } else {
+            log::error!("construct_source_url: Failed to parse repo query result");
+        }
+    } else {
+        log::error!("construct_source_url: Repo query failed");
+    }
+
+    // Fallback to default values (no env vars for base URL to avoid issues with multiple repos)
+    log::warn!(
+        "construct_source_url: Using fallback for repo '{}'",
+        clean_repo_name
+    );
+    let source_base = "https://github.com".to_string();
+    let source_branch = std::env::var("SOURCE_BRANCH").unwrap_or_else(|_| "main".to_string());
+    // Clean and compute repo-relative path similar to the DB-backed branch above
+    let normalized_file = utils::clean_file_path(file_path);
+    let parts: Vec<&str> = normalized_file
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut repo_relative = if parts.len() > 1 {
+        parts[1..].join("/")
+    } else {
+        normalized_file.clone()
+    };
+    for (i, p) in parts.iter().enumerate() {
+        if *p == clean_repo_name || p.starts_with(&format!("{}-", clean_repo_name)) {
+            repo_relative = if i + 1 < parts.len() {
+                parts[i + 1..].join("/")
+            } else {
+                String::new()
+            };
+            break;
+        }
+    }
+
+    let url = format!(
+        "{}/{}/blob/{}/{}",
+        source_base.trim_end_matches('/'),
+        clean_repo_name,
+        source_branch,
+        repo_relative
+    );
+    log::debug!("construct_source_url: Fallback URL: '{}'", url);
+    Some(url)
 }
 
 #[cfg(test)]
@@ -3711,14 +2513,14 @@ mod tests {
 
         // Insert a repo row into the in-memory SurrealDB to test DB-backed resolution
         let insert_q = "CREATE repo SET name = 'gpt-researcher', git_url = 'git@github.com:assafelovic/gpt-researcher.git', branch = 'dev'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
@@ -3743,14 +2545,14 @@ mod tests {
 
         // Insert a GitLab HTTP repo row with branch specified
         let insert_q = "CREATE repo SET name = 'gl-repo', git_url = 'https://gitlab.com/owner/gl-repo.git', branch = 'feature'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
@@ -3775,14 +2577,14 @@ mod tests {
 
         // Insert a repo row without branch -> should default to main
         let insert_q = "CREATE repo SET name = 'repo-no-branch', git_url = 'https://github.com/owner/repo-no-branch.git'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
@@ -3831,14 +2633,14 @@ mod tests {
 
         // Insert a repo row whose git_url is a local path (not convertible)
         let insert_q = "CREATE repo SET name = 'local-repo', git_url = 'file:///home/repos/local-repo', branch = 'dev'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
@@ -3872,14 +2674,14 @@ mod tests {
         let state = make_state().await;
 
         let insert_q = "CREATE repo SET name = 'gl-ssh', git_url = 'git@gitlab.com:owner/gl-ssh.git', branch = 'feat'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
@@ -3899,21 +2701,21 @@ mod tests {
         let state = make_state().await;
 
         let insert_q = "CREATE repo SET name = 'empty-url', git_url = ''";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }
 
         std::env::remove_var("SOURCE_BASE_URL");
         std::env::remove_var("SOURCE_BRANCH");
-        std::env::set_var("SOURCE_BASE_URL", "https://fallback.example");
+        std::env::set_var("SOURCE_BASE_URL", "https://example.com");
 
         let repo_name = "empty-url";
         let file_path = "/tmp/hyperzoekt-clones/uuid/empty-url/src/lib.rs";
@@ -3929,14 +2731,14 @@ mod tests {
         let state = make_state().await;
 
         let insert_q = "CREATE repo SET name = 'branch-slash', git_url = 'https://github.com/owner/branch-slash.git', branch = 'feature/new-thing'";
-        match &*state.db.db {
-            SurrealConnection::Local(db_conn) => {
+        match &**state.db.connection() {
+            hyperzoekt::db::connection::SurrealConnection::Local(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteHttp(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteHttp(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
-            SurrealConnection::RemoteWs(db_conn) => {
+            hyperzoekt::db::connection::SurrealConnection::RemoteWs(db_conn) => {
                 db_conn.query(insert_q).await.expect("insert repo");
             }
         }

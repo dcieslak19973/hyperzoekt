@@ -20,7 +20,7 @@ pub mod repo_index;
 pub use repo_index::RepoIndexService;
 
 // Shared modules for binaries
-pub mod db_writer;
+pub mod db;
 pub mod event_consumer;
 pub mod graph_api;
 pub mod index;

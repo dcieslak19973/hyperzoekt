@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Integration test: run full RepoIndexService build on fixture repo and persist to SurrealDB (remote if available)
+// Integration test: run full RepoIndexService build on fixture repo and persist entities with call relationships to SurrealDB (remote if available)
 // Skips if SurrealDB not reachable on SURREAL_TEST_HTTP_URL or localhost:8000.
 
-use hyperzoekt::db_writer::connection::connect;
-use hyperzoekt::db_writer::{spawn_db_writer, DbWriterConfig};
+use hyperzoekt::db::connection::connect;
+use hyperzoekt::db::{spawn_db_writer, DbWriterConfig};
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
 use hyperzoekt::repo_index::RepoIndexService;
 use std::time::Duration;
@@ -39,7 +39,7 @@ fn remote_url() -> Option<String> {
 }
 
 #[tokio::test]
-async fn full_index_persists_minimum_entities() {
+async fn full_index_persists_entities_with_call_relationships() {
     // Attempt remote url; if not configured/allowed, skip the test.
     let url = match remote_url() {
         Some(u) => {
@@ -146,9 +146,6 @@ async fn full_index_persists_minimum_entities() {
     if std::env::var("HZ_KEEP_TEST_DB").ok().as_deref() != Some("1") {
         let _ = conn.query("BEGIN;").await; // Start transaction
         let _ = conn.query("DELETE repo WHERE name = 'fixture_repo';").await;
-        let _ = conn.query("DELETE dependency WHERE name = 'serde';").await;
-        let _ = conn.query("DELETE repo_dependency_rel;").await;
-        let _ = conn.query("DELETE dependency_repo_rel;").await;
         let _ = conn
             .query("DELETE entity WHERE repo_name = 'fixture_repo';")
             .await;
@@ -162,48 +159,7 @@ async fn full_index_persists_minimum_entities() {
     let (_svc, stats) = RepoIndexService::build(root).expect("build index");
     assert!(stats.files_indexed > 0, "fixture should index some files");
 
-    // Persist a subset: create repo + dependencies; then exercise writer pipeline for call edges.
-    let repo_name = "fixture_repo";
-    let git_url = "git://example/fixture_repo.git";
-
-    // Add a minimal dependency list so we can validate depends_on edges.
-    let deps = vec![hyperzoekt::repo_index::deps::Dependency {
-        name: "serde".into(),
-        version: Some("1.0.0".into()),
-        language: "rust".into(),
-    }];
-
-    if diag_enabled() {
-        eprintln!(
-            "LOG: About to call persist_repo_dependencies_with_connection with {} deps",
-            deps.len()
-        );
-    }
-    if let Err(e) = hyperzoekt::db_writer::persist_repo_dependencies_with_connection(
-        &conn, repo_name, git_url, None, None, None, None, &deps,
-    )
-    .await
-    {
-        // Permissions? Skip instead of fail hard.
-        if e.to_string().contains("IAM error") || e.to_string().contains("permission") {
-            eprintln!("Skipping: insufficient permissions to persist repo: {}", e);
-            return;
-        } else {
-            panic!("persist repo failed: {}", e);
-        }
-    }
-    if diag_enabled() {
-        eprintln!("LOG: persist_repo_dependencies_with_connection completed successfully");
-    }
-
-    // No need for transaction management since we're using the same connection
-    if diag_enabled() {
-        eprintln!("LOG: Starting dependency validation (same connection)...");
-    }
-
-    // (Removed flaky fixture entity presence validation; synthetic entities below exercise relationships.)
-
-    // Now exercise the full writer pipeline for relationship (calls) edges using two synthetic entities.
+    // Exercise the full writer pipeline for relationship (calls) edges using two synthetic entities.
     // Pre-create relation tables for calls/imports to avoid permission or implicit creation races.
     let _ = conn
         .query("DEFINE TABLE calls TYPE RELATION; CREATE TABLE calls; DEFINE TABLE imports TYPE RELATION; CREATE TABLE imports;")
@@ -221,7 +177,9 @@ async fn full_index_persists_minimum_entities() {
         initial_batch: false,
         ..Default::default()
     };
+    let repo_name = "fixture_repo";
     let callee = EntityPayload {
+        id: "callee_fn_id".into(),
         language: "rust".into(),
         kind: "function".into(),
         name: "callee_fn".into(),
@@ -235,6 +193,7 @@ async fn full_index_persists_minimum_entities() {
         unresolved_imports: vec![],
         stable_id: "callee_fn_id".into(),
         repo_name: repo_name.into(),
+        file: Some("callee.rs".into()),
         source_url: None,
         source_display: None,
         calls: vec![],
@@ -242,6 +201,7 @@ async fn full_index_persists_minimum_entities() {
         source_content: None,
     };
     let caller = EntityPayload {
+        id: "caller_fn_id".into(),
         language: "rust".into(),
         kind: "function".into(),
         name: "caller_fn".into(),
@@ -255,6 +215,7 @@ async fn full_index_persists_minimum_entities() {
         unresolved_imports: vec![],
         stable_id: "caller_fn_id".into(),
         repo_name: repo_name.into(),
+        file: Some("caller.rs".into()),
         source_url: None,
         source_display: None,
         calls: vec!["callee_fn".into()],
@@ -306,158 +267,6 @@ async fn full_index_persists_minimum_entities() {
         repo_found,
         "fixture_repo should be persisted (count() never > 0)"
     );
-
-    // Validate dependency row exists (reduced polling since same connection)
-    let mut dep_rows: Vec<serde_json::Value> = Vec::new();
-    for attempt in 0..10 {
-        // Reduced from 50 to 10 attempts
-        let mut dep_sel = conn
-            .query(
-                "SELECT id, name, language, version FROM dependency WHERE name = 'serde' LIMIT 1;",
-            )
-            .await
-            .expect("select dependency");
-        dep_rows = dep_sel.take(0).unwrap_or_default();
-        if !dep_rows.is_empty() {
-            if diag_enabled() {
-                eprintln!("LOG: Found dependency 'serde' on attempt {}", attempt + 1);
-            }
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await; // Reduced from 100ms to 20ms
-        if attempt == 9 {
-            // Changed from 49 to 9
-            // Dump whole table for diagnostics
-            if let Ok(mut dump) = conn
-                .query("SELECT id, name, language, version FROM dependency;")
-                .await
-            {
-                let all: Vec<serde_json::Value> = dump.take(0).unwrap_or_default();
-                if diag_enabled() {
-                    eprintln!(
-                        "dependency table dump: {}",
-                        serde_json::to_string_pretty(&all).unwrap_or_default()
-                    );
-                }
-            }
-        }
-    }
-    if dep_rows.is_empty() {
-        if diag_enabled() {
-            eprintln!(
-                "dependency 'serde' missing after polling; attempting manual create fallback"
-            );
-        }
-        let _ = conn
-            .query(
-                "CREATE dependency CONTENT { name: 'serde', language: 'rust', version: '1.0.0' };",
-            )
-            .await;
-        if let Ok(mut second) = conn
-            .query("SELECT id, name FROM dependency WHERE name='serde' LIMIT 1;")
-            .await
-        {
-            dep_rows = second.take(0).unwrap_or_default();
-        }
-    }
-    let mut dependency_verified = true;
-    if dep_rows.is_empty() {
-        if diag_enabled() {
-            eprintln!("dependency validation skipped: unable to create or read 'serde'");
-        }
-        dependency_verified = false;
-    }
-    let dep_id_str = dep_rows
-        .first()
-        .and_then(|r| r.get("id").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    // Validate depends_on edge via traversal (repo -> dependency) and reverse required_by edge (dependency -> repo)
-    if dependency_verified {
-        // Forward traversal
-        let mut dep_trav = conn
-            .query("SELECT ->dependency.name AS dep_names FROM repo WHERE name = 'fixture_repo' LIMIT 1;")
-            .await
-            .expect("dependency traversal");
-        let trav_rows: Vec<serde_json::Value> = dep_trav.take(0).unwrap_or_default();
-        if trav_rows.is_empty() {
-            if diag_enabled() {
-                eprintln!("dependency traversal empty; edge may be missing");
-            }
-            dependency_verified = false;
-        } else {
-            // Use normalization helper to extract dep_names robustly
-            let dep_names = hyperzoekt::test_utils::collect_field_ids(&trav_rows, "dep_names");
-            if !dep_names.iter().any(|s| s.contains("serde")) {
-                if diag_enabled() {
-                    eprintln!(
-                        "'serde' not found in dependency traversal list: {:?}",
-                        dep_names
-                    );
-                }
-                dependency_verified = false;
-            }
-        }
-        // Reverse traversal: dependency -> required_by -> repo
-        if dependency_verified {
-            let mut rev_trav = conn
-                .query("SELECT <-repo.name AS repos FROM dependency WHERE name = 'serde' LIMIT 1;")
-                .await
-                .expect("reverse dependency traversal");
-            let rev_rows: Vec<serde_json::Value> = rev_trav.take(0).unwrap_or_default();
-            if rev_rows.is_empty() {
-                if diag_enabled() {
-                    eprintln!("reverse dependency traversal empty; reverse edge may be missing");
-                }
-                dependency_verified = false;
-            } else {
-                let repo_names = hyperzoekt::test_utils::collect_field_ids(&rev_rows, "repos");
-                if !repo_names.iter().any(|s| s.contains("fixture_repo")) {
-                    if diag_enabled() {
-                        eprintln!(
-                            "fixture_repo not found in reverse dependency traversal list: {:?}",
-                            repo_names
-                        );
-                    }
-                    dependency_verified = false;
-                }
-            }
-        }
-    }
-
-    // Verify the dependency relationship using traversal queries and normalization
-    // helpers; avoid relying on an explicit `depends_on` relation table or
-    // brittle direct table deserialization across different Surreal client shapes.
-    if dependency_verified {
-        let mut edge_ok = false;
-        for _ in 0..15 {
-            if let Ok(mut edges) = conn
-                .query("SELECT ->dependency FROM repo WHERE name = 'fixture_repo';")
-                .await
-            {
-                let erows: Vec<serde_json::Value> = edges.take(0).unwrap_or_default();
-                if erows.is_empty() {
-                    // Traversal returned empty rows; give the writer some credit and
-                    // continue polling briefly to tolerate races.
-                } else {
-                    // Normalize in/out ids
-                    let ins = hyperzoekt::test_utils::collect_field_ids(&erows, "in");
-                    let outs = hyperzoekt::test_utils::collect_field_ids(&erows, "out");
-                    if ins.iter().any(|i| i.contains("repo:"))
-                        && outs.iter().any(|o| o == &dep_id_str || o.contains("serde"))
-                    {
-                        edge_ok = true;
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-        if !edge_ok {
-            eprintln!("dependency relationship missing via traversal; writer evidence or later retries may still show it (non-fatal for this test)");
-        }
-    }
 
     // Check calls table for the expected relationship. Use a broad SELECT to avoid
     // query-shape differences across Surreal client instances.

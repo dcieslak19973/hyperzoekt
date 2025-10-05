@@ -34,12 +34,12 @@ struct RepoSummaryQueryResult {
 
 #[derive(Clone)]
 struct TestDatabase {
-    db: std::sync::Arc<hyperzoekt::db_writer::connection::SurrealConnection>,
+    db: std::sync::Arc<hyperzoekt::db::connection::SurrealConnection>,
 }
 
 impl TestDatabase {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        use hyperzoekt::db_writer::connection::connect;
+        use hyperzoekt::db::connection::connect;
         // Ensure tests use the embedded in-memory SurrealDB even if
         // SURREALDB_URL is set in the environment. Use an ephemeral Mem
         // instance per-test to avoid shared state across concurrently or

@@ -1,0 +1,187 @@
+{% extends "base" %}
+
+{% block title %}SBOMs - HyperZoekt{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h3>🧾 Software Bill of Materials (SBOM)</h3>
+    </div>
+    <div class="card-body">
+        <div style="margin-bottom:1rem; display:flex; gap:8px; align-items:center;">
+            <label for="sbom-repo-input">Repository (select one):</label>
+            <div id="sbom-repo-multiselect" class="search-input"
+                style="position:relative; padding:6px; background:var(--input-bg); border-radius:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-height:40px;">
+                <div id="sbom-dep-tags" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
+                <input id="sbom-repo-input" placeholder="Type to search repositories..."
+                    style="border:none; background:transparent; outline:none; flex:1; min-width:160px; padding:6px;">
+                <div id="sbom-dep-repo-options"
+                    style="position:absolute; left:6px; right:6px; top:46px; max-height:220px; overflow:auto; background:var(--panel); border:1px solid var(--input-border); border-radius:6px; display:none; z-index:50;">
+                </div>
+            </div>
+            <label for="sbom-ref" style="font-size:12px; color:var(--muted); margin-left:6px;">Ref</label>
+            <input id="sbom-ref" type="text" placeholder="branch/tag/commit (optional)" class="input"
+                style="width:220px;" />
+            <button id="sbom-load" class="btn">Load SBOM</button>
+        </div>
+
+        <div id="sbom-error" style="display:none; color:#b91c1c; margin-bottom:1rem;">Failed to load SBOM.</div>
+
+        <div id="sbom-results" style="margin-top:1rem;">
+            <div style="margin-top:8px; display:flex; align-items:flex-start; gap:8px;">
+                <div style="flex:1;">
+                    <div id="sbom-toolbar" style="display:flex; gap:8px; margin-bottom:8px;">
+                        <button id="sbom-copy" class="btn" title="Copy SBOM to clipboard">Copy</button>
+                        <button id="sbom-download" class="btn" title="Download SBOM as file">Download</button>
+                        <button id="sbom-toggle-raw" class="btn" title="Toggle raw/plain view">Raw</button>
+                    </div>
+                    <!-- Highlight.js styles and script (CDN) -->
+                    <link rel="stylesheet"
+                        href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github-dark.min.css">
+                    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+
+                    <pre id="sbom-blob-content"
+                        style="font-family:monospace; font-size:13px; line-height:1.5; background:#0d1117; color:#c9d1d9; padding:12px; border-radius:6px; max-height:70vh; overflow:auto; border:1px solid rgba(255,255,255,0.04);">
+                        <code id="sbom-blob-content-code" class="language-json" style="display:block; white-space:pre;">
+                            <!-- SBOM content will be shown here -->
+                        </code>
+                    </pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+    import { createMultiselect } from '/static/common/multiselect.js';
+    (function () {
+        const multiselect = createMultiselect({ inputId: 'sbom-repo-input', tagsId: 'sbom-dep-tags', optionsContainerId: 'sbom-dep-repo-options', storageKey: 'hz_recent_repos' });
+        // Wrap multiselect to enforce single selection
+        const singleSelect = {
+            getSelected: () => {
+                const s = multiselect.getSelected();
+                return s.length ? [s[0]] : [];
+            },
+            addSingle: (v) => {
+                // remove any existing selections
+                const cur = multiselect.getSelected();
+                for (const c of cur) {
+                    multiselect.remove(c);
+                }
+                multiselect.add(v);
+            }
+        };
+
+        const refInput = document.getElementById('sbom-ref');
+        const loadBtn = document.getElementById('sbom-load');
+        const error = document.getElementById('sbom-error');
+        const tbody = document.querySelector('#sbom-table tbody');
+
+        const codeEl = document.getElementById('sbom-blob-content-code');
+        const preEl = document.getElementById('sbom-blob-content');
+        const copyBtn = document.getElementById('sbom-copy');
+        const downloadBtn = document.getElementById('sbom-download');
+        const toggleRawBtn = document.getElementById('sbom-toggle-raw');
+        let lastRawText = '';
+        let lastPretty = true;
+
+        function highlightCode() {
+            try {
+                if (window.hljs && typeof window.hljs.highlightElement === 'function') {
+                    window.hljs.highlightElement(codeEl);
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        copyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(codeEl.innerText || '');
+                const old = copyBtn.textContent;
+                copyBtn.textContent = 'Copied!';
+                setTimeout(() => copyBtn.textContent = old, 1500);
+            } catch (e) {
+                console.error('Copy failed', e);
+                alert('Copy failed: ' + e.message);
+            }
+        });
+
+        downloadBtn.addEventListener('click', () => {
+            try {
+                const blob = new Blob([lastRawText || codeEl.innerText || ''], { type: 'application/json;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'sbom.json';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                console.error('Download failed', e);
+                alert('Download failed: ' + e.message);
+            }
+        });
+
+        toggleRawBtn.addEventListener('click', () => {
+            // toggle between pretty (json) and raw text
+            lastPretty = !lastPretty;
+            if (lastPretty) {
+                // attempt to pretty-print
+                try {
+                    const parsed = JSON.parse(lastRawText);
+                    codeEl.textContent = JSON.stringify(parsed, null, 2);
+                    codeEl.classList.add('language-json');
+                } catch (e) {
+                    codeEl.textContent = lastRawText || '(empty)';
+                    codeEl.classList.remove('language-json');
+                }
+            } else {
+                codeEl.textContent = lastRawText || '(empty)';
+                codeEl.classList.remove('language-json');
+            }
+            highlightCode();
+            toggleRawBtn.textContent = lastPretty ? 'Raw' : 'Pretty';
+        });
+
+        async function loadSbom() {
+            error.style.display = 'none';
+            const repos = singleSelect.getSelected();
+            const ref = refInput.value.trim();
+            if (!repos.length) return alert('Please select a repository');
+            const repo = encodeURIComponent(repos[0]);
+            const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+            try {
+                const res = await fetch(`/api/repo/${repo}/sbom/blob${qs}`);
+                if (!res.ok) {
+                    throw new Error('HTTP ' + res.status);
+                }
+                const text = await res.text();
+                // store raw text for copy/download and toggling
+                lastRawText = text || '';
+                // Attempt to parse JSON and pretty-print, otherwise show raw
+                try {
+                    const parsed = JSON.parse(text);
+                    codeEl.textContent = JSON.stringify(parsed, null, 2);
+                    codeEl.classList.add('language-json');
+                    lastPretty = true;
+                    toggleRawBtn.textContent = 'Raw';
+                } catch (e) {
+                    codeEl.textContent = text || '(empty)';
+                    codeEl.classList.remove('language-json');
+                    lastPretty = false;
+                    toggleRawBtn.textContent = 'Pretty';
+                }
+                highlightCode();
+            } catch (e) {
+                console.error('Failed to fetch SBOM blob', e);
+                error.style.display = 'block';
+            }
+        }
+
+        loadBtn.addEventListener('click', () => loadSbom());
+    })();
+</script>
+
+{% endblock %}

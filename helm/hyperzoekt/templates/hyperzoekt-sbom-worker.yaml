@@ -1,26 +1,26 @@
-{{- if .Values.hyperzoektIndexer.enabled }}
+{{- if .Values.hyperzoektSbomWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-indexer
+  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-sbom-worker
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: hyperzoekt-indexer
-  {{- with .Values.hyperzoektIndexer.annotations }}
+    app.kubernetes.io/component: hyperzoekt-sbom-worker
+  {{- with .Values.hyperzoektSbomWorker.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ .Values.hyperzoektIndexer.replicaCount }}
+  replicas: {{ .Values.hyperzoektSbomWorker.replicaCount }}
   selector:
     matchLabels:
       {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: hyperzoekt-indexer
+      app.kubernetes.io/component: hyperzoekt-sbom-worker
   template:
     metadata:
       labels:
         {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: hyperzoekt-indexer
+        app.kubernetes.io/component: hyperzoekt-sbom-worker
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -28,13 +28,13 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "hyperzoekt.serviceAccountName" . }}
       containers:
-        - name: hyperzoekt-indexer
-          image: {{ .Values.hyperzoektIndexer.image.registry }}/{{ .Values.hyperzoektIndexer.image.repository }}:{{ .Values.hyperzoektIndexer.image.tag }}
-          imagePullPolicy: {{ .Values.hyperzoektIndexer.image.pullPolicy }}
-          command: ["/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", {{ .Values.hyperzoektIndexer.service.port | quote }}]
+        - name: hyperzoekt-sbom-worker
+          image: {{ .Values.hyperzoektSbomWorker.image.registry }}/{{ .Values.hyperzoektSbomWorker.image.repository }}:{{ .Values.hyperzoektSbomWorker.image.tag }}
+          imagePullPolicy: {{ .Values.hyperzoektSbomWorker.image.pullPolicy }}
+          command: ["/app/hyperzoekt-sbom-worker", "--host", "0.0.0.0", "--port", "{{ .Values.hyperzoektSbomWorker.service.port }}"]
           ports:
             - name: http
-              containerPort: {{ .Values.hyperzoektIndexer.service.port }}
+              containerPort: {{ .Values.hyperzoektSbomWorker.service.port }}
               protocol: TCP
           readinessProbe:
             httpGet:
@@ -61,45 +61,42 @@ spec:
               value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
             - name: SURREAL_DB
               value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
-            - name: HZ_ENABLE_EMBED_JOBS
-              value: {{ ternary "1" "0" (default true .Values.hyperzoektIndexer.enableEmbedJobs) | quote }}
-            - name: HZ_ENABLE_SBOM_JOBS
-              value: {{ ternary "1" "0" (default true .Values.hyperzoektIndexer.enableSbomJobs) | quote }}
-            {{- with .Values.hyperzoektIndexer.env }}
+            {{- with .Values.hyperzoektSbomWorker.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml .Values.hyperzoektIndexer.resources | nindent 12 }}
-      {{- with .Values.hyperzoektIndexer.nodeSelector }}
+            {{- toYaml .Values.hyperzoektSbomWorker.resources | nindent 12 }}
+      {{- with .Values.hyperzoektSbomWorker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.hyperzoektIndexer.tolerations }}
+      {{- with .Values.hyperzoektSbomWorker.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.hyperzoektIndexer.affinity }}
+      {{- with .Values.hyperzoektSbomWorker.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
+
 ---
-{{- if and .Values.hyperzoektIndexer.enabled (eq .Values.hyperzoektIndexer.exposure.type "service") }}
+{{- if and .Values.hyperzoektSbomWorker.enabled (eq .Values.hyperzoektSbomWorker.exposure.type "service") }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-indexer
+  name: {{ include "hyperzoekt.fullname" . }}-hyperzoekt-sbom-worker
   labels:
     {{- include "hyperzoekt.labels" . | nindent 4 }}
-    app.kubernetes.io/component: hyperzoekt-indexer
+    app.kubernetes.io/component: hyperzoekt-sbom-worker
 spec:
-  type: {{ .Values.hyperzoektIndexer.exposure.serviceType }}
+  type: {{ .Values.hyperzoektSbomWorker.exposure.serviceType }}
   ports:
-    - port: {{ .Values.hyperzoektIndexer.service.port }}
+    - port: {{ .Values.hyperzoektSbomWorker.service.port }}
       targetPort: http
       protocol: TCP
       name: http
   selector:
     {{- include "hyperzoekt.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: hyperzoekt-indexer
+    app.kubernetes.io/component: hyperzoekt-sbom-worker
 {{- end }}

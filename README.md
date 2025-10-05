@@ -87,6 +87,12 @@ Env vars:
 - `HZ_WEBUI_BASE`: base URL for WebUI (used to proxy dupes; default `http://127.0.0.1:7878` or your WebUI host)
 - `HZ_TEI_BASE`: TEI embeddings endpoint base (e.g. `http://127.0.0.1:8088` or `http://tei:80`)
 - `HZ_EMBED_MODEL`: embedding model id (e.g. `jinaai/jina-embeddings-v2-base-code`)
+- `HZ_ENABLE_EMBED_SIMILARITY`: enable similarity computation (default: false)
+- `HZ_SIMILARITY_THRESHOLD_SAME_REPO`: minimum similarity score for same-repo matches (default: 0.90)
+- `HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO`: minimum similarity score for external-repo matches (default: 0.95)
+- `HZ_SIMILARITY_MAX_SAME_REPO`: maximum similar entities to find within same repo (default: 25)
+- `HZ_SIMILARITY_MAX_EXTERNAL_REPO`: maximum similar entities to find across repos (default: 50)
+- `HZ_SIMILARITY_MIN_SOURCE_CHARS`: minimum source content length to consider (default: 100)
 - Optional: `HZ_SIMSEARCH_TOPK` (default 50), `HZ_SIMSEARCH_SAMPLE` (default 3000)
 
 Run locally:

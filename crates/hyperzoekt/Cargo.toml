@@ -53,6 +53,7 @@ zoekt-distributed = { path = "../zoekt-distributed" }
 "zoekt-rs" = { path = "../zoekt-rs" }
 ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http"] }
 async-trait = "0.1"
+tempfile = "3"
 
 # Web UI dependencies
 axum = { version = "0.8", features = ["json", "query"] }
@@ -60,6 +61,7 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 minijinja = "1.0"
 url = "2"
+base64 = "0.22"
 
 # For timestamps used when creating repo records
 chrono = { version = "0.4", features = ["serde"] }
@@ -100,8 +102,6 @@ path = "src/bin/hyperzoekt-indexer.rs"
 name = "hyperzoekt-webui"
 path = "src/bin/hyperzoekt-webui.rs"
 
- 
-
 [[bin]]
 name = "hyperzoekt-embed-worker"
 path = "src/bin/hyperzoekt-embed-worker.rs"
@@ -110,4 +110,6 @@ path = "src/bin/hyperzoekt-embed-worker.rs"
 name = "hyperzoekt-mcp"
 path = "src/bin/hyperzoekt-mcp.rs"
 
-
+[[bin]]
+name = "hyperzoekt-sbom-worker"
+path = "src/bin/hyperzoekt-sbom-worker.rs"

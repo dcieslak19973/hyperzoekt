@@ -11,7 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use hyperzoekt::graph_api::{fetch_entity_graph, GraphDbConfig};
+use hyperzoekt::db::connection::SurrealConnection;
+use hyperzoekt::graph_api::fetch_entity_graph_with_conn;
 use std::env;
 
 // Integration test: write two entities (caller + callee) via db_writer, then fetch graph via public API.
@@ -22,7 +23,7 @@ async fn graph_api_returns_call_edges_after_indexing() {
     let ns = env::var("SURREAL_NS").unwrap_or_else(|_| "graph_call_ns".into());
     let dbn = env::var("SURREAL_DB").unwrap_or_else(|_| "graph_call_db".into());
 
-    use hyperzoekt::db_writer::connection::connect;
+    use hyperzoekt::db::connection::connect;
     // Connect to remote SurrealDB; skip test if unreachable to avoid CI flakes.
     let surreal_url = match env::var("SURREALDB_URL") {
         Ok(u) => {
@@ -40,8 +41,8 @@ async fn graph_api_returns_call_edges_after_indexing() {
     };
     let db = match connect(
         &Some(surreal_url.clone()),
-        &None,
-        &None,
+        &Some("root".into()),
+        &Some("root".into()),
         ns.as_str(),
         dbn.as_str(),
     )
@@ -59,12 +60,18 @@ async fn graph_api_returns_call_edges_after_indexing() {
     // Define schema and ensure a clean starting state for this test by deleting
     // any pre-existing entities/relations for these deterministic stable ids.
     db.query(
-        "DEFINE TABLE entity SCHEMALESS; DEFINE TABLE calls TYPE RELATION FROM entity TO entity;",
+        "DEFINE TABLE entity SCHEMALESS; DEFINE TABLE entity_snapshot SCHEMALESS; DEFINE TABLE calls TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
     )
     .await
     .ok();
     // Remove any previous test data that may exist in a shared test DB
-    db.query("DELETE FROM calls WHERE in = entity:caller_stable AND out = entity:callee_stable;")
+    db.query("DELETE FROM calls WHERE in = entity_snapshot:caller_stable AND out = entity_snapshot:callee_stable;")
+        .await
+        .ok();
+    db.query("DELETE FROM entity_snapshot:caller_stable;")
+        .await
+        .ok();
+    db.query("DELETE FROM entity_snapshot:callee_stable;")
         .await
         .ok();
     db.query("DELETE FROM entity:caller_stable;").await.ok();
@@ -76,21 +83,25 @@ async fn graph_api_returns_call_edges_after_indexing() {
     db.query("CREATE entity:caller_stable SET stable_id='caller_stable', name='do_caller', file='r/f.rs', language='rust', kind='function', start_line=1, end_line=2, imports=[], unresolved_imports=[], repo_name='r'; CREATE entity:callee_stable SET stable_id='callee_stable', name='do_callee', file='r/f.rs', language='rust', kind='function', start_line=3, end_line=4, imports=[], unresolved_imports=[], repo_name='r';")
         .await
         .expect("create entities");
-    db.query("RELATE entity:caller_stable->calls->entity:callee_stable;")
+    db.query("CREATE entity_snapshot:caller_stable SET stable_id='caller_stable', name='do_caller', file='r/f.rs', language='rust', kind='function', start_line=1, end_line=2, imports=[], unresolved_imports=[], repo_name='r'; CREATE entity_snapshot:callee_stable SET stable_id='callee_stable', name='do_callee', file='r/f.rs', language='rust', kind='function', start_line=3, end_line=4, imports=[], unresolved_imports=[], repo_name='r';")
+        .await
+        .expect("create entity_snapshots");
+    db.query("RELATE entity_snapshot:caller_stable->calls->entity_snapshot:callee_stable;")
         .await
         .expect("relate call");
 
     // Do not set SHARED_MEM for remote connections
-    let graph_cfg = GraphDbConfig {
-        surreal_url: Some(surreal_url.clone()),
-        surreal_ns: ns,
-        surreal_db: dbn,
-        surreal_username: None,
-        surreal_password: None,
-    };
-    let g_caller = fetch_entity_graph(&graph_cfg, "caller_stable", 10)
-        .await
-        .expect("fetch caller graph");
+    // Use the same connection for fetch to avoid memory DB isolation
+    let g_caller = match db {
+        SurrealConnection::RemoteHttp(ref c) => {
+            fetch_entity_graph_with_conn(c, "caller_stable", 10).await
+        }
+        SurrealConnection::RemoteWs(ref c) => {
+            fetch_entity_graph_with_conn(c, "caller_stable", 10).await
+        }
+        _ => panic!("expected remote connection"),
+    }
+    .expect("fetch caller graph");
     assert_eq!(
         g_caller.callees.len(),
         1,
@@ -98,9 +109,16 @@ async fn graph_api_returns_call_edges_after_indexing() {
         g_caller
     );
     assert_eq!(g_caller.callees[0].name, "do_callee");
-    let g_callee = fetch_entity_graph(&graph_cfg, "callee_stable", 10)
-        .await
-        .expect("fetch callee graph");
+    let g_callee = match db {
+        SurrealConnection::RemoteHttp(ref c) => {
+            fetch_entity_graph_with_conn(c, "callee_stable", 10).await
+        }
+        SurrealConnection::RemoteWs(ref c) => {
+            fetch_entity_graph_with_conn(c, "callee_stable", 10).await
+        }
+        _ => panic!("expected remote connection"),
+    }
+    .expect("fetch callee graph");
     assert_eq!(
         g_callee.callers.len(),
         1,

@@ -1,9 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 
-use crate::{
-    db_writer::connection::SurrealConnection, repo_index::indexer::payload::EntityPayload,
-};
+use crate::{db::connection::SurrealConnection, repo_index::indexer::payload::EntityPayload};
 
 #[derive(serde::Deserialize)]
 struct TeiOut {
@@ -32,7 +30,9 @@ pub async fn embed_query(query_text: &str) -> Result<Vec<f32>> {
         model: &model,
         input: [query_text],
     })?;
-    let http = Client::builder().build()?;
+    let http = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
     let resp = http
         .post(&tei_endpoint)
         .header("content-type", "application/json")
@@ -140,7 +140,7 @@ pub async fn similarity_with_conn_multi(
 
     // If a snapshot_id is provided, sample candidate entity -> content mappings
     // from `entity_snapshot` for that snapshot, then fetch embeddings from
-    // `content_embedding` for the sampled content_ids. This ensures similarity
+    // `content` table for the sampled content_ids. This ensures similarity
     // sampling is scoped to a specific snapshot's contents.
     let scored = if let Some(sid) = snapshot_id {
         #[derive(serde::Deserialize)]
@@ -180,7 +180,7 @@ pub async fn similarity_with_conn_multi(
         }
 
         // Fetch embeddings for the sampled content_ids
-        let sql_ce = "SELECT id AS content_id, embedding FROM content_embedding WHERE id IN $ids AND embedding_len > 0".to_string();
+        let sql_ce = "SELECT id AS content_id, embedding FROM content WHERE id IN $ids AND embedding_len > 0".to_string();
         let mut resp_ce = conn
             .query_with_binds(&sql_ce, vec![("ids", serde_json::Value::Array(unique_ids))])
             .await?;
@@ -210,10 +210,8 @@ pub async fn similarity_with_conn_multi(
         }
         score_top_k(&query_embedding, &candidates, top_k)
     } else {
-        // Backwards-compatible sampling across entity embeddings (legacy path)
-        // Build SQL for sampling candidate embeddings. If repo_filters contains
-        // at least one repo name, use `repo_name IN $repos` bind. Otherwise sample
-        // across all entities with embeddings.
+        // Unified approach: use content table for all searches
+        // Build SQL for sampling candidate embeddings via content_id joins
         let (sql, binds): (String, Vec<(&'static str, serde_json::Value)>) = if let Some(rfs) =
             repo_filters
         {
@@ -231,7 +229,7 @@ pub async fn similarity_with_conn_multi(
                 );
                 (
                     format!(
-                        "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 AND repo_name IN $repos START AT 0 LIMIT {}",
+                        "SELECT stable_id, (SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0] AS embedding FROM entity WHERE content_id != '' AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] > 0 AND repo_name IN $repos START AT 0 LIMIT {}",
                         sample
                     ),
                     vec![("repos", bind_arr)],
@@ -239,7 +237,7 @@ pub async fn similarity_with_conn_multi(
             } else {
                 (
                     format!(
-                        "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
+                        "SELECT stable_id, (SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0] AS embedding FROM entity WHERE content_id != '' AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] > 0 START AT 0 LIMIT {}",
                         sample
                     ),
                     vec![],
@@ -248,7 +246,7 @@ pub async fn similarity_with_conn_multi(
         } else {
             (
                 format!(
-                    "SELECT stable_id, embedding FROM entity WHERE embedding_len > 0 START AT 0 LIMIT {}",
+                    "SELECT stable_id, (SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0] AS embedding FROM entity WHERE content_id != '' AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] > 0 START AT 0 LIMIT {}",
                     sample
                 ),
                 vec![],
