@@ -1,5 +1,5 @@
-use hyperzoekt::db_writer::connection::connect;
-use hyperzoekt::db_writer::connection::SurrealConnection;
+use hyperzoekt::db::connection::connect;
+use hyperzoekt::db::connection::SurrealConnection;
 use std::env;
 
 #[tokio::test]

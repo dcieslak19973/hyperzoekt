@@ -208,6 +208,7 @@ impl ToolHandler for DistributedSearchHandler {
                         let include = args.get("include").and_then(|v| v.as_str());
                         let exclude = args.get("exclude").and_then(|v| v.as_str());
                         let repo = args.get("repo").and_then(|v| v.as_str());
+                        let branch = args.get("branch").and_then(|v| v.as_str());
                         let max_results = args
                             .get("max_results")
                             .and_then(|v| v.as_u64())
@@ -239,6 +240,7 @@ impl ToolHandler for DistributedSearchHandler {
                             include: include.map(|s| s.to_string()),
                             exclude: exclude.map(|s| s.to_string()),
                             repo: repo.map(|s| s.to_string()),
+                            branch: branch.map(|s| s.to_string()),
                             max_results: Some(max_results),
                             context: Some(context),
                             case_sensitive: Some(case_sensitive),

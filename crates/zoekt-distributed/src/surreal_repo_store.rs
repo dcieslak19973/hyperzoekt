@@ -183,6 +183,122 @@ impl SurrealRepoStore {
         Self::init_connection(SurrealConnection::Remote(db), namespace, database).await
     }
 
+    /// Create a new SurrealRepoStore with remote database connection but optional
+    /// authentication. If `username` and `password` are provided (Some), an explicit
+    /// signin is attempted. If they are None, no signin is performed which is useful
+    /// when the remote SurrealDB instance allows anonymous or token-based auth.
+    pub async fn new_remote_optional_auth(
+        url: String,
+        username: Option<String>,
+        password: Option<String>,
+        namespace: String,
+        database: String,
+    ) -> Result<Self> {
+        // Defensive sanitization: mirror hyperzoekt's normalization so callers can
+        // provide http(s), ws(s), or scheme-less host:port values.
+        let mut u = url.trim().to_string();
+        if u.starts_with("http//") {
+            u = u.replacen("http//", "http://", 1);
+        } else if u.starts_with("https//") {
+            u = u.replacen("https//", "https://", 1);
+        } else if u.starts_with("ws//") {
+            u = u.replacen("ws//", "ws://", 1);
+        } else if u.starts_with("wss//") {
+            u = u.replacen("wss//", "wss://", 1);
+        }
+        // Remove accidental duplicate schemes like "http://http://"
+        if u.contains("http://http://") {
+            u = u.replacen("http://http://", "http://", 1);
+        }
+        if u.contains("https://https://") {
+            u = u.replacen("https://https://", "https://", 1);
+        }
+
+        // Normalize to an HTTP(S) URL targeting the /rpc path.
+        let mut http_url = if u.starts_with("http://") || u.starts_with("https://") {
+            if u.contains("/rpc") {
+                u.clone()
+            } else {
+                let stripped = u.trim_end_matches('/');
+                format!("{}/rpc", stripped)
+            }
+        } else if u.starts_with("ws://") || u.starts_with("wss://") {
+            if u.starts_with("wss://") {
+                let v = u.replacen("wss://", "https://", 1);
+                if v.contains("/rpc") {
+                    v
+                } else {
+                    format!("{}/rpc", v.trim_end_matches('/'))
+                }
+            } else {
+                let v = u.replacen("ws://", "http://", 1);
+                if v.contains("/rpc") {
+                    v
+                } else {
+                    format!("{}/rpc", v.trim_end_matches('/'))
+                }
+            }
+        } else {
+            let host = u.trim_end_matches('/');
+            format!("http://{}/rpc", host)
+        };
+
+        // Sanitize common malformed forms
+        if http_url.contains("http//") {
+            http_url = http_url.replace("http//", "http://");
+        }
+        if http_url.contains("https//") {
+            http_url = http_url.replace("https//", "https://");
+        }
+        if http_url.contains("http://http://") {
+            http_url = http_url.replacen("http://http://", "http://", 1);
+        }
+        if http_url.contains("https://https://") {
+            http_url = http_url.replacen("https://https://", "https://", 1);
+        }
+
+        // Expose normalized base without /rpc for legacy callers/tests
+        let base = if http_url.ends_with("/rpc") {
+            http_url
+                .trim_end_matches("/rpc")
+                .trim_end_matches('/')
+                .to_string()
+        } else {
+            http_url.trim_end_matches('/').to_string()
+        };
+        std::env::set_var("SURREALDB_URL", &base);
+        std::env::set_var("SURREALDB_HTTP_BASE", &base);
+
+        // Prepare client target by removing scheme so Surreal::new won't double-prefix
+        let mut client_target = http_url.clone();
+        if client_target.starts_with("http://") {
+            client_target = client_target.replacen("http://", "", 1);
+        } else if client_target.starts_with("https://") {
+            client_target = client_target.replacen("https://", "", 1);
+        }
+        while client_target.starts_with('/') {
+            client_target = client_target.replacen("/", "", 1);
+        }
+
+        // Create the HTTP(S) client
+        let db = if http_url.starts_with("https://") {
+            Surreal::new::<Https>(&client_target).await?
+        } else {
+            Surreal::new::<Http>(&client_target).await?
+        };
+
+        // Only attempt signin if both username and password provided
+        if let (Some(u), Some(p)) = (username.as_ref(), password.as_ref()) {
+            db.signin(surrealdb::opt::auth::Root {
+                username: u,
+                password: p,
+            })
+            .await?;
+        }
+
+        Self::init_connection(SurrealConnection::Remote(db), namespace, database).await
+    }
+
     /// Legacy method for backwards compatibility - always uses in-memory
     pub async fn new(_url: Option<String>, namespace: String, database: String) -> Result<Self> {
         Self::new_in_memory(namespace, database).await

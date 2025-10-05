@@ -53,6 +53,7 @@ pub struct MethodItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityPayload {
+    pub id: String,
     pub language: String,
     pub kind: String,
     pub name: String,
@@ -70,6 +71,7 @@ pub struct EntityPayload {
     pub methods: Vec<MethodItem>,
     pub stable_id: String,
     pub repo_name: String,
+    pub file: Option<String>,
     // Optional URL pointing to the source hosting (e.g. GitHub) for quick navigation from the UI
     pub source_url: Option<String>,
     /// Optional precomputed short display like "owner/repo/path" for UI link text

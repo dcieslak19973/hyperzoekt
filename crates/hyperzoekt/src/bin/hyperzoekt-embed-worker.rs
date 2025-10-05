@@ -1,11 +1,79 @@
 use anyhow::Result;
+use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use deadpool_redis::redis::AsyncCommands;
-use hyperzoekt::db_writer::connection::{connect, SurrealConnection};
-use hyperzoekt::db_writer::{upsert_content_if_missing, write_content_embedding};
+use hyperzoekt::db::connection::{connect, SurrealConnection};
+use hyperzoekt::db::{upsert_content_if_missing, write_content_embedding};
 use log::{error, info, warn};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal;
+use zoekt_distributed::redis_adapter::{create_redis_pool, DynRedis, RealRedis};
+
+/// Metrics for the embed worker
+#[derive(Debug)]
+struct EmbedWorkerMetrics {
+    jobs_processed: AtomicU64,
+    jobs_failed: AtomicU64,
+    last_job_unix: AtomicU64,
+}
+
+impl EmbedWorkerMetrics {
+    fn new() -> Self {
+        Self {
+            jobs_processed: AtomicU64::new(0),
+            jobs_failed: AtomicU64::new(0),
+            last_job_unix: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> EmbedWorkerMetricsSnapshot {
+        EmbedWorkerMetricsSnapshot {
+            jobs_processed: self.jobs_processed.load(Ordering::Relaxed),
+            jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
+            last_job_unix: self.last_job_unix.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EmbedWorkerMetricsSnapshot {
+    jobs_processed: u64,
+    jobs_failed: u64,
+    last_job_unix: u64,
+}
+
+async fn health_handler() -> impl IntoResponse {
+    // Try to create a redis pool and ping it
+    match create_redis_pool() {
+        Some(p) => {
+            let r = RealRedis { pool: p };
+            match r.ping().await {
+                Ok(_) => (axum::http::StatusCode::OK, "OK".to_string()),
+                Err(e) => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("ERR: {}", e),
+                ),
+            }
+        }
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no redis".to_string(),
+        ),
+    }
+}
+
+async fn metrics_handler(State(metrics): State<Arc<EmbedWorkerMetrics>>) -> impl IntoResponse {
+    let s = metrics.snapshot();
+    let body = format!("# HELP hyperzoekt_embed_worker_jobs_processed_total Total jobs processed\n# TYPE hyperzoekt_embed_worker_jobs_processed_total counter\nhyperzoekt_embed_worker_jobs_processed_total {}\n# HELP hyperzoekt_embed_worker_jobs_failed_total Jobs that failed processing\n# TYPE hyperzoekt_embed_worker_jobs_failed_total counter\nhyperzoekt_embed_worker_jobs_failed_total {}\n# HELP hyperzoekt_embed_worker_last_job_unix_seconds Last job time (unix seconds)\n# TYPE hyperzoekt_embed_worker_last_job_unix_seconds gauge\nhyperzoekt_embed_worker_last_job_unix_seconds {}\n", s.jobs_processed, s.jobs_failed, s.last_job_unix);
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -200,732 +268,783 @@ async fn main() -> Result<()> {
         );
     }
 
-    loop {
-        if let Err(e) = recover_expired(&pool, &queue_key, &processing_prefix).await {
-            warn!("recover_expired error: {}", e);
-        }
-        let mut conn = match pool.get().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("redis pool.get failed: {}", e);
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-        };
+    // Initialize metrics
+    let metrics = Arc::new(EmbedWorkerMetrics::new());
 
-        // Pop first job (blocking) to start a micro-batch
-        let mut batch_msgs: Vec<(String, String)> = Vec::new(); // (processing_key, json)
-        let start_pop = std::time::Instant::now();
-        let consumer_id = format!("embed-{}", std::process::id());
-        let processing_key = format!(
-            "{}:{}:{}",
-            processing_prefix,
-            consumer_id,
-            start_pop.elapsed().as_millis()
-        );
-        if let Some(first) = conn.brpoplpush(&queue_key, &processing_key, 5.0).await? {
-            let _: () = conn.expire(&processing_key, processing_ttl as i64).await?;
-            batch_msgs.push((processing_key.clone(), first));
-            // Try to quickly accumulate more (non-blocking) up to max_batch
-            while batch_msgs.len() < max_batch {
-                let k2 = format!(
+    // Start HTTP server for health/metrics
+    let host = std::env::var("HZ_EMBED_WORKER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("HZ_EMBED_WORKER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7208);
+    let metrics_for_server = Arc::clone(&metrics);
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(metrics_for_server);
+
+    let addr = format!("{}:{}", host, port)
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("HTTP server listening on {}", addr);
+    let serve_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("HTTP server failed: {:?}", e);
+        }
+    });
+
+    // Run the main processing loop with shutdown handling
+    tokio::select! {
+        _ = async {
+            loop {
+                if let Err(e) = recover_expired(&pool, &queue_key, &processing_prefix).await {
+                    warn!("recover_expired error: {}", e);
+                }
+                let mut conn = match pool.get().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("redis pool.get failed: {}", e);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+
+                // Pop first job (blocking) to start a micro-batch
+                let mut batch_msgs: Vec<(String, String)> = Vec::new(); // (processing_key, json)
+                let start_pop = std::time::Instant::now();
+                let consumer_id = format!("embed-{}", std::process::id());
+                let processing_key = format!(
                     "{}:{}:{}",
                     processing_prefix,
                     consumer_id,
                     start_pop.elapsed().as_millis()
                 );
-                match conn.rpoplpush(&queue_key, &k2).await {
-                    Ok(Some(m)) => {
-                        let _: () = conn.expire(&k2, processing_ttl as i64).await?;
-                        batch_msgs.push((k2, m));
-                    }
-                    Ok(None) => break,
+                if let Some(first) = match conn.brpoplpush(&queue_key, &processing_key, 5.0).await {
+                    Ok(first) => first,
                     Err(e) => {
-                        warn!("rpoplpush error while batching: {}", e);
-                        break;
+                        warn!("brpoplpush error: {}", e);
+                        continue;
                     }
-                }
-            }
-        } else {
-            // no messages
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-
-        // Parse jobs and build inputs
-        #[derive(serde::Serialize)]
-        struct TeiReq<'a> {
-            model: &'a str,
-            input: &'a [&'a str],
-        }
-        // ...existing code...
-
-        struct WorkItem {
-            key: String,
-            job: EmbeddingJob,
-            // Full, untruncated text to persist on the entity
-            source_content: String,
-            // Truncated text used for embedding requests (to honor TEI limits)
-            embed_text: String,
-            // Whether the source_content came from DB (authoritative) and should be persisted
-            persist_source: bool,
-        }
-
-        let mut work: Vec<WorkItem> = Vec::new();
-        for (key, json) in batch_msgs.iter() {
-            match serde_json::from_str::<EmbeddingJob>(json) {
-                Ok(job) => {
-                    // Prefer full function body from DB source_content; otherwise fall back
-                    let mut combined: Option<String> = None;
-                    let mut from_db = false;
-                    if let Ok(mut r) = db
-                        .query_with_binds(
-                            "SELECT source_content, name, signature, doc FROM entity WHERE id = $eid LIMIT 1;",
-                            vec![
-                                (
-                                    "eid",
-                                    serde_json::Value::String(format!(
-                                        "entity:{}",
-                                        sanitize_id(&job.stable_id)
-                                    )),
-                                ),
-                            ],
-                        )
-                        .await
-                    {
-                        let row: Vec<serde_json::Value> = r.take(0).unwrap_or_default();
-                        if let Some(obj) = row.first().and_then(|v| v.as_object()) {
-                            if let Some(sc) = obj.get("source_content").and_then(|v| v.as_str()) {
-                                if !sc.is_empty() {
-                                    combined = Some(sc.to_string());
-                                    from_db = true;
+                } {
+                    if let Err(e) = conn.expire::<_, ()>(&processing_key, processing_ttl as i64).await {
+                        warn!("expire error for {}: {}", processing_key, e);
+                    }
+                    batch_msgs.push((processing_key.clone(), first));
+                    // Try to quickly accumulate more (non-blocking) up to max_batch
+                    while batch_msgs.len() < max_batch {
+                        let k2 = format!(
+                            "{}:{}:{}",
+                            processing_prefix,
+                            consumer_id,
+                            start_pop.elapsed().as_millis()
+                        );
+                        match conn.rpoplpush(&queue_key, &k2).await {
+                            Ok(Some(m)) => {
+                                if let Err(e) = conn.expire::<_, ()>(&k2, processing_ttl as i64).await {
+                                    warn!("expire error for {}: {}", k2, e);
                                 }
+                                batch_msgs.push((k2, m));
                             }
-                            if combined.is_none() {
-                                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let sig = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-                                let doc = obj.get("doc").and_then(|v| v.as_str()).unwrap_or("");
-                                combined = Some(format!("{}\n{}\n{}", name, sig, doc));
+                            Ok(None) => break,
+                            Err(e) => {
+                                warn!("rpoplpush error while batching: {}", e);
+                                break;
                             }
                         }
                     }
-                    let source_content = combined.unwrap_or_else(|| job.name.clone());
-                    let mut embed_text = source_content.clone();
-                    if embed_text.len() > max_text_bytes {
-                        embed_text.truncate(max_text_bytes);
-                    }
-                    work.push(WorkItem {
-                        key: key.clone(),
-                        job,
-                        source_content,
-                        embed_text,
-                        persist_source: from_db,
-                    });
-                }
-                Err(e) => {
-                    warn!("bad embed job JSON: {} (dropping)", e);
-                    let _: () = conn.del(key).await?;
-                }
-            }
-        }
-
-        if work.is_empty() {
-            continue;
-        }
-
-        // Call TEI in batches (we already limited to max_batch but keep chunks)
-        let mut idx = 0usize;
-        while idx < work.len() {
-            let end = (idx + max_batch).min(work.len());
-            let slice = &work[idx..end];
-            let input_refs: Vec<&str> = slice.iter().map(|w| w.embed_text.as_str()).collect();
-            // Retry loop
-            let mut attempt = 0usize;
-            let call_start = std::time::Instant::now();
-            let mut embeddings: Option<Vec<Vec<f32>>> = None;
-            let mut response_model: Option<String> = None;
-            loop {
-                attempt += 1;
-                // Debug: log a compact representation of the TEI request payload (truncated inputs)
-                if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1") {
-                    let mut snippet_inputs: Vec<String> = Vec::new();
-                    for s in input_refs.iter().take(4) {
-                        let mut t = s.to_string();
-                        if t.len() > 200 {
-                            t.truncate(200);
-                            t.push_str("...[truncated]");
-                        }
-                        snippet_inputs.push(t);
-                    }
-                    info!(
-                        "TEI request model={} inputs_sample={:?} count={}",
-                        embed_model,
-                        snippet_inputs,
-                        input_refs.len()
-                    );
+                } else {
+                    // no messages
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
 
-                let resp = http
-                    .post(&tei_endpoint)
-                    .json(&TeiReq {
-                        model: embed_model.as_str(),
-                        input: &input_refs,
-                    })
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        // Read raw bytes first so we can both attempt JSON parse and
-                        // log the body on parse failure for diagnostics.
-                        match r.bytes().await {
-                            Ok(b) => match parse_embeddings_and_model(&b) {
-                                Ok((vecs, maybe_model)) => {
-                                    embeddings = Some(vecs);
-                                    response_model = maybe_model.clone();
-                                    if let Some(mid) = maybe_model {
-                                        info!("TEI response reported model={}", mid);
+                // Parse jobs and build inputs
+                #[derive(serde::Serialize)]
+                struct TeiReq<'a> {
+                    model: &'a str,
+                    input: &'a [&'a str],
+                }
+                // ...existing code...
+
+                struct WorkItem {
+                    key: String,
+                    job: EmbeddingJob,
+                    // Full, untruncated text to persist on the entity
+                    source_content: String,
+                    // Truncated text used for embedding requests (to honor TEI limits)
+                    embed_text: String,
+                    // Whether the source_content came from DB (authoritative) and should be persisted
+                    persist_source: bool,
+                    // Content ID for deduplication
+                    content_id: String,
+                }
+
+                let mut work: Vec<WorkItem> = Vec::new();
+                for (key, json) in batch_msgs.iter() {
+                    match serde_json::from_str::<EmbeddingJob>(json) {
+                        Ok(job) => {
+                            // Prefer full function body from DB source_content; otherwise fall back
+                            let mut combined: Option<String> = None;
+                            let mut from_db = false;
+                            let mut content_id_from_db: Option<String> = None;
+                            if let Ok(mut r) = db
+                                .query_with_binds(
+                                    "SELECT source_content, name, signature, doc, content_id FROM entity WHERE id = $eid LIMIT 1;",
+                                    vec![
+                                        (
+                                            "eid",
+                                            serde_json::Value::String(format!(
+                                                "entity:{}",
+                                                sanitize_id(&job.stable_id)
+                                            )),
+                                        ),
+                                    ],
+                                )
+                                .await
+                            {
+                                let row: Vec<serde_json::Value> = r.take(0).unwrap_or_default();
+                                if let Some(obj) = row.first().and_then(|v| v.as_object()) {
+                                    if let Some(sc) = obj.get("source_content").and_then(|v| v.as_str()) {
+                                        if !sc.is_empty() {
+                                            combined = Some(sc.to_string());
+                                            from_db = true;
+                                        }
                                     }
-                                    if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref()
-                                        == Some("1")
-                                    {
-                                        let body_snip = String::from_utf8_lossy(&b);
-                                        let snippet = if body_snip.len() > 2000 {
-                                            &body_snip[..2000]
-                                        } else {
-                                            &body_snip
-                                        };
-                                        info!(
-                                            "TEI response body snippet (truncated 2k): {}",
-                                            snippet
-                                        );
+                                    if let Some(cid) = obj.get("content_id").and_then(|v| v.as_str()) {
+                                        if !cid.is_empty() {
+                                            content_id_from_db = Some(cid.to_string());
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    let body_snippet = String::from_utf8_lossy(&b);
-                                    let snippet = if body_snippet.len() > 1024 {
-                                        &body_snippet[..1024]
-                                    } else {
-                                        &body_snippet
-                                    };
-                                    warn!(
-                                        "TEI parse error attempt {}: {}; body snippet: {}",
-                                        attempt, e, snippet
-                                    );
-                                }
-                            },
-                            Err(e) => warn!("TEI read bytes error attempt {}: {}", attempt, e),
-                        }
-                    }
-                    Ok(r) => {
-                        warn!("TEI non-success attempt {} status {}", attempt, r.status());
-                        // Try to autodetect a lower max-batch hint from headers
-                        if let Some(hv) = r.headers().get("x-max-batch") {
-                            if let Ok(s) = hv.to_str() {
-                                if let Ok(n) = s.parse::<usize>() {
-                                    if n > 0 && n < max_batch {
-                                        warn!(
-                                            "TEI suggested max_batch={} via header; lowering from {}",
-                                            n, max_batch
-                                        );
-                                        max_batch = n;
+                                    if combined.is_none() {
+                                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let sig = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+                                        let doc = obj.get("doc").and_then(|v| v.as_str()).unwrap_or("");
+                                        combined = Some(format!("{}\n{}\n{}", name, sig, doc));
                                     }
                                 }
                             }
+                            let source_content = combined.unwrap_or_else(|| job.name.clone());
+                            let mut embed_text = source_content.clone();
+                            if embed_text.len() > max_text_bytes {
+                                embed_text.truncate(max_text_bytes);
+                            }
+                            // Compute content_id: use from DB if available, otherwise compute
+                            let content_id = if let Some(cid) = content_id_from_db {
+                                cid
+                            } else {
+                                // Compute from source_content
+                                let mut ch = Sha256::new();
+                                ch.update(source_content.as_bytes());
+                                let cdig = ch.finalize();
+                                format!("{:x}", cdig)
+                            };
+                            work.push(WorkItem {
+                                key: key.clone(),
+                                job,
+                                source_content,
+                                embed_text,
+                                persist_source: from_db,
+                                content_id,
+                            });
                         }
-                        // Also inspect textual body for hints (best-effort)
-                        if let Ok(text) = r.text().await {
-                            let lowered = parse_max_batch_from_text(&text, max_batch);
-                            if lowered < max_batch {
-                                warn!(
-                                    "TEI message suggests lowering max_batch to {} (was {})",
-                                    lowered, max_batch
-                                );
-                                max_batch = lowered;
+                        Err(e) => {
+                            warn!("bad embed job JSON: {} (dropping)", e);
+                            if let Err(e) = conn.del::<_, ()>(key).await {
+                                warn!("del error for {}: {}", key, e);
                             }
                         }
                     }
-                    Err(e) => warn!("TEI request error attempt {}: {}", attempt, e),
-                }
-                if embeddings.is_some() || attempt >= max_retries {
-                    break;
-                }
-                let backoff = 100u64 * (1 << (attempt - 1)).min(5);
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-            }
-            let elapsed = call_start.elapsed().as_millis();
-            if elapsed >= slow_log_ms {
-                warn!("slow embed batch: {} ms for {} items", elapsed, slice.len());
-            }
-
-            if let Some(vecs) = embeddings {
-                // Write results; lengths should match. Log counts for diagnostics.
-                info!(
-                    "TEI returned {} embeddings for {} inputs",
-                    vecs.len(),
-                    slice.len()
-                );
-                if vecs.len() != slice.len() {
-                    warn!(
-                        "embedding count mismatch: got {} embeddings for {} inputs",
-                        vecs.len(),
-                        slice.len()
-                    );
                 }
 
-                // Use parameterized updates per-entity to avoid SQL quoting/type issues.
-                for (i, w) in slice.iter().enumerate() {
-                    if let Some(v) = vecs.get(i) {
-                        // Debug: log a small sample of embedding values for visibility
+                if work.is_empty() {
+                    continue;
+                }
+
+                // Call TEI in batches (we already limited to max_batch but keep chunks)
+                let mut idx = 0usize;
+                while idx < work.len() {
+                    let end = (idx + max_batch).min(work.len());
+                    let slice = &work[idx..end];
+                    let input_refs: Vec<&str> = slice.iter().map(|w| w.embed_text.as_str()).collect();
+                    // Retry loop
+                    let mut attempt = 0usize;
+                    let call_start = std::time::Instant::now();
+                    let mut embeddings: Option<Vec<Vec<f32>>> = None;
+                    let mut response_model: Option<String> = None;
+                    loop {
+                        attempt += 1;
+                        // Debug: log a compact representation of the TEI request payload (truncated inputs)
                         if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1") {
-                            let sample: Vec<f32> = v.iter().take(5).cloned().collect();
+                            let mut snippet_inputs: Vec<String> = Vec::new();
+                            for s in input_refs.iter().take(4) {
+                                let mut t = s.to_string();
+                                if t.len() > 200 {
+                                    t.truncate(200);
+                                    t.push_str("...[truncated]");
+                                }
+                                snippet_inputs.push(t);
+                            }
                             info!(
-                                "embedding sample for {}: len={} first_values={:?}",
-                                sanitize_id(&w.job.stable_id),
-                                v.len(),
-                                sample
+                                "TEI request model={} inputs_sample={:?} count={}",
+                                embed_model,
+                                snippet_inputs,
+                                input_refs.len()
                             );
                         }
-                        match serde_json::to_value(v) {
-                            Ok(vval) => {
-                                let model_id = response_model
-                                    .as_deref()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| embed_model.clone());
-                                let dim = v.len() as i64;
 
-                                let rid = sanitize_id(&w.job.stable_id);
-                                let _binds = vec![
-                                    ("embedding", vval),
-                                    ("embedding_len", serde_json::Value::Number(dim.into())),
-                                    ("embedding_dim", serde_json::Value::Number(dim.into())),
-                                    (
-                                        "embedding_model",
-                                        serde_json::Value::String(model_id.clone()),
-                                    ),
-                                ];
-
-                                let q = if w.persist_source {
-                                    format!(
-                                        "UPDATE entity:{} SET embedding = $embedding, embedding_len = $embedding_len, embedding_dim = $embedding_dim, embedding_model = $embedding_model, embedding_created_at = time::now(), source_content = $source_content;",
-                                        rid
-                                    )
-                                } else {
-                                    format!(
-                                        "UPDATE entity:{} SET embedding = $embedding, embedding_len = $embedding_len, embedding_dim = $embedding_dim, embedding_model = $embedding_model, embedding_created_at = time::now();",
-                                        rid
-                                    )
-                                };
-                                if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1")
-                                {
-                                    // Log a compact debug message (avoid huge vector prints)
-                                    info!(
-                                        "embed SQL (param): {} -> embedding_len={} model={}",
-                                        sanitize_id(&w.job.stable_id),
-                                        dim,
-                                        model_id
-                                    );
-                                    // Detailed binds: include sample of embedding and serialized embedding value
-                                    let mut map = serde_json::Map::new();
-                                    map.insert(
-                                        "embedding_len".to_string(),
-                                        serde_json::Value::Number(dim.into()),
-                                    );
-                                    let sample_vals: Vec<serde_json::Value> = v
-                                        .iter()
-                                        .take(5)
-                                        .map(|f| serde_json::Value::from(*f))
-                                        .collect();
-                                    map.insert(
-                                        "embedding_sample".to_string(),
-                                        serde_json::Value::Array(sample_vals),
-                                    );
-                                    // Clone vval (the full serialized embedding) into the log map
-                                    // vval is a serde_json::Value created earlier
-                                    match serde_json::to_value(v) {
-                                        Ok(full) => {
-                                            map.insert("embedding_full".to_string(), full);
+                        let resp = http
+                            .post(&tei_endpoint)
+                            .json(&TeiReq {
+                                model: embed_model.as_str(),
+                                input: &input_refs,
+                            })
+                            .send()
+                            .await;
+                        match resp {
+                            Ok(r) if r.status().is_success() => {
+                                match r.bytes().await {
+                                    Ok(b) => match parse_embeddings_and_model(&b) {
+                                        Ok((vecs, maybe_model)) => {
+                                            embeddings = Some(vecs);
+                                            response_model = maybe_model.clone();
+                                            if let Some(mid) = maybe_model {
+                                                info!("TEI response reported model={}", mid);
+                                            }
+                                            if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref()
+                                                == Some("1")
+                                            {
+                                                let body_snip = String::from_utf8_lossy(&b);
+                                                let snippet = if body_snip.len() > 2000 {
+                                                    &body_snip[..2000]
+                                                } else {
+                                                    &body_snip
+                                                };
+                                                info!(
+                                                    "TEI response body snippet (truncated 2k): {}",
+                                                    snippet
+                                                );
+                                            }
                                         }
-                                        Err(_) => {
-                                            map.insert(
-                                                "embedding_full".to_string(),
-                                                serde_json::Value::String(
-                                                    "<unserializable>".to_string(),
-                                                ),
+                                        Err(e) => {
+                                            let body_snippet = String::from_utf8_lossy(&b);
+                                            let snippet = if body_snippet.len() > 1024 {
+                                                &body_snippet[..1024]
+                                            } else {
+                                                &body_snippet
+                                            };
+                                            warn!(
+                                                "TEI parse error attempt {}: {}; body snippet: {}",
+                                                attempt, e, snippet
                                             );
                                         }
-                                    }
-                                    match serde_json::to_string(&map) {
-                                        Ok(s) => info!("embed SQL full binds: {}", s),
-                                        Err(_) => info!("embed SQL full binds: <unserializable>"),
-                                    }
-                                    info!("embed SQL string: {}", q);
+                                    },
+                                    Err(e) => warn!("TEI read bytes error attempt {}: {}", attempt, e),
                                 }
-
-                                // Use underlying Surreal client `.query().bind()` so the client
-                                // serializes types (Vec<f32>, i64, String) in a way Surreal expects.
-                                // Precompute similarity arrays if enabled
-                                let (similar_same_vals, similar_external_vals) =
-                                    if enable_similarity {
-                                        // Need repo name; we have it on job
-                                        let sim_params = SimilarityParams {
-                                            max_same: max_similar_same,
-                                            max_external: max_similar_external,
-                                            min_source_chars,
-                                        };
-                                        match compute_similarity_arrays(
-                                            &db,
-                                            &w.job.stable_id,
-                                            &w.job.repo_name,
-                                            v,
-                                            &sim_params,
-                                        )
-                                        .await
-                                        {
-                                            Ok((a, b)) => (a, b),
-                                            Err(e) => {
+                            }
+                            Ok(r) => {
+                                warn!("TEI non-success attempt {} status {}", attempt, r.status());
+                                // Try to autodetect a lower max-batch hint from headers
+                                if let Some(hv) = r.headers().get("x-max-batch") {
+                                    if let Ok(s) = hv.to_str() {
+                                        if let Ok(n) = s.parse::<usize>() {
+                                            if n > 0 && n < max_batch {
                                                 warn!(
-                                                    "similarity arrays compute failed for {}: {}",
-                                                    w.job.stable_id, e
+                                                    "TEI suggested max_batch={} via header; lowering from {}",
+                                                    n, max_batch
                                                 );
-                                                (Vec::new(), Vec::new())
+                                                max_batch = n;
                                             }
                                         }
-                                    } else {
-                                        (Vec::new(), Vec::new())
-                                    };
-
-                                // Also persist embedding into the deduplicated content table (Option C).
-                                // Compute content_id from full source_content and upsert content row.
-                                let content_text = w.source_content.clone();
-                                let mut ch = Sha256::new();
-                                ch.update(content_text.as_bytes());
-                                let cdig = ch.finalize();
-                                let content_id = format!("{:x}", cdig);
-                                if let Err(e) =
-                                    upsert_content_if_missing(&db, &content_id, &content_text).await
-                                {
-                                    warn!(
-                                        "upsert_content_if_missing failed for {}: {}",
-                                        content_id, e
-                                    );
-                                } else {
-                                    // write embedding for content_id
-                                    if let Err(e) =
-                                        write_content_embedding(&db, &content_id, v.clone()).await
-                                    {
+                                    }
+                                }
+                                // Also inspect textual body for hints (best-effort)
+                                if let Ok(text) = r.text().await {
+                                    let lowered = parse_max_batch_from_text(&text, max_batch);
+                                    if lowered < max_batch {
                                         warn!(
-                                            "write_content_embedding failed for {}: {}",
-                                            content_id, e
+                                            "TEI message suggests lowering max_batch to {} (was {})",
+                                            lowered, max_batch
                                         );
-                                    }
-                                }
-
-                                match &db {
-                                    SurrealConnection::Local(db_conn) => {
-                                        let mut call = db_conn.query(&q);
-                                        call = call.bind(("embedding", v.clone()));
-                                        call = call.bind(("embedding_len", dim));
-                                        call = call.bind(("embedding_dim", dim));
-                                        call = call.bind(("embedding_model", model_id.clone()));
-                                        if w.persist_source {
-                                            call = call
-                                                .bind(("source_content", w.source_content.clone()));
-                                        }
-                                        // similarity edges are written after this update
-                                        match call.await {
-                                            Ok(resp) => {
-                                                if std::env::var("HZ_EMBED_DEBUG_DB")
-                                                    .ok()
-                                                    .as_deref()
-                                                    == Some("1")
-                                                {
-                                                    info!("Surreal update response: {:?}", resp);
-                                                }
-                                                if enable_similarity {
-                                                    let mut rel_stmts: Vec<String> = Vec::new();
-                                                    rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity:{};", rid));
-                                                    rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity:{};", rid));
-                                                    for v in &similar_same_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_same_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    for v in &similar_external_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_external_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    if !rel_stmts.is_empty() {
-                                                        let batch = format!(
-                                                            "BEGIN; {} COMMIT;",
-                                                            rel_stmts.join(" ")
-                                                        );
-                                                        if let Err(e) = db.query(&batch).await {
-                                                            warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
-                                                        }
-                                                    }
-                                                }
-                                                let _: () = conn.del(&w.key).await?;
-                                                if std::env::var("HZ_EMBED_DEBUG_DB")
-                                                    .ok()
-                                                    .as_deref()
-                                                    == Some("1")
-                                                {
-                                                    let q2 = format!(
-                                                        "SELECT embedding, embedding_len, embedding_dim, embedding_model, embedding_created_at, string::len(source_content) AS src_len FROM entity:{} LIMIT 1;",
-                                                        rid
-                                                    );
-                                                    match db.query(&q2).await {
-                                                        Ok(mut r) => {
-                                                            if let Ok(rows) =
-                                                                r.take::<Vec<serde_json::Value>>(0)
-                                                            {
-                                                                info!(
-                                                                    "post-update select for {} -> {:?}",
-                                                                    w.job.stable_id, rows
-                                                                );
-                                                            } else {
-                                                                warn!(
-                                                                    "post-update select returned no rows for {}",
-                                                                    w.job.stable_id
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => warn!(
-                                                            "post-update select failed for {}: {}",
-                                                            w.job.stable_id, e
-                                                        ),
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Surreal update failed for {}: {}",
-                                                    w.job.stable_id, e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    SurrealConnection::RemoteHttp(db_conn) => {
-                                        let mut call = db_conn.query(&q);
-                                        call = call.bind(("embedding", v.clone()));
-                                        call = call.bind(("embedding_len", dim));
-                                        call = call.bind(("embedding_dim", dim));
-                                        call = call.bind(("embedding_model", model_id.clone()));
-                                        if w.persist_source {
-                                            call = call
-                                                .bind(("source_content", w.source_content.clone()));
-                                        }
-                                        // similarity edges are written after this update
-                                        match call.await {
-                                            Ok(resp) => {
-                                                if std::env::var("HZ_EMBED_DEBUG_DB")
-                                                    .ok()
-                                                    .as_deref()
-                                                    == Some("1")
-                                                {
-                                                    info!("Surreal update response: {:?}", resp);
-                                                }
-                                                if enable_similarity {
-                                                    let mut rel_stmts: Vec<String> = Vec::new();
-                                                    rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity:{};", rid));
-                                                    rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity:{};", rid));
-                                                    for v in &similar_same_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_same_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    for v in &similar_external_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_external_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    if !rel_stmts.is_empty() {
-                                                        let batch = format!(
-                                                            "BEGIN; {} COMMIT;",
-                                                            rel_stmts.join(" ")
-                                                        );
-                                                        if let Err(e) = db.query(&batch).await {
-                                                            warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
-                                                        }
-                                                    }
-                                                }
-                                                let _: () = conn.del(&w.key).await?;
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Surreal update failed for {}: {}",
-                                                    w.job.stable_id, e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    SurrealConnection::RemoteWs(db_conn) => {
-                                        let mut call = db_conn.query(&q);
-                                        call = call.bind(("embedding", v.clone()));
-                                        call = call.bind(("embedding_len", dim));
-                                        call = call.bind(("embedding_dim", dim));
-                                        call = call.bind(("embedding_model", model_id.clone()));
-                                        if w.persist_source {
-                                            call = call
-                                                .bind(("source_content", w.source_content.clone()));
-                                        }
-                                        // similarity edges are written after this update
-                                        match call.await {
-                                            Ok(resp) => {
-                                                if std::env::var("HZ_EMBED_DEBUG_DB")
-                                                    .ok()
-                                                    .as_deref()
-                                                    == Some("1")
-                                                {
-                                                    info!("Surreal update response: {:?}", resp);
-                                                }
-                                                if enable_similarity {
-                                                    let mut rel_stmts: Vec<String> = Vec::new();
-                                                    rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity:{};", rid));
-                                                    rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity:{};", rid));
-                                                    for v in &similar_same_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_same_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    for v in &similar_external_vals {
-                                                        if let Some(obj) = v.as_object() {
-                                                            if let (Some(tid), Some(score)) = (
-                                                                obj.get("stable_id")
-                                                                    .and_then(|x| x.as_str()),
-                                                                obj.get("score")
-                                                                    .and_then(|x| x.as_f64()),
-                                                            ) {
-                                                                rel_stmts.push(format!(
-                                                                    "RELATE entity:{}->similar_external_repo->entity:{} SET score = {};",
-                                                                    rid, sanitize_id(tid), score
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    if !rel_stmts.is_empty() {
-                                                        let batch = format!(
-                                                            "BEGIN; {} COMMIT;",
-                                                            rel_stmts.join(" ")
-                                                        );
-                                                        if let Err(e) = db.query(&batch).await {
-                                                            warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
-                                                        }
-                                                    }
-                                                }
-                                                let _: () = conn.del(&w.key).await?;
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Surreal update failed for {}: {}",
-                                                    w.job.stable_id, e
-                                                );
-                                            }
-                                        }
+                                        max_batch = lowered;
                                     }
                                 }
                             }
-                            Err(e) => warn!(
-                                "failed to convert embedding to json value for {}: {}",
-                                w.job.stable_id, e
-                            ),
+                            Err(e) => warn!("TEI request error attempt {}: {}", attempt, e),
+                        }
+                        if embeddings.is_some() || attempt >= max_retries {
+                            break;
+                        }
+                        let backoff = 100u64 * (1 << (attempt - 1)).min(5);
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    }
+                    let elapsed = call_start.elapsed().as_millis();
+                    if elapsed >= slow_log_ms {
+                        warn!("slow embed batch: {} ms for {} items", elapsed, slice.len());
+                    }
+
+                    if let Some(vecs) = embeddings {
+                        // Write results; lengths should match. Log counts for diagnostics.
+                        info!(
+                            "TEI returned {} embeddings for {} inputs",
+                            vecs.len(),
+                            slice.len()
+                        );
+                        if vecs.len() != slice.len() {
+                            warn!(
+                                "embedding count mismatch: got {} embeddings for {} inputs",
+                                vecs.len(),
+                                slice.len()
+                            );
+                        }
+
+                        // Use parameterized updates per-entity to avoid SQL quoting/type issues.
+                        for (i, w) in slice.iter().enumerate() {
+                            if let Some(v) = vecs.get(i) {
+                                // Debug: log a small sample of embedding values for visibility
+                                if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1") {
+                                    let sample: Vec<f32> = v.iter().take(5).cloned().collect();
+                                    info!(
+                                        "embedding sample for {}: len={} first_values={:?}",
+                                        sanitize_id(&w.job.stable_id),
+                                        v.len(),
+                                        sample
+                                    );
+                                }
+                                match serde_json::to_value(v) {
+                                    Ok(vval) => {
+                                        let model_id = response_model
+                                            .as_deref()
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| embed_model.clone());
+                                        let dim = v.len() as i64;
+
+                                        let rid = sanitize_id(&w.job.stable_id);
+                                        let _binds = vec![
+                                            ("embedding", vval),
+                                            ("embedding_len", serde_json::Value::Number(dim.into())),
+                                            ("embedding_dim", serde_json::Value::Number(dim.into())),
+                                            (
+                                                "embedding_model",
+                                                serde_json::Value::String(model_id.clone()),
+                                            ),
+                                        ];
+
+                                        let q = if w.persist_source {
+                                            format!(
+                                                "UPDATE entity:{} SET content_id = $content_id, source_content = $source_content;",
+                                                rid
+                                            )
+                                        } else {
+                                            format!(
+                                                "UPDATE entity:{} SET content_id = $content_id;",
+                                                rid
+                                            )
+                                        };
+                                        if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1")
+                                        {
+                                            // Log a compact debug message (avoid huge vector prints)
+                                            info!(
+                                                "embed SQL (param): {} -> embedding_len={} model={}",
+                                                sanitize_id(&w.job.stable_id),
+                                                dim,
+                                                model_id
+                                            );
+                                            // Detailed binds: include sample of embedding and serialized embedding value
+                                            let mut map = serde_json::Map::new();
+                                            map.insert(
+                                                "embedding_len".to_string(),
+                                                serde_json::Value::Number(dim.into()),
+                                            );
+                                            let sample_vals: Vec<serde_json::Value> = v
+                                                .iter()
+                                                .take(5)
+                                                .map(|f| serde_json::Value::from(*f))
+                                                .collect();
+                                            map.insert(
+                                                "embedding_sample".to_string(),
+                                                serde_json::Value::Array(sample_vals),
+                                            );
+                                            // Clone vval (the full serialized embedding) into the log map
+                                            // vval is a serde_json::Value created earlier
+                                            match serde_json::to_value(v) {
+                                                Ok(full) => {
+                                                    map.insert("embedding_full".to_string(), full);
+                                                }
+                                                Err(_) => {
+                                                    map.insert(
+                                                        "embedding_full".to_string(),
+                                                        serde_json::Value::String(
+                                                            "<unserializable>".to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            match serde_json::to_string(&map) {
+                                                Ok(s) => info!("embed SQL full binds: {}", s),
+                                                Err(_) => info!("embed SQL full binds: <unserializable>"),
+                                            }
+                                            info!("embed SQL string: {}", q);
+                                        }
+
+                                        // Use underlying Surreal client `.query().bind()` so the client
+                                        // serializes types (Vec<f32>, i64, String) in a way Surreal expects.
+                                        // Precompute similarity arrays if enabled
+                                        let (similar_same_vals, similar_external_vals) =
+                                            if enable_similarity {
+                                                // Need repo name; we have it on job
+                                                let sim_params = SimilarityParams {
+                                                    max_same: max_similar_same,
+                                                    max_external: max_similar_external,
+                                                    min_source_chars,
+                                                    same_repo_threshold: _same_repo_threshold,
+                                                    external_repo_threshold: _external_repo_threshold,
+                                                };
+                                                match compute_similarity_arrays(
+                                                    &db,
+                                                    &w.job.stable_id,
+                                                    &w.job.repo_name,
+                                                    v,
+                                                    &sim_params,
+                                                )
+                                                .await
+                                                {
+                                                    Ok((a, b)) => (a, b),
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "similarity arrays compute failed for {}: {}",
+                                                            w.job.stable_id, e
+                                                        );
+                                                        (Vec::new(), Vec::new())
+                                                    }
+                                                }
+                                            } else {
+                                                (Vec::new(), Vec::new())
+                                            };
+
+                                        // Also persist embedding into the deduplicated content table (Option C).
+                                        // Use content_id from WorkItem
+                                        let content_id = w.content_id.clone();
+                                        if let Err(e) = upsert_content_if_missing(&db, &content_id, &w.source_content).await
+                                        {
+                                            warn!(
+                                                "upsert_content_if_missing failed for {}: {}",
+                                                content_id, e
+                                            );
+                                        } else {
+                                            info!("successfully upserted content for {}", content_id);
+                                            // write embedding for content_id
+                                            if let Err(e) =
+                                                write_content_embedding(&db, &content_id, v.clone(), &model_id, dim as usize).await
+                                            {
+                                                warn!(
+                                                    "write_content_embedding failed for {}: {}",
+                                                    content_id, e
+                                                );
+                                            } else {
+                                                info!("successfully wrote embedding for {}", content_id);
+                                            }
+                                        }                                        match &db {
+                                            SurrealConnection::Local(db_conn) => {
+                                                let mut call = db_conn.query(&q);
+                                                call = call.bind(("content_id", content_id.clone()));
+                                                if w.persist_source {
+                                                    call = call
+                                                        .bind(("source_content", w.source_content.clone()));
+                                                }
+                                                // similarity edges are written after this update
+                                                match call.await {
+                                                    Ok(resp) => {
+                                                        if std::env::var("HZ_EMBED_DEBUG_DB")
+                                                            .ok()
+                                                            .as_deref()
+                                                            == Some("1")
+                                                        {
+                                                            info!("Surreal update response: {:?}", resp);
+                                                        }
+                                                        if enable_similarity {
+                                                            let mut rel_stmts: Vec<String> = Vec::new();
+                                                            rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity_snapshot:{};", rid));
+                                                            rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity_snapshot:{};", rid));
+                                                            for v in &similar_same_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_same_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            for v in &similar_external_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_external_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !rel_stmts.is_empty() {
+                                                                let batch = format!(
+                                                                    "BEGIN; {} COMMIT;",
+                                                                    rel_stmts.join(" ")
+                                                                );
+                                                                if let Err(e) = db.query(&batch).await {
+                                                                    warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
+                                                                } else {
+                                                                    info!("created {} similarity relations for {}", rel_stmts.len() - 2, w.job.stable_id); // -2 for the DELETE statements
+                                                                }
+                                                            } else {
+                                                                info!("no similarities found for {}", w.job.stable_id);
+                                                            }
+                                                        }
+                                                        if let Err(e) = conn.del::<_, ()>(&w.key).await {
+                                                            warn!("del error for {}: {}", w.key, e);
+                                                        }
+                                                        if std::env::var("HZ_EMBED_DEBUG_DB")
+                                                            .ok()
+                                                            .as_deref()
+                                                            == Some("1")
+                                                        {
+                                                            let q2 = format!(
+                                                                "SELECT embedding, embedding_len, embedding_dim, embedding_model, embedding_created_at, string::len(source_content) AS src_len FROM entity:{} LIMIT 1;",
+                                                                rid
+                                                            );
+                                                            match db.query(&q2).await {
+                                                                Ok(mut r) => {
+                                                                    if let Ok(rows) =
+                                                                        r.take::<Vec<serde_json::Value>>(0)
+                                                                    {
+                                                                        info!(
+                                                                            "post-update select for {} -> {:?}",
+                                                                            w.job.stable_id, rows
+                                                                        );
+                                                                    } else {
+                                                                        warn!(
+                                                                            "post-update select returned no rows for {}",
+                                                                            w.job.stable_id
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(e) => warn!(
+                                                                    "post-update select failed for {}: {}",
+                                                                    w.job.stable_id, e
+                                                                ),
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Surreal update failed for {}: {}",
+                                                            w.job.stable_id, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            SurrealConnection::RemoteHttp(db_conn) => {
+                                                let mut call = db_conn.query(&q);
+                                                call = call.bind(("content_id", content_id.clone()));
+                                                if w.persist_source {
+                                                    call = call
+                                                        .bind(("source_content", w.source_content.clone()));
+                                                }
+                                                // similarity edges are written after this update
+                                                match call.await {
+                                                    Ok(resp) => {
+                                                        if std::env::var("HZ_EMBED_DEBUG_DB")
+                                                            .ok()
+                                                            .as_deref()
+                                                            == Some("1")
+                                                        {
+                                                            info!("Surreal update response: {:?}", resp);
+                                                        }
+                                                        if enable_similarity {
+                                                            let mut rel_stmts: Vec<String> = Vec::new();
+                                                            rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity_snapshot:{};", rid));
+                                                            rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity_snapshot:{};", rid));
+                                                            for v in &similar_same_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_same_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            for v in &similar_external_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_external_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !rel_stmts.is_empty() {
+                                                                let batch = format!(
+                                                                    "BEGIN; {} COMMIT;",
+                                                                    rel_stmts.join(" ")
+                                                                );
+                                                                if let Err(e) = db.query(&batch).await {
+                                                                    warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Err(e) = conn.del::<_, ()>(&w.key).await {
+                                                            warn!("del error for {}: {}", w.key, e);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Surreal update failed for {}: {}",
+                                                            w.job.stable_id, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            SurrealConnection::RemoteWs(db_conn) => {
+                                                let mut call = db_conn.query(&q);
+                                                call = call.bind(("content_id", content_id.clone()));
+                                                if w.persist_source {
+                                                    call = call
+                                                        .bind(("source_content", w.source_content.clone()));
+                                                }
+                                                // similarity edges are written after this update
+                                                match call.await {
+                                                    Ok(resp) => {
+                                                        if std::env::var("HZ_EMBED_DEBUG_DB")
+                                                            .ok()
+                                                            .as_deref()
+                                                            == Some("1")
+                                                        {
+                                                            info!("Surreal update response: {:?}", resp);
+                                                        }
+                                                        if enable_similarity {
+                                                            let mut rel_stmts: Vec<String> = Vec::new();
+                                                            rel_stmts.push(format!("DELETE similar_same_repo WHERE in = entity_snapshot:{};", rid));
+                                                            rel_stmts.push(format!("DELETE similar_external_repo WHERE in = entity_snapshot:{};", rid));
+                                                            for v in &similar_same_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_same_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            for v in &similar_external_vals {
+                                                                if let Some(obj) = v.as_object() {
+                                                                    if let (Some(tid), Some(score)) = (
+                                                                        obj.get("stable_id")
+                                                                            .and_then(|x| x.as_str()),
+                                                                        obj.get("score")
+                                                                            .and_then(|x| x.as_f64()),
+                                                                    ) {
+                                                                        rel_stmts.push(format!(
+                                                                            "RELATE entity_snapshot:{}->similar_external_repo->entity_snapshot:{} SET score = {};",
+                                                                            rid, sanitize_id(tid), score
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !rel_stmts.is_empty() {
+                                                                let batch = format!(
+                                                                    "BEGIN; {} COMMIT;",
+                                                                    rel_stmts.join(" ")
+                                                                );
+                                                                if let Err(e) = db.query(&batch).await {
+                                                                    warn!("similarity RELATE batch failed for {}: {}", w.job.stable_id, e);
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Err(e) = conn.del::<_, ()>(&w.key).await {
+                                                            warn!("del error for {}: {}", w.key, e);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Surreal update failed for {}: {}",
+                                                            w.job.stable_id, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => warn!(
+                                        "failed to convert embedding to json value for {}: {}",
+                                        w.job.stable_id, e
+                                    ),
+                                }
+                            } else {
+                                warn!("no embedding vector for index {} when writing batch", i);
+                            }
                         }
                     } else {
-                        warn!("no embedding vector for index {} when writing batch", i);
+                        warn!(
+                            "TEI failed for batch of {} items; leaving for retry",
+                            slice.len()
+                        );
                     }
+                    idx = end;
                 }
-            } else {
-                warn!(
-                    "TEI failed for batch of {} items; leaving for retry",
-                    slice.len()
-                );
             }
-            idx = end;
+        } => {},
+        _ = signal::ctrl_c() => {
+            info!("Received shutdown signal");
         }
     }
-}
 
-async fn ensure_embedding_schema(
-    db: &hyperzoekt::db_writer::connection::SurrealConnection,
-) -> Result<()> {
+    // Shutdown HTTP server gracefully
+    serve_handle.abort();
+    Ok(())
+}
+async fn ensure_embedding_schema(db: &hyperzoekt::db::connection::SurrealConnection) -> Result<()> {
     let stmts: &[&str] = &[
-        // embedding array
-        "DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
-        "REMOVE FIELD embedding ON entity; DEFINE FIELD embedding ON entity TYPE array DEFAULT [];",
-        // embedding_len
-        "DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
-        "REMOVE FIELD embedding_len ON entity; DEFINE FIELD embedding_len ON entity TYPE int DEFAULT 0;",
-        // embedding_model
-        "DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
-        "REMOVE FIELD embedding_model ON entity; DEFINE FIELD embedding_model ON entity TYPE string DEFAULT '';",
-        // embedding_dim
-        "DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
-        "REMOVE FIELD embedding_dim ON entity; DEFINE FIELD embedding_dim ON entity TYPE int DEFAULT 0;",
-        // embedding_created_at
-        "DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
-        "REMOVE FIELD embedding_created_at ON entity; DEFINE FIELD embedding_created_at ON entity TYPE datetime DEFAULT time::now();",
+        // content_id (SHA256 hash of source content for deduplication)
+        "DEFINE FIELD content_id ON entity TYPE string DEFAULT '';",
+        "REMOVE FIELD content_id ON entity; DEFINE FIELD content_id ON entity TYPE string DEFAULT '';",
         // source_content (full text used for embeddings)
         "DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
         "REMOVE FIELD source_content ON entity; DEFINE FIELD source_content ON entity TYPE string DEFAULT '';",
         // similarity relations and metadata (score)
-        "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
+        "DEFINE TABLE similar_same_repo TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
         "DEFINE TABLE similar_same_repo TYPE RELATION;",
         "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
         "DEFINE INDEX idx_similar_same_repo_unique ON similar_same_repo FIELDS in, out UNIQUE;",
         "DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
         "REMOVE FIELD score ON similar_same_repo; DEFINE FIELD score ON similar_same_repo TYPE number DEFAULT 0;",
-        "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
+        "DEFINE TABLE similar_external_repo TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
         "DEFINE TABLE similar_external_repo TYPE RELATION;",
         "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
         "DEFINE INDEX idx_similar_external_repo_unique ON similar_external_repo FIELDS in, out UNIQUE;",
@@ -949,8 +1068,8 @@ async fn ensure_embedding_schema(
     }
     // best-effort upgrade of relation tables if only created generically earlier
     for upgrade in [
-        "ALTER TABLE similar_same_repo TYPE RELATION FROM entity TO entity;",
-        "ALTER TABLE similar_external_repo TYPE RELATION FROM entity TO entity;",
+        "ALTER TABLE similar_same_repo TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
+        "ALTER TABLE similar_external_repo TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
     ] {
         if let Err(e) = db.query(upgrade).await {
             if std::env::var("HZ_EMBED_DEBUG_SQL").ok().as_deref() == Some("1") {
@@ -1040,10 +1159,12 @@ struct SimilarityParams {
     max_same: usize,
     max_external: usize,
     min_source_chars: usize,
+    same_repo_threshold: f32,
+    external_repo_threshold: f32,
 }
 
 async fn compute_similarity_arrays(
-    db: &hyperzoekt::db_writer::connection::SurrealConnection,
+    db: &hyperzoekt::db::connection::SurrealConnection,
     stable_id: &str,
     repo_name: &str,
     embedding: &[f32],
@@ -1063,8 +1184,9 @@ async fn compute_similarity_arrays(
 
     // Server-side cosine similarity query for same-repo candidates
     // Exclude self (stable_id) and require minimum source length to avoid trivial matches
+    // Join with content table to get embeddings
     let same_q = format!(
-        "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name = $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC START AT 0 LIMIT {}",
+        "SELECT stable_id, vector::similarity::cosine((SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0], $vec) AS score FROM entity WHERE repo_name = $r AND stable_id != $sid AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] = $dim AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] > 0 AND string::len(source_content) >= $min_chars AND vector::similarity::cosine((SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0], $vec) >= $threshold ORDER BY score DESC START AT 0 LIMIT {}",
         params.max_same
     );
     let same_rows: Vec<serde_json::Value> = match db
@@ -1078,6 +1200,12 @@ async fn compute_similarity_arrays(
                 (
                     "min_chars",
                     serde_json::Value::Number((params.min_source_chars as i64).into()),
+                ),
+                (
+                    "threshold",
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(params.same_repo_threshold as f64).unwrap(),
+                    ),
                 ),
             ],
         )
@@ -1108,7 +1236,7 @@ async fn compute_similarity_arrays(
 
     // Server-side cosine similarity query for external-repo candidates
     let ext_q = format!(
-        "SELECT stable_id, vector::similarity::cosine(embedding, $vec) AS score FROM entity WHERE repo_name != $r AND stable_id != $sid AND embedding_len = $dim AND embedding_len > 0 AND string::len(source_content) >= $min_chars ORDER BY score DESC START AT 0 LIMIT {}",
+        "SELECT stable_id, vector::similarity::cosine((SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0], $vec) AS score FROM entity WHERE repo_name != $r AND stable_id != $sid AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] = $dim AND (SELECT embedding_len FROM content WHERE id = content_id LIMIT 1)[0] > 0 AND string::len(source_content) >= $min_chars AND vector::similarity::cosine((SELECT embedding FROM content WHERE id = content_id LIMIT 1)[0], $vec) >= $threshold ORDER BY score DESC START AT 0 LIMIT {}",
         params.max_external
     );
     let ext_rows: Vec<serde_json::Value> = match db
@@ -1123,6 +1251,13 @@ async fn compute_similarity_arrays(
                 (
                     "min_chars",
                     serde_json::Value::Number((params.min_source_chars as i64).into()),
+                ),
+                (
+                    "threshold",
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(params.external_repo_threshold as f64)
+                            .unwrap(),
+                    ),
                 ),
             ],
         )
@@ -1150,6 +1285,14 @@ async fn compute_similarity_arrays(
             }
         }
     }
+
+    info!(
+        "similarity search for {} (repo: {}): found {} same-repo, {} external matches",
+        stable_id,
+        repo_name,
+        same_json.len(),
+        ext_json.len()
+    );
 
     Ok((same_json, ext_json))
 }

@@ -24,7 +24,7 @@
 //!   otherwise uses the embedded Mem engine via db_writer connection logic.
 //! - Skips dependency traversal assertions if permissions prevent table creation.
 
-use hyperzoekt::db_writer::connection::connect;
+use hyperzoekt::db::connection::connect;
 use hyperzoekt::event_consumer::EventProcessor;
 use std::time::Duration;
 use zoekt_distributed::lease_manager::RepoEvent;
@@ -192,10 +192,7 @@ async fn indexing_finished_event_end_to_end() {
 
         // Additional validation: ensure single repo, multiple files, and bidirectional repo<->file edges.
         // Helper closure to run a count query returning u64 (0 on error/empty).
-        async fn run_count(
-            conn: &hyperzoekt::db_writer::connection::SurrealConnection,
-            q: &str,
-        ) -> u64 {
+        async fn run_count(conn: &hyperzoekt::db::connection::SurrealConnection, q: &str) -> u64 {
             if let Ok(mut resp) = conn.query(q).await {
                 if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
                     if let Some(first) = rows.first() {
@@ -230,20 +227,56 @@ async fn indexing_finished_event_end_to_end() {
             file_table_total
         );
 
-        // Count distinct file ids reachable from repo via has_file
-        let file_total_from_repo = run_count(
-            &conn,
-            "SELECT count() AS c FROM has_file WHERE in=repo:fixture_example GROUP ALL;",
-        )
-        .await;
-        assert!(
-            file_total_from_repo > 1,
-            "expected >1 files related to repo, got {}",
-            file_total_from_repo
-        );
+        // Count distinct file ids reachable from commit via has_file
+        let mut file_total_from_commit = 0;
+        // First find the commit id for this repo
+        let commit_query = r#"SELECT id FROM commits WHERE ->in_repo->repo:fixture_example;"#;
+        if let Ok(mut commit_resp) = conn.query(commit_query).await {
+            if let Ok(commit_rows) = commit_resp.take::<Vec<serde_json::Value>>(0) {
+                eprintln!(
+                    "DEBUG: Found {} commits for fixture_example",
+                    commit_rows.len()
+                );
+                if let Some(first_commit) = commit_rows.first() {
+                    eprintln!("DEBUG: First commit: {:?}", first_commit);
+                    if let Some(commit_id_val) = first_commit.get("id") {
+                        if let Some(commit_id_str) = commit_id_val.as_str() {
+                            eprintln!("DEBUG: Commit ID string: {}", commit_id_str);
+                            let has_file_query = format!(
+                                r#"SELECT count() AS c FROM has_file WHERE in = commits:{};"#,
+                                commit_id_str
+                            );
+                            eprintln!("DEBUG: has_file query: {}", has_file_query);
+                            file_total_from_commit = run_count(&conn, &has_file_query).await;
+                            eprintln!("DEBUG: file_total_from_commit: {}", file_total_from_commit);
 
-        // Fetch distinct edge pairs from both directions and compare normalized sets.
-        // has_file: in=repo, out=file. in_repo: in=file, out=repo. Normalize to (repo_id,file_id).
+                            // Debug: check all has_file relations
+                            let all_has_file_query =
+                                "SELECT in, out FROM has_file LIMIT 10;".to_string();
+                            if let Ok(mut resp) = conn.query(&all_has_file_query).await {
+                                if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
+                                    eprintln!("DEBUG: Sample has_file relations: {:?}", rows);
+                                }
+                            }
+
+                            // Debug: check has_file relations with any commit
+                            let any_commit_has_file_query =
+                                "SELECT count() AS c FROM has_file WHERE in =~ 'commits:';"
+                                    .to_string();
+                            let any_count = run_count(&conn, &any_commit_has_file_query).await;
+                            eprintln!("DEBUG: has_file relations with commits: {}", any_count);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            file_total_from_commit > 1,
+            "expected >1 files related to commit, got {}",
+            file_total_from_commit
+        ); // Fetch distinct edge pairs from both directions and compare normalized sets.
+           // has_file: in=repo, out=file. in_repo: in=file, out=repo. Normalize to (repo_id,file_id).
         fn extract_pairs(
             rows: &[serde_json::Value],
             in_is_repo: bool,
@@ -257,10 +290,8 @@ async fn indexing_finished_event_end_to_end() {
                         } else {
                             (os.to_string(), is.to_string())
                         };
-                        if repo_id.starts_with("repo:fixture_example") {
-                            // scope to repo of interest
-                            set.insert((repo_id, file_id));
-                        }
+                        // No need to scope since query already filters to repo
+                        set.insert((repo_id, file_id));
                     }
                 }
             }
@@ -268,12 +299,12 @@ async fn indexing_finished_event_end_to_end() {
         }
 
         let mut has_file_rows_resp = conn
-            .query("SELECT in, out FROM has_file WHERE in=repo:fixture_example;")
+            .query(r#"SELECT in, out FROM has_file WHERE in->in_repo->repo:fixture_example;"#)
             .await
             .expect("has_file pairs");
         let has_file_rows: Vec<serde_json::Value> = has_file_rows_resp.take(0).unwrap_or_default();
         let mut in_repo_rows_resp = conn
-            .query("SELECT in, out FROM in_repo WHERE out=repo:fixture_example;")
+            .query(r#"SELECT in, out FROM in_repo WHERE out->in_repo->repo:fixture_example;"#)
             .await
             .expect("in_repo pairs");
         let in_repo_rows: Vec<serde_json::Value> = in_repo_rows_resp.take(0).unwrap_or_default();

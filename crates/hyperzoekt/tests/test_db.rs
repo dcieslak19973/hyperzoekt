@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use hyperzoekt::db_writer::connection::{connect, SurrealConnection};
+use hyperzoekt::db::connection::{connect, SurrealConnection};
 use hyperzoekt::test_utils::normalize_surreal_host;
 use surrealdb::Response;
 

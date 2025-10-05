@@ -20,3 +20,15 @@ Longer term, we want to be mindful that the MCP interface should be optimized fo
 an LLM would use it.  Since most LLMs explore codebases using tools like `grep` and
 `ripgrep`, we should assume that the LLM would want to interact with this search tool
 in the same way.
+
+9. Add support for discovering and storing git tags associated with commits
+   - Currently only branches are created as refs pointing to commits during indexing
+   - Need to scan the git repository for tags and create tag refs similar to branch refs
+   - This would allow queries to find commits by tag names
+
+10. Store the actual default branch name when indexing repositories
+   - Current implementation: WebUI hardcodes common default branch names ('main', 'master', 'trunk') when looking up SBOM dependencies
+   - Better approach: Query git's HEAD symbolic ref (e.g., `git symbolic-ref HEAD`) during initial repository indexing to determine the actual default branch
+   - Store this information in the database (either in a separate `repos` table or as metadata in the refs table)
+   - Benefits: More accurate, supports non-standard default branch names, avoids ambiguity when multiple common branch names exist
+   - Location: `crates/hyperzoekt/src/bin/hyperzoekt-webui.rs` function `get_sbom_dependencies_for_repo`

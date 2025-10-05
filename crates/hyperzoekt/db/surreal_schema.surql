@@ -4,7 +4,7 @@
 -- Commits: immutable snapshots of repository state
 -- Fields:
 --  id: string (primary key) - commit id (content-addressed or VCS commit hash)
---  repo: string - repository id
+--  repo: record<repo> - repository record reference (e.g., "repo:name")
 --  parents: array<string> - parent commit ids
 --  tree: string - snapshot id or pointer to stored tree
 --  author: string?
@@ -14,6 +14,9 @@
 --  indexed_at: datetime? - when indexing completed
 
 DEFINE TABLE commits SCHEMAFULL;
+
+-- Relationship between commits and repos
+DEFINE TABLE in_repo TYPE RELATION FROM commits TO repo;
 
 -- Example insert:
 -- INSERT INTO commits (id, repo, parents, tree, author, message, timestamp) VALUES (
@@ -32,6 +35,9 @@ DEFINE TABLE commits SCHEMAFULL;
 --  created_by: string?
 
 DEFINE TABLE refs SCHEMAFULL;
+
+-- Relationship between refs and commits
+DEFINE TABLE points_to TYPE RELATION FROM refs TO commits;
 
 -- Snapshot metadata: maps snapshots to commits
 -- Fields:

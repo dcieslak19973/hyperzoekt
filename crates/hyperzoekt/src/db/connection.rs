@@ -321,9 +321,19 @@ pub async fn connect(
         } else if client_target.starts_with("https://") {
             client_target = client_target.replacen("https://", "", 1);
         }
+        // The Surreal client constructors (Surreal::new::<Http> / <Https>) expect a host:port
+        // target without the /rpc path; they append it internally. If we leave /rpc here we risk
+        // attempting to connect to /rpc/rpc which fails, preventing the worker from creating
+        // tables. Strip a trailing /rpc segment if present.
+        if client_target.ends_with("/rpc") {
+            client_target = client_target.trim_end_matches("/rpc").to_string();
+        }
         // Ensure no leading slashes remain
         while client_target.starts_with('/') {
             client_target = client_target.replacen("/", "", 1);
+        }
+        if surreal_debug_enabled() {
+            eprintln!("DEBUG: final Surreal client_target='{}'", client_target);
         }
 
         for attempt in 0..2 {
@@ -430,12 +440,25 @@ pub async fn connect(
                 }
                 use std::sync::mpsc::channel as std_channel;
                 let (tx, rx) = std_channel();
+                // Spawn a dedicated thread which owns a Tokio runtime. Create the
+                // embedded Surreal instance on that runtime and send the Surreal
+                // Arc back to the caller. Keep the runtime alive inside the
+                // spawned thread by blocking on a pending future so the runtime
+                // isn't dropped from within an async context later (which
+                // causes panics when tests drop their runtimes).
                 std::thread::spawn(move || match Runtime::new() {
                     Ok(rt2) => {
                         let res = rt2.block_on(async { Surreal::new::<Mem>(()).await });
                         match res {
                             Ok(s) => {
-                                let _ = tx.send(Ok((Arc::new(s), rt2)));
+                                // Send only the Surreal instance back. Do NOT send
+                                // the runtime into the async test context. Instead
+                                // keep the runtime alive here by blocking on a
+                                // never-completing future so Surreal's background
+                                // tasks continue to run on this runtime.
+                                let _ = tx.send(Ok(Arc::new(s)));
+                                // Keep the runtime alive and running.
+                                rt2.block_on(async { std::future::pending::<()>().await });
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(anyhow::anyhow!(e)));
@@ -451,10 +474,14 @@ pub async fn connect(
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 match res {
-                    Ok(Ok((s, rt2))) => {
+                    Ok(Ok(s)) => {
                         let a = s;
                         let _ = SHARED_MEM.set(a.clone());
-                        let _ = SHARED_MEM_RUNTIME.set(Arc::new(rt2));
+                        // We intentionally do NOT set SHARED_MEM_RUNTIME here because
+                        // the runtime is owned and kept alive by the spawned
+                        // thread. This avoids dropping a runtime inside an async
+                        // context which can cause panics when test runtimes are
+                        // dropped.
                         SurrealConnection::Local(a)
                     }
                     Ok(Err(e)) => {
