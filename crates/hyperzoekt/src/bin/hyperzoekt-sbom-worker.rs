@@ -825,162 +825,6 @@ async fn run_cargo_sbom(repo_path: &Path) -> Result<Option<Value>> {
     Ok(None)
 }
 
-/// Scan for Dockerfiles in the repository and generate SBOMs for each one
-async fn scan_dockerfiles(repo_path: &Path) -> Vec<(String, Value)> {
-    let mut docker_sboms = Vec::new();
-
-    // Recursively find all Dockerfiles in the repository
-    match find_dockerfiles(repo_path) {
-        Ok(dockerfiles) => {
-            for dockerfile_path in dockerfiles {
-                info!("Found Dockerfile: {}", dockerfile_path.display());
-
-                // Generate SBOM for this Dockerfile
-                match generate_dockerfile_sbom(&dockerfile_path).await {
-                    Ok(Some(sbom)) => {
-                        let relative_path = dockerfile_path
-                            .strip_prefix(repo_path)
-                            .unwrap_or(&dockerfile_path)
-                            .to_string_lossy()
-                            .to_string();
-                        info!("Generated SBOM for Dockerfile: {}", relative_path);
-                        docker_sboms.push((relative_path, sbom));
-                    }
-                    Ok(None) => {
-                        warn!("No SBOM generated for {}", dockerfile_path.display());
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to generate SBOM for {}: {}",
-                            dockerfile_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to search for Dockerfiles: {}", e);
-        }
-    }
-
-    docker_sboms
-}
-
-/// Recursively find all Dockerfiles in a directory
-fn find_dockerfiles(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut dockerfiles = Vec::new();
-
-    if !dir.is_dir() {
-        return Ok(dockerfiles);
-    }
-
-    let entries = fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            // Recursively search subdirectories
-            if let Ok(mut sub_dockerfiles) = find_dockerfiles(&path) {
-                dockerfiles.append(&mut sub_dockerfiles);
-            }
-        } else if path.is_file() {
-            // Check if this is a Dockerfile
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                if filename == "Dockerfile" || filename.starts_with("Dockerfile.") {
-                    dockerfiles.push(path);
-                }
-            }
-        }
-    }
-
-    Ok(dockerfiles)
-}
-
-/// Generate an SBOM for a specific Dockerfile using cdxgen
-async fn generate_dockerfile_sbom(dockerfile_path: &Path) -> Result<Option<Value>> {
-    let parent_dir = dockerfile_path.parent().unwrap_or(dockerfile_path);
-    let out_file = parent_dir.join(format!(
-        "{}.sbom.json",
-        dockerfile_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-
-    // Remove any existing SBOM file
-    let _ = std::fs::remove_file(&out_file);
-
-    let mut cmd = Command::new("cdxgen");
-    cmd.arg("-t")
-        .arg("docker")
-        .arg("--output")
-        .arg(out_file.to_str().unwrap())
-        .arg(dockerfile_path)
-        .current_dir(parent_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    info!(
-        "Running cdxgen on Dockerfile: {}",
-        dockerfile_path.display()
-    );
-
-    let status = cmd
-        .status()
-        .await
-        .context("failed to run cdxgen for Dockerfile")?;
-
-    if !status.success() {
-        warn!(
-            "cdxgen exited with non-zero status for Dockerfile {}",
-            dockerfile_path.display()
-        );
-        return Ok(None);
-    }
-
-    if out_file.exists() {
-        match std::fs::read_to_string(&out_file) {
-            Ok(data) => {
-                if data.is_empty() {
-                    warn!(
-                        "cdxgen produced empty output for Dockerfile {}",
-                        dockerfile_path.display()
-                    );
-                    Ok(None)
-                } else {
-                    match serde_json::from_str::<Value>(&data) {
-                        Ok(json) => {
-                            // Clean up the temporary SBOM file
-                            let _ = std::fs::remove_file(&out_file);
-                            Ok(Some(json))
-                        }
-                        Err(e) => {
-                            warn!(
-                                "failed to parse Dockerfile SBOM for {}: {}",
-                                dockerfile_path.display(),
-                                e
-                            );
-                            Ok(None)
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "failed to read Dockerfile SBOM for {}: {}",
-                    dockerfile_path.display(),
-                    e
-                );
-                Ok(None)
-            }
-        }
-    } else {
-        Ok(None)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -1360,27 +1204,6 @@ async fn main() -> Result<()> {
                                         Ok(Some(id)) => {
                                             info!("upserted sbom for {}@{} (id={})", repo, commit, id);
                                             metrics.jobs_processed.fetch_add(1, Ordering::Relaxed);
-                                            // Enqueue a HiRAG job so downstream hierarchical
-                                            // clustering can run after dependencies are stored.
-                                            let hirag_queue = env::var("HZ_HIRAG_JOBS_QUEUE")
-                                                .unwrap_or_else(|_| "hirag_jobs".to_string());
-                                            let job = serde_json::json!({
-                                                "repo": repo,
-                                                "commit": commit,
-                                                "sbom_id": id,
-                                            })
-                                            .to_string();
-                                            info!("pushing hirag job to queue='{}' payload={}", hirag_queue, job);
-                                            match conn.lpush::<_, _, i64>(&hirag_queue, job.clone()).await {
-                                                Ok(new_len) => {
-                                                    info!("pushed hirag job to {} (new length={})", hirag_queue, new_len);
-                                                }
-                                                Err(e) => {
-                                                    warn!("failed to push hirag job to {}: {}", hirag_queue, e);
-                                                    debug!("failed hirag job payload: {}", job);
-                                                    metrics.redis_errors.fetch_add(1, Ordering::Relaxed);
-                                                }
-                                            }
                                             // Don't attempt to re-query the row here — some remote
                                             // Surreal client response shapes can cause deserialization
                                             // errors when selecting `*`. The presence of a returned
@@ -1390,26 +1213,6 @@ async fn main() -> Result<()> {
                                         Ok(None) => {
                                             info!("upserted sbom for {}@{} (no id returned)", repo, commit);
                                             metrics.jobs_processed.fetch_add(1, Ordering::Relaxed);
-                                            // Enqueue a HiRAG job even if we couldn't extract the
-                                            // sbom id; the HiRAG worker will re-query by repo+commit.
-                                            let hirag_queue = env::var("HZ_HIRAG_JOBS_QUEUE")
-                                                .unwrap_or_else(|_| "hirag_jobs".to_string());
-                                            let job = serde_json::json!({
-                                                "repo": repo,
-                                                "commit": commit,
-                                            })
-                                            .to_string();
-                                            info!("pushing hirag job to queue='{}' payload={}", hirag_queue, job);
-                                            match conn.lpush::<_, _, i64>(&hirag_queue, job.clone()).await {
-                                                Ok(new_len) => {
-                                                    info!("pushed hirag job to {} (new length={})", hirag_queue, new_len);
-                                                }
-                                                Err(e) => {
-                                                    warn!("failed to push hirag job to {}: {}", hirag_queue, e);
-                                                    debug!("failed hirag job payload: {}", job);
-                                                    metrics.redis_errors.fetch_add(1, Ordering::Relaxed);
-                                                }
-                                            }
                                             // No further verification here to avoid brittle
                                             // SELECTs that may fail across client backends.
                                         }
@@ -1423,40 +1226,6 @@ async fn main() -> Result<()> {
                         }
                     } else {
                         metrics.jobs_failed.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    // Scan for Dockerfiles and generate SBOMs for them
-                    info!("Scanning for Dockerfiles in repository...");
-                    let dockerfile_sboms = scan_dockerfiles(&repo_path).await;
-                    if !dockerfile_sboms.is_empty() {
-                        info!("Found {} Dockerfiles with SBOMs", dockerfile_sboms.len());
-
-                        // Store Dockerfile SBOMs in the database
-                        let ns = env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".into());
-                        let db = env::var("SURREAL_DB").unwrap_or_else(|_| "repos".into());
-                        if let Ok(conn_s) = hz_connect(&None, &None, &None, &ns, &db).await {
-                            for (dockerfile_path, dockerfile_sbom) in dockerfile_sboms {
-                                let repo_name = repo.as_deref().unwrap_or("unknown");
-                                let dockerfile_repo_key = format!("{}::{}", repo_name, dockerfile_path);
-
-                                info!("Storing SBOM for Dockerfile: {}", dockerfile_repo_key);
-                                match upsert_sbom(&conn_s, &dockerfile_repo_key, &commit, dockerfile_sbom).await {
-                                    Ok(Some(id)) => {
-                                        info!("✅ Stored Dockerfile SBOM: {} (id={})", dockerfile_path, id);
-                                    }
-                                    Ok(None) => {
-                                        info!("✅ Stored Dockerfile SBOM: {} (no id returned)", dockerfile_path);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to store Dockerfile SBOM for {}: {}", dockerfile_path, e);
-                                    }
-                                }
-                            }
-                        } else {
-                            warn!("Failed to connect to database for Dockerfile SBOM storage");
-                        }
-                    } else {
-                        info!("No Dockerfiles found in repository");
                     }
 
                     if tmp.path().exists() {

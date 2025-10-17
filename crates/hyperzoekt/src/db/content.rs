@@ -2,12 +2,129 @@ use super::writer::sanitize_json_strings;
 use crate::db::connection::SurrealConnection;
 use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// Compute content_id as hex sha256 of the input string.
+pub fn compute_content_id(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Upsert a content row keyed by content_id (e.g. sha256 hex). Stores raw text
+/// and marks embedding as pending. Idempotent: only creates if not exists.
+pub async fn upsert_content_if_missing(
+    conn: &SurrealConnection,
+    content_id: &str,
+    text: &str,
+) -> Result<()> {
+    // Sanitize the text to remove null bytes that cause bincode serialization errors
+    let sanitized_text = text.replace('\0', " ");
+
+    // Use CREATE with type::thing for the record ID
+    let create_result = conn
+        .query_with_binds(
+            "CREATE type::thing('content', $id) SET text = $text, embedding_status = 'pending';",
+            vec![
+                ("id", content_id.to_string().into()),
+                ("text", sanitized_text.clone().into()),
+            ],
+        )
+        .await;
+
+    // If CREATE failed because the record already exists, try UPDATE instead
+    if create_result.is_err() {
+        let update_result = conn
+            .query_with_binds(
+                "UPDATE type::thing('content', $id) SET text = $text, embedding_status = 'pending';",
+                vec![
+                    ("id", content_id.to_string().into()),
+                    ("text", sanitized_text.into()),
+                ],
+            )
+            .await;
+
+        if let Err(e) = update_result {
+            log::warn!("UPDATE failed for content {}: {:?}", content_id, e);
+            return Err(e.into());
+        } else {
+            log::info!("Successfully updated existing content for {}", content_id);
+        }
+    } else if let Err(e) = create_result {
+        log::warn!("CREATE failed for content {}: {:?}", content_id, e);
+        return Err(e.into());
+    } else {
+        log::info!("Successfully created new content for {}", content_id);
+    }
+
+    // Ensure created_at token is set (only if missing)
+    let created_at_result = conn
+        .query_with_binds(
+            "UPDATE type::thing('content', $id) SET created_at = time::now() WHERE created_at = NONE;",
+            vec![("id", content_id.to_string().into())],
+        )
+        .await;
+
+    if let Err(e) = created_at_result {
+        log::warn!(
+            "created_at update failed for content {}: {:?}",
+            content_id,
+            e
+        );
+        // Don't fail the whole operation for this
+    }
+
+    log::debug!("Successfully upserted content for {}", content_id);
+    Ok(())
+}
+
+/// Write an embedding to the content table. Assumes the content row already exists.
+/// This is called after upsert_content_if_missing.
+pub async fn write_content_embedding(
+    conn: &SurrealConnection,
+    content_id: &str,
+    embedding: Vec<f32>,
+    model: &str,
+    dim: usize,
+) -> Result<()> {
+    let len = embedding.len();
+
+    // Update the existing content row with embedding data
+    let update_result = conn
+        .query_with_binds(
+            "UPDATE type::thing('content', $id) SET embedding = $embedding, embedding_len = $len, embedding_model = $model, embedding_dim = $dim, embedding_status = 'ready', embedding_created_at = time::now();",
+            vec![
+                ("id", content_id.to_string().into()),
+                ("embedding", embedding.into()),
+                ("len", (len as i64).into()),
+                ("model", model.to_string().into()),
+                ("dim", (dim as i64).into()),
+            ],
+        )
+        .await;
+
+    if let Err(e) = update_result {
+        log::error!(
+            "write_content_embedding UPDATE failed for {}: {:?}",
+            content_id,
+            e
+        );
+        return Err(e.into());
+    }
+
+    log::info!(
+        "Successfully wrote embedding for content_id: {}",
+        content_id
+    );
+    Ok(())
+}
 
 /// Struct used to provide parameters for `upsert_entity_snapshot`.
 #[derive(Debug)]
 pub struct EntitySnapshotUpsert<'a> {
     pub snapshot_id: &'a str,
     pub stable_id: &'a str,
+    pub content_id: &'a str,
     pub entity_id: &'a str,
     pub commit_id: Option<&'a str>,
     pub file: Option<&'a str>,
@@ -24,15 +141,16 @@ pub struct EntitySnapshotUpsert<'a> {
     pub source_content: Option<&'a str>,
 }
 
-/// Upsert or create an entity_snapshot record for a given snapshot and entity.
+/// Upsert a snapshot mapping row for an entity: (snapshot_id, stable_id) -> content_id
 pub async fn upsert_entity_snapshot(
     conn: &SurrealConnection,
     up: &EntitySnapshotUpsert<'_>,
 ) -> Result<()> {
     log::info!(
-        "upsert_entity_snapshot called with snapshot_id={}, stable_id={}",
+        "upsert_entity_snapshot called with snapshot_id={}, stable_id={}, content_id={}",
         up.snapshot_id,
         up.stable_id,
+        up.content_id
     );
     // Build content object via serde_json to avoid manual escaping
     let mut content = serde_json::Map::new();
@@ -241,8 +359,28 @@ pub async fn upsert_entity_snapshot(
     );
     let _ = conn.query(&created_at_sql).await?;
 
-    // 4) No separate content table: embeddings and source_content are stored
-    //    directly on the entity_snapshot record. Nothing to relate here.
+    // 4) Create relation to content
+    // Note: We assume content exists since we just created it above
+    let relate_sql = format!(
+        "RELATE entity_snapshot:`{}` -> has_content -> content:`{}`;",
+        id, up.content_id
+    );
+    let relate_result = conn.query(&relate_sql).await;
+
+    if let Err(e) = relate_result {
+        log::warn!(
+            "Failed to create has_content relation between entity_snapshot:{} and content:{}: {:?}",
+            id,
+            up.content_id,
+            e
+        );
+    } else {
+        log::info!(
+            "Successfully created has_content relation between entity_snapshot:{} and content:{}",
+            id,
+            up.content_id
+        );
+    }
 
     Ok(())
 }
@@ -267,11 +405,15 @@ pub async fn create_entity_snapshot(
         sanitize_json_strings(&mut val);
         val.as_str().unwrap_or("").to_string()
     };
-    let _content = if !sanitized_doc.is_empty() {
+    let content = if !sanitized_doc.is_empty() {
         sanitized_doc.clone()
     } else {
         format!("{}:{}", name, signature)
     };
+    let content_id = compute_content_id(&content);
+
+    // Upsert content
+    upsert_content_if_missing(conn, &content_id, &sanitized_doc).await?;
 
     // Create entity_snapshot
     let mut content_obj = serde_json::Map::new();
@@ -314,6 +456,28 @@ pub async fn create_entity_snapshot(
     let create_sql = format!("CREATE entity_snapshot:`{}` CONTENT $content;", snapshot_id);
     conn.query_with_binds(&create_sql, vec![("content", content_value)])
         .await?;
+
+    // RELATE
+    let relate_sql = format!(
+        "RELATE entity_snapshot:`{}` -> has_content -> content:`{}`;",
+        snapshot_id, content_id
+    );
+    let relate_result = conn.query(&relate_sql).await;
+
+    if let Err(e) = relate_result {
+        log::warn!(
+            "Failed to create has_content relation between entity_snapshot:{} and content:{}: {:?}",
+            snapshot_id,
+            content_id,
+            e
+        );
+    } else {
+        log::info!(
+            "Successfully created has_content relation between entity_snapshot:{} and content:{}",
+            snapshot_id,
+            content_id
+        );
+    }
 
     Ok(())
 }

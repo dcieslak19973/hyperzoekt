@@ -18,6 +18,7 @@
 pub mod branch;
 pub mod config;
 pub mod connection;
+pub mod content;
 pub mod helpers;
 pub mod models;
 pub mod queries;
@@ -27,7 +28,8 @@ pub mod writer;
 pub use branch::{resolve_commit_branch, resolve_default_branch, DefaultBranchInfo};
 pub use config::{DbWriterConfig, SpawnResult};
 pub use connection::{connect, SurrealConnection, SHARED_MEM};
-// content module removed: embeddings and snapshot storage now live on `entity_snapshot`.
+// content module exists for internal use but functions are not re-exported since
+// embeddings and snapshot storage now happen during indexing via entity_snapshot.
 pub use helpers::normalize_git_url;
 pub use helpers::normalize_sql_value_id;
 pub use helpers::response_to_json;
