@@ -1,0 +1,303 @@
+{% extends "base" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>📁 Repository: {{ repo_name }}</h2>
+    </div>
+    <div class="card-body">
+        <div style="margin-bottom: 1rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+            <a href="/" class="btn" style="margin-right: 1rem; text-decoration:none;">← Back to Repositories</a>
+            {% if not dupes_page %}
+            <a href="/search?repo={{ repo_name }}" class="btn" style="text-decoration:none;">🔍 Search</a>
+            {% endif %}
+            {% if not dupes_page %}
+            <a href="/repo/{{ repo_name }}" class="btn btn-active" style="text-decoration:none;">📄 Entities</a>
+            <a href="/repo/{{ repo_name }}/dupes" class="btn" style="text-decoration:none;">🧭 Code Dupes</a>
+            {% endif %}
+        </div>
+
+        {% if dupes_page %}
+        <div>
+            <p>Showing top duplicate-like pairs for <strong>{{ repo_name }}</strong>.</p>
+            <form id="dupes-filters" class="card"
+                style="padding:10px; display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">
+                <div>
+                    <label for="limit" style="display:block; font-size:12px; color:var(--muted);">Limit</label>
+                    <input id="limit" type="number" min="1" max="500" value="100" class="input" style="width:100px;" />
+                </div>
+                <div>
+                    <label for="min_score" style="display:block; font-size:12px; color:var(--muted);">Min score</label>
+                    <input id="min_score" type="number" step="0.01" min="0" max="1" placeholder="e.g. 0.80"
+                        class="input" style="width:120px;" />
+                </div>
+                <div>
+                    <label for="language" style="display:block; font-size:12px; color:var(--muted);">Language</label>
+                    <input id="language" type="text" placeholder="e.g. rust" class="input" style="width:140px;" />
+                </div>
+                <div>
+                    <label for="kind" style="display:block; font-size:12px; color:var(--muted);">Kind</label>
+                    <input id="kind" type="text" placeholder="e.g. function" class="input" style="width:140px;" />
+                </div>
+                <button type="submit" class="btn">Apply</button>
+            </form>
+            <div id="dupes-loading" style="color: var(--muted); font-size: 0.9rem;">Loading…</div>
+            <div id="dupes-error" style="display:none; color:#b91c1c; font-size: 0.9rem;">Failed to load dupes.</div>
+            <div id="dupes-content" style="display:none;">
+                <h3 style="margin-top:10px;">Within Repo</h3>
+                <div id="dupes-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+                <h3 style="margin-top:16px;">Cross Repo</h3>
+                <div id="dupes-external-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+            </div>
+        </div>
+        <script>
+            (function () {
+                const repo = encodeURIComponent('{{ repo_name }}');
+                const loading = document.getElementById('dupes-loading');
+                const err = document.getElementById('dupes-error');
+                const content = document.getElementById('dupes-content');
+                const list = document.getElementById('dupes-list');
+                const listExt = document.getElementById('dupes-external-list');
+                const form = document.getElementById('dupes-filters');
+
+                function item(p) {
+                    function ent(e) {
+                        const href = e.stable_id ? `/entity/${encodeURIComponent(e.stable_id)}` : (e.source_url || '#');
+                        const file = e.source_display || e.file || '';
+                        const repo = e.repo_name ? `<div style="color: var(--muted); font-size: 12px;">${e.repo_name}</div>` : '';
+                        return `<div style="display:flex; flex-direction:column;">
+                            <a href="${href}" style="color: var(--accent); text-decoration:none; font-weight:600;">${e.name || '(unknown)'}</a>
+                            <div style="color: var(--muted); font-size: 12px;">${file}</div>
+                            ${repo}
+                        </div>`;
+                    }
+                    const score = (typeof p.score === 'number') ? p.score.toFixed(3) : '';
+                    return `<div class="card" style="padding:10px; display:flex; justify-content:space-between; gap:12px; align-items:center;">
+                        <div style="flex:1;">${ent(p.a)}</div>
+                        <div style="color: var(--muted); font-size: 12px;">score ${score}</div>
+                        <div style="flex:1;">${ent(p.b)}</div>
+                    </div>`;
+                }
+
+                function buildQuery() {
+                    const limit = document.getElementById('limit').value || '100';
+                    const minScore = document.getElementById('min_score').value;
+                    const language = document.getElementById('language').value;
+                    const kind = document.getElementById('kind').value;
+                    const params = new URLSearchParams({ limit: String(limit) });
+                    if (minScore) params.set('min_score', minScore);
+                    if (language) params.set('language', language);
+                    if (kind) params.set('kind', kind);
+                    return params.toString();
+                }
+
+                async function load() {
+                    loading.style.display = 'block';
+                    err.style.display = 'none';
+                    content.style.display = 'none';
+                    list.innerHTML = '';
+                    listExt.innerHTML = '';
+                    const qs = buildQuery();
+                    const urlIn = `/api/repo/${repo}/dupes?${qs}`;
+                    const urlEx = `/api/repo/${repo}/external_dupes?${qs}`;
+                    try {
+                        const [inRes, exRes] = await Promise.all([fetch(urlIn), fetch(urlEx)]);
+                        const inData = await inRes.json();
+                        const exData = await exRes.json();
+                        const inPairs = Array.isArray(inData.pairs) ? inData.pairs : [];
+                        const exPairs = Array.isArray(exData.pairs) ? exData.pairs : [];
+                        list.innerHTML = inPairs.map(item).join('') || '<div class="muted">No pairs found.</div>';
+                        listExt.innerHTML = exPairs.map(item).join('') || '<div class="muted">No pairs found.</div>';
+                        loading.style.display = 'none';
+                        content.style.display = 'block';
+                    } catch (e) {
+                        loading.style.display = 'none';
+                        err.style.display = 'block';
+                    }
+                }
+
+                form.addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    load();
+                });
+
+                load();
+            })();
+        </script>
+        {% else %}
+        <p>Showing {{ entities|length }} entities in this repository.</p>
+        {% if entities %}
+        <ul class="entity-list">
+            {% for entity in entities %}
+            <li
+                class="entity-item {% if 'function' in entity.kind or 'method' in entity.kind %}entity-function{% elif 'class' in entity.kind or 'struct' in entity.kind or 'interface' in entity.kind or 'trait' in entity.kind %}entity-class{% elif 'enum' in entity.kind %}entity-enum{% elif 'module' in entity.kind or 'namespace' in entity.kind %}entity-module{% elif 'variable' in entity.kind or 'constant' in entity.kind or 'field' in entity.kind %}entity-variable{% elif 'macro' in entity.kind %}entity-macro{% else %}entity-other{% endif %}">
+                <div class="entity-name">
+                    <a href="/entity/{{ entity.stable_id }}" style="color: #333; text-decoration: none;">
+                        {{ entity.name }}
+                    </a>
+                    <span
+                        class="badge badge-{% if 'function' in entity.kind or 'method' in entity.kind %}entity-function{% elif 'class' in entity.kind or 'struct' in entity.kind or 'interface' in entity.kind or 'trait' in entity.kind %}entity-class{% elif 'enum' in entity.kind %}entity-enum{% elif 'module' in entity.kind or 'namespace' in entity.kind %}entity-module{% elif 'variable' in entity.kind or 'constant' in entity.kind or 'field' in entity.kind %}entity-variable{% elif 'macro' in entity.kind %}entity-macro{% else %}entity-other{% endif %}">{{
+                        entity.kind }}</span>
+                    <span
+                        class="badge {% if entity.language|lower == 'rust' or entity.language|lower == 'rs' %}lang-rust{% elif entity.language|lower == 'python' or entity.language|lower == 'py' %}lang-python{% elif entity.language|lower == 'javascript' or entity.language|lower == 'js' %}lang-javascript{% elif entity.language|lower == 'typescript' or entity.language|lower == 'ts' %}lang-typescript{% elif entity.language|lower == 'go' %}lang-go{% elif entity.language|lower == 'java' %}lang-java{% elif entity.language|lower == 'cpp' or entity.language|lower == 'c++' %}lang-cpp{% elif entity.language|lower == 'c' %}lang-c{% elif entity.language|lower == 'csharp' or entity.language|lower == 'c#' %}lang-csharp{% elif entity.language|lower == 'swift' %}lang-swift{% elif entity.language|lower == 'kotlin' %}lang-kotlin{% elif entity.language|lower == 'scala' %}lang-scala{% elif entity.language|lower == 'ruby' %}lang-ruby{% elif entity.language|lower == 'php' %}lang-php{% elif entity.language|lower == 'html' %}lang-html{% elif entity.language|lower == 'css' %}lang-css{% else %}lang-other{% endif %}">{{
+                        entity.language }}</span>
+                </div>
+                <div class="entity-meta">
+                    📄 {% if entity.source_url %}
+                    <a href="{{ entity.source_url }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                        target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                        entity.source_display else entity.file }}{% if
+                        entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% else %}
+                    {# Server injects a `file` hint into the template JSON when needed. Use it as fallback. #}
+                    <a href="https://github.com/{{ repo_name }}/{{ (entity.file if entity.file else '')|replace(repo_name + '/', '') }}{% if entity.start_line %}#L{{ entity.start_line }}{% endif %}"
+                        target="_blank" style="color: #0366d6; text-decoration: none;">{{ entity.source_display if
+                        entity.source_display else (entity.file if entity.file else '') }}{% if
+                        entity.start_line %}:{{ entity.start_line }}{% endif %}</a>
+                    {% endif %}
+                    {% if entity.end_line %}-{{ entity.end_line }}{% endif %}
+                    • 🔢 Rank: <strong>{{ entity.rank }}</strong>
+                    {% if entity.parent %}
+                    • 📦 {{ entity.parent }}
+                    {% endif %}
+                </div>
+                {% if entity.signature %}
+                <div class="entity-signature"><code>{{ entity.signature }}</code></div>
+                {% endif %}
+                {% if entity.calls %}
+                <div class="entity-calls">📞 Calls: {{ entity.calls[:3]|join(', ') }}{% if entity.calls|length > 3 %}
+                    +{{ entity.calls|length - 3 }} more{% endif %}</div>
+                {% endif %}
+                {% if entity.doc %}
+                <div class="entity-doc">{{ entity.doc|truncate(150) }}</div>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p>No entities found in this repository.</p>
+        {% endif %}
+        <hr />
+        <div class="card" id="dependencies-card" style="margin-top: 1rem;">
+            <div class="card-header">
+                <h3>📦 Dependencies</h3>
+            </div>
+            <div class="card-body">
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+                    <label for="dep-ref" style="font-size:12px; color:var(--muted);">Ref</label>
+                    <input id="dep-ref" type="text" placeholder="branch or tag (optional)" class="input"
+                        style="width:220px;" />
+                    <button id="dep-refresh" class="btn">Refresh</button>
+                </div>
+                <div id="deps-loading" style="color: var(--muted);">Loading…</div>
+                <div id="deps-error" style="display:none; color:#b91c1c;">Failed to load dependencies.</div>
+                <div id="deps-content" style="display:none;">
+                    <table style="width:100%; border-collapse:collapse;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Name</th>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Language</th>
+                                <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Version</th>
+                            </tr>
+                        </thead>
+                        <tbody id="deps-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="card" id="sbom-card" style="margin-top: 1rem;">
+            <div class="card-header">
+                <h3>🧾 SBOM</h3>
+            </div>
+            <div class="card-body">
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+                    <label for="sbom-ref" style="font-size:12px; color:var(--muted);">Ref</label>
+                    <input id="sbom-ref" type="text" placeholder="branch or tag (optional)" class="input"
+                        style="width:220px;" />
+                    <button id="sbom-refresh" class="btn">Fetch SBOM</button>
+                </div>
+                <div id="sbom-loading" style="color: var(--muted);">Loading…</div>
+                <div id="sbom-error" style="display:none; color:#b91c1c;">Failed to load SBOM.</div>
+                <div id="sbom-content"
+                    style="display:none; white-space:pre-wrap; font-family:monospace; background:#f9f9f9; padding:12px; border-radius:6px; max-height:400px; overflow:auto;">
+                </div>
+            </div>
+        </div>
+        <script>
+            (function () {
+                const repo = encodeURIComponent('{{ repo_name }}');
+                const loading = document.getElementById('deps-loading');
+                const err = document.getElementById('deps-error');
+                const content = document.getElementById('deps-content');
+                const tbody = document.getElementById('deps-table-body');
+                const refInput = document.getElementById('dep-ref');
+                const btn = document.getElementById('dep-refresh');
+
+                async function loadDeps() {
+                    loading.style.display = 'block';
+                    err.style.display = 'none';
+                    content.style.display = 'none';
+                    tbody.innerHTML = '';
+                    const ref = refInput.value.trim();
+                    const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+                    try {
+                        const res = await fetch(`/api/repo/${repo}/dependencies${qs}`);
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        const data = await res.json();
+                        const deps = Array.isArray(data.dependencies) ? data.dependencies : [];
+                        if (deps.length === 0) {
+                            tbody.innerHTML = '<tr><td colspan="3" class="muted">No dependencies discovered.</td></tr>';
+                        } else {
+                            tbody.innerHTML = deps.map(d => {
+                                const name = d.name || '(unknown)';
+                                const lang = d.language || '';
+                                const ver = d.version || '';
+                                return `<tr><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${name}</td><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${lang}</td><td style="padding:6px; border-bottom:1px solid #f3f3f3;">${ver}</td></tr>`;
+                            }).join('');
+                        }
+                        loading.style.display = 'none';
+                        content.style.display = 'block';
+                    } catch (e) {
+                        loading.style.display = 'none';
+                        err.style.display = 'block';
+                    }
+                }
+                btn.addEventListener('click', function (e) { e.preventDefault(); loadDeps(); });
+                // Try auto-loading once after a short delay to allow server-side template work
+                setTimeout(loadDeps, 200);
+            })();
+            (function () {
+                const repo = encodeURIComponent('{{ repo_name }}');
+                const loading = document.getElementById('sbom-loading');
+                const err = document.getElementById('sbom-error');
+                const content = document.getElementById('sbom-content');
+                const refInput = document.getElementById('sbom-ref');
+                const btn = document.getElementById('sbom-refresh');
+
+                async function loadSbom() {
+                    loading.style.display = 'block';
+                    err.style.display = 'none';
+                    content.style.display = 'none';
+                    content.textContent = '';
+                    const ref = refInput.value.trim();
+                    const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+                    try {
+                        const res = await fetch(`/api/repo/${repo}/sbom/blob${qs}`);
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        const text = await res.text();
+                        content.textContent = text || '(empty)';
+                        loading.style.display = 'none';
+                        content.style.display = 'block';
+                    } catch (e) {
+                        loading.style.display = 'none';
+                        err.style.display = 'block';
+                    }
+                }
+                btn.addEventListener('click', function (e) { e.preventDefault(); loadSbom(); });
+                // Do not auto-fetch SBOM by default to avoid heavy payloads; user clicks to fetch
+            })();
+        </script>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

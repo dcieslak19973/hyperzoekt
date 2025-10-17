@@ -1,0 +1,5 @@
+#!/bin/bash
+# Minimal cdxgen shim for tests — outputs a simple CycloneDX JSON
+cat <<'JSON'
+{"bomFormat":"CycloneDX","specVersion":"1.4","components":[{"name":"test","version":"0.1.0"}]}
+JSON

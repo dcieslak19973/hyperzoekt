@@ -1,0 +1,474 @@
+# Port mappings use environment variable substitution so a single source
+# of truth can live in `docker/.env`. Example: REDIS_PORT=6379
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "${REDIS_PORT}:${REDIS_PORT}"
+    command: redis-server --port ${REDIS_PORT} --appendonly yes
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "${REDIS_PORT}", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    pull_policy: always
+    ports:
+      - "${SURREALDB_PORT}:${SURREALDB_PORT}"
+    command: start --bind 0.0.0.0:${SURREALDB_PORT} --user root --pass root memory
+    restart: unless-stopped
+    environment:
+      SURREAL_CAPS_ALLOW_EXPERIMENTAL: graphql
+
+  surrealdb-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      surrealdb:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://surrealdb:${SURREALDB_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  zoekt-indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${ZOEK_INDEXER_PORT}:${ZOEK_INDEXER_PORT}"
+    environment:
+      - DISTRIBUTED_ZOEKT_REPO_EVENTS=1
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      # - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_DB_VERBOSE_PAYLOADS=1
+      - SURREAL_NS=zoekt
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_INDEXER_PORT}
+      - ZOEKT_ENDPOINT=http://zoekt-indexer:${ZOEK_INDEXER_PORT}
+    command: [ "/app/dzr-indexer", "--host", "0.0.0.0", "--port", "${ZOEK_INDEXER_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  zoekt-admin:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${ZOEK_ADMIN_PORT}:${ZOEK_ADMIN_PORT}"
+    environment:
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - ZOEKTD_ADMIN_USERNAME=admin
+      - ZOEKTD_ADMIN_PASSWORD=password
+    command: [ "/app/dzr-admin", "--host", "0.0.0.0", "--port", "${ZOEK_ADMIN_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  zoekt-admin-poller:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    environment:
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - ZOEKTD_POLL_INTERVAL_SECONDS=30
+      # Bind internal metrics/health server to the same port we map on the host
+      - ZOEKT_POLLER_METRICS_PORT=${ZOEK_ADMIN_POLLER_PORT}
+    ports:
+      - "${ZOEK_ADMIN_POLLER_PORT}:${ZOEK_ADMIN_POLLER_PORT}"
+    command: [ "/app/dzr-admin-poller", "--host", "0.0.0.0", "--port", "${ZOEK_ADMIN_POLLER_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  poller-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      zoekt-admin-poller:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://zoekt-admin-poller:${ZOEK_ADMIN_POLLER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 2s
+
+  zoekt-search:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${ZOEK_SEARCH_PORT}:${ZOEK_SEARCH_PORT}"
+    environment:
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_SEARCH_PORT}
+    command: [ "/app/dzr-http-search", "--host", "0.0.0.0", "--port", "${ZOEK_SEARCH_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  zoekt-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${ZOEK_MCP_PORT}:${ZOEK_MCP_PORT}"
+    environment:
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_MCP_PORT}
+    command: [ "/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "${ZOEK_MCP_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${HYPERZOEKT_INDEXER_PORT}:${HYPERZOEKT_INDEXER_PORT}"
+    environment:
+      # Enqueue embedding jobs after indexing (default ON for local dev)
+      - HZ_EMBED_BATCH_SIZE=8
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      # Default limits for embeddings (overridable via environment)
+      - HZ_EMBED_MAX_BYTES=${HZ_EMBED_MAX_BYTES:-10000}
+      - HZ_EMBED_TOKEN_LIMIT=${HZ_EMBED_TOKEN_LIMIT:-4096}
+      # LLM endpoint (OpenAI-compatible). If unset, defaults to the public OpenAI API.
+      # Override with HZ_LLM_URL to point to a local or private OpenAI-compatible endpoint.
+      - HZ_LLM_URL=${HZ_LLM_URL:-https://api.openai.com}
+      - HZ_DEBUG_SQL=0
+      - HZ_DEBUG_SQL_RESP=0
+      - HZ_ENABLE_SBOM_JOBS=1
+      - HZ_INDEXER_PORT=${HYPERZOEKT_INDEXER_PORT}
+      # Path where the writer will append embedding DLQ records (mount host ./docker/embed-dlq to /tmp to persist)
+      - HZ_EMBED_DLQ_PATH=${HZ_EMBED_DLQ_PATH:-/tmp/hz_embed_dlq.log}
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+    command: [ "/app/hyperzoekt-indexer", "--host", "0.0.0.0", "--port", "7205" ]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7205/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+      tei-prober:
+        condition: service_healthy
+
+  hyperzoekt-webui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${HYPERZOEKT_WEBUI_PORT}:${HYPERZOEKT_WEBUI_PORT}"
+    environment:
+      - HYPERZOEKT_LOG_LEVEL=debug
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      # Default embedding limits (overridable)
+      - HZ_EMBED_MAX_BYTES=${HZ_EMBED_MAX_BYTES:-10000}
+      - HZ_EMBED_TOKEN_LIMIT=${HZ_EMBED_TOKEN_LIMIT:-4096}
+      - HZ_EMBED_DLQ_PATH=${HZ_EMBED_DLQ_PATH:-/tmp/hz_embed_dlq.log}
+      # LLM endpoint (OpenAI-compatible). If unset, defaults to the public OpenAI API.
+      # Override with HZ_LLM_URL to point to a local or private OpenAI-compatible endpoint.
+      - HZ_LLM_URL=${HZ_LLM_URL:-https://api.openai.com}
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=debug
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+    command: [ "/app/hyperzoekt-webui", "--host", "0.0.0.0", "--port", "${HYPERZOEKT_WEBUI_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${HYPERZOEKT_MCP_PORT}:${HYPERZOEKT_MCP_PORT}"
+    environment:
+      - HZ_MCP_HOST=0.0.0.0
+      - HZ_MCP_PORT=${HYPERZOEKT_MCP_PORT}
+      - HZ_WEBUI_BASE=http://hyperzoekt-webui:${HYPERZOEKT_WEBUI_PORT}
+      - HZ_TEI_BASE=http://tei:80
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      # Default embedding limits (overridable)
+      - HZ_EMBED_MAX_BYTES=${HZ_EMBED_MAX_BYTES:-10000}
+      - HZ_EMBED_TOKEN_LIMIT=${HZ_EMBED_TOKEN_LIMIT:-4096}
+      - HZ_EMBED_DLQ_PATH=${HZ_EMBED_DLQ_PATH:-/tmp/hz_embed_dlq.log}
+      - RUST_LOG=info
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+    command: [ "/app/hyperzoekt-mcp", "--host", "0.0.0.0", "--port", "${HYPERZOEKT_MCP_PORT}" ]
+    restart: unless-stopped
+    depends_on:
+      surrealdb-prober:
+        condition: service_healthy
+      hyperzoekt-webui:
+        condition: service_started
+      tei-prober:
+        condition: service_healthy
+
+  hyperzoekt-similarity-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${HYPERZOEKT_SIMILARITY_WORKER_PORT}:${HYPERZOEKT_SIMILARITY_WORKER_PORT}"
+    environment:
+      - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
+      - HZ_EMBED_PROCESSING_TTL_SECONDS=300
+      # Model id used for embeddings (required)
+      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
+      # Default embedding limits (overridable)
+      - HZ_EMBED_MAX_BYTES=${HZ_EMBED_MAX_BYTES:-10000}
+      - HZ_EMBED_TOKEN_LIMIT=${HZ_EMBED_TOKEN_LIMIT:-4096}
+      # LLM endpoint (OpenAI-compatible). If unset, defaults to the public OpenAI API.
+      # Override with HZ_LLM_URL to point to a local or private OpenAI-compatible endpoint.
+      - HZ_LLM_URL=${HZ_LLM_URL:-https://api.openai.com}
+      # Similarity thresholds (cosine similarity scores)
+      - HZ_SIMILARITY_THRESHOLD_SAME_REPO=0.85
+      - HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO=0.90
+      - HZ_SIMILARITY_WORKER_PORT=${HYPERZOEKT_SIMILARITY_WORKER_PORT}
+      # Debugging toggles - enable to log SQL and verify DB updates
+      - HZ_EMBED_DEBUG_SQL=1
+      - HZ_EMBED_DEBUG_DB=1
+      - HZ_EMBED_DLQ_PATH=${HZ_EMBED_DLQ_PATH:-/tmp/hz_embed_dlq.log}
+      # Enable SurrealDB client debug output and verbose payload logs for troubleshooting
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=info
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      # Disable verbose debug logging for similarity worker (embeddings are huge)
+      # - SURREAL_DEBUG=1
+      # - SURREAL_DB_VERBOSE_PAYLOADS=1
+    command: [ "/app/hyperzoekt-similarity-worker" ]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${HYPERZOEKT_SIMILARITY_WORKER_PORT}/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-sbom-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      - "${HYPERZOEKT_SBOM_WORKER_PORT}:${HYPERZOEKT_SBOM_WORKER_PORT}"
+    environment:
+      - HZ_SBOM_JOBS_QUEUE=zoekt:sbom_jobs
+      - HZ_HIRAG_JOBS_QUEUE=zoekt:hirag_jobs
+      - HZ_SBOM_PROCESSING_TTL_SECONDS=300
+      - HZ_SBOM_WORKER_PORT=${HYPERZOEKT_SBOM_WORKER_PORT}
+      - HZ_SBOM_TOOL=cdxgen
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=info,hyperzoekt=debug
+      # Enable SurrealDB client debug output for SBOM worker
+      - SURREAL_DEBUG=1
+      - SURREAL_DB_VERBOSE_PAYLOADS=1
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+    command: [ "/app/hyperzoekt-sbom-worker" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-hirag-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hyperzoekt:latest
+    ports:
+      # Default host port 7211 when HYPERZOEKT_HIRAG_WORKER_PORT is not set
+      - "${HYPERZOEKT_HIRAG_WORKER_PORT:-7211}:7211"
+    environment:
+      - HZ_HIRAG_JOBS_QUEUE=zoekt:hirag_jobs
+      - HZ_HIRAG_PROCESSING_TTL_SECONDS=300
+      - HZ_HIRAG_WORKER_PORT=${HYPERZOEKT_HIRAG_WORKER_PORT:-7211}
+      - REDIS_URL=redis://redis:${REDIS_PORT}
+      - RUST_LOG=info,hyperzoekt=debug
+      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
+      - SURREALDB_USERNAME=root
+      - SURREALDB_PASSWORD=root
+      - SURREAL_DB=repos
+      - SURREAL_NS=zoekt
+      # LLM endpoint (OpenAI-compatible) default
+      - HZ_LLM_URL=${HZ_LLM_URL:-https://api.openai.com}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - HZ_OPENAI_API_KEY=${HZ_OPENAI_API_KEY}
+      - HZ_LLM_MODEL=${HZ_LLM_MODEL:-gpt-5-nano}
+    command: [ "/app/hyperzoekt-hirag-worker" ]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      surrealdb-prober:
+        condition: service_healthy
+
+  hyperzoekt-hirag-worker-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      hyperzoekt-hirag-worker:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://hyperzoekt-hirag-worker:${HYPERZOEKT_HIRAG_WORKER_PORT:-7211}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # Local embeddings service powered by Hugging Face TEI
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    ports:
+      - "${TEI_HTTP_PORT}:80"
+    restart: unless-stopped
+    command: [ "--model-id", "jinaai/jina-embeddings-v2-base-code" ]
+
+  # External prober for TEI health (avoids requiring curl inside the TEI image)
+  tei-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      tei:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://tei:80/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Health check probers for hyperzoekt workers
+  hyperzoekt-indexer-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      hyperzoekt-indexer:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://hyperzoekt-indexer:${HYPERZOEKT_INDEXER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  hyperzoekt-similarity-worker-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      hyperzoekt-similarity-worker:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://hyperzoekt-similarity-worker:${HYPERZOEKT_SIMILARITY_WORKER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  hyperzoekt-sbom-worker-prober:
+    image: curlimages/curl:8.3.0
+    command: [ "tail", "-f", "/dev/null" ]
+    depends_on:
+      hyperzoekt-sbom-worker:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sS http://hyperzoekt-sbom-worker:${HYPERZOEKT_SBOM_WORKER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+

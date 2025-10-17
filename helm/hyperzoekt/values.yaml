@@ -1,0 +1,574 @@
+# Default values for hyperzoekt.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global settings
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+
+# Redis configuration
+redis:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: redis
+    tag: "alpine"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 6379
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  persistence:
+    enabled: false
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # External Redis configuration (when redis.enabled=false)
+  external:
+    host: ""
+    port: 6379
+    password: ""
+
+# SurrealDB configuration
+surrealdb:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: surrealdb/surrealdb
+    tag: "v2.3.1"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  persistence:
+    enabled: false
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+  # External SurrealDB configuration (when surrealdb.enabled=false)
+  external:
+    url: ""
+    username: "root"
+    password: "root"
+    namespace: "zoekt"
+    database: "repos"
+
+# Indexer configuration
+indexer:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetMemoryUtilizationPercentage: 80
+    targetCPUUtilizationPercentage: 80
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:7676"
+    - name: ZOEKTD_ENABLE_REINDEX
+      value: "true"
+    - name: ZOEKTD_INDEX_ONCE
+      value: "false"
+  # Additional environment variables
+  extraEnvVars: []
+  # Mount host repository directory
+  hostRepoPath: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Admin UI configuration
+admin:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7201
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: admin.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKT_ADMIN_USERNAME
+      value: "admin"
+    - name: ZOEKT_ADMIN_PASSWORD
+      value: "password"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Search API configuration
+search:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7203
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: search.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:7203"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# MCP Server configuration
+mcp:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7204
+  # Exposure configuration
+  exposure:
+    type: service  # service or ingress
+    serviceType: ClusterIP  # Only used when type is service
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: mcp.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: ZOEKTD_BIND_ADDR
+      value: "0.0.0.0:7204"
+  # Additional environment variables
+  extraEnvVars: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: hyperzoekt.local
+      paths:
+        - path: /admin
+          pathType: Prefix
+          service:
+            name: hyperzoekt-admin
+            port:
+              number: 7201
+        - path: /search
+          pathType: Prefix
+          service:
+            name: hyperzoekt-search
+            port:
+              number: 7203
+        - path: /mcp
+          pathType: Prefix
+          service:
+            name: hyperzoekt-mcp
+            port:
+              number: 7204
+  tls: []
+
+# Service account configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod security context
+podSecurityContext: {}
+  # fsGroup: 2000
+
+# Security context
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+# Node selector, tolerations, and affinity for all components
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# HyperZoekt indexer (embeddings-aware indexer)
+hyperzoektIndexer:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7205
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # Enable enqueueing embedding jobs after indexing
+  enableEmbedJobs: true
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt Web UI
+hyperzoektWebui:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7206
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: webui.hyperzoekt.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt MCP server
+hyperzoektMcp:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7207
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # Defaults for MCP env
+  env:
+    - name: HZ_MCP_HOST
+      value: "0.0.0.0"
+    - name: HZ_MCP_PORT
+      value: "7207"
+    - name: HZ_EMBED_MODEL
+      value: "jinaai/jina-embeddings-v2-base-code"
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: hyperzoekt-mcp.local
+      path: /
+      pathType: Prefix
+      tls:
+        enabled: false
+        secretName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Similarity worker (rebranded from embed-worker)
+hyperzoektSimilarityWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7208
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt embedding worker
+hyperzoektEmbedWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env:
+    - name: HZ_EMBED_JOBS_QUEUE
+      value: "zoekt:embed_jobs"
+    - name: HZ_EMBED_PROCESSING_TTL_SECONDS
+      value: "300"
+    - name: HZ_EMBED_MODEL
+      value: "jinaai/jina-embeddings-v2-base-code"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HyperZoekt SBOM worker
+hyperzoektSbomWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  service:
+    port: 7210
+  # Exposure configuration (service or ingress)
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      host: sbom.hyperzoekt.local
+      path: /
+      pathType: Prefix
+  # Environment variables specific to the SBOM worker
+  env:
+    - name: HZ_SBOM_JOBS_QUEUE
+      value: "zoekt:sbom_jobs"
+    - name: HZ_SBOM_PROCESSING_TTL_SECONDS
+      value: "300"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# HiRAG worker configuration (mirrors SBOM worker defaults)
+hyperzoektHiragWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  service:
+    port: 7211
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  env:
+    - name: HZ_HIRAG_JOBS_QUEUE
+      value: "zoekt:hirag_jobs"
+    - name: HZ_HIRAG_PROCESSING_TTL_SECONDS
+      value: "300"
+    - name: HZ_LLM_URL
+      value: "{{ .Values.defaultLlmUrl }}"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Make indexer publish SBOM jobs by default (parity with docker-compose)
+hyperzoektIndexer:
+  enableSbomJobs: true
+  # Additional environment variables (kept empty by default; set locally if needed)
+  extraEnvVars: []
+
+# Local TEI service (Bring Your Own Embedder)
+# TEI provides a local inference service used by the embed worker. It is
+# enabled by default for local development. For production or custom
+# environments, you can disable this and point `HZ_TEI_BASE` to your external
+# embedder service (BYOE - Bring Your Own Embedder).
+tei:
+  enabled: true
+  annotations: {}
+  image:
+    registry: ghcr.io
+    repository: huggingface/text-embeddings-inference
+    tag: cpu-latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+  modelId: "jinaai/jina-embeddings-v2-base-code"
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Default LLM endpoint env. Components will point to the public OpenAI API by default.
+# Default LLM endpoint env. Components will point to the public OpenAI API by default.
+# Configure an external OpenAI-compatible endpoint here. At runtime components
+# will read the endpoint from `defaultLlmUrl` or the `HZ_LLM_URL` environment
+# variable. Provide an API key using `HZ_OPENAI_API_KEY` (preferred) or
+# `OPENAI_API_KEY` as a fallback.
+defaultLlmUrl: "https://api.openai.com"

@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Login - Distributed Zoekt</title>
+    <link rel="stylesheet" href="/static/common/styles.css" />
+    <script src="/static/common/theme.js" defer></script>
+    <script src="/static/admin.js" defer></script>
+</head>
+
+<body>
+    <div class="container">
+        <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                    <div class="brand">Distributed Zoekt</div>
+                    <h1>Admin console — sign in</h1>
+                    <p class="muted">This login page is for the Distributed Zoekt administrator interface.</p>
+                </div>
+                <div>
+                    <button id="theme-toggle-login" class="theme-toggle"><span class="icon">🌙</span> <span
+                            class="label">Dark</span></button>
+                </div>
+            </div>
+            <form method="post" action="/login">
+                <label>Username
+                    <input type="text" name="username" value="{{USERNAME_VALUE}}" required autocomplete="username" />
+                </label>
+                <label>Password
+                    <input type="password" name="password" required autocomplete="current-password" />
+                </label>
+                <button type="submit">Sign in</button>
+            </form>
+            {{ERROR_BLOCK}}
+            <div class="footer muted">Use your admin credentials to manage repositories.</div>
+        </div>
+    </div>
+</body>
+
+</html>

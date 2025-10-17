@@ -1,0 +1,37 @@
+{% extends "base" %}
+{% block title %}Code Dupes{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>🧭 Code Dupes Overview</h2>
+    </div>
+    <div class="card-body">
+        <p>Select a repository to view duplicate-like pairs. Use filters on the repo page for fine-grained control.</p>
+        <div id="dupes-index-loading" style="color: var(--muted); font-size: 0.9rem;">Loading…</div>
+        <div id="dupes-index-error" style="display:none; color:#b91c1c; font-size: 0.9rem;">Failed to load repositories.
+        </div>
+        <div id="dupes-index-content" style="display:none;"></div>
+    </div>
+</div>
+<script>
+    (function () {
+        const loading = document.getElementById('dupes-index-loading');
+        const err = document.getElementById('dupes-index-error');
+        const content = document.getElementById('dupes-index-content');
+        fetch('/api/repos').then(r => r.json()).then(repos => {
+            loading.style.display = 'none';
+            content.style.display = 'block';
+            const list = Array.isArray(repos) ? repos : [];
+            content.innerHTML = `<div class="repo-grid">${list.map(r => `
+      <div class="repo-card">
+        <h3><a href="/repo/${encodeURIComponent(r.name)}/dupes">${r.name}</a></h3>
+        <div class="repo-stats">
+          <div class="stat">${r.entity_count || 0} entities</div>
+          <div class="stat">${r.language_counts ? Object.keys(r.language_counts).length : 0} languages</div>
+        </div>
+      </div>
+    `).join('')}</div>`;
+        }).catch(() => { loading.style.display = 'none'; err.style.display = 'block'; });
+    })();
+</script>
+{% endblock %}

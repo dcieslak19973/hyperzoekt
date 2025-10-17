@@ -1,0 +1,139 @@
+{{- if .Values.surrealdb.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-surrealdb
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: surrealdb
+  {{- with .Values.surrealdb.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "hyperzoekt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: surrealdb
+  template:
+    metadata:
+      labels:
+        {{- include "hyperzoekt.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: surrealdb
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "hyperzoekt.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: surrealdb
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ .Values.surrealdb.image.registry }}/{{ .Values.surrealdb.image.repository }}:{{ .Values.surrealdb.image.tag }}
+          imagePullPolicy: {{ .Values.surrealdb.image.pullPolicy }}
+          command:
+            - start
+            - --bind
+            - 0.0.0.0:{{ .Values.surrealdb.service.port }}
+            - --user
+            - root
+            - --pass
+            - root
+            {{- if .Values.surrealdb.persistence.enabled }}
+            - rocksdb:/data/database.db
+            {{- else }}
+            - memory
+            {{- end }}
+          ports:
+            - name: surrealdb
+              containerPort: {{ .Values.surrealdb.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: surrealdb
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: surrealdb
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.surrealdb.resources | nindent 12 }}
+          {{- if .Values.surrealdb.persistence.enabled }}
+          volumeMounts:
+            - name: surrealdb-data
+              mountPath: /data
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.surrealdb.persistence.enabled }}
+      volumes:
+        - name: surrealdb-data
+          persistentVolumeClaim:
+            claimName: {{ include "hyperzoekt.fullname" . }}-surrealdb
+      {{- end }}
+{{- end }}
+---
+{{- if .Values.surrealdb.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-surrealdb
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: surrealdb
+  {{- with .Values.surrealdb.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.surrealdb.service.type }}
+  ports:
+    - port: {{ .Values.surrealdb.service.port }}
+      targetPort: surrealdb
+      protocol: TCP
+      name: surrealdb
+  selector:
+    {{- include "hyperzoekt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: surrealdb
+{{- end }}
+---
+{{- if and .Values.surrealdb.enabled .Values.surrealdb.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hyperzoekt.fullname" . }}-surrealdb
+  labels:
+    {{- include "hyperzoekt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: surrealdb
+  {{- with .Values.surrealdb.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.surrealdb.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.surrealdb.persistence.size }}
+  {{- if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+{{- end }}

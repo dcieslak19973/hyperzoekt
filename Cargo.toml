@@ -1,0 +1,40 @@
+[workspace]
+members = [
+	"crates/hyperzoekt",
+	"crates/zoekt-rs",
+
+
+	"crates/zoekt-distributed",
+]
+
+# Use the edition-2021 dependency resolver semantics for workspace members.
+resolver = "2"
+
+# Force newer versions of dependencies to reduce duplicates
+[workspace.dependencies]
+# Force thiserror v2 everywhere
+thiserror = "2"
+# Force newer versions of dependencies that still use thiserror v1
+affinitypool = "0.3"
+async-graphql = "7"
+miette = "7"
+rustls = "0.23"
+storekey = "0.8"
+sysinfo = "0.33"
+tokio-tungstenite = "0.23"
+webpki-roots = "0.26"
+# Align heavy transitive dependencies to single versions
+itertools = "0.14"
+hashbrown = "0.15"
+indexmap = "2.11"
+toml_edit = "0.22"
+lru = "0.16"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 16
+ 
+
+

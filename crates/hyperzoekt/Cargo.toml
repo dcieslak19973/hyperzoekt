@@ -1,0 +1,134 @@
+[package]
+name = "hyperzoekt"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+futures = "0.3"
+walkdir = "2"
+regex = "1"
+ignore = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tree-sitter = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = { version = "0.23", package = "tree-sitter-python" }
+tree-sitter-javascript = { version = "0.23", package = "tree-sitter-javascript" }
+tree-sitter-typescript = { version = "0.23", package = "tree-sitter-typescript" }
+tree-sitter-cpp = "0.23"
+tree-sitter-java = { version = "0.23", package = "tree-sitter-java" }
+tree-sitter-c-sharp = { version = "0.23", package = "tree-sitter-c-sharp" }
+tree-sitter-swift = { version = "0.6", package = "tree-sitter-swift" }
+tree-sitter-go = { version = "0.23", package = "tree-sitter-go" }
+tree-sitter-verilog = "1.0"
+
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+rayon = "1"
+num_cpus = "1.17"
+
+# SurrealDB client for importer/streaming integration. This is a core dependency.
+surrealdb = { version = "2.3", features = ["kv-mem", "protocol-ws", "protocol-http"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "0.7"
+sha2 = "0.10"
+signal-hook = "0.3.18"
+petgraph = "0.6"
+
+# Redis for event consumption from zoekt-distributed
+deadpool-redis = "0.22"
+redis = { version = "0.32", features = ["tokio-comp"] }
+libc = "0.2"
+
+# Git for cloning remote repositories
+git2 = "0.20"
+
+# UUID for unique temporary directory names
+uuid = { version = "1.0", features = ["v4"] }
+
+# zoekt-distributed for shared event types
+zoekt-distributed = { path = "../zoekt-distributed" }
+"zoekt-rs" = { path = "../zoekt-rs" }
+ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http"] }
+async-trait = "0.1"
+tempfile = "3"
+
+# small dependency used by hirag prototype
+rand = "0.8"
+
+# Web UI dependencies
+axum = { version = "0.8", features = ["json", "query"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+minijinja = "1.0"
+url = "2"
+base64 = "0.22"
+
+# Tokenizer for token-aware embedding handling (always enabled)
+tiktoken-rs = "0.5"
+
+# For timestamps used when creating repo records
+chrono = { version = "0.4", features = ["serde"] }
+pulldown-cmark = "0.13"
+ammonia = "4.1"
+
+# Optional: tracing + OpenTelemetry for performance instrumentation
+tracing = { version = "0.1", optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", optional = true }
+
+[features]
+otel = [
+	"tracing",
+	"tracing-opentelemetry",
+	"tracing-subscriber",
+	"opentelemetry",
+	"opentelemetry_sdk",
+	"opentelemetry-otlp",
+]
+
+# Tokenization support via tiktoken-rs is always compiled in (no feature gate).
+# Provide a no-op `tiktoken` feature so any remaining #[cfg(feature = "tiktoken")] checks
+# across the codebase don't error. This does not make the dependency optional.
+tiktoken = []
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serial_test = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+futures = "0.3"
+
+
+
+[[bin]]
+name = "hyperzoekt-indexer"
+path = "src/bin/hyperzoekt-indexer.rs"
+
+[[bin]]
+name = "hyperzoekt-webui"
+path = "src/bin/hyperzoekt-webui.rs"
+
+[[bin]]
+name = "hyperzoekt-similarity-worker"
+path = "src/bin/hyperzoekt-similarity-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-mcp"
+path = "src/bin/hyperzoekt-mcp.rs"
+
+[[bin]]
+name = "hyperzoekt-sbom-worker"
+path = "src/bin/hyperzoekt-sbom-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-hirag-worker"
+path = "src/bin/hyperzoekt-hirag-worker.rs"

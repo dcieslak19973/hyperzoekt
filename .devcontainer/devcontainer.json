@@ -1,0 +1,55 @@
+{
+  "name": "hyperzoekt - Rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-vscode.cpptools",
+        "ms-kubernetes-tools.vscode-helm"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  // SSH forwarding options
+  // - If you run VS Code from a host that exposes an SSH agent socket, set
+  //   the host env var `SSH_AUTH_SOCK` (typically already set). The devcontainer
+  //   will bind that socket into the container at `/ssh-agent/socket` so the
+  //   container can authenticate with your host keys (no copying required).
+  // - If you prefer binding your host ~/.ssh directly into the container, set
+  //   `WSL_SSH_PATH` (or another host env var) to the full path of your host
+  //   .ssh directory; the container will mount it into `/home/vscode/.ssh`.
+  // Examples (PowerShell, run once):
+  // setx WSL_SSH_PATH "\\\\wsl.localhost\\Ubuntu-24.04\\home\\YOUR_USER_NAME_HERE\\.ssh"
+  // For macOS/Linux run the container from a user with SSH_AGENT running so
+  // the `SSH_AUTH_SOCK` env var is available to the Remote - Containers process.
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+  "postCreateCommand": "bash .devcontainer/scripts/setup_devcontainer.sh",
+  "postStartCommand": "bash .devcontainer/scripts/start_devcontainer.sh",
+  // If you want SSH agent forwarding, configure it in your environment or use the
+  // "ssh-agent" devcontainer feature instead of binding SSH_AUTH_SOCK directly.
+  "remoteEnv": {
+    // SSH agent is provided by the ssh-agent feature; do not hardcode SSH_AUTH_SOCK here
+    "SCCACHE_DIR": "/workspaces/hyperzoekt/.sccache",
+    "CARGO_HOME": "/home/vscode/.cargo",
+    "CARGO_TARGET_DIR": "/tmp/hyperzoekt-target",
+    "RUSTUP_HOME": "/home/vscode/.rustup",
+    "PATH": "/usr/local/bin:/home/vscode/.cargo/bin:/usr/bin:/bin:${PATH}",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "DISABLE_LOCAL_SURREAL": "1",
+    "SURREAL_CAPS_ALLOW_EXPERIMENTAL": "graphql",
+    "SURREALDB_URL": "http://localhost:8000",
+    "SURREALDB_USERNAME": "root",
+    "SURREALDB_PASSWORD": "root"
+  },
+  "remoteUser": "vscode"
+}

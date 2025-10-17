@@ -1,0 +1,409 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Distributed Zoekt</title>
+    <link rel="stylesheet" href="/static/common/styles.css">
+    <style>
+        /* Admin-specific styles */
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            margin-bottom: 16px;
+        }
+
+        table {
+            border-collapse: collapse;
+
+            .tab-button {
+                padding: 8px 14px;
+                border: none;
+                background: transparent;
+                cursor: pointer;
+                color: #333;
+                font-weight: 500;
+            }
+
+            .tab-button:hover {
+                background: rgba(0, 0, 0, 0.03);
+            }
+
+            .tab-button[aria-pressed="true"] {
+                background: #fff;
+                position: relative;
+                z-index: 2;
+                box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06) inset;
+            }
+
+            /* Make adjacent content look like a connected tab */
+            .tab-content {
+                border: 1px solid #ddd;
+                padding: 12px;
+                border-radius: 6px;
+                background: #fff;
+            }
+        }
+
+        th,
+        td {
+            border: 1px solid var(--input-border);
+            padding: 10px;
+            text-align: left;
+        }
+
+        /* Numeric columns right aligned */
+        td.numeric,
+        th.numeric {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Small tooltip style for raw bytes */
+        td.memory[title] {
+            position: relative;
+        }
+
+        th {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        /* Clickable sortable header hint */
+        th.sortable {
+            cursor: pointer;
+        }
+
+        th .sort-indicator {
+            font-size: 0.8em;
+            opacity: 0.8;
+        }
+
+        /* Create form: put inputs on one line */
+        #create-form {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        #create-form label {
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            white-space: nowrap;
+        }
+
+        #create-form input[name="name"] {
+            width: 120px;
+        }
+
+        #create-form input[name="url"] {
+            flex: 1;
+            min-width: 180px;
+        }
+
+        #create-form input[name="frequency"] {
+            width: 60px;
+        }
+
+        #create-form input[name="branches"] {
+            width: 140px;
+        }
+
+        a.button {
+            background: var(--danger);
+            color: white;
+            padding: 6px 10px;
+            border-radius: var(--border-radius);
+            text-decoration: none;
+        }
+
+        form.inline {
+            display: inline;
+        }
+
+        /* Branch details subrow */
+        tr.branch-row td {
+            background: rgba(255, 255, 255, 0.02);
+            padding: 12px;
+        }
+
+        /* .expander removed: expansion UI is no longer used server- or client-side */
+
+        /* Tab bar and button visuals: make them look like connected tabs */
+        .tab-bar {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+            margin-bottom: 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--input-border);
+        }
+
+        .tab-button {
+            background: transparent;
+            border: 1px solid transparent;
+            border-bottom: none;
+            /* visually connect to card */
+            padding: 10px 14px;
+            cursor: pointer;
+            color: var(--muted);
+            font-weight: 600;
+            margin-right: 0;
+            transition: all 0.12s ease;
+            position: relative;
+            border-radius: 6px 6px 0 0;
+        }
+
+        .tab-button:hover {
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.02);
+            border-color: rgba(255, 255, 255, 0.03);
+        }
+
+        .tab-button:focus {
+            outline: 2px solid rgba(14, 165, 164, 0.3);
+            outline-offset: 2px;
+        }
+
+        .tab-button[aria-pressed="true"] {
+            background: var(--panel);
+            color: var(--text);
+            border-color: var(--input-border);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+            margin-bottom: -1px;
+            /* overlap the card border */
+        }
+
+        .tab-button[aria-pressed="true"]:hover {
+            background: var(--panel);
+        }
+
+        /* Make the active tab visually connected to the card */
+        .card.tabbed {
+            margin-top: -2px;
+            border-top-left-radius: 0;
+            border-top-right-radius: 0;
+            padding-top: 20px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+            border-top: 1px solid var(--accent);
+        }
+
+        /* Reduce visual noise for inactive tabs */
+        .tab-button[aria-pressed="false"] {
+            opacity: 0.8;
+        }
+
+        .spacer {
+            height: 16px;
+        }
+
+        .export-btn {
+            margin-left: 6px;
+        }
+
+        /* Preview panel animation */
+        #preview-results {
+            transition: opacity 180ms ease, transform 180ms ease;
+            opacity: 0;
+            transform: translateY(-4px) scale(0.995);
+            pointer-events: none;
+        }
+
+        #preview-results.visible {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            pointer-events: auto;
+        }
+    </style>
+    <script src="/static/common/theme.js"></script>
+    <script src="/static/admin.js" defer></script>
+</head>
+
+<body>
+    <div class="container">
+        <nav>
+            <div><strong>Distributed Zoekt</strong></div>
+            <div style="display:flex;gap:10px;align-items:center"> <button id="theme-toggle" class="theme-toggle">
+                    <span class="icon">🌙</span>
+                    <span class="label">Dark</span>
+                </button>
+                <div class="muted">Signed in as {{ADMIN_USER}} · <a href="/logout" class="button">Logout</a></div>
+            </div>
+        </nav>
+
+        <!-- Tab bar -->
+        <div class="tab-bar">
+            <button id="tab-builders" class="tab-button" aria-pressed="false">Builders</button>
+            <button id="tab-repos" class="tab-button" aria-pressed="true">Repositories</button>
+            <button id="tab-branches" class="tab-button" aria-pressed="false">Branches</button>
+            <button id="tab-indexers" class="tab-button" aria-pressed="false">Indexers</button>
+            <button id="tab-leases" class="tab-button" aria-pressed="false">Leases</button>
+        </div>
+
+        <div id="repos-tab" class="card">
+            <h2>Repositories <button id="export-csv" class="export-btn" title="Export repositories as CSV">Export
+                    CSV</button></h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Name</th>
+                        <th class="sortable" data-type="text">URL</th>
+                        <th class="sortable" data-type="text">Branches</th>
+                        <th class="sortable numeric" data-type="number">Frequency (min)</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="repo-table-body">{{ROWS}}</tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Branches tab (hidden by default) -->
+        <div id="branches-tab" class="card" style="display:none">
+            <h2>Branches</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Repository</th>
+                        <th class="sortable" data-type="text">Branch</th>
+                        <th class="sortable" data-type="date">Last indexed</th>
+                        <th class="sortable numeric" data-type="number">Duration (ms)</th>
+                        <th class="sortable numeric" data-type="number">Memory</th>
+                    </tr>
+                </thead>
+                <tbody id="branch-table-body"></tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Builders tab (hidden by default) -->
+        <div id="builders-tab" class="card" style="display:none">
+            <h2>Repo Builders</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Base Repo</th>
+                        <th>Branches Include</th>
+                        <th>Branches Exclude</th>
+                        <th>Tags Include</th>
+                        <th>Tags Exclude</th>
+                        <th>Owner Include</th>
+                        <th>Owner Exclude</th>
+                        <th>Default Branch</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="builder-table-body"></tbody>
+            </table>
+
+            <div style="height:16px"></div>
+
+            <h3>Add builder</h3>
+            <form id="create-builder-form" method="post" action="/create-builder">
+                <label>ID: <input type="text" name="id" placeholder="builder-name" required /></label>
+                <label>Base Repo URL: <input type="url" name="base_repo" placeholder="https://github.com/org/repo.git"
+                        required /></label>
+                <label>Include Branches: <input type="text" name="include_branches"
+                        placeholder="^main$,^release-.*$" /></label>
+                <label>Exclude Branches: <input type="text" name="exclude_branches" placeholder="^wip-.*$" /></label>
+                <label>Include Tags: <input type="text" name="include_tags" placeholder="^v\\d+\\.\\d+" /></label>
+                <label>Exclude Tags: <input type="text" name="exclude_tags" placeholder="^beta-.*" /></label>
+                <label>Include Owner: <input type="text" name="include_owner" placeholder="^org-.*$" /></label>
+                <label>Exclude Owner: <input type="text" name="exclude_owner" placeholder="^bot-.*$" /></label>
+                <div style="font-size:12px;color:var(--muted);max-width:720px;margin-top:6px">Owner patterns match the
+                    owner path portion of the repository URL (everything before the final
+                    repo segment). You can use full regex (e.g. <code>^org/suborg$</code>) or simple globs using
+                    <code>*</code> (e.g. <code>org/*</code>); leave empty to match any owner.
+                </div>
+                <label>Default Branch: <input type="text" name="default_branch" value="main" /></label>
+                <label>Max Tags: <input type="number" name="max_tags" value="200" min="1" step="1" /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <!-- The base repo will be managed by the admin poller; do not auto-create a Repositories entry here. -->
+                <button type="submit">Add Builder</button>
+                <button id="preview-builder-btn" type="button">Preview</button>
+            </form>
+            <div id="preview-results"
+                style="margin-top:12px;display:none;border:1px solid var(--input-border);padding:8px;border-radius:6px;background:var(--panel);">
+                <strong>Preview</strong>
+                <div id="preview-branches" style="margin-top:8px;"></div>
+                <div id="preview-tags" style="margin-top:8px;"></div>
+            </div>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Indexers tab (hidden by default) -->
+        <div id="indexers-tab" class="card" style="display:none">
+            <h2>Indexers</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Node ID</th>
+                        <th class="sortable" data-type="text">Endpoint</th>
+                        <th class="sortable" data-type="date">Last Heartbeat</th>
+                        <th class="sortable" data-type="text">Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="indexer-table-body"></tbody>
+            </table>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <!-- Leases tab (hidden by default) -->
+        <div id="leases-tab" class="card" style="display:none">
+            <h2>Active Leases</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-type="text">Repository</th>
+                        <th class="sortable" data-type="text">Branch</th>
+                        <th class="sortable" data-type="text">Holder</th>
+                        <th class="sortable" data-type="date">Expires</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="lease-table-body"></tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Add repository</h2>
+            <form id="create-form" method="post" action="/create">
+                <label>Name: <input type="text" name="name" placeholder="my-repo" required /></label>
+                <label>URL: <input type="url" name="url" placeholder="https://example.com/repo.git" required /></label>
+                <label>Freq: <input type="number" name="frequency" min="1" step="1" value="60" required /></label>
+                <label>Branches: <input type="text" name="branches" value="main"
+                        placeholder="main,features/*" /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <button type="submit">Add</button>
+            </form>
+        </div>
+
+        <div style="height:16px"></div>
+
+        <div class="card">
+            <h2>Bulk import from CSV</h2>
+            <form id="bulk-import-form" enctype="multipart/form-data" method="post" action="/bulk-import">
+                <label>CSV File: <input type="file" name="csv_file" accept=".csv" required /></label>
+                <input type="hidden" name="csrf" value="{{CSRF}}" />
+                <button type="submit">Import CSV</button>
+            </form>
+            <div style="margin-top: 8px; font-size: 12px; color: var(--muted)">
+                CSV format: name,url,branches,frequency<br>
+                Example: my-repo,https://github.com/user/repo.git,main,60
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>

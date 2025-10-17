@@ -1,0 +1,21 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.idea/
+.vscode/
+*.log
+
+.data/
+
+# workspace-local sccache directory persisted across devcontainer rebuilds
+.sccache/
+.tmp/
+.tmp_experiments/
+.bench_results/
+.upstream/
+dump.rdb
+
+linux_clone_*/
+test_repos/goose/
+docker/.env
+.envdocker/.env

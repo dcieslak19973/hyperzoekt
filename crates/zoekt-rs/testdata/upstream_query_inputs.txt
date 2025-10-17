@@ -1,0 +1,9 @@
+\bword\b
+fi"le:bla"
+(abc def)
+(abc
+--
+"abc
+abc.*def
+abc\.\*def
+lang:c++
