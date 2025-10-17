@@ -1350,6 +1350,7 @@ impl ToolHandler for HZHandler {
                 let stable_id = args
                     .get("stable_id")
                     .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
                     .ok_or_else(|| MCPError::invalid_params("missing stable_id".into()))?;
                 let start = args
                     .get("start")
@@ -1361,18 +1362,16 @@ impl ToolHandler for HZHandler {
                     .map(|v| v as usize);
 
                 // Query entity_snapshot table for the record with this stable_id
-                let sql = format!(
-                    "SELECT stable_id, repo_name, file, start_line, source_display, source_content FROM entity_snapshot WHERE stable_id = $sid LIMIT 1"
-                );
+                let sql = "SELECT stable_id, repo_name, file, start_line, source_display, source_content FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
                 let resp = match self.state.db.connection().as_ref() {
                     SurrealConnection::Local(db_conn) => {
-                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                        db_conn.query(sql).bind(("sid", stable_id.clone())).await
                     }
                     SurrealConnection::RemoteHttp(db_conn) => {
-                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                        db_conn.query(sql).bind(("sid", stable_id.clone())).await
                     }
                     SurrealConnection::RemoteWs(db_conn) => {
-                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                        db_conn.query(sql).bind(("sid", stable_id.clone())).await
                     }
                 };
 
@@ -1383,7 +1382,7 @@ impl ToolHandler for HZHandler {
                 if rows.is_empty() {
                     return Err(MCPError::invalid_params(format!(
                         "entity_snapshot not found: {}",
-                        stable_id
+                        &stable_id
                     )));
                 }
                 let row = &rows[0];
@@ -1420,7 +1419,7 @@ impl ToolHandler for HZHandler {
                         None
                     };
                     let mut obj = serde_json::json!({
-                        "stable_id": stable_id,
+                        "stable_id": &stable_id,
                         "repo_name": repo_name,
                         "file": file,
                         "start_line": start_line,
@@ -1438,7 +1437,7 @@ impl ToolHandler for HZHandler {
                     obj
                 } else {
                     serde_json::json!({
-                        "stable_id": stable_id,
+                        "stable_id": &stable_id,
                         "repo_name": repo_name,
                         "file": file,
                         "start_line": start_line,

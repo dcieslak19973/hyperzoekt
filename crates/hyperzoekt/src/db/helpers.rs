@@ -260,6 +260,121 @@ pub async fn relate_and_collect_ids(
     Ok(ids)
 }
 
+/// Fetch a short snippet for an entity by stable_id from entity_snapshot.source_content.
+pub async fn get_snippet_for_entity(
+    conn: &crate::db::connection::SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<String>, surrealdb::Error> {
+    #[derive(serde::Deserialize)]
+    struct ERow {
+        source_content: Option<String>,
+    }
+    let q = format!(
+        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
+        stable_id
+    );
+    if let Ok(mut r) = conn.query(&q).await {
+        if let Ok(rows) = r.take::<Vec<ERow>>(0) {
+            if let Some(row) = rows.into_iter().next() {
+                if let Some(s) = row.source_content {
+                    // Filter out empty strings
+                    if !s.trim().is_empty() {
+                        return Ok(Some(s));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Try to fetch the embedding vector for a given entity stable_id by looking
+/// up the corresponding `entity_snapshot` record. Returns None when no embedding is found.
+pub async fn get_embedding_for_entity(
+    conn: &crate::db::connection::SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<Vec<f32>>, surrealdb::Error> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        embedding: Option<Vec<f32>>,
+    }
+    let q = format!(
+        "SELECT embedding FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
+        stable_id
+    );
+    if let Ok(mut resp) = conn.query(&q).await {
+        if let Ok(rows) = resp.take::<Vec<Row>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                return Ok(r.embedding);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch a short snippet for an entity by stable_id from entity_snapshot.source_content.
+/// This is an alias to get_snippet_for_entity for clarity when specifically targeting entity_snapshot.
+pub async fn get_snippet_for_entity_snapshot(
+    conn: &crate::db::connection::SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<String>, surrealdb::Error> {
+    #[derive(serde::Deserialize)]
+    struct SRow {
+        source_content: Option<String>,
+    }
+    let q = format!(
+        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
+        stable_id
+    );
+    if let Ok(mut resp) = conn.query(&q).await {
+        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                if let Some(s) = r.source_content {
+                    // Filter out empty strings
+                    if !s.trim().is_empty() {
+                        return Ok(Some(s));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract repo provenance for a given entity stable_id. Returns a deduped Vec of repo strings.
+pub async fn get_repos_for_entity(
+    conn: &crate::db::connection::SurrealConnection,
+    stable_id: &str,
+) -> Result<Vec<String>, surrealdb::Error> {
+    use std::collections::HashSet;
+    #[derive(serde::Deserialize)]
+    struct SRow {
+        repo_name: Option<String>,
+    }
+    let mut repos_set: HashSet<String> = HashSet::new();
+
+    let q_snap = format!(
+        "SELECT repo_name FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
+        stable_id
+    );
+    if let Ok(mut resp) = conn.query(&q_snap).await {
+        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
+            if let Some(r) = rows.into_iter().next() {
+                if let Some(rn) = r.repo_name {
+                    let n = normalize_git_url(&rn);
+                    if !n.is_empty() {
+                        repos_set.insert(n);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut list: Vec<String> = repos_set.into_iter().collect();
+    list.sort();
+    Ok(list)
+}
+
 /// Convert a `surrealdb::Response` into a `serde_json::Value` when possible.
 /// Tries multiple result slots and both `serde_json::Value` and
 /// `surrealdb::sql::Value` shapes to maximize compatibility with remote
