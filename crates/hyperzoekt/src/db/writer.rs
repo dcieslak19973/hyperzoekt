@@ -1,29 +1,20 @@
 // Copyright 2025 HyperZoekt Project
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-use super::config::{DbWriterConfig, PersistAckSender, PersistedEntityMeta, SpawnResult};
-use super::helpers::CALL_EDGE_CAPTURE;
-use crate::db::connection::{connect, SurrealConnection};
 
+use crate::db::config::DbWriterConfig;
+use crate::db::config::{PersistAckSender, PersistedEntityMeta, SpawnResult};
+use crate::db::connection::{connect, SurrealConnection};
+use crate::db::helpers::CALL_EDGE_CAPTURE;
 use crate::repo_index::indexer::payload::EntityPayload;
 use anyhow::Result;
 use log::{debug, info, trace, warn};
+use reqwest::Client as HttpClient;
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::sync::mpsc::sync_channel;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use tiktoken_rs::cl100k_base;
 
 pub fn spawn_db_writer(
     payloads: Vec<EntityPayload>,
@@ -37,7 +28,8 @@ pub fn spawn_db_writer(
     let max_retries = cfg.max_retries.unwrap_or(3);
     let cfg_clone = cfg.clone();
     let join = thread::spawn(move || {
-        // Allow tests to request a reset of global dedup/creation sets for deterministic edge counts.
+        // Allow tests to request a reset of global dedup/creation sets for deterministic
+        // edge counts.
         if std::env::var("HZ_RESET_GLOBALS").ok().as_deref() == Some("1") {
             if let Some(set) = FILE_REPO_EDGE_SEEN.get() {
                 if let Ok(mut g) = set.lock() {
@@ -65,7 +57,14 @@ pub fn spawn_db_writer(
                     info!("db_writer session info: {:?}", session_info);
                 }
             }
-            if cfg_clone.initial_batch { initial_batch_insert(&db, &payloads_clone, batch_capacity).await?; return Ok(()); }
+            if cfg_clone.initial_batch {
+                if !payloads_clone.is_empty() {
+                    initial_batch_insert(&db, &payloads_clone, batch_capacity).await?;
+                    return Ok(());
+                } else {
+                    info!("initial_batch=true but no initial payloads provided; continuing to normal writer loop");
+                }
+            }
             info!("db_writer starting schema init");
             init_schema(&db, &cfg_clone.surreal_ns, &cfg_clone.surreal_db).await;
             info!("db_writer finished schema init");
@@ -81,6 +80,19 @@ pub fn spawn_db_writer(
             let embed_queue = std::env::var("HZ_EMBED_JOBS_QUEUE").unwrap_or_else(|_| "zoekt:embed_jobs".to_string());
             let embed_pool = if embed_jobs_enabled { zoekt_distributed::redis_adapter::create_redis_pool() } else { None };
             if embed_jobs_enabled && embed_pool.is_none() { info!("embed enqueue disabled: redis pool not available"); }
+            // Pre-create embedding client/endpoint if a model is configured so we can reuse it per batch.
+            let embed_model = std::env::var("HZ_EMBED_MODEL").unwrap_or_else(|_| String::new());
+            let (tei_endpoint_opt, http_client_opt) = if !embed_model.is_empty() {
+                let tei_base = std::env::var("HZ_TEI_BASE").unwrap_or_else(|_| "http://tei:80".to_string());
+                let tei_endpoint = format!("{}/embeddings", tei_base.trim_end_matches('/'));
+                let http_client = HttpClient::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("http client");
+                (Some(tei_endpoint), Some(http_client))
+            } else {
+                (None, None)
+            };
             let mut batches_sent=0usize; let mut entities_sent=0usize; let mut total_retries=0usize; let mut sum_ms: u128=0; let mut min_ms: Option<u128>=None; let mut max_ms: Option<u128>=None; let mut failures=0usize; let mut attempt_counts=std::collections::BTreeMap::new();
             loop {
                 info!("writer loop tick: waiting for first batch (timeout {:?})", batch_timeout);
@@ -95,7 +107,30 @@ pub fn spawn_db_writer(
                 let mut success = false;
                 loop {
                     attempt += 1;
-                    let (mut statements_raw, entity_count) = build_batch_sql(&acc, &cfg_clone);
+                    // If an embed model is configured and we are not enqueuing embed jobs,
+                    // compute embeddings now so they can be persisted on entity_snapshot.
+                    // NOTE: embeddings are mostly working; however, some entities may
+                    // still be left without embeddings when their `source_content`
+                    // is empty. This often stems from upstream tree-sitter extraction
+                    // not populating `source_content` for certain entities (or when
+                    // extraction is partial). If you observe many missing embeddings
+                    // investigate the indexer/tree-sitter extraction path first —
+                    // falling back to fabricating snippets (e.g. using `name`) was
+                    // intentionally removed to avoid masking this root cause.
+                    let embeddings_for_batch: Vec<MaybeEmbedding> = if !embed_jobs_enabled {
+                        if !embed_model.is_empty() {
+                            if let (Some(endpoint), Some(client)) = (tei_endpoint_opt.as_deref(), http_client_opt.as_ref()) {
+                                compute_embeddings_for_payloads(client, endpoint, &embed_model, &acc).await
+                            } else {
+                                vec![None; acc.len()]
+                            }
+                        } else {
+                            vec![None; acc.len()]
+                        }
+                    } else {
+                        vec![None; acc.len()]
+                    };
+                    let (mut statements_raw, entity_count) = build_batch_sql(&acc, &cfg_clone, &embeddings_for_batch);
                     if statements_raw.is_empty() {
                         success = true;
                         info!("empty sql batch (no ops) size {} attempt {}", acc.len(), attempt);
@@ -127,17 +162,15 @@ pub fn spawn_db_writer(
                     // duplicate-edge errors without aborting the main transactional writes.
                     // Additionally, split CREATE entity statements into their own chunks so
                     // duplicate-create errors don't abort other updates in the same transaction.
-                                    type StmtBinds = Vec<(&'static str, serde_json::Value)>;
-                                    type SqlStmt = (String, Option<StmtBinds>);
-                                    let mut create_entities: Vec<SqlStmt> = Vec::new();
-                                    let mut non_create: Vec<SqlStmt> = Vec::new();
-                                    let mut relates: Vec<SqlStmt> = Vec::new();
+                    type StmtBinds = Vec<(&'static str, serde_json::Value)>;
+                    type SqlStmt = (String, Option<StmtBinds>);
+                    let mut create_entities: Vec<SqlStmt> = Vec::new();
+                    let mut non_create: Vec<SqlStmt> = Vec::new();
+                    let mut relates: Vec<SqlStmt> = Vec::new();
                     for (sql, binds) in statements_raw.iter() {
                         let ts = sql.trim_start();
                         if ts.to_uppercase().starts_with("RELATE ") {
-                            if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                                println!("SEPARATING RELATE: {}", sql);
-                            }
+                            if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("SEPARATING RELATE: {}", sql); }
                             relates.push((sql.clone(), binds.clone()));
                         } else if ts.starts_with("CREATE entity:") || ts.starts_with("CREATE repo:") || ts.starts_with("CREATE entity_snapshot:") {
                             create_entities.push((sql.clone(), binds.clone()));
@@ -159,12 +192,11 @@ pub fn spawn_db_writer(
                     let statements = group_statements(&non_create_no_binds, group_size);
                     if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
                         let total_len: usize = statements.iter().map(|s| s.len()).sum();
-                        info!("BATCH SQL ({} grouped chunks, original {} stmts non-create={} relate={}) total_len={} chars", statements.len(), statements_raw.len(), non_create.len(), relates.len(), total_len);
+                        info!("BATCH SQL ({} grouped chunks, original {} stmts non_create={} relate={}) total_len={} chars", statements.len(), statements_raw.len(), non_create.len(), relates.len(), total_len);
                     }
                     let start = std::time::Instant::now();
                     let mut exec_error: Option<String> = None;
-                    info!("executing create-entity chunks={} and non-create chunks={} (orig stmts create={} non_create={} relate={})",
-                        create_statements.len(), statements.len(), create_entities.len(), non_create.len(), relates.len());
+                    info!("executing create-entity chunks={} and non-create chunks={} (orig stmts create={} non_create={} relate={})", create_statements.len(), statements.len(), create_entities.len(), non_create.len(), relates.len());
                     // Execute CREATE entity statements individually so we can detect which
                     // specific ids failed and issue a targeted UPDATE for that entity only.
                     for (s_sql, s_binds) in &create_entities {
@@ -184,29 +216,19 @@ pub fn spawn_db_writer(
                                     // If the error is a duplicate-create, perform a per-entity UPDATE fallback.
                                     if resp_str.contains("already exists") || resp_str.contains("already contains") {
                                         // Parse id and json from the original CREATE statement and run UPDATE fallback.
-                                        // Support both entity and repo CREATE forms.
                                         let mut handled = false;
                                         if let Some(rest) = s_sql.strip_prefix("CREATE entity:") {
                                             if let Some((id_part, json_part)) = rest.split_once(" CONTENT ") {
                                                 let id = id_part.trim();
                                                 let mut json = json_part.trim();
-                                                if json.ends_with(';') {
-                                                    json = json.trim_end_matches(';').trim();
-                                                }
+                                                if json.ends_with(';') { json = json.trim_end_matches(';').trim(); }
                                                 let update_q = format!("BEGIN; UPDATE entity:{id} CONTENT {json}; COMMIT;", id=id, json=json);
-                                                if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                                                    println!("CREATE duplicate for {} detected; running per-entity fallback: {}", id, update_q);
-                                                }
+                                                if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("CREATE duplicate for {} detected; running per-entity fallback: {}", id, update_q); }
                                                 match db.query(&update_q).await {
-                                                    Ok(uresp) => {
-                                                        if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
-                                                            info!("per-entity UPDATE ok for {}", id);
-                                                            debug!("update resp: {:?}", uresp);
-                                                        }
+                                                    Ok(_uresp) => {
+                                                        if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") { info!("per-entity UPDATE ok for {}", id); }
                                                     }
-                                                    Err(ue) => {
-                                                        warn!("per-entity UPDATE failed for {} err={}", id, ue);
-                                                    }
+                                                    Err(ue) => { warn!("per-entity UPDATE failed for {} err={}", id, ue); }
                                                 }
                                                 handled = true;
                                             }
@@ -216,23 +238,14 @@ pub fn spawn_db_writer(
                                                 if let Some((id_part, json_part)) = rest.split_once(" CONTENT ") {
                                                     let id = id_part.trim();
                                                     let mut json = json_part.trim();
-                                                    if json.ends_with(';') {
-                                                        json = json.trim_end_matches(';').trim();
-                                                    }
+                                                    if json.ends_with(';') { json = json.trim_end_matches(';').trim(); }
                                                     let update_q = format!("BEGIN; UPDATE repo:{id} CONTENT {json}; COMMIT;", id=id, json=json);
-                                                    if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                                                        println!("CREATE duplicate for repo {} detected; running per-repo fallback: {}", id, update_q);
-                                                    }
+                                                    if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("CREATE duplicate for repo {} detected; running per-repo fallback: {}", id, update_q); }
                                                     match db.query(&update_q).await {
-                                                        Ok(uresp) => {
-                                                            if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
-                                                                info!("per-repo UPDATE ok for {}", id);
-                                                                debug!("update resp: {:?}", uresp);
-                                                            }
+                                                        Ok(_uresp) => {
+                                                            if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") { info!("per-repo UPDATE ok for {}", id); }
                                                         }
-                                                        Err(ue) => {
-                                                            warn!("per-repo UPDATE failed for {} err={}", id, ue);
-                                                        }
+                                                        Err(ue) => { warn!("per-repo UPDATE failed for {} err={}", id, ue); }
                                                     }
                                                     handled = true;
                                                 }
@@ -243,37 +256,27 @@ pub fn spawn_db_writer(
                                                 if let Some((id_part, json_part)) = rest.split_once(" CONTENT ") {
                                                     let id = id_part.trim();
                                                     let mut json = json_part.trim();
-                                                    if json.ends_with(';') {
-                                                        json = json.trim_end_matches(';').trim();
-                                                    }
+                                                    if json.ends_with(';') { json = json.trim_end_matches(';').trim(); }
                                                     let update_q = format!("BEGIN; UPDATE entity_snapshot:{id} CONTENT {json}; COMMIT;", id=id, json=json);
-                                                    if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                                                        println!("CREATE duplicate for entity_snapshot {} detected; running per-entity_snapshot fallback: {}", id, update_q);
-                                                    }
+                                                    if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("CREATE duplicate for entity_snapshot {} detected; running per-entity_snapshot fallback: {}", id, update_q); }
                                                     match db.query(&update_q).await {
-                                                        Ok(uresp) => {
-                                                            if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
-                                                                info!("per-entity_snapshot UPDATE ok for {}", id);
-                                                                debug!("update resp: {:?}", uresp);
-                                                            }
+                                                        Ok(_uresp) => {
+                                                            if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") { info!("per-entity_snapshot UPDATE ok for {}", id); }
                                                         }
-                                                        Err(ue) => {
-                                                            warn!("per-entity_snapshot UPDATE failed for {} err={}", id, ue);
-                                                        }
+                                                        Err(ue) => { warn!("per-entity_snapshot UPDATE failed for {} err={}", id, ue); }
                                                     }
                                                     handled = true;
                                                 }
                                             }
                                         }
-                                        if !handled {
-                                            info!("create-entity duplicate ignored (couldn't parse id/json): {}", resp_str);
-                                        }
+                                        if !handled { info!("create-entity duplicate ignored (couldn't parse id/json): {}", resp_str); }
                                     } else {
                                         // Unexpected error on create: log and continue
                                         warn!("create-entity had unexpected error (continuing): {}", resp_str);
                                     }
                                 } else if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
-                                    debug!("create-entity ok resp: {:?}", resp);
+                                    // Print to stdout so test harness captures it reliably.
+                                    println!("CREATE-ENTITY RESP: {:?}", resp_str);
                                 }
                             }
                             Err(e) => {
@@ -285,9 +288,7 @@ pub fn spawn_db_writer(
                     // Execute non-create statements that have binds (each as its own transaction).
                     for (s_sql, binds) in &non_create_with_binds {
                         let q = format!("BEGIN; {} COMMIT;", s_sql);
-                        if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                            println!("EXECUTING NON-CREATE WITH BINDS: {}", q);
-                        }
+                        if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("EXECUTING NON-CREATE WITH BINDS: {}", q); }
                         match db.query_with_binds(&q, binds.clone()).await {
                             Ok(resp) => {
                                 let resp_str = format!("{:?}", resp);
@@ -306,9 +307,7 @@ pub fn spawn_db_writer(
                     }
                     // Execute primary non-RELATE transactional chunks next. Failures here abort the batch.
                     for chunk in &statements {
-                        if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                            println!("EXECUTING CHUNK: {}", chunk);
-                        }
+                        if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("EXECUTING CHUNK: {}", chunk); }
                         match db.query(chunk).await {
                             Ok(resp) => {
                                 let resp_str = format!("{:?}", resp);
@@ -316,10 +315,7 @@ pub fn spawn_db_writer(
                                     warn!("non-RELATE chunk response contained errors: {}", resp_str);
                                     exec_error = Some(resp_str);
                                     break;
-                                } else if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
-                                    info!("chunk ok len={} bytes", chunk.len());
-                                    debug!("resp: {:?}", resp);
-                                }
+                                } else if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") { info!("chunk ok len={} bytes", chunk.len()); debug!("resp: {:?}", resp); }
                             }
                             Err(e) => {
                                 warn!("chunk failed (len={}): first 200 chars: {} err:{}", chunk.len(), &chunk.chars().take(200).collect::<String>(), e);
@@ -335,9 +331,7 @@ pub fn spawn_db_writer(
                         // Now execute RELATE statements individually and tolerate duplicate/index errors.
                         for (rel_sql, _rel_binds) in &relates {
                             let q = format!("BEGIN; {} COMMIT;", rel_sql);
-                            if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") {
-                                println!("EXECUTING RELATE CHUNK: {}", q);
-                            }
+                            if std::env::var("HZ_DEBUG_SQL").ok().as_deref() == Some("1") { println!("EXECUTING RELATE CHUNK: {}", q); }
                             match db.query(&q).await {
                                 Ok(resp) => {
                                     let resp_str = format!("{:?}", resp);
@@ -367,18 +361,17 @@ pub fn spawn_db_writer(
                         // CREATE repo:<id> -> UPDATE repo:<id> and retry once. This handles
                         // cases where another path (e.g., persist_repo_dependencies) already
                         // created the deterministic repo id before the writer batch runs.
-                        // If we still have retry budget, try a heuristic transform then retry.
                         if attempt < max_retries && e.contains("Database record") && e.contains("already exists") {
                             info!("batch failure looks like 'already exists'; transforming CREATE -> UPDATE for deterministic ids and retrying");
                             // Transform CREATE repo:... and CREATE entity:... into UPDATE to handle races
-                                for s in statements_raw.iter_mut() {
-                                    if s.0.trim_start().starts_with("CREATE entity:") {
-                                        s.0 = s.0.replacen("CREATE entity:", "UPDATE entity:", 1);
-                                    }
-                                    if s.0.trim_start().starts_with("CREATE entity_snapshot:") {
-                                        s.0 = s.0.replacen("CREATE entity_snapshot:", "UPDATE entity_snapshot:", 1);
-                                    }
+                            for s in statements_raw.iter_mut() {
+                                if s.0.trim_start().starts_with("CREATE entity:") {
+                                    s.0 = s.0.replacen("CREATE entity:", "UPDATE entity:", 1);
                                 }
+                                if s.0.trim_start().starts_with("CREATE entity_snapshot:") {
+                                    s.0 = s.0.replacen("CREATE entity_snapshot:", "UPDATE entity_snapshot:", 1);
+                                }
+                            }
                             total_retries += 1;
                             std::thread::sleep(Duration::from_millis(100 * (1 << (attempt - 1)).min(8)));
                             continue;
@@ -424,10 +417,7 @@ pub fn spawn_db_writer(
                                 let mut job_buf: Vec<String> = Vec::with_capacity(acc.len());
                                 for e in &acc {
                                     let job = EmbeddingJob { stable_id: &e.stable_id, repo_name: &e.repo_name, language: &e.language, kind: &e.kind, name: &e.name, source_url: e.source_url.as_deref() };
-                                    match serde_json::to_string(&job) {
-                                        Ok(js) => job_buf.push(js),
-                                        Err(err) => { warn!("serialize embed job failed stable_id={} err={}", e.stable_id, err); }
-                                    }
+                                    match serde_json::to_string(&job) { Ok(js) => job_buf.push(js), Err(err) => { warn!("serialize embed job failed stable_id={} err={}", e.stable_id, err); } }
                                 }
                                 if !job_buf.is_empty() {
                                     match pool.get().await { Ok(mut conn) => {
@@ -435,10 +425,7 @@ pub fn spawn_db_writer(
                                         let mut pushed_total = 0usize;
                                         for chunk in job_buf.chunks(500) {
                                             let res: Result<usize, _> = deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &embed_queue, chunk).await;
-                                            match res {
-                                                Ok(_n) => { pushed_total += chunk.len(); },
-                                                Err(e) => { warn!("embed enqueue rpush failed chunk={} err={}", chunk.len(), e); break; }
-                                            }
+                                            match res { Ok(_n) => { pushed_total += chunk.len(); }, Err(e) => { warn!("embed enqueue rpush failed chunk={} err={}", chunk.len(), e); break; } }
                                         }
                                         info!("embed enqueue batch complete repo={} jobs={} queue={} batches_sent={}", acc.first().map(|e| e.repo_name.as_str()).unwrap_or("?"), pushed_total, embed_queue, batches_sent);
                                     }, Err(e) => warn!("embed enqueue redis get conn failed: {}", e) }
@@ -449,28 +436,13 @@ pub fn spawn_db_writer(
                     // After successful batch commit, emit acks if channel provided.
                     if let Some(ref sender) = ack_tx {
                         let mut metas: Vec<PersistedEntityMeta> = Vec::with_capacity(acc.len());
-                        for e in &acc {
-                            metas.push(PersistedEntityMeta {
-                                stable_id: e.stable_id.clone(),
-                                repo_name: e.repo_name.clone(),
-                                language: e.language.clone(),
-                                kind: e.kind.clone(),
-                                name: e.name.clone(),
-                                source_url: e.source_url.clone(),
-                            });
-                        }
+                        for e in &acc { metas.push(PersistedEntityMeta { stable_id: e.stable_id.clone(), repo_name: e.repo_name.clone(), language: e.language.clone(), kind: e.kind.clone(), name: e.name.clone(), source_url: e.source_url.clone(), }); }
                         if let Err(e) = sender.send(metas) { log::warn!("persist ack send failed: {}", e); }
                     }
                     info!("batch success size {} attempt {} ms {}", entity_count, attempt, dur);
                     // Separate count queries to avoid multi-statement response shape ambiguity
-                    let repo_count = if let Ok(mut r) = db.query("SELECT count() FROM repo GROUP ALL;").await {
-                        let rows: Vec<serde_json::Value> = r.take(0).unwrap_or_default();
-                        rows.first().and_then(|o| o.get("count").and_then(|v| v.as_i64()))
-                    } else { None };
-                    let file_count = if let Ok(mut r) = db.query("SELECT count() FROM file GROUP ALL;").await {
-                        let rows: Vec<serde_json::Value> = r.take(0).unwrap_or_default();
-                        rows.first().and_then(|o| o.get("count").and_then(|v| v.as_i64()))
-                    } else { None };
+                    let repo_count = if let Ok(mut r) = db.query("SELECT count() FROM repo GROUP ALL;").await { let rows: Vec<serde_json::Value> = r.take(0).unwrap_or_default(); rows.first().and_then(|o| o.get("count").and_then(|v| v.as_i64())) } else { None };
+                    let file_count = if let Ok(mut r) = db.query("SELECT count() FROM file GROUP ALL;").await { let rows: Vec<serde_json::Value> = r.take(0).unwrap_or_default(); rows.first().and_then(|o| o.get("count").and_then(|v| v.as_i64())) } else { None };
                     info!("post-batch table counts repo_count={:?} file_count={:?}", repo_count, file_count);
                     break;
                 }
@@ -495,211 +467,307 @@ async fn initial_batch_insert(
     chunk: usize,
 ) -> Result<()> {
     info!("Initial batch mode: inserting {} entities", payloads.len());
-    let mut vals = Vec::new();
-    for p in payloads {
-        // Create entity with embedded snapshot data
-        let mut entity_obj = serde_json::Map::new();
-        entity_obj.insert(
-            "language".to_string(),
-            serde_json::Value::String(p.language.clone()),
-        );
-        entity_obj.insert(
-            "kind".to_string(),
-            serde_json::Value::String(p.kind.clone()),
-        );
-        entity_obj.insert(
-            "name".to_string(),
-            serde_json::Value::String(p.name.clone()),
-        );
-        if let Some(rank) = p.rank {
-            entity_obj.insert(
-                "rank".to_string(),
-                serde_json::Value::Number(serde_json::Number::from_f64(rank as f64).unwrap()),
-            );
-        }
-        entity_obj.insert(
-            "repo_name".to_string(),
-            serde_json::Value::String(p.repo_name.clone()),
-        );
-        entity_obj.insert(
-            "signature".to_string(),
-            serde_json::Value::String(p.signature.clone()),
-        );
-        entity_obj.insert(
-            "stable_id".to_string(),
-            serde_json::Value::String(p.stable_id.clone()),
-        );
-        if let Some(sc) = &p.source_content {
-            entity_obj.insert(
-                "source_content".to_string(),
-                serde_json::Value::String(sc.clone()),
-            );
-        }
 
-        // Embed snapshot data directly in the entity
-        let mut snapshot_obj = serde_json::Map::new();
-        if let Some(f) = &p.file {
-            snapshot_obj.insert("file".to_string(), serde_json::Value::String(f.clone()));
-        }
-        if let Some(p) = &p.parent {
-            snapshot_obj.insert("parent".to_string(), serde_json::Value::String(p.clone()));
-        }
-        if let Some(sl) = p.start_line {
-            snapshot_obj.insert(
-                "start_line".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(sl)),
-            );
-        }
-        if let Some(el) = p.end_line {
-            snapshot_obj.insert(
-                "end_line".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(el)),
-            );
-        }
-        if let Some(d) = &p.doc {
-            snapshot_obj.insert("doc".to_string(), serde_json::Value::String(d.clone()));
-        }
-        if !p.imports.is_empty() {
-            snapshot_obj.insert(
-                "imports".to_string(),
-                serde_json::to_value(&p.imports).unwrap_or(serde_json::Value::Array(vec![])),
-            );
-        }
-        if !p.unresolved_imports.is_empty() {
-            snapshot_obj.insert(
-                "unresolved_imports".to_string(),
-                serde_json::to_value(&p.unresolved_imports)
-                    .unwrap_or(serde_json::Value::Array(vec![])),
-            );
-        }
-        if !p.methods.is_empty() {
-            snapshot_obj.insert(
-                "methods".to_string(),
-                serde_json::to_value(&p.methods).unwrap_or(serde_json::Value::Array(vec![])),
-            );
-        }
-        if let Some(su) = &p.source_url {
-            snapshot_obj.insert(
-                "source_url".to_string(),
-                serde_json::Value::String(su.clone()),
-            );
-        }
-        if let Some(sd) = &p.source_display {
-            snapshot_obj.insert(
-                "source_display".to_string(),
-                serde_json::Value::String(sd.clone()),
-            );
-        }
-        if !p.calls.is_empty() {
-            snapshot_obj.insert(
-                "calls".to_string(),
-                serde_json::Value::Array(
-                    p.calls
-                        .iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-            );
-        }
-        entity_obj.insert(
-            "snapshot".to_string(),
-            serde_json::Value::Object(snapshot_obj),
-        );
+    // Compute embeddings for the initial batch and persist them on the
+    // entity_snapshot records so no external worker/enqueue is necessary.
+    let tei_base = std::env::var("HZ_TEI_BASE").unwrap_or_else(|_| "http://tei:80".to_string());
+    let tei_endpoint = format!("{}/embeddings", tei_base.trim_end_matches('/'));
+    let embed_model = std::env::var("HZ_EMBED_MODEL").unwrap_or_else(|_| String::new());
+    let http_client = HttpClient::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("http client");
+    let embeddings_for_batch = if !embed_model.is_empty() {
+        compute_embeddings_for_payloads(&http_client, &tei_endpoint, &embed_model, payloads).await
+    } else {
+        vec![None; payloads.len()]
+    };
 
-        let mut entity_json = serde_json::Value::Object(entity_obj);
-        sanitize_json_strings(&mut entity_json);
-        vals.push(entity_json);
-    }
-    for ch in vals.chunks(chunk.clamp(1, 5000)) {
-        // For safety, insert each entity in the chunk using parameterized binds
-        // instead of embedding serialized JSON into SQL strings. This keeps
-        // Surreal tokens and JSON content from being accidentally quoted or
-        // interpolated and keeps initial-batch logic simple and correct.
-        let mut success_count = 0usize;
+    // Persist entities + snapshots in chunks to avoid huge transactions
+    let mut base_idx = 0usize;
+    for ch in payloads.chunks(chunk.clamp(1, 5000)) {
         let st = std::time::Instant::now();
-        for it in ch {
-            let val = it.clone();
-            // Ensure string fields are sanitized already.
-            let sql = "BEGIN; CREATE entity CONTENT $e; COMMIT;";
-            match db.query_with_binds(sql, vec![("e", val)]).await {
-                Ok(_) => {
+        let mut success_count = 0usize;
+        // Diagnostics: count how many embeddings were available for this chunk
+        let mut embeddings_present = 0usize;
+        let mut embeddings_missing = 0usize;
+        for (local_i, p) in ch.iter().enumerate() {
+            // Determine index into embeddings_for_batch for this payload
+            // (we computed embeddings aligned with payloads slice)
+            let global_idx = base_idx + local_i;
+
+            // Build entity JSON
+            let mut entity_obj = serde_json::Map::new();
+            entity_obj.insert(
+                "language".to_string(),
+                serde_json::Value::String(p.language.clone()),
+            );
+            entity_obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String(p.kind.clone()),
+            );
+            entity_obj.insert(
+                "name".to_string(),
+                serde_json::Value::String(p.name.clone()),
+            );
+            entity_obj.insert(
+                "repo_name".to_string(),
+                serde_json::Value::String(p.repo_name.clone()),
+            );
+            entity_obj.insert(
+                "signature".to_string(),
+                serde_json::Value::String(p.signature.clone()),
+            );
+            entity_obj.insert(
+                "stable_id".to_string(),
+                serde_json::Value::String(p.stable_id.clone()),
+            );
+            if let Some(sc) = &p.source_content {
+                entity_obj.insert(
+                    "source_content".to_string(),
+                    serde_json::Value::String(sc.clone()),
+                );
+            }
+            let mut entity_json = serde_json::Value::Object(entity_obj);
+            sanitize_json_strings(&mut entity_json);
+
+            // Build snapshot JSON (include embedding fields if computed)
+            let mut snapshot_obj = serde_json::Map::new();
+            snapshot_obj.insert(
+                "repo_name".to_string(),
+                serde_json::Value::String(p.repo_name.clone()),
+            );
+            snapshot_obj.insert(
+                "stable_id".to_string(),
+                serde_json::Value::String(p.stable_id.clone()),
+            );
+            snapshot_obj.insert(
+                "name".to_string(),
+                serde_json::Value::String(p.name.clone()),
+            );
+            if let Some(f) = &p.file {
+                snapshot_obj.insert("file".to_string(), serde_json::Value::String(f.clone()));
+                // Add embedded record reference to file table
+                // Generate a deterministic file ID from repo_name and file path
+                let file_id = format!("{}:{}", p.repo_name, f);
+                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                snapshot_obj.insert(
+                    "file_ref".to_string(),
+                    serde_json::Value::String(format!("file:{}", file_id_hash)),
+                );
+            }
+            if let Some(par) = &p.parent {
+                snapshot_obj.insert("parent".to_string(), serde_json::Value::String(par.clone()));
+            }
+            if let Some(sl) = p.start_line {
+                snapshot_obj.insert(
+                    "start_line".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(sl)),
+                );
+            }
+            if let Some(el) = p.end_line {
+                snapshot_obj.insert(
+                    "end_line".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(el)),
+                );
+            }
+            if let Some(d) = &p.doc {
+                snapshot_obj.insert("doc".to_string(), serde_json::Value::String(d.clone()));
+            }
+            if !p.imports.is_empty() {
+                snapshot_obj.insert(
+                    "imports".to_string(),
+                    serde_json::to_value(&p.imports).unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+            if !p.unresolved_imports.is_empty() {
+                snapshot_obj.insert(
+                    "unresolved_imports".to_string(),
+                    serde_json::to_value(&p.unresolved_imports)
+                        .unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+            if !p.methods.is_empty() {
+                snapshot_obj.insert(
+                    "methods".to_string(),
+                    serde_json::to_value(&p.methods).unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+            if let Some(su) = &p.source_url {
+                snapshot_obj.insert(
+                    "source_url".to_string(),
+                    serde_json::Value::String(su.clone()),
+                );
+            }
+            if let Some(sd) = &p.source_display {
+                snapshot_obj.insert(
+                    "source_display".to_string(),
+                    serde_json::Value::String(sd.clone()),
+                );
+            }
+            if !p.calls.is_empty() {
+                snapshot_obj.insert(
+                    "calls".to_string(),
+                    serde_json::Value::Array(
+                        p.calls
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(rank) = p.rank {
+                snapshot_obj.insert(
+                    "page_rank_value".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from_f64(rank as f64).unwrap()),
+                );
+            }
+            // Persist full source text (used for embeddings) on the snapshot
+            if let Some(sc) = &p.source_content {
+                snapshot_obj.insert(
+                    "source_content".to_string(),
+                    serde_json::Value::String(sc.clone()),
+                );
+            } else {
+                snapshot_obj.insert(
+                    "source_content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+
+            // Embedding fields
+            if let Some((vec, model, chunk_count)) =
+                embeddings_for_batch.get(global_idx).and_then(|e| e.clone())
+            {
+                embeddings_present += 1;
+                let arr: Vec<serde_json::Value> = vec
+                    .iter()
+                    .map(|f| serde_json::Value::from(*f as f64))
+                    .collect();
+                snapshot_obj.insert("embedding".to_string(), serde_json::Value::Array(arr));
+                snapshot_obj.insert(
+                    "embedding_len".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(vec.len() as i64)),
+                );
+                snapshot_obj.insert(
+                    "embedding_model".to_string(),
+                    serde_json::Value::String(model),
+                );
+                snapshot_obj.insert(
+                    "embedding_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(vec.len() as i64)),
+                );
+                // Record how many chunks contributed to this snapshot embedding
+                snapshot_obj.insert(
+                    "embedding_chunk_count".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(chunk_count as i64)),
+                );
+                snapshot_obj.insert(
+                    "embedding_created_at".to_string(),
+                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+                snapshot_obj.insert(
+                    "similarity_status".to_string(),
+                    serde_json::Value::String("ready".to_string()),
+                );
+            } else {
+                embeddings_missing += 1;
+                debug!("initial_batch: snapshot left without embedding id={} reason=no_embedding snippet_len={}", p.stable_id, p.source_content.as_ref().map(|s| s.len()).unwrap_or(0));
+                snapshot_obj.insert("embedding".to_string(), serde_json::Value::Array(vec![]));
+                snapshot_obj.insert(
+                    "embedding_len".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(0)),
+                );
+                snapshot_obj.insert(
+                    "embedding_model".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+                snapshot_obj.insert(
+                    "embedding_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(0)),
+                );
+                snapshot_obj.insert("embedding_created_at".to_string(), serde_json::Value::Null);
+                snapshot_obj.insert(
+                    "similarity_status".to_string(),
+                    serde_json::Value::String("pending".to_string()),
+                );
+            }
+
+            // No commit_id available in this initial-batch helper; set empty commit ref.
+            snapshot_obj.insert(
+                "sourcecontrol_commit".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+
+            let mut snapshot_json = serde_json::Value::Object(snapshot_obj);
+            sanitize_json_strings(&mut snapshot_json);
+
+            // Deterministic id for entity/snapshot
+            let eid = sanitize_id(&p.stable_id);
+
+            // Build SQL with optional snapshot_file relation
+            let mut sql = format!(
+                "BEGIN; CREATE entity:{eid} CONTENT $e; CREATE entity_snapshot:{eid} CONTENT $s; RELATE entity:{eid}->has_snapshot->entity_snapshot:{eid};",
+                eid = eid
+            );
+
+            // If we have a file, create the snapshot_file relation
+            if p.file.is_some() {
+                let file_id = format!("{}:{}", p.repo_name, p.file.as_ref().unwrap());
+                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                sql.push_str(&format!(
+                    " RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id_hash};",
+                    eid = eid,
+                    file_id_hash = file_id_hash
+                ));
+            }
+
+            sql.push_str(" COMMIT;");
+            match db
+                .query_with_binds(&sql, vec![("e", entity_json), ("s", snapshot_json)])
+                .await
+            {
+                Ok(resp) => {
+                    // Emit the raw response for diagnostics when requested by env.
+                    if std::env::var("HZ_DEBUG_SQL_RESP").ok().as_deref() == Some("1") {
+                        debug!(
+                            "initial batch insert resp for id={} -> {:?}",
+                            p.stable_id, resp
+                        );
+                    }
                     success_count += 1;
                 }
                 Err(e) => {
-                    warn!("entity insert failed err={}", e);
+                    warn!(
+                        "initial batch entity+snapshot insert failed id={} err={}",
+                        p.stable_id, e
+                    );
+                    // Persist a DLQ record so operators can inspect failed snapshots
+                    let head = p
+                        .source_content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(256)
+                        .collect::<String>();
+                    append_to_embed_dlq(
+                        &p.stable_id,
+                        &format!("db_insert_error: {}", e),
+                        p.source_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                        &head,
+                    );
                 }
             }
         }
+        base_idx += ch.len();
         info!(
-            "chunk inserted size={} succeeded={} ms={}",
+            "initial chunk inserted size={} succeeded={} ms={} embeddings_present={} embeddings_missing={}",
             ch.len(),
             success_count,
-            st.elapsed().as_millis()
+            st.elapsed().as_millis(),
+            embeddings_present,
+            embeddings_missing,
         );
-    }
-    // Enqueue embed jobs if enabled
-    if let Ok(embed_jobs_enabled) = std::env::var("HZ_ENABLE_EMBED_JOBS") {
-        if matches!(
-            embed_jobs_enabled.as_str(),
-            "1" | "true" | "TRUE" | "yes" | "YES"
-        ) {
-            if let Some(pool) = zoekt_distributed::redis_adapter::create_redis_pool() {
-                let queue_key = std::env::var("HZ_EMBED_JOBS_QUEUE")
-                    .unwrap_or_else(|_| "zoekt:embed_jobs".to_string());
-                let mut job_buf: Vec<String> = Vec::new();
-                for p in payloads {
-                    #[derive(serde::Serialize)]
-                    struct EmbeddingJob<'a> {
-                        stable_id: &'a str,
-                        repo_name: &'a str,
-                        language: &'a str,
-                        kind: &'a str,
-                        name: &'a str,
-                        source_url: Option<&'a str>,
-                    }
-                    let job = EmbeddingJob {
-                        stable_id: &p.stable_id,
-                        repo_name: &p.repo_name,
-                        language: &p.language,
-                        kind: &p.kind,
-                        name: &p.name,
-                        source_url: p.source_url.as_deref(),
-                    };
-                    if let Ok(js) = serde_json::to_string(&job) {
-                        job_buf.push(js);
-                    }
-                }
-                if !job_buf.is_empty() {
-                    if let Ok(mut conn) = pool.get().await {
-                        let mut pushed_total = 0usize;
-                        for chunk in job_buf.chunks(500) {
-                            let res: Result<usize, _> =
-                                deadpool_redis::redis::AsyncCommands::rpush(
-                                    &mut conn, &queue_key, chunk,
-                                )
-                                .await;
-                            match res {
-                                Ok(_) => {
-                                    pushed_total += chunk.len();
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "embed enqueue rpush failed chunk={} err={}",
-                                        chunk.len(),
-                                        e
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        info!(
-                            "initial batch embed enqueue complete repo=? jobs={} queue={}",
-                            pushed_total, queue_key
-                        );
-                    }
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -752,11 +820,6 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
             "DEFINE TABLE commits SCHEMALESS PERMISSIONS FULL;",
             "DEFINE TABLE commits;",
         ],
-        // Content table for deduplicated source content and embeddings
-        vec![
-            "DEFINE TABLE content SCHEMALESS PERMISSIONS FULL;",
-            "DEFINE TABLE content;",
-        ],
         // Entity snapshot table for commit-specific entity metadata
         vec![
             "DEFINE TABLE entity_snapshot SCHEMALESS PERMISSIONS FULL;",
@@ -786,11 +849,6 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
             "DEFINE TABLE imports TYPE RELATION FROM entity_snapshot TO entity_snapshot;",
             "DEFINE TABLE imports TYPE RELATION;",
         ],
-        // entity_snapshot to content relation
-        vec![
-            "DEFINE TABLE has_content TYPE RELATION FROM entity_snapshot TO content;",
-            "DEFINE TABLE has_content TYPE RELATION;",
-        ],
         // entity to entity_snapshot relation
         vec![
             "DEFINE TABLE has_snapshot TYPE RELATION FROM entity TO entity_snapshot;",
@@ -800,6 +858,11 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
         vec![
             "DEFINE TABLE snapshot_file TYPE RELATION FROM entity_snapshot TO file;",
             "DEFINE TABLE snapshot_file TYPE RELATION;",
+        ],
+        // entity_snapshot to commits relation
+        vec![
+            "DEFINE TABLE snapshot_commit TYPE RELATION FROM entity_snapshot TO commits;",
+            "DEFINE TABLE snapshot_commit TYPE RELATION;",
         ],
         // refs to commits relation
         vec![
@@ -819,30 +882,10 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
             "DEFINE FIELD sourcecontrol_commit ON entity_snapshot TYPE string;",
             "REMOVE FIELD sourcecontrol_commit ON entity_snapshot; DEFINE FIELD sourcecontrol_commit ON entity_snapshot TYPE string;",
         ],
-        // Content table embedding fields
         vec![
-            "DEFINE FIELD embedding ON content TYPE array DEFAULT [];",
-            "REMOVE FIELD embedding ON content; DEFINE FIELD embedding ON content TYPE array DEFAULT [];",
-        ],
-        vec![
-            "DEFINE FIELD embedding_len ON content TYPE int DEFAULT 0;",
-            "REMOVE FIELD embedding_len ON content; DEFINE FIELD embedding_len ON content TYPE int DEFAULT 0;",
-        ],
-        vec![
-            "DEFINE FIELD embedding_model ON content TYPE string DEFAULT '';",
-            "REMOVE FIELD embedding_model ON content; DEFINE FIELD embedding_model ON content TYPE string DEFAULT '';",
-        ],
-        vec![
-            "DEFINE FIELD embedding_dim ON content TYPE int DEFAULT 0;",
-            "REMOVE FIELD embedding_dim ON content; DEFINE FIELD embedding_dim ON content TYPE int DEFAULT 0;",
-        ],
-        vec![
-            "DEFINE FIELD embedding_created_at ON content TYPE datetime DEFAULT time::now();",
-            "REMOVE FIELD embedding_created_at ON content; DEFINE FIELD embedding_created_at ON content TYPE datetime DEFAULT time::now();",
-        ],
-        vec![
-            "DEFINE FIELD embedding_status ON content TYPE string DEFAULT 'pending';",
-            "REMOVE FIELD embedding_status ON content; DEFINE FIELD embedding_status ON content TYPE string DEFAULT 'pending';",
+            // Track similarity processing status on snapshots (was embedding_status on content previously)
+            "DEFINE FIELD similarity_status ON entity_snapshot TYPE string DEFAULT 'pending';",
+            "REMOVE FIELD similarity_status ON entity_snapshot; DEFINE FIELD similarity_status ON entity_snapshot TYPE string DEFAULT 'pending';",
         ],
         vec![
             "DEFINE INDEX idx_entity_stable_id ON entity COLUMNS stable_id;",
@@ -868,16 +911,13 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
             "DEFINE INDEX idx_in_repo_unique ON in_repo FIELDS in, out UNIQUE;",
         ],
         vec![
-            "DEFINE INDEX idx_content_id ON content COLUMNS id;",
-        ],
-        vec![
-            "DEFINE INDEX idx_has_content_unique ON has_content FIELDS in, out UNIQUE;",
-        ],
-        vec![
             "DEFINE INDEX idx_has_snapshot_unique ON has_snapshot FIELDS in, out UNIQUE;",
         ],
         vec![
             "DEFINE INDEX idx_snapshot_file_unique ON snapshot_file FIELDS in, out UNIQUE;",
+        ],
+        vec![
+            "DEFINE INDEX idx_snapshot_commit_unique ON snapshot_commit FIELDS in, out UNIQUE;",
         ],
         vec![
             "DEFINE INDEX idx_points_to_unique ON points_to FIELDS in, out UNIQUE;",
@@ -979,9 +1019,32 @@ fn sanitize_id(raw: &str) -> String {
     }
 }
 
+fn build_file_record_id(repo_name: &str, commit_id: Option<&str>, path: &str) -> String {
+    let repo_component = if repo_name.trim().is_empty() {
+        "repo".to_string()
+    } else {
+        sanitize_id(repo_name)
+    };
+    let commit_component = commit_id
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(sanitize_id)
+        .unwrap_or_else(|| "no_commit".to_string());
+    let path_component = sanitize_id(path);
+    format!("{}_{}_{}", repo_component, commit_component, path_component)
+}
+
 type BatchStatements = Vec<(String, Option<Vec<(&'static str, serde_json::Value)>>)>;
 #[allow(clippy::type_complexity)]
-fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStatements, usize) {
+/// Optional embedding shape per payload: None if not computed, otherwise
+/// (Vec<f32>, model_id, chunk_count).
+type MaybeEmbedding = Option<(Vec<f32>, String, usize)>;
+
+fn build_batch_sql(
+    acc: &[EntityPayload],
+    cfg: &DbWriterConfig,
+    embeddings: &[MaybeEmbedding],
+) -> (BatchStatements, usize) {
     // Return pre-separated statements as tuples of (sql, optional binds).
     // Using binds for JSON payloads prevents manual JSON embedding while
     // allowing deterministic ids to remain interpolated (they're sanitized).
@@ -997,9 +1060,9 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
         );
     }
     use std::collections::HashMap;
-    // de-duplicate files by repo-relative path (store relative paths in DB)
-    let mut file_map: HashMap<String, usize> = HashMap::new();
-    let mut file_list: Vec<(String, &str)> = Vec::new();
+    // de-duplicate files by repo + repo-relative path (store relative paths in DB)
+    let mut file_map: HashMap<(String, String), usize> = HashMap::new();
+    let mut file_list: Vec<(String, String, String)> = Vec::new();
     // Helper: derive a file-like hint from the payload. Prefer a precomputed
     // `source_display` if present. We intentionally avoid complex URL parsing
     // here; if no display hint exists, skip file metadata for that entity.
@@ -1052,13 +1115,15 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
         None
     }
 
-    for p in acc {
+    for p in acc.iter() {
         if let Some(fp) = payload_file_hint(p) {
-            let repo_rel = compute_repo_relative(&fp, &p.repo_name);
-            if !file_map.contains_key(&repo_rel) {
+            let repo_name = p.repo_name.clone();
+            let repo_rel = compute_repo_relative(&fp, &repo_name);
+            let key = (repo_name.clone(), repo_rel.clone());
+            if let std::collections::hash_map::Entry::Vacant(e) = file_map.entry(key) {
                 let idx = file_list.len();
-                file_map.insert(repo_rel.clone(), idx);
-                file_list.push((repo_rel, &p.language));
+                e.insert(idx);
+                file_list.push((repo_name, repo_rel, p.language.clone()));
             }
         }
     }
@@ -1069,25 +1134,69 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
             created_set.lock().unwrap().clear();
         }
         let mut guard = created_set.lock().unwrap();
-        for (path, lang) in file_list.iter() {
-            let fid = sanitize_id(path);
+        for (repo_name, path, lang) in file_list.iter() {
+            let fid = build_file_record_id(repo_name, cfg.commit_id.as_deref(), path);
             if guard.insert(fid.clone()) {
                 // First time we've seen this file in-process: create the row with binds
                 let mut map = serde_json::Map::new();
                 map.insert("path".to_string(), serde_json::Value::String(path.clone()));
                 map.insert(
                     "language".to_string(),
-                    serde_json::Value::String(lang.to_string()),
+                    serde_json::Value::String(lang.clone()),
                 );
+                map.insert(
+                    "repo_name".to_string(),
+                    serde_json::Value::String(repo_name.clone()),
+                );
+                match cfg.commit_id.as_deref() {
+                    Some(commit) if !commit.is_empty() => {
+                        map.insert(
+                            "commit_id".to_string(),
+                            serde_json::Value::String(commit.to_string()),
+                        );
+                        // Add record reference to commits table
+                        map.insert(
+                            "commit_ref".to_string(),
+                            serde_json::Value::String(format!("commits:{}", commit)),
+                        );
+                    }
+                    _ => {
+                        map.insert("commit_id".to_string(), serde_json::Value::Null);
+                        map.insert("commit_ref".to_string(), serde_json::Value::Null);
+                    }
+                }
                 let sql = format!("CREATE file:{fid} CONTENT $f;", fid = fid);
                 statements.push((sql, Some(vec![("f", serde_json::Value::Object(map))])));
             } else {
                 // Subsequent occurrences: update the existing row.
-                let binds = vec![
+                let mut binds = vec![
                     ("p", serde_json::Value::String(path.clone())),
-                    ("l", serde_json::Value::String(lang.to_string())),
+                    ("l", serde_json::Value::String(lang.clone())),
+                    ("r", serde_json::Value::String(repo_name.clone())),
                 ];
-                let sql = format!("UPDATE file:{fid} SET path = $p, language = $l;", fid = fid);
+                let mut set_fragments = vec!["path = $p", "language = $l", "repo_name = $r"];
+                match cfg.commit_id.as_deref() {
+                    Some(commit) if !commit.is_empty() => {
+                        binds.push(("c", serde_json::Value::String(commit.to_string())));
+                        binds.push((
+                            "cr",
+                            serde_json::Value::String(format!("commits:{}", commit)),
+                        ));
+                        set_fragments.push("commit_id = $c");
+                        set_fragments.push("commit_ref = $cr");
+                    }
+                    _ => {
+                        binds.push(("c", serde_json::Value::Null));
+                        binds.push(("cr", serde_json::Value::Null));
+                        set_fragments.push("commit_id = $c");
+                        set_fragments.push("commit_ref = $cr");
+                    }
+                }
+                let sql = format!(
+                    "UPDATE file:{fid} SET {};",
+                    set_fragments.join(", "),
+                    fid = fid
+                );
                 statements.push((sql, Some(binds)));
             }
         }
@@ -1108,7 +1217,7 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
     }
     {
         let _guard = created_entities.lock().unwrap();
-        for p in acc {
+        for (idx, p) in acc.iter().enumerate() {
             // Create entity with embedded snapshot data
             let mut entity_obj = serde_json::Map::new();
             entity_obj.insert(
@@ -1123,12 +1232,9 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
                 "name".to_string(),
                 serde_json::Value::String(p.name.clone()),
             );
-            if let Some(rank) = p.rank {
-                entity_obj.insert(
-                    "rank".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from_f64(rank as f64).unwrap()),
-                );
-            }
+            // NOTE: rank is now stored on the entity_snapshot record (snapshot-level)
+            // to allow PageRank to be associated with a specific snapshot/commit.
+            // Keep rank out of the top-level entity JSON to avoid duplication.
             entity_obj.insert(
                 "repo_name".to_string(),
                 serde_json::Value::String(p.repo_name.clone()),
@@ -1213,39 +1319,22 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
                     ),
                 );
             }
+            // Attach per-snapshot PageRank value when provided by the indexer.
+            // Persist under `page_rank_value` to avoid conflict with SQL keywords
+            // and to make it explicit this is a snapshot-scoped metric.
+            if let Some(rank) = p.rank {
+                snapshot_obj.insert(
+                    "page_rank_value".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from_f64(rank as f64).unwrap()),
+                );
+            }
             entity_obj.insert(
                 "snapshot".to_string(),
                 serde_json::Value::Object(snapshot_obj),
             );
 
-            // Compute content_id for deduplication
-            let content_text = if let Some(sc) = &p.source_content {
-                if !sc.is_empty() {
-                    sc.clone()
-                } else {
-                    format!(
-                        "{}\n{}\n{}",
-                        p.name,
-                        p.signature,
-                        p.doc.clone().unwrap_or_default()
-                    )
-                }
-            } else {
-                format!(
-                    "{}\n{}\n{}",
-                    p.name,
-                    p.signature,
-                    p.doc.clone().unwrap_or_default()
-                )
-            };
-            let mut hasher = Sha256::new();
-            hasher.update(content_text.as_bytes());
-            let digest = hasher.finalize();
-            let content_id = format!("{:x}", digest);
-            entity_obj.insert(
-                "content_id".to_string(),
-                serde_json::Value::String(content_id.clone()),
-            );
+            // We no longer deduplicate text into a separate `content` table.
+            // Persist source_content on the snapshot and keep entity simple.
 
             let eid = sanitize_id(&p.stable_id);
             let mut entity_json = serde_json::Value::Object(entity_obj);
@@ -1255,6 +1344,11 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
 
             // Create entity_snapshot with the same ID for relations
             let mut snapshot_obj = serde_json::Map::new();
+            // Include repo_name so snapshot-scoped queries can filter by repo
+            snapshot_obj.insert(
+                "repo_name".to_string(),
+                serde_json::Value::String(p.repo_name.clone()),
+            );
             snapshot_obj.insert(
                 "stable_id".to_string(),
                 serde_json::Value::String(p.stable_id.clone()),
@@ -1326,17 +1420,95 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
                     ),
                 );
             }
+            // Persist full source text (used for embeddings) on the snapshot
+            if let Some(sc) = &p.source_content {
+                snapshot_obj.insert(
+                    "source_content".to_string(),
+                    serde_json::Value::String(sc.clone()),
+                );
+            } else {
+                snapshot_obj.insert(
+                    "source_content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+            // If an embedding was computed for this payload, persist it directly
+            // on the snapshot to avoid a separate upsert step. Otherwise set
+            // default placeholder fields.
+            if let Some((vec, model, chunk_count)) = embeddings.get(idx).and_then(|e| e.clone()) {
+                // store embedding array
+                let arr: Vec<serde_json::Value> = vec
+                    .iter()
+                    .map(|f| serde_json::Value::from(*f as f64))
+                    .collect();
+                snapshot_obj.insert("embedding".to_string(), serde_json::Value::Array(arr));
+                snapshot_obj.insert(
+                    "embedding_len".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(vec.len() as i64)),
+                );
+                snapshot_obj.insert(
+                    "embedding_model".to_string(),
+                    serde_json::Value::String(model),
+                );
+                snapshot_obj.insert(
+                    "embedding_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(vec.len() as i64)),
+                );
+                snapshot_obj.insert(
+                    "embedding_chunk_count".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(chunk_count as i64)),
+                );
+                snapshot_obj.insert(
+                    "embedding_created_at".to_string(),
+                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+                snapshot_obj.insert(
+                    "similarity_status".to_string(),
+                    serde_json::Value::String("ready".to_string()),
+                );
+            } else {
+                // Prepare embedding metadata fields on the snapshot (defaults)
+                snapshot_obj.insert("embedding".to_string(), serde_json::Value::Array(vec![]));
+                snapshot_obj.insert(
+                    "embedding_len".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(0)),
+                );
+                snapshot_obj.insert(
+                    "embedding_model".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+                snapshot_obj.insert(
+                    "embedding_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(0)),
+                );
+                snapshot_obj.insert("embedding_created_at".to_string(), serde_json::Value::Null);
+                snapshot_obj.insert(
+                    "similarity_status".to_string(),
+                    serde_json::Value::String("pending".to_string()),
+                );
+            }
             // Add embedded commit reference if available
             if let Some(commit_id) = &cfg.commit_id {
+                let commit_ref = format!("commits:{}", commit_id);
+                // Keep the original field for backward compatibility
                 snapshot_obj.insert(
                     "sourcecontrol_commit".to_string(),
-                    serde_json::Value::String(format!("commits:{}", commit_id)),
+                    serde_json::Value::String(commit_ref.clone()),
+                );
+                // Add explicit record reference field for graph queries
+                snapshot_obj.insert(
+                    "sourcecontrol_commit_ref".to_string(),
+                    serde_json::Value::String(commit_ref),
                 );
             } else {
                 // Set to empty string when no commit_id is available
                 snapshot_obj.insert(
                     "sourcecontrol_commit".to_string(),
                     serde_json::Value::String(String::new()),
+                );
+                snapshot_obj.insert(
+                    "sourcecontrol_commit_ref".to_string(),
+                    serde_json::Value::Null,
                 );
             }
             let mut snapshot_json = serde_json::Value::Object(snapshot_obj);
@@ -1351,20 +1523,29 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
             );
             statements.push((snapshot_rel, None));
 
-            // Create content record if it doesn't exist and relate to entity_snapshot
-            let content_sql = format!(
-                "CREATE content:{content_id} CONTENT {{}};",
-                content_id = content_id
-            );
-            statements.push((content_sql, None));
+            // Link entity_snapshot to file if available
+            if p.file.is_some() {
+                let file_id = format!("{}:{}", cfg.repo_name, p.file.as_ref().unwrap());
+                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                let file_rel = format!(
+                    "RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id_hash};",
+                    eid = eid,
+                    file_id_hash = file_id_hash
+                );
+                statements.push((file_rel, None));
+            }
 
-            // Create has_content relation
-            let content_rel = format!(
-                "RELATE entity_snapshot:{eid}->has_content->content:{content_id};",
-                eid = eid,
-                content_id = content_id
-            );
-            statements.push((content_rel, None));
+            // Link entity_snapshot to commit if available
+            if let Some(commit_id) = &cfg.commit_id {
+                let commit_rel = format!(
+                    "RELATE entity_snapshot:{eid}->snapshot_commit->commits:{commit_id};",
+                    eid = eid,
+                    commit_id = commit_id
+                );
+                statements.push((commit_rel, None));
+            }
+
+            // We no longer create separate content records; embeddings and text live on entity_snapshot.
 
             // Create entity_snapshot if we have a commit_id (linking entity to commit)
             if let Some(_commit_id) = &cfg.commit_id {
@@ -1539,8 +1720,8 @@ fn build_batch_sql(acc: &[EntityPayload], cfg: &DbWriterConfig) -> (BatchStateme
             global.lock().unwrap().clear();
         }
         let mut guard = global.lock().unwrap();
-        for (path, _lang) in file_list.iter() {
-            let fid = sanitize_id(path);
+        for (repo_name, path, _lang) in file_list.iter() {
+            let fid = build_file_record_id(repo_name, cfg.commit_id.as_deref(), path);
             // match entities by repo-relative path equivalence
             for ent in acc.iter().filter(|e| {
                 if let Some(fp) = payload_file_hint(e) {
@@ -1653,6 +1834,45 @@ pub fn sanitize_json_strings(val: &mut serde_json::Value) {
     }
 }
 
+/// Append a minimal DLQ record for failed embedding persistence/requests.
+pub fn append_to_embed_dlq(stable_id: &str, reason: &str, snippet_len: usize, snippet_head: &str) {
+    let path =
+        std::env::var("HZ_EMBED_DLQ_PATH").unwrap_or_else(|_| "/tmp/hz_embed_dlq.log".to_string());
+    let record = format!(
+        "{} | ts={} | reason={} | snippet_len={} | head={}\n",
+        stable_id,
+        chrono::Utc::now().to_rfc3339(),
+        reason,
+        snippet_len,
+        snippet_head.replace('\n', "\\n")
+    );
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(record.as_bytes()))
+    {
+        warn!("failed to write embedding DLQ record to {}: {}", path, e);
+    } else {
+        warn!(
+            "wrote embed DLQ record for {} reason={} path={}",
+            stable_id, reason, path
+        );
+    }
+}
+
+fn normalize_string_for_json(s: &str) -> String {
+    // Ensure we produce a valid UTF-8 string and remove embedded NULs
+    let lossy = String::from_utf8_lossy(s.as_bytes()).to_string();
+    if lossy.contains('\u{0000}') {
+        return lossy
+            .chars()
+            .map(|c| if c == '\u{0000}' { ' ' } else { c })
+            .collect();
+    }
+    lossy
+}
+
 /// Compute a repository-relative path from a file path and repo name.
 /// This is a lightweight version of the webui helper to avoid importing UI code.
 fn compute_repo_relative(file_path: &str, repo_name: &str) -> String {
@@ -1754,4 +1974,795 @@ fn group_statements(stmts: &[String], group_size: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+/// Compute embeddings for a slice of EntityPayloads using the TEI endpoint.
+/// Returns a vector of length `payloads.len()` where each entry is None on
+/// failure or Some((vec_f32, model_id, chunk_count)) on success.
+pub async fn compute_embeddings_for_payloads(
+    client: &HttpClient,
+    tei_endpoint: &str,
+    model: &str,
+    payloads: &[EntityPayload],
+) -> Vec<MaybeEmbedding> {
+    // Keep a reference to the original payload slice so we don't accidentally
+    // shadow it later when working with chunked payloads.
+    let orig_payloads = payloads;
+
+    // We'll build the actual inputs for TEI from the chunked payloads below so
+    // indices align with `chunked_payloads`. We'll populate `inputs_owned` and
+    // `inputs` after performing token-aware chunking (avoid placeholder
+    // allocations that become overwritten and trigger unused-assignment warnings).
+
+    // Allow configuring per-request sub-batch size to avoid TEI rejecting large
+    // requests (413). Default to 100 inputs per request which is a reasonable
+    // hard cap; operators can tune HZ_EMBED_BATCH_SIZE in env.
+    let batch_size: usize = std::env::var("HZ_EMBED_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(100usize);
+
+    // Allow configuring a maximum serialized payload size per request. TEI
+    // deployments often enforce a request body size limit which manifests as
+    // HTTP 413. Default to 80KB but operators can tune HZ_EMBED_MAX_BYTES.
+    let max_bytes: usize = std::env::var("HZ_EMBED_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(80_000usize);
+
+    // Token-aware handling configuration (moved early so chunking logic can use it)
+    let token_limit: usize = std::env::var("HZ_EMBED_TOKEN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(8192usize);
+    let truncate_dir =
+        std::env::var("HZ_EMBED_TRUNCATE_DIR").unwrap_or_else(|_| "Right".to_string());
+
+    // Initialize tokenizer for token counting.
+    let tk = match cl100k_base() {
+        Ok(enc) => Some(enc),
+        Err(e) => {
+            warn!("failed to initialize tokenizer (tiktoken-rs): {}", e);
+            None
+        }
+    };
+
+    // Build chunked payloads when possible and pre-allocate results
+    let orig_len = orig_payloads.len();
+    let chunk_overlap: usize = std::env::var("HZ_EMBED_CHUNK_OVERLAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256usize);
+    let (send_payloads, chunk_to_orig) =
+        chunk_payloads_for_embeddings(orig_payloads, token_limit, chunk_overlap, tk.clone());
+    // Chunked view of payloads for network requests.
+    let chunked_payloads = &send_payloads[..];
+    // Build inputs for TEI from the chunked payloads so the serialized
+    // JSON matches the chunk indices and to ensure each payload is properly
+    // normalized for JSON. This avoids using the original (unchunked)
+    // inputs which would misalign indices and cause DLQ/mapping issues.
+    let mut inputs_owned: Vec<String> = chunked_payloads
+        .iter()
+        .map(|p| {
+            p.source_content
+                .as_deref()
+                .unwrap_or(p.name.as_str())
+                .to_string()
+        })
+        .collect();
+    for s in inputs_owned.iter_mut() {
+        *s = normalize_string_for_json(s);
+    }
+    let inputs: Vec<&str> = inputs_owned.iter().map(|s| s.as_str()).collect();
+    // Pre-allocate results aligned with chunked payload list. Each entry will
+    // eventually be aggregated back to its original payload via chunking.
+    let mut results: Vec<Option<(Vec<f32>, String, usize)>> = vec![None; chunked_payloads.len()];
+
+    // Early exit: when no model configured, return all None for original inputs
+    if model.is_empty() {
+        return vec![None; orig_len];
+    }
+
+    // Helper: post a chunk of inputs, handling HTTP 413 by splitting the chunk
+    // iteratively to avoid recursive async calls. This will split oversized
+    // requests into smaller pieces up to a limited recursion depth (attempts).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_chunk_and_handle(
+        client: &HttpClient,
+        tei_endpoint: &str,
+        model: &str,
+        initial_inputs: Vec<String>,
+        initial_indices: Vec<usize>,
+        chunked_payloads: &[EntityPayload],
+        results: &mut [Option<(Vec<f32>, String, usize)>],
+        tk: &Option<tiktoken_rs::CoreBPE>,
+        token_limit: usize,
+        truncate_dir: &str,
+        attempts: usize,
+        max_bytes: usize,
+    ) {
+        use std::collections::VecDeque;
+        use tokio::time::{sleep, Duration as TokioDuration};
+
+        let mut queue: VecDeque<(Vec<String>, Vec<usize>, usize)> = VecDeque::new();
+        queue.push_back((initial_inputs, initial_indices, attempts));
+
+        while let Some((inputs, indices, attempts_left)) = queue.pop_front() {
+            if inputs.is_empty() {
+                continue;
+            }
+            let req_body = serde_json::json!({"model": model, "input": inputs});
+            match client.post(tei_endpoint).json(&req_body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    debug!(
+                        "tei response status={} for chunk {}..{}",
+                        status,
+                        indices.first().copied().unwrap_or(0),
+                        indices.last().copied().unwrap_or(0)
+                    );
+                    if resp.status().is_success() {
+                        match resp.bytes().await {
+                            Ok(b) => match local_parse_embeddings_and_model(&b) {
+                                Ok((vecs, maybe_model)) => {
+                                    // Ensure embeddings array is non-empty; if empty, treat as failure and retry
+                                    if vecs.is_empty() {
+                                        let snippet = inputs
+                                            .get(indices.first().copied().unwrap_or(0))
+                                            .map(|s| s.chars().take(4096).collect::<String>())
+                                            .unwrap_or_default();
+                                        warn!("tei returned empty embeddings array for chunk {}..{}; marking for retry (attempts_left={}) body_snippet='{}'", indices.first().copied().unwrap_or(0), indices.last().copied().unwrap_or(0), attempts_left, snippet);
+                                        // Requeue for retry if attempts remain
+                                        if attempts_left > 0 {
+                                            queue.push_back((
+                                                inputs.clone(),
+                                                indices.clone(),
+                                                attempts_left - 1,
+                                            ));
+                                            // small backoff
+                                            sleep(TokioDuration::from_millis(50)).await;
+                                            continue;
+                                        } else {
+                                            // write DLQ entries for each index in this chunk
+                                            for &gi in indices.iter() {
+                                                if let Some(p) = chunked_payloads.get(gi) {
+                                                    let head = p
+                                                        .source_content
+                                                        .as_deref()
+                                                        .unwrap_or(&p.name)
+                                                        .chars()
+                                                        .take(256)
+                                                        .collect::<String>();
+                                                    append_to_embed_dlq(
+                                                        &p.stable_id,
+                                                        "empty_embeddings",
+                                                        p.source_content
+                                                            .as_ref()
+                                                            .map(|s| s.len())
+                                                            .unwrap_or(0),
+                                                        &head,
+                                                    );
+                                                }
+                                            }
+                                            for &gi in indices.iter() {
+                                                if gi < results.len() {
+                                                    results[gi] = None;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    let model_id = maybe_model.unwrap_or_else(|| model.to_string());
+                                    for (j, v) in vecs.into_iter().enumerate() {
+                                        if let Some(global_idx) = indices.get(j).copied() {
+                                            if global_idx < results.len() {
+                                                // Single-chunk response -> chunk_count = 1 for now
+                                                results[global_idx] =
+                                                    Some((v, model_id.clone(), 1usize));
+                                            } else {
+                                                warn!("tei returned embedding for out-of-range index {} (global_idx {}), ignoring", j, global_idx);
+                                            }
+                                        } else {
+                                            warn!("tei returned more embeddings than tracked inputs (index {})", j);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let snippet = String::from_utf8_lossy(&b)
+                                        .chars()
+                                        .take(4096)
+                                        .collect::<String>();
+                                    warn!("failed to parse tei response (chunk {}..{}): {} ; body_snippet='{}'", indices.first().copied().unwrap_or(0), indices.last().copied().unwrap_or(0), e, snippet);
+                                    for &gi in indices.iter() {
+                                        if gi < results.len() {
+                                            results[gi] = None;
+                                        }
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "failed to read tei response bytes for chunk {}..{}: {}",
+                                    indices.first().copied().unwrap_or(0),
+                                    indices.last().copied().unwrap_or(0),
+                                    e
+                                );
+                                for &gi in indices.iter() {
+                                    if gi < results.len() {
+                                        results[gi] = None;
+                                    }
+                                }
+                            }
+                        }
+                    } else if status.as_u16() == 413 {
+                        warn!("tei returned 413 for chunk {}..{} (attempts_left={}) - will try splitting/truncating", indices.first().copied().unwrap_or(0), indices.last().copied().unwrap_or(0), attempts_left);
+                        // If we have multiple inputs, split the chunk and retry halves.
+                        if inputs.len() > 1 && attempts_left > 0 {
+                            let mid = inputs.len() / 2;
+                            let mut left_inputs = inputs.clone();
+                            let right_inputs = left_inputs.split_off(mid);
+                            let mut left_indices = indices.clone();
+                            let right_indices = left_indices.split_off(mid);
+                            queue.push_back((left_inputs, left_indices, attempts_left - 1));
+                            // small backoff between retries
+                            sleep(TokioDuration::from_millis(25)).await;
+                            queue.push_back((right_inputs, right_indices, attempts_left - 1));
+                        } else if inputs.len() == 1 {
+                            // Single-input case: try to safely truncate and retry even if
+                            // truncation wasn't explicitly enabled. This addresses TEI
+                            // rejecting single large inputs (413) due to token limits.
+                            let gi = indices[0];
+                            if attempts_left > 0 {
+                                let orig = inputs[0].clone();
+                                // Try token-aware truncation if tokenizer available
+                                if let Some(enc) = tk.as_ref() {
+                                    let tokens = enc.encode_ordinary(&orig);
+                                    if tokens.len() > token_limit {
+                                        let truncated_tokens = if truncate_dir
+                                            .eq_ignore_ascii_case("Left")
+                                        {
+                                            let start = tokens.len().saturating_sub(token_limit);
+                                            tokens[start..].to_vec()
+                                        } else {
+                                            let end = token_limit.min(tokens.len());
+                                            tokens[..end].to_vec()
+                                        };
+                                        if let Ok(decoded) = enc.decode(truncated_tokens) {
+                                            debug!("forcing token-truncation for single-input index {}: original_tokens={} truncated_tokens={}", gi, tokens.len(), token_limit);
+                                            queue.push_back((
+                                                vec![decoded],
+                                                vec![gi],
+                                                attempts_left - 1,
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Fallback to byte-length truncation based on max_bytes
+                                let byte_trim = if max_bytes > 0 { max_bytes / 2 } else { 40_000 };
+                                if orig.len() > byte_trim {
+                                    let trimmed = orig.chars().take(byte_trim).collect::<String>();
+                                    debug!("forcing byte-truncation for single-input index {}: original_bytes={} trimmed_bytes={}", gi, orig.len(), trimmed.len());
+                                    queue.push_back((vec![trimmed], vec![gi], attempts_left - 1));
+                                    continue;
+                                }
+                            }
+                            // If we reach here, truncation not possible or attempts exhausted
+                            warn!("single input chunk too large and retries exhausted or truncation failed; marking as None for index {}", gi);
+                            if gi < results.len() {
+                                results[gi] = None;
+                            }
+                        } else {
+                            match resp.text().await {
+                                Ok(text) => {
+                                    let snippet = text.chars().take(4096).collect::<String>();
+                                    warn!(
+                                        "tei returned 413 body snippet='{}' for chunk {}..{}",
+                                        snippet,
+                                        indices.first().copied().unwrap_or(0),
+                                        indices.last().copied().unwrap_or(0)
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("tei returned 413 and body could not be read: {}", e);
+                                }
+                            }
+                            for &gi in indices.iter() {
+                                if gi < results.len() {
+                                    results[gi] = None;
+                                }
+                            }
+                        }
+                    } else {
+                        match resp.text().await {
+                            Ok(text) => {
+                                let snippet = text.chars().take(4096).collect::<String>();
+                                warn!("tei returned non-success status={} for chunk {}..{} body_snippet='{}'", status, indices.first().copied().unwrap_or(0), indices.last().copied().unwrap_or(0), snippet);
+                            }
+                            Err(e) => {
+                                warn!("tei returned non-success status={} for chunk {}..{} and body could not be read: {}", status, indices.first().copied().unwrap_or(0), indices.last().copied().unwrap_or(0), e);
+                            }
+                        }
+                        for &gi in indices.iter() {
+                            if gi < results.len() {
+                                results[gi] = None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "failed to POST to tei endpoint {} for chunk {}..{} stable_ids=[{}]: {}",
+                        tei_endpoint,
+                        indices.first().copied().unwrap_or(0),
+                        indices.last().copied().unwrap_or(0),
+                        chunked_payloads
+                            .get(indices.first().copied().unwrap_or(0))
+                            .map(|p| p.stable_id.clone())
+                            .unwrap_or_default(),
+                        e
+                    );
+                    for &gi in indices.iter() {
+                        if gi < results.len() {
+                            results[gi] = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build dynamic chunks that respect both a per-input cap (batch_size),
+    // an approximate serialized byte limit (max_bytes), and a token limit per input.
+    // Use owned strings for current_inputs so we can safely store truncated text
+    let mut current_inputs: Vec<String> = Vec::new();
+    let mut idx_in_current: Vec<usize> = Vec::new();
+
+    // Iterate inputs and flush chunks inline when limits are hit.
+    for (i, input) in inputs.iter().enumerate() {
+        // Token-aware check/truncation per input -> produce an owned String to push.
+        // Proactively truncate oversized inputs to avoid TEI 413s even if truncation
+        // wasn't explicitly enabled. This addresses the root cause.
+        let mut effective_owned = input.to_string();
+        if let Some(enc) = tk.as_ref() {
+            let tokens = enc.encode_ordinary(input);
+            if tokens.len() > token_limit {
+                // Truncate to token_limit according to direction.
+                let truncated_tokens = if truncate_dir.eq_ignore_ascii_case("Left") {
+                    let start = tokens.len().saturating_sub(token_limit);
+                    tokens[start..].to_vec()
+                } else {
+                    let end = token_limit.min(tokens.len());
+                    tokens[..end].to_vec()
+                };
+                if let Ok(decoded) = enc.decode(truncated_tokens) {
+                    debug!("proactively token-truncated input index {} original_tokens={} truncated_tokens={}", i, tokens.len(), token_limit);
+                    effective_owned = decoded;
+                }
+            }
+        } else {
+            static TOKEN_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            TOKEN_WARN_ONCE.call_once(|| {
+                warn!("tokenizer initialization failed – HZ_EMBED_TOKEN_LIMIT cannot be enforced precisely; falling back to byte-size heuristic");
+            });
+            // Byte-based fallback: clamp to max_bytes/2 to avoid giant payloads
+            if max_bytes > 0 && effective_owned.len() > max_bytes / 2 {
+                let allowed = max_bytes / 2;
+                effective_owned = effective_owned.chars().take(allowed).collect();
+                debug!(
+                    "proactively byte-truncated input index {} to {} bytes (no tokenizer)",
+                    i, allowed
+                );
+            }
+        }
+        current_inputs.push(effective_owned);
+        idx_in_current.push(i);
+        // Estimate size with current inputs
+        let req_body = serde_json::json!({"model": model, "input": current_inputs});
+        let size = match serde_json::to_vec(&req_body) {
+            Ok(b) => b.len(),
+            Err(e) => {
+                // Serialization failed for current_inputs: log and DLQ each payload
+                warn!(
+                    "failed to serialize embedding request body for chunk (will DLQ) err={}",
+                    e
+                );
+                for &gi in idx_in_current.iter() {
+                    if let Some(p) = chunked_payloads.get(gi) {
+                        let head = p
+                            .source_content
+                            .as_deref()
+                            .unwrap_or("")
+                            .chars()
+                            .take(256)
+                            .collect::<String>();
+                        append_to_embed_dlq(
+                            &p.stable_id,
+                            "serialize_error",
+                            p.source_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                            &head,
+                        );
+                        if gi < results.len() {
+                            results[gi] = None;
+                        }
+                    }
+                }
+                0usize
+            }
+        };
+
+        // Decide whether we've exceeded size or count limits. If so, remove the
+        // last added element and flush the chunk, then start a new chunk with
+        // the last element.
+        if (size > max_bytes && current_inputs.len() > 1) || current_inputs.len() >= batch_size {
+            // Pop last to requeue into next chunk
+            let last = current_inputs.pop().unwrap();
+            let _last_idx = idx_in_current.pop().unwrap();
+            // Send current chunk (without last)
+            // Build request using the provided `client` and await response inline.
+            let req_body = serde_json::json!({"model": model, "input": current_inputs});
+            let size = match serde_json::to_vec(&req_body) {
+                Ok(b) => b.len(),
+                Err(e) => {
+                    warn!("failed to serialize single-oversized embedding request body (will DLQ) err={}", e);
+                    for &gi in idx_in_current.iter() {
+                        if let Some(p) = payloads.get(gi) {
+                            let head = p
+                                .source_content
+                                .as_deref()
+                                .unwrap_or("")
+                                .chars()
+                                .take(256)
+                                .collect::<String>();
+                            append_to_embed_dlq(
+                                &p.stable_id,
+                                "serialize_error",
+                                p.source_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                                &head,
+                            );
+                            if gi < results.len() {
+                                results[gi] = None;
+                            }
+                        }
+                    }
+                    0usize
+                }
+            };
+            // Compute chunk index range and stable ids for better diagnostics
+            let chunk_start = idx_in_current.first().copied().unwrap_or(0);
+            let chunk_end = idx_in_current.last().copied().unwrap_or(0);
+            let stable_ids: Vec<String> = idx_in_current
+                .iter()
+                .filter_map(|&gi| chunked_payloads.get(gi))
+                .map(|p| p.stable_id.clone())
+                .collect();
+            debug!(
+                "posting embeddings request size_bytes={} inputs_in_chunk={} chunk_range={}..{} stable_ids=[{}]",
+                size,
+                current_inputs.len(),
+                chunk_start,
+                chunk_end,
+                stable_ids.first().map(|s| s.as_str()).unwrap_or("")
+            );
+            // Use helper that will retry/split on 413
+            send_chunk_and_handle(
+                client,
+                tei_endpoint,
+                model,
+                current_inputs.clone(),
+                idx_in_current.clone(),
+                chunked_payloads,
+                &mut results[..],
+                &tk,
+                token_limit,
+                &truncate_dir,
+                3,
+                max_bytes,
+            )
+            .await;
+            // Start new chunk with last
+            current_inputs.clear();
+            idx_in_current.clear();
+            current_inputs.push(last);
+            idx_in_current.push(i);
+        } else if size > max_bytes && current_inputs.len() == 1 {
+            // Single input exceeds max_bytes; send it anyway to avoid infinite loop
+            // Send single oversized input anyway
+            let req_body = serde_json::json!({"model": model, "input": current_inputs});
+            let size = serde_json::to_vec(&req_body).map(|b| b.len()).unwrap_or(0);
+            // Single-input oversized branch: add same diagnostics as multi-input
+            let chunk_start = idx_in_current.first().copied().unwrap_or(0);
+            let chunk_end = idx_in_current.last().copied().unwrap_or(0);
+            let stable_ids: Vec<String> = idx_in_current
+                .iter()
+                .filter_map(|&gi| chunked_payloads.get(gi))
+                .map(|p| p.stable_id.clone())
+                .collect();
+            debug!(
+                "posting embeddings request size_bytes={} inputs_in_chunk={} chunk_range={}..{} stable_ids=[{}]",
+                size,
+                current_inputs.len(),
+                chunk_start,
+                chunk_end,
+                stable_ids.first().map(|s| s.as_str()).unwrap_or("")
+            );
+            // Use helper that will retry/split on 413
+            send_chunk_and_handle(
+                client,
+                tei_endpoint,
+                model,
+                current_inputs.clone(),
+                idx_in_current.clone(),
+                chunked_payloads,
+                &mut results[..],
+                &tk,
+                token_limit,
+                &truncate_dir,
+                3,
+                max_bytes,
+            )
+            .await;
+            current_inputs.clear();
+            idx_in_current.clear();
+        }
+    }
+
+    // Send any remaining inputs (reuse same inline logic as above)
+    if !current_inputs.is_empty() {
+        let req_body = serde_json::json!({"model": model, "input": current_inputs});
+        let size = serde_json::to_vec(&req_body).map(|b| b.len()).unwrap_or(0);
+        debug!(
+            "posting embeddings request size_bytes={} inputs_in_chunk={}",
+            size,
+            current_inputs.len()
+        );
+        // Final remaining inputs: diagnostic similar to earlier branches
+        let chunk_start = idx_in_current.first().copied().unwrap_or(0);
+        let chunk_end = idx_in_current.last().copied().unwrap_or(0);
+        let stable_ids: Vec<String> = idx_in_current
+            .iter()
+            .filter_map(|&gi| chunked_payloads.get(gi))
+            .map(|p| p.stable_id.clone())
+            .collect();
+        debug!(
+            "posting embeddings request size_bytes={} inputs_in_chunk={} chunk_range={}..{} stable_ids=[{}]",
+            size,
+            current_inputs.len(),
+            chunk_start,
+            chunk_end,
+            stable_ids.first().map(|s| s.as_str()).unwrap_or("")
+        );
+        // Use helper that will retry/split on 413
+        send_chunk_and_handle(
+            client,
+            tei_endpoint,
+            model,
+            current_inputs.clone(),
+            idx_in_current.clone(),
+            chunked_payloads,
+            &mut results[..],
+            &tk,
+            token_limit,
+            &truncate_dir,
+            3,
+            max_bytes,
+        )
+        .await;
+    }
+
+    // At this point `results` holds per-chunk embeddings aligned with the
+    // `send_payloads` slice. Aggregate element-wise into one embedding per
+    // original payload by averaging successful chunk embeddings. If some
+    // chunks failed, we still average the successful ones and write a DLQ
+    // entry noting a partial failure so operators can triage.
+    let mut final_out: Vec<MaybeEmbedding> = vec![None; orig_len];
+    // count total chunks per original
+    let mut total_chunks: Vec<usize> = vec![0usize; orig_len];
+    for &orig in chunk_to_orig.iter() {
+        if orig < total_chunks.len() {
+            total_chunks[orig] += 1;
+        }
+    }
+    // accumulate successful chunks
+    let mut acc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); orig_len];
+    let mut acc_model_per_orig: Vec<Option<String>> = vec![None; orig_len];
+    for (chunk_idx, res_opt) in results.into_iter().enumerate() {
+        let orig = chunk_to_orig.get(chunk_idx).copied().unwrap_or(0);
+        if let Some((vec_f, model_id, _chunk_count)) = res_opt {
+            if orig < acc.len() {
+                acc[orig].push(vec_f);
+                if acc_model_per_orig[orig].is_none() {
+                    acc_model_per_orig[orig] = Some(model_id);
+                }
+            }
+        }
+    }
+    for i in 0..orig_len {
+        let success = &acc[i];
+        if success.is_empty() {
+            // no successful chunks -> None
+            final_out[i] = None;
+            // If we had chunks but none succeeded, write DLQ to help ops
+            if total_chunks[i] > 0 {
+                // Use the original payloads slice when emitting DLQ entries so the
+                // stable_id and snippet map to the original entity (not a chunked
+                // representation). Previously we accidentally referenced the
+                // chunked view here which produced incorrect DLQ lines.
+                if let Some(p) = orig_payloads.get(i) {
+                    let head = p
+                        .source_content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(256)
+                        .collect::<String>();
+                    append_to_embed_dlq(
+                        &p.stable_id,
+                        "all_chunks_failed",
+                        p.source_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                        &head,
+                    );
+                }
+            }
+            continue;
+        }
+        // Ensure consistent dimensionality; skip mismatched
+        let dim = success[0].len();
+        let mut sum: Vec<f32> = vec![0.0f32; dim];
+        let mut count = 0usize;
+        for v in success.iter() {
+            if v.len() != dim {
+                warn!(
+                    "skipping chunk with mismatched embedding dim for orig={} expected={} got={}",
+                    i,
+                    dim,
+                    v.len()
+                );
+                continue;
+            }
+            for (k, val) in v.iter().enumerate() {
+                sum[k] += *val;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            final_out[i] = None;
+            continue;
+        }
+        for s in sum.iter_mut() {
+            *s /= count as f32;
+        }
+        let model_id = acc_model_per_orig[i]
+            .clone()
+            .unwrap_or_else(|| model.to_string());
+        // chunk_count = number of successful chunks aggregated
+        final_out[i] = Some((sum, model_id, count));
+        // If partial failure occured (some chunks failed), write DLQ note
+        if total_chunks[i] > count {
+            if let Some(p) = orig_payloads.get(i) {
+                let head = p
+                    .source_content
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(256)
+                    .collect::<String>();
+                append_to_embed_dlq(
+                    &p.stable_id,
+                    "partial_chunks",
+                    p.source_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                    &head,
+                );
+            }
+        }
+    }
+    final_out
+}
+
+// Local parsing helper: accept TEI-native or OpenAI-style responses and return
+// embeddings + optional model id.
+fn local_parse_embeddings_and_model(
+    b: &[u8],
+) -> Result<(Vec<Vec<f32>>, Option<String>), serde_json::Error> {
+    // Try TEI-native first
+    #[derive(serde::Deserialize)]
+    struct TeiRespLocal {
+        embeddings: Vec<Vec<f32>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OpenAiItemLocal {
+        embedding: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OpenAiRespLocal {
+        data: Vec<OpenAiItemLocal>,
+    }
+
+    match serde_json::from_slice::<TeiRespLocal>(b) {
+        Ok(t) => {
+            let model = serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .and_then(|v| {
+                    v.get("model")
+                        .and_then(|m| m.as_str().map(|s| s.to_string()))
+                        .or_else(|| {
+                            v.get("model_id")
+                                .and_then(|m| m.as_str().map(|s| s.to_string()))
+                        })
+                        .or_else(|| {
+                            v.get("modelName")
+                                .and_then(|m| m.as_str().map(|s| s.to_string()))
+                        })
+                });
+            Ok((t.embeddings, model))
+        }
+        Err(_first) => match serde_json::from_slice::<OpenAiRespLocal>(b) {
+            Ok(oa) => {
+                let vecs: Vec<Vec<f32>> = oa.data.into_iter().map(|it| it.embedding).collect();
+                let model = serde_json::from_slice::<serde_json::Value>(b)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("model")
+                            .and_then(|m| m.as_str().map(|s| s.to_string()))
+                    });
+                Ok((vecs, model))
+            }
+            Err(second) => Err(second),
+        },
+    }
+}
+
+/// Chunk payloads into smaller payloads based on tokenizer and token_limit.
+pub fn chunk_payloads_for_embeddings(
+    payloads: &[EntityPayload],
+    token_limit: usize,
+    chunk_overlap: usize,
+    tk: Option<tiktoken_rs::CoreBPE>,
+) -> (Vec<EntityPayload>, Vec<usize>) {
+    let mut send_payloads: Vec<EntityPayload> = Vec::new();
+    let mut chunk_to_orig: Vec<usize> = Vec::new();
+    for (i, p) in payloads.iter().enumerate() {
+        let text = p.source_content.as_deref().unwrap_or("").to_string();
+        if let Some(ref enc) = tk {
+            let tokens = enc.encode_ordinary(&text);
+            if tokens.len() > token_limit {
+                let step = token_limit.saturating_sub(chunk_overlap).max(1);
+                let mut start = 0usize;
+                while start < tokens.len() {
+                    let end = (start + token_limit).min(tokens.len());
+                    let window = tokens[start..end].to_vec();
+                    if let Ok(decoded) = enc.decode(window) {
+                        let mut cp = p.clone();
+                        cp.source_content = Some(decoded);
+                        send_payloads.push(cp);
+                        chunk_to_orig.push(i);
+                    } else {
+                        let total = tokens.len();
+                        let s_char = text.len() * start / total;
+                        let e_char = text.len() * end / total;
+                        let substr = text
+                            .chars()
+                            .skip(s_char)
+                            .take(e_char.saturating_sub(s_char))
+                            .collect::<String>();
+                        let mut cp = p.clone();
+                        cp.source_content = Some(substr);
+                        send_payloads.push(cp);
+                        chunk_to_orig.push(i);
+                    }
+                    if end == tokens.len() {
+                        break;
+                    }
+                    start = start.saturating_add(step);
+                }
+                continue;
+            }
+        }
+        send_payloads.push(p.clone());
+        chunk_to_orig.push(i);
+    }
+    (send_payloads, chunk_to_orig)
 }

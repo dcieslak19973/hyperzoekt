@@ -37,7 +37,9 @@ async fn test_entity_relations_basic_sql() {
          end_line: 10,
          calls: ["B", "unknown"],
          doc: null,
-         rank: 0.5,
+        imports: [],
+        unresolved_imports: [],
+        snapshot: { page_rank_value: 0.5 },
          imports: [],
          unresolved_imports: []
      }"#;
@@ -55,7 +57,7 @@ async fn test_entity_relations_basic_sql() {
          end_line: 8,
          calls: [],
          doc: null,
-         rank: 0.6,
+        snapshot: { page_rank_value: 0.6 },
          imports: [],
          unresolved_imports: []
      }"#;
@@ -73,7 +75,7 @@ async fn test_entity_relations_basic_sql() {
          end_line: 12,
          calls: ["A"],
          doc: null,
-         rank: 0.7,
+        snapshot: { page_rank_value: 0.7 },
          imports: [],
          unresolved_imports: []
      }"#;
@@ -83,7 +85,7 @@ async fn test_entity_relations_basic_sql() {
     db.query(create_c).await.expect("create c");
 
     // Run callers query (with rank in select) to ensure ORDER BY rank works
-    let callers_q = r#"SELECT name, stable_id, rank FROM entity WHERE 'A' IN calls OR 'Alpha' IN calls ORDER BY rank DESC LIMIT 10"#;
+    let callers_q = r#"SELECT name, stable_id, snapshot.page_rank_value AS page_rank_value FROM entity WHERE 'A' IN calls OR 'Alpha' IN calls ORDER BY snapshot.page_rank_value DESC LIMIT 10"#;
     let mut resp = db.query(callers_q).await.expect("callers q");
     let rows: Vec<serde_json::Value> = resp.take(0).expect("rows");
     // Should find one caller (Gamma)

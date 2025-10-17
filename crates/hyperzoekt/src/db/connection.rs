@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use log::{error, info};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use surrealdb::engine::local::Mem;
 use surrealdb::engine::remote::http::{Http, Https};
 use surrealdb::Surreal;
@@ -29,6 +29,13 @@ fn surreal_debug_enabled() -> bool {
 }
 
 pub static SHARED_MEM: OnceLock<Arc<Surreal<surrealdb::engine::local::Db>>> = OnceLock::new();
+// Prevent concurrent creation of multiple embedded Mem instances when
+// connect() is called from multiple threads/runtimes at once. Without
+// this guard two callers can both observe SHARED_MEM empty and spawn their
+// own Mem instance threads, returning distinct Arcs and causing callers to
+// operate on different in-memory databases. The mutex serializes creation
+// so only a single Mem instance is produced for the process.
+pub static MEM_CREATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // Ensure the runtime that services the embedded Mem instance lives for the
 // lifetime of the process. If tests create per-test tokio runtimes and the
 // Mem instance was created on one of them, dropping that runtime can leave
@@ -199,6 +206,100 @@ pub async fn connect(
     } else {
         None
     };
+
+    // If environment usage is disabled for Surreal and no resolved URL is provided,
+    // create and return a fresh in-memory Mem instance for test isolation.
+    if resolved_url.is_none() && !allow_env {
+        if surreal_debug_enabled() {
+            eprintln!("LOG: HZ_DISABLE_SURREAL_ENV=1; returning shared embedded Mem instance");
+        }
+        // If tests explicitly request an ephemeral Mem instance, create it
+        // in-process and return it directly to avoid any cross-runtime
+        // lifetime issues. Honor HZ_EPHEMERAL_MEM even when HZ_DISABLE_SURREAL_ENV
+        // is set so per-test ephemeral instances can be used.
+        if std::env::var("HZ_EPHEMERAL_MEM").ok().as_deref() == Some("1") {
+            if surreal_debug_enabled() {
+                eprintln!("LOG: HZ_EPHEMERAL_MEM=1 (with HZ_DISABLE_SURREAL_ENV=1); creating ephemeral Mem instance");
+            }
+            let arc = Arc::new(Surreal::new::<Mem>(()).await?);
+            // ensure ns/db set on ephemeral instance as callers expect
+            arc.use_ns(ns).await?;
+            arc.use_db(db).await?;
+            return Ok(SurrealConnection::Local(arc));
+        }
+        // Prefer returning an existing shared Mem instance so multiple callers
+        // (tests, writer thread) operate on the same in-memory DB. If none
+        // exists, create one on a dedicated thread/runtime and store it in
+        // SHARED_MEM to keep it alive for the process lifetime.
+        // We perform the mutex acquisition and thread spawn inside
+        // `spawn_blocking` so no std::sync::MutexGuard is held inside the
+        // async future (which would make the future non-Send).
+        use std::sync::mpsc::channel as std_channel;
+        let arc_res: Result<Arc<Surreal<surrealdb::engine::local::Db>>, anyhow::Error> =
+            tokio::task::spawn_blocking(move || {
+                // Synchronous context: acquire creation lock and inspect SHARED_MEM
+                let create_lock = MEM_CREATE_LOCK.get_or_init(|| Mutex::new(()));
+                let _guard = create_lock.lock().unwrap();
+                if let Some(existing) = SHARED_MEM.get() {
+                    if surreal_debug_enabled() {
+                        eprintln!(
+                            "LOG: spawn_blocking returning existing SHARED_MEM ptr={:p}",
+                            Arc::as_ptr(existing)
+                        );
+                    }
+                    return Ok(existing.clone());
+                }
+                let (tx, rx) = std_channel();
+                std::thread::spawn(move || match Runtime::new() {
+                    Ok(rt2) => {
+                        let res = rt2.block_on(async { Surreal::new::<Mem>(()).await });
+                        match res {
+                            Ok(s) => {
+                                let _ = tx.send(Ok(Arc::new(s)));
+                                // Keep the runtime alive and running.
+                                rt2.block_on(async { std::future::pending::<()>().await });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(anyhow::anyhow!(e)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::anyhow!(e)));
+                    }
+                });
+                match rx.recv() {
+                    Ok(Ok(s)) => {
+                        // s is already an Arc<Surreal<Mem>> sent from the spawned thread.
+                        let a: Arc<Surreal<surrealdb::engine::local::Db>> = s;
+                        let _ = SHARED_MEM.set(a.clone());
+                        if surreal_debug_enabled() {
+                            eprintln!(
+                                "LOG: spawn_blocking created new SHARED_MEM ptr={:p}",
+                                Arc::as_ptr(&a)
+                            );
+                        }
+                        Ok(a)
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(anyhow::anyhow!(e)),
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let a = arc_res?;
+        if surreal_debug_enabled() {
+            eprintln!(
+                "LOG: returned SHARED_MEM Arc ptr={:p} to async context",
+                Arc::as_ptr(&a)
+            );
+        }
+        // Now select ns/db in async context and return
+        a.use_ns(ns).await?;
+        a.use_db(db).await?;
+        return Ok(SurrealConnection::Local(a));
+    }
 
     let conn = if let Some(url) = resolved_url {
         // A SURREALDB_URL was provided; prefer using a remote HTTP client so

@@ -61,6 +61,8 @@ spec:
               value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
             - name: SURREAL_DB
               value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
+            - name: HZ_LLM_URL
+              value: {{ .Values.defaultLlmUrl | quote }}
             {{- with .Values.hyperzoektWebui.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

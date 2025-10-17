@@ -452,7 +452,7 @@ impl SurrealRepoStore {
 
     pub async fn upsert_repo_metadata(&self, metadata: RepoMetadata) -> anyhow::Result<()> {
         let db = self.db.read().await;
-        let now = chrono::Utc::now();
+        let _now = chrono::Utc::now();
 
         let visibility_str = match &metadata.visibility {
             zoekt_rs::types::RepoVisibility::Public => "public",
@@ -469,7 +469,6 @@ impl SurrealRepoStore {
         let allowed_users = metadata.allowed_users.clone();
         let last_commit_sha = metadata.last_commit_sha.clone();
         let last_indexed_at = metadata.last_indexed_at;
-        let updated_at = now;
 
         let query_result = match &*db {
             SurrealConnection::Local(db_conn) => {
@@ -484,7 +483,7 @@ impl SurrealRepoStore {
                             owner = $owner,
                             allowed_users = $allowed_users,
                             last_commit_sha = $last_commit_sha,
-                            updated_at = $updated_at
+                            updated_at = time::now()
                         WHERE git_url = $git_url
                     "#,
                     )
@@ -495,7 +494,6 @@ impl SurrealRepoStore {
                     .bind(("owner", owner))
                     .bind(("allowed_users", allowed_users))
                     .bind(("last_commit_sha", last_commit_sha))
-                    .bind(("updated_at", updated_at))
                     .await
             }
             SurrealConnection::Remote(db_conn) => {
@@ -510,7 +508,7 @@ impl SurrealRepoStore {
                             owner = $owner,
                             allowed_users = $allowed_users,
                             last_commit_sha = $last_commit_sha,
-                            updated_at = $updated_at
+                            updated_at = time::now()
                         WHERE git_url = $git_url
                     "#,
                     )
@@ -521,7 +519,6 @@ impl SurrealRepoStore {
                     .bind(("owner", owner))
                     .bind(("allowed_users", allowed_users))
                     .bind(("last_commit_sha", last_commit_sha))
-                    .bind(("updated_at", updated_at))
                     .await
             }
         };

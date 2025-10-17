@@ -1,5 +1,6 @@
 use anyhow::Result;
-use axum::{response::IntoResponse, routing::get, Router};
+use axum::{extract::State, response::IntoResponse, routing::get, Router};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::watch;
@@ -7,19 +8,22 @@ use tokio::sync::watch;
 use zoekt_distributed::poller::{run_poller, snapshot_metrics, PollerConfig};
 use zoekt_distributed::redis_adapter::{create_redis_pool, DynRedis, RealRedis};
 
-async fn health_handler() -> impl IntoResponse {
-    // Try to create a redis pool and ping it
-    match create_redis_pool() {
-        Some(p) => {
-            let r = RealRedis { pool: p };
-            match r.ping().await {
-                Ok(_) => (axum::http::StatusCode::OK, "OK".to_string()),
-                Err(e) => (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!("ERR: {}", e),
-                ),
-            }
-        }
+/// Shared state for the HTTP server
+#[derive(Clone)]
+struct AppState {
+    redis: Option<Arc<RealRedis>>,
+}
+
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Use pre-created Redis pool from state instead of creating on every request
+    match &state.redis {
+        Some(r) => match r.ping().await {
+            Ok(_) => (axum::http::StatusCode::OK, "OK".to_string()),
+            Err(e) => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!("ERR: {}", e),
+            ),
+        },
         None => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "no redis".to_string(),
@@ -63,6 +67,12 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Create Redis pool once at startup for health endpoint
+    let redis_pool = create_redis_pool().map(|p| Arc::new(RealRedis { pool: p }));
+    tracing::info!("Redis pool created for health endpoint");
+
+    let app_state = AppState { redis: redis_pool };
+
     // Start a small HTTP server for health/metrics
     let metrics_port = std::env::var("ZOEKT_POLLER_METRICS_PORT")
         .ok()
@@ -70,7 +80,8 @@ async fn main() -> Result<()> {
         .unwrap_or(9900);
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        .with_state(app_state);
     // Bind a TcpListener and run axum::serve for portability with existing binaries
     let addr = format!("0.0.0.0:{}", metrics_port)
         .parse::<std::net::SocketAddr>()

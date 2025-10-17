@@ -127,7 +127,7 @@ fn generic_class_function_walk<'a>(
                                 signature: extract_signature(&ch, src).to_string(),
                                 start_line: Some(ch.start_position().row as u32),
                                 end_line: Some(ch.end_position().row as u32),
-                                source_content: None,
+                                source_content: Some(snippet.to_string()),
                             });
                         } else {
                             stack_impl.push(ch);
@@ -287,7 +287,7 @@ fn generic_class_function_walk<'a>(
                             signature: extract_signature(&child, src).to_string(),
                             start_line: Some(child.start_position().row as u32),
                             end_line: Some(child.end_position().row as u32),
-                            source_content: None,
+                            source_content: Some(snippet.to_string()),
                         });
                     } else {
                         stack2.push(child);
@@ -368,7 +368,7 @@ fn generic_class_function_walk<'a>(
                                             signature: extract_signature(&node, src).to_string(),
                                             start_line: Some(node.start_position().row as u32),
                                             end_line: Some(node.end_position().row as u32),
-                                            source_content: None,
+                                            source_content: Some(snippet.to_string()),
                                         },
                                     );
                                     // traverse children but do not emit a function entity
@@ -407,7 +407,7 @@ fn generic_class_function_walk<'a>(
                                                     .to_string(),
                                                 start_line: Some(node.start_position().row as u32),
                                                 end_line: Some(node.end_position().row as u32),
-                                                source_content: None,
+                                                source_content: Some(snippet.to_string()),
                                             },
                                         ],
                                     });
@@ -909,6 +909,19 @@ pub fn extract_entities<'a>(
         if out[i].kind == "function" {
             if let Some(pname) = out[i].parent.clone() {
                 if let Some(idx) = out.iter().position(|e| e.name == pname) {
+                    // Extract source content from the function entity's line range
+                    let source_content = if out[i].start_line < out[i].end_line {
+                        let lines: Vec<&str> = src.lines().collect();
+                        let start = out[i].start_line.min(lines.len().saturating_sub(1));
+                        let end = (out[i].end_line + 1).min(lines.len());
+                        if start < end {
+                            Some(lines[start..end].join("\n"))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     // move into methods
                     let method = crate::repo_index::indexer::payload::MethodItem {
                         name: out[i].name.clone(),
@@ -916,7 +929,7 @@ pub fn extract_entities<'a>(
                         signature: out[i].signature.clone(),
                         start_line: Some(out[i].start_line as u32),
                         end_line: Some(out[i].end_line as u32),
-                        source_content: None,
+                        source_content,
                     };
                     out[idx].methods.push(method);
                     // remove only for non-Python languages
