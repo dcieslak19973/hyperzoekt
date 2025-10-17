@@ -5,7 +5,7 @@ use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json, Router
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use hyperzoekt::db::connection::SurrealConnection;
-use hyperzoekt::{db, repo_index::indexer::payload::EntityPayload, similarity, utils};
+use hyperzoekt::{db, hirag, repo_index::indexer::payload::EntityPayload, similarity, utils};
 use serde::Deserialize;
 use ultrafast_mcp::{
     ListToolsRequest, ListToolsResponse, MCPError, MCPResult, Tool, ToolAnnotations, ToolCall,
@@ -1268,6 +1268,192 @@ impl ToolHandler for HZHandler {
                     is_error: Some(false),
                 })
             }
+            "hirag_retrieve" => {
+                let args = call.arguments.clone().unwrap_or_default();
+                let q = args
+                    .get("q")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| MCPError::invalid_params("missing q".into()))?;
+                let top_k = args
+                    .get("top_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(5usize);
+
+                // Accept either a single "repo" string or an array "repos"
+                let allowed_repos: Option<Vec<String>> = if let Some(repos_v) = args.get("repos") {
+                    repos_v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                } else if let Some(r) = args.get("repo").and_then(|v| v.as_str()) {
+                    Some(vec![r.to_string()])
+                } else {
+                    None
+                };
+
+                // Embed the query text
+                let emb: Vec<f32> = similarity::embed_query(q)
+                    .await
+                    .map_err(|e| MCPError::internal_error(e.to_string()))?;
+
+                // Call HiRAG retrieval (3-level) with optional allowed repos
+                let (top, clusters, bridge) = hirag::retrieve_three_level_with_allowed_repos(
+                    self.state.db.connection(),
+                    &emb,
+                    top_k,
+                    allowed_repos.as_deref(),
+                )
+                .await
+                .map_err(|e| MCPError::internal_error(e.to_string()))?;
+
+                // Build a structured JSON result so consuming agents can parse it easily.
+                let clusters_json: Vec<serde_json::Value> = clusters
+                    .into_iter()
+                    .map(|c| {
+                        // Omit centroid vectors/lengths from the returned JSON; callers
+                        // should fetch member snapshots individually (see member_fetch_tool).
+                        serde_json::json!({
+                            "label": c.label,
+                            "summary": c.summary,
+                            "members": c.members,
+                            "member_repos": c.member_repos
+                        })
+                    })
+                    .collect();
+
+                let bridge_json: Vec<serde_json::Value> = bridge
+                    .into_iter()
+                    .map(|(a, b, c)| serde_json::json!({"a": a, "b": b, "meta": c}))
+                    .collect();
+
+                let payload = serde_json::json!({
+                    "top_entities": top,
+                    "clusters": clusters_json,
+                    "bridge": bridge_json,
+                    // Guidance for clients/LLMs: use this tool name to fetch member snapshots
+                    "member_fetch_tool": "fetch_entity_snapshot"
+                });
+
+                // Serialize as compact JSON string in a single ToolContent::text so clients
+                // and LLM tools can parse the output deterministically.
+                let content: Vec<ToolContent> = vec![ToolContent::text(payload.to_string())];
+
+                Ok(ToolResult {
+                    content,
+                    is_error: Some(false),
+                })
+            }
+            "fetch_entity_snapshot" => {
+                let args = call.arguments.clone().unwrap_or_default();
+                let stable_id = args
+                    .get("stable_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| MCPError::invalid_params("missing stable_id".into()))?;
+                let start = args
+                    .get("start")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+
+                // Query entity_snapshot table for the record with this stable_id
+                let sql = format!(
+                    "SELECT stable_id, repo_name, file, start_line, source_display, source_content FROM entity_snapshot WHERE stable_id = $sid LIMIT 1"
+                );
+                let resp = match self.state.db.connection().as_ref() {
+                    SurrealConnection::Local(db_conn) => {
+                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                    }
+                    SurrealConnection::RemoteHttp(db_conn) => {
+                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                    }
+                    SurrealConnection::RemoteWs(db_conn) => {
+                        db_conn.query(&sql).bind(("sid", stable_id)).await
+                    }
+                };
+
+                let mut resp = resp.map_err(|e| MCPError::internal_error(e.to_string()))?;
+                let rows: Vec<serde_json::Value> = resp
+                    .take(0)
+                    .map_err(|e| MCPError::internal_error(e.to_string()))?;
+                if rows.is_empty() {
+                    return Err(MCPError::invalid_params(format!(
+                        "entity_snapshot not found: {}",
+                        stable_id
+                    )));
+                }
+                let row = &rows[0];
+
+                // Extract fields
+                let repo_name = row
+                    .get("repo_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let file = row
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let start_line = row.get("start_line").and_then(|v| v.as_i64());
+                let source_display = row
+                    .get("source_display")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let source_content = row
+                    .get("source_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Handle slicing if start/limit provided
+                let payload = if let (Some(s), Some(l)) = (start, limit) {
+                    let total_len = source_content.len();
+                    let end = (s + l).min(total_len);
+                    let snippet = source_content.get(s..end).unwrap_or("").to_string();
+                    let next_cursor = if end < total_len {
+                        Some(end.to_string())
+                    } else {
+                        None
+                    };
+                    let mut obj = serde_json::json!({
+                        "stable_id": stable_id,
+                        "repo_name": repo_name,
+                        "file": file,
+                        "start_line": start_line,
+                        "source_display": source_display,
+                        "snippet": snippet,
+                        "snippet_start": s,
+                        "snippet_end": end,
+                        "total_len": total_len
+                    });
+                    if let Some(nc) = next_cursor {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("next_cursor".to_string(), serde_json::Value::String(nc));
+                    }
+                    obj
+                } else {
+                    serde_json::json!({
+                        "stable_id": stable_id,
+                        "repo_name": repo_name,
+                        "file": file,
+                        "start_line": start_line,
+                        "source_display": source_display,
+                        "source_content": source_content
+                    })
+                };
+
+                let content: Vec<ToolContent> = vec![ToolContent::text(payload.to_string())];
+
+                Ok(ToolResult {
+                    content,
+                    is_error: Some(false),
+                })
+            }
             _ => Err(MCPError::method_not_found(format!(
                 "Unknown tool: {}",
                 call.name
@@ -1342,6 +1528,68 @@ impl ToolHandler for HZHandler {
                     "type": "object", "properties": { "repo": {"type": "string"}, "branch": {"type": "string", "description": "Branch or tag (defaults to main)."}, "limit": {"type": "integer"}, "cursor": {"type": "string"} }, "required": ["repo"]
                 }),
                 output_schema: None,
+                annotations: Some(ToolAnnotations::default()),
+            },
+            Tool {
+                name: "hirag_retrieve".into(),
+                description:
+                    "Retrieve HiRAG three-level context (top entities + clusters) for a query"
+                        .into(),
+                input_schema: serde_json::json!({
+                    "type": "object", "properties": { "q": {"type": "string"}, "repo": {"type":"string"}, "repos": {"type":"array","items":{"type":"string"}}, "top_k": {"type":"integer"} }, "required": ["q"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "top_entities": { "type": "array", "items": { "type": "string" } },
+                        "clusters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "summary": { "type": "string" },
+                                    "members": { "type": "array", "items": { "type": "string" } },
+                                    "member_repos": { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["label", "summary", "members"]
+                            }
+                        },
+                        "bridge": { "type": "array", "items": { "type": "object", "properties": { "a": {"type":"string"}, "b": {"type":"string"}, "meta": {"type":"string"} }, "required": ["a","b"] } },
+                        "member_fetch_tool": { "type": "string", "description": "Tool name clients can call to fetch member snapshots by stable_id" }
+                    },
+                    "required": ["top_entities", "clusters", "bridge", "member_fetch_tool"]
+                })),
+                annotations: Some(ToolAnnotations::default()),
+            },
+            Tool {
+                name: "fetch_entity_snapshot".into(),
+                description:
+                    "Fetch a single entity_snapshot record (metadata + source_content) by stable_id.\nOptional `start` and `limit` parameters can be provided to request a byte/character slice of the source content when supported by the server; large results may be paged. If more content remains, the MCP response will set `next_cursor`.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stable_id": { "type": "string", "description": "Stable id of the entity_snapshot to fetch." },
+                        "start": { "type": "integer", "description": "Optional start offset (bytes or characters, server-dependent) for slicing the returned source content." },
+                        "limit": { "type": "integer", "description": "Optional maximum number of bytes/characters to return starting at `start`. If omitted the full content may be returned." }
+                    },
+                    "required": ["stable_id"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stable_id": { "type": "string" },
+                        "repo_name": { "type": "string" },
+                        "file": { "type": "string" },
+                        "start_line": { "type": ["integer", "null"] },
+                        "source_display": { "type": ["string", "null"] },
+                        "source_content": { "type": ["string", "null"], "description": "Full source content when returned in full." },
+                        "snippet": { "type": ["string", "null"], "description": "A sliced snippet of source_content when start/limit were used." },
+                        "snippet_start": { "type": ["integer", "null"], "description": "Offset of the returned snippet within the full content." },
+                        "snippet_end": { "type": ["integer", "null"], "description": "Offset end (exclusive) of the returned snippet within the full content." },
+                        "total_len": { "type": ["integer", "null"], "description": "Total length of the full source_content when known." }
+                    }
+                })),
                 annotations: Some(ToolAnnotations::default()),
             },
         ];

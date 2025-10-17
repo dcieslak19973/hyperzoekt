@@ -23,7 +23,9 @@ pub use repo_index::RepoIndexService;
 pub mod db;
 pub mod event_consumer;
 pub mod graph_api;
+pub mod hirag;
 pub mod index;
+pub mod llm;
 pub mod utils; // public graph traversal API
                // Test utilities exposed for integration tests.
 pub mod similarity;
