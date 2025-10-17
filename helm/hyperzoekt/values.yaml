@@ -470,6 +470,42 @@ hyperzoektSbomWorker:
   tolerations: []
   affinity: {}
 
+# HyperZoekt HiRAG worker
+hyperzoektHiragWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  service:
+    port: 7211
+  # Exposure configuration (service or ingress)
+  exposure:
+    type: service
+    serviceType: ClusterIP
+    ingress:
+      enabled: false
+      host: hirag.hyperzoekt.local
+      path: /
+      pathType: Prefix
+  # Environment variables specific to the HiRAG worker
+  env:
+    - name: HZ_LLM_URL
+      value: "http://localhost:11434"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # Make indexer publish SBOM jobs by default (parity with docker-compose)
 hyperzoektIndexer:
   enableSbomJobs: true
