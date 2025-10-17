@@ -61,10 +61,10 @@ spec:
               value: {{ .Values.surrealdb.external.namespace | default "zoekt" | quote }}
             - name: SURREAL_DB
               value: {{ .Values.surrealdb.external.database | default "repos" | quote }}
-            - name: HZ_ENABLE_EMBED_JOBS
-              value: {{ ternary "1" "0" (default true .Values.hyperzoektIndexer.enableEmbedJobs) | quote }}
             - name: HZ_ENABLE_SBOM_JOBS
               value: {{ ternary "1" "0" (default true .Values.hyperzoektIndexer.enableSbomJobs) | quote }}
+            - name: HZ_LLM_URL
+              value: {{ .Values.defaultLlmUrl | quote }}
             {{- with .Values.hyperzoektIndexer.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

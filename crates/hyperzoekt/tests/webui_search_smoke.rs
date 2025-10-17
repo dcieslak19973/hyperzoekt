@@ -147,8 +147,8 @@ impl TestDatabase {
 async fn webui_search_smoke_handles_null_fields() -> Result<(), Box<dyn std::error::Error>> {
     let db = TestDatabase::new().await?;
 
-    let insert1 = "CREATE entity CONTENT { stable_id: 'e-null-file', name: 'NullFileEntity', file: NONE, repo_name: 'r1', language: 'rust', kind: 'function', signature: '', start_line: NONE, end_line: NONE, doc: NONE, rank: 0.0, imports: [], unresolved_imports: [], calls: [] }";
-    let insert2 = "CREATE entity CONTENT { stable_id: 'e-has-file', name: 'HasFileEntity', file: 'r1/path/to/file.rs', repo_name: 'r1', language: 'rust', kind: 'function', signature: '', start_line: NONE, end_line: NONE, doc: NONE, rank: 0.0, imports: [], unresolved_imports: [], calls: [] }";
+    let insert1 = "CREATE entity CONTENT { stable_id: 'e-null-file', name: 'NullFileEntity', file: NONE, repo_name: 'r1', language: 'rust', kind: 'function', signature: '', start_line: NONE, end_line: NONE, doc: NONE, imports: [], unresolved_imports: [], calls: [], snapshot: { page_rank_value: 0.0 } }";
+    let insert2 = "CREATE entity CONTENT { stable_id: 'e-has-file', name: 'HasFileEntity', file: 'r1/path/to/file.rs', repo_name: 'r1', language: 'rust', kind: 'function', signature: '', start_line: NONE, end_line: NONE, doc: NONE, imports: [], unresolved_imports: [], calls: [], snapshot: { page_rank_value: 0.0 } }";
 
     db.insert_raw(insert1).await?;
     db.insert_raw(insert2).await?;

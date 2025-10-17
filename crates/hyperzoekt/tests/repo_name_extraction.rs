@@ -167,9 +167,9 @@ async fn test_get_repo_summaries_handles_null_array_elements(
         end_line: 2,
         calls: [],
         doc: null,
-        rank: 0.1,
         imports: [],
         unresolved_imports: [],
+        snapshot: { page_rank_value: 0.1 },
         repo_name: "null-repo"
     }"#;
 
@@ -185,9 +185,9 @@ async fn test_get_repo_summaries_handles_null_array_elements(
         end_line: 20,
         calls: [],
         doc: null,
-        rank: 0.2,
         imports: [],
         unresolved_imports: [],
+        snapshot: { page_rank_value: 0.2 },
         repo_name: "null-repo"
     }"#;
 

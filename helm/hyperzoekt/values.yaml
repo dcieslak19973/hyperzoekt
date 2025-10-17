@@ -404,6 +404,34 @@ hyperzoektMcp:
   tolerations: []
   affinity: {}
 
+# Similarity worker (rebranded from embed-worker)
+hyperzoektSimilarityWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 7208
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  env: []
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # HyperZoekt embedding worker
 hyperzoektEmbedWorker:
   enabled: true
@@ -470,6 +498,39 @@ hyperzoektSbomWorker:
   tolerations: []
   affinity: {}
 
+# HiRAG worker configuration (mirrors SBOM worker defaults)
+hyperzoektHiragWorker:
+  enabled: true
+  annotations: {}
+  image:
+    registry: docker.io
+    repository: hyperzoekt
+    tag: "latest"
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  service:
+    port: 7211
+  exposure:
+    type: service
+    serviceType: ClusterIP
+  env:
+    - name: HZ_HIRAG_JOBS_QUEUE
+      value: "zoekt:hirag_jobs"
+    - name: HZ_HIRAG_PROCESSING_TTL_SECONDS
+      value: "300"
+    - name: HZ_LLM_URL
+      value: "{{ .Values.defaultLlmUrl }}"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # Make indexer publish SBOM jobs by default (parity with docker-compose)
 hyperzoektIndexer:
   enableSbomJobs: true
@@ -503,3 +564,11 @@ tei:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# Default LLM endpoint env. Components will point to the public OpenAI API by default.
+# Default LLM endpoint env. Components will point to the public OpenAI API by default.
+# Configure an external OpenAI-compatible endpoint here. At runtime components
+# will read the endpoint from `defaultLlmUrl` or the `HZ_LLM_URL` environment
+# variable. Provide an API key using `HZ_OPENAI_API_KEY` (preferred) or
+# `OPENAI_API_KEY` as a fallback.
+defaultLlmUrl: "https://api.openai.com"

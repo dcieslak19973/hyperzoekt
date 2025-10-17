@@ -26,7 +26,7 @@ impl TestDb {
             let repo = if i % 2 == 0 { "r1" } else { "r2" };
             let file = format!("/{}//file{}.rs", repo, i);
             let q = format!(
-                "CREATE entity CONTENT {{ stable_id: \"{}\", name: \"{}\", repo_name: \"{}\", signature: \"sig{}\", file: \"{}\", language: \"rust\", kind: \"function\", parent: null, start_line: 1, end_line: 2, calls: [], doc: null, rank: 0.5, imports: [], unresolved_imports: [] }}",
+                "CREATE entity CONTENT {{ stable_id: \"{}\", name: \"{}\", repo_name: \"{}\", signature: \"sig{}\", file: \"{}\", language: \"rust\", kind: \"function\", parent: null, start_line: 1, end_line: 2, calls: [], doc: null, imports: [], unresolved_imports: [], snapshot: {{ page_rank_value: 0.5 }} }}",
                 stable, name, repo, i, file
             );
             self.db.query(&q).await?;
@@ -38,9 +38,9 @@ impl TestDb {
         // Create a few entities and add rows to similar_same_repo table
         // We'll create 6 edges so pagination of 2 items per page can be tested
         let create_entities = vec![
-            r#"CREATE entity CONTENT { stable_id: "a", name: "A", repo_name: "r1", signature: "s", file: "/r1/a.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, rank: 0.1, imports: [], unresolved_imports: [] }"#,
-            r#"CREATE entity CONTENT { stable_id: "b", name: "B", repo_name: "r1", signature: "s", file: "/r1/b.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, rank: 0.2, imports: [], unresolved_imports: [] }"#,
-            r#"CREATE entity CONTENT { stable_id: "c", name: "C", repo_name: "r1", signature: "s", file: "/r1/c.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, rank: 0.3, imports: [], unresolved_imports: [] }"#,
+            r#"CREATE entity CONTENT { stable_id: "a", name: "A", repo_name: "r1", signature: "s", file: "/r1/a.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, imports: [], unresolved_imports: [], snapshot: { page_rank_value: 0.1 } }"#,
+            r#"CREATE entity CONTENT { stable_id: "b", name: "B", repo_name: "r1", signature: "s", file: "/r1/b.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, imports: [], unresolved_imports: [], snapshot: { page_rank_value: 0.2 } }"#,
+            r#"CREATE entity CONTENT { stable_id: "c", name: "C", repo_name: "r1", signature: "s", file: "/r1/c.rs", language: "rust", kind: "function", parent: null, start_line:1, end_line:2, calls: [], doc: null, imports: [], unresolved_imports: [], snapshot: { page_rank_value: 0.3 } }"#,
         ];
         for q in create_entities.iter() {
             self.db.query(q).await?;

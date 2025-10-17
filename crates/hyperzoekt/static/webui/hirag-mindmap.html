@@ -1,0 +1,131 @@
+{% extends "base" %}
+
+{% block title %}HiRAG Mindmap{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>HiRag WebUI — Architecture Mindmap</h2>
+    </div>
+    <div class="card-body">
+        <style>
+            /* Make the mermaid diagram taller and let the SVG scale to the container */
+            #diagram.mermaid {
+                min-height: 480px;
+                height: 480px;
+                max-height: 900px;
+                overflow: auto;
+            }
+
+            #diagram.mermaid svg {
+                width: 100% !important;
+                height: 100% !important;
+            }
+        </style>
+        <p class="note">Interactive Mermaid mindmap summarizing the HiRag WebUI: frontend, backend, DB relations, and
+            tests.</p>
+        <div id="diagram" class="mermaid">Loading mindmap…</div>
+        <script type="module">
+            import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+            mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+
+            async function buildMindmap() {
+                try {
+                    const resp = await fetch('/api/hirag');
+                    if (!resp.ok) throw new Error('Failed to fetch /api/hirag: ' + resp.status);
+                    const data = await resp.json();
+                    const clusters = data.clusters || [];
+
+                    const idToLabel = {};
+                    for (const c of clusters) {
+                        const id = c.stable_id || c.id || JSON.stringify(c.id);
+                        const label = c.label || (c.summary ? c.summary.substring(0, 40) : id);
+                        idToLabel[id] = label.replace(/\n/g, ' ');
+                    }
+
+                    let mermaidSrc = 'graph LR\n';
+                    mermaidSrc += 'subgraph HiRag_Clusters\n';
+                    for (const c of clusters) {
+                        // normalize id and ensure it starts with a letter to satisfy Mermaid
+                        let rawId = (c.stable_id || c.id) || '';
+                        let id = rawId.replace(/[:\/\.\-@]/g, '_');
+                        if (!/^[a-zA-Z]/.test(id)) id = 'n_' + id;
+                        // sanitize label: escape double quotes and replace square brackets
+                        let label = (idToLabel[c.stable_id || c.id] || id).toString();
+                        label = label.replace(/"/g, '\\"').replace(/\[/g, '(').replace(/\]/g, ')');
+                        mermaidSrc += `${id}["${label}"]\n`;
+                    }
+                    mermaidSrc += 'end\n';
+
+                    for (const c of clusters) {
+                        let rawSrc = (c.stable_id || c.id) || '';
+                        let src = rawSrc.replace(/[:\/\.\-@]/g, '_');
+                        if (!/^[a-zA-Z]/.test(src)) src = 'n_' + src;
+                        const members = c.members || [];
+                        for (const m of members) {
+                            if (typeof m === 'string' && m.startsWith('hirag::')) {
+                                let tgt = m.replace(/[:\/\.\-@]/g, '_');
+                                if (!/^[a-zA-Z]/.test(tgt)) tgt = 'n_' + tgt;
+                                mermaidSrc += `${src} --> ${tgt}\n`;
+                            }
+                        }
+                    }
+
+                    mermaidSrc += 'classDef cluster fill:#fef7e6,stroke:#ffcc66\n';
+                    // build class list with normalized ids
+                    const classNodes = Object.keys(idToLabel).map(id => {
+                        let n = (id || '').replace(/[:\/\.\-@]/g, '_');
+                        if (!/^[a-zA-Z]/.test(n)) n = 'n_' + n;
+                        return n;
+                    }).join(',');
+                    if (classNodes) mermaidSrc += 'class ' + classNodes + ' cluster\n';
+
+                    const diagramEl = document.getElementById('diagram');
+                    // Try rendering to SVG via mermaid.render (async), fallback to init
+                    try {
+                        if (typeof mermaid.render === 'function') {
+                            const svg = await mermaid.render('m' + Date.now(), mermaidSrc);
+                            // mermaid.render may return a string or an object with svg property depending on version
+                            if (svg && typeof svg === 'object' && svg.svg) {
+                                diagramEl.innerHTML = svg.svg;
+                            } else if (typeof svg === 'string') {
+                                diagramEl.innerHTML = svg;
+                            } else {
+                                // fallback: set text and try init
+                                diagramEl.textContent = mermaidSrc;
+                                try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
+                            }
+                        } else {
+                            diagramEl.textContent = mermaidSrc;
+                            try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
+                        }
+                    } catch (e) {
+                        console.error('mermaid.render failed, falling back to init', e);
+                        diagramEl.textContent = mermaidSrc;
+                        try { mermaid.init(undefined, diagramEl); } catch (ee) { console.error(ee); }
+                    }
+                } catch (e) {
+                    document.getElementById('diagram').textContent = 'Error building mindmap: ' + e;
+                    console.error(e);
+                }
+            }
+
+            window.addEventListener('load', () => setTimeout(buildMindmap, 50));
+        </script>
+
+        <section style="margin-top:20px">
+            <h3>Quick links</h3>
+            <ul>
+                <li><code>crates/hyperzoekt/static/webui/hirag.html</code> — UI template (Cytoscape, fetches API)</li>
+                <li><code>crates/hyperzoekt/src/bin/hyperzoekt-webui.rs</code> — handlers:
+                    <code>hirag_api_handler</code>, <code>hirag_members_api_handler</code>
+                </li>
+                <li><code>crates/hyperzoekt/src/hirag.rs</code> — clustering and <code>persist_cluster_relations</code>
+                </li>
+                <li><code>crates/hyperzoekt/tests/persist_cluster_relations.rs</code> — integration test
+                    (cluster->cluster relations)</li>
+            </ul>
+        </section>
+    </div>
+</div>
+{% endblock %}

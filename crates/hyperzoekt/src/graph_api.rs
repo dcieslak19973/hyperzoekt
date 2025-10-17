@@ -618,9 +618,13 @@ mod tests {
         let saved_url = std::env::var("SURREALDB_URL").ok();
         let saved_user = std::env::var("SURREALDB_USERNAME").ok();
         let saved_pass = std::env::var("SURREALDB_PASSWORD").ok();
+        let saved_disable = std::env::var("HZ_DISABLE_SURREAL_ENV").ok();
         std::env::remove_var("SURREALDB_URL");
         std::env::remove_var("SURREALDB_USERNAME");
         std::env::remove_var("SURREALDB_PASSWORD");
+        // Force the connect() helper to ignore environment-specified SurrealDB
+        // endpoints for the duration of this test.
+        std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
 
         let cfg = GraphDbConfig {
             surreal_url: None,
@@ -639,6 +643,11 @@ mod tests {
         }
         if let Some(v) = saved_pass {
             std::env::set_var("SURREALDB_PASSWORD", v);
+        }
+        if let Some(v) = saved_disable {
+            std::env::set_var("HZ_DISABLE_SURREAL_ENV", v);
+        } else {
+            std::env::remove_var("HZ_DISABLE_SURREAL_ENV");
         }
     }
 

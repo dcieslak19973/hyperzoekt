@@ -1,8 +1,16 @@
 use hyperzoekt::db::Database;
 use std::env;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+fn surreal_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[tokio::test]
 async fn uses_refs_when_repo_branch_missing() {
+    let _guard = surreal_test_lock().lock().await;
     // Force in-memory Surreal so tests are hermetic
     env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
 
@@ -87,6 +95,7 @@ async fn uses_refs_when_repo_branch_missing() {
 
 #[tokio::test]
 async fn prefers_repo_branch_if_present() {
+    let _guard = surreal_test_lock().lock().await;
     env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
 
     let db = Database::new(None, "test_ns2", "test_db2").await.unwrap();

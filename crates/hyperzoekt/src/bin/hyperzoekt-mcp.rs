@@ -4,15 +4,18 @@ use async_trait::async_trait;
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use futures::future::BoxFuture;
 use hyperzoekt::db::connection::SurrealConnection;
-use hyperzoekt::{db, repo_index::indexer::payload::EntityPayload, similarity, utils};
+use hyperzoekt::{db, hirag, repo_index::indexer::payload::EntityPayload, similarity, utils};
 use serde::Deserialize;
+use std::sync::Arc as StdArc;
 use ultrafast_mcp::{
     ListToolsRequest, ListToolsResponse, MCPError, MCPResult, Tool, ToolAnnotations, ToolCall,
     ToolContent, ToolHandler, ToolResult,
 };
 
-const ENTITY_FIELDS: &str = "id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+// Use per-snapshot page rank value stored on the snapshot record. No fallback to entity-level fields.
+const ENTITY_FIELDS: &str = "id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 
 // Local helper duplicated from db_writer::helpers (kept minimal) to avoid changing visibility.
 
@@ -21,6 +24,10 @@ struct AppState {
     db: db::Database,
     webui_base: String,
     http: reqwest::Client,
+    // Optional test hooks to allow injecting mocked implementations in tests.
+    // Boxed futures are used to avoid generic async trait issues.
+    embed_query_hook: Option<EmbedHook>,
+    hirag_retrieve_hook: Option<HiragRetrieveHook>,
 }
 
 #[derive(Clone)]
@@ -28,6 +35,27 @@ struct HZHandler {
     state: AppState,
 }
 
+// Type aliases reduce visual complexity and satisfy clippy's `type_complexity` lint.
+type EmbedHook = StdArc<dyn Fn(&str) -> BoxFuture<'static, anyhow::Result<Vec<f32>>> + Send + Sync>;
+
+type HiragRetrieveHook = StdArc<
+    dyn Fn(
+            &db::connection::SurrealConnection,
+            &Vec<f32>,
+            usize,
+            Option<&[String]>,
+        ) -> BoxFuture<
+            'static,
+            anyhow::Result<(
+                Vec<String>,
+                Vec<hirag::ClusterSummary>,
+                Vec<(String, String, String)>,
+            )>,
+        > + Send
+        + Sync,
+>;
+
+#[allow(dead_code)]
 fn paginate(total: usize, start: usize, limit: usize) -> (usize, usize, Option<String>) {
     let end = (start + limit).min(total);
     let next = if end < total {
@@ -37,7 +65,6 @@ fn paginate(total: usize, start: usize, limit: usize) -> (usize, usize, Option<S
     };
     (start, end, next)
 }
-
 #[async_trait]
 impl ToolHandler for HZHandler {
     #[allow(unused_assignments)]
@@ -49,46 +76,24 @@ impl ToolHandler for HZHandler {
                     .get("q")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| MCPError::invalid_params("missing q".into()))?;
-                let repo = args.get("repo").and_then(|v| v.as_str());
-                let start = args
+                let start: usize = args
                     .get("cursor")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                let limit = args
+                let limit: usize = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize)
                     .unwrap_or(50)
                     .clamp(1, 500);
-                // If repo param contains an explicit ref `repo@ref`, resolve it to
-                // a commit and attempt to lookup a matching snapshot id. Pass the
-                // cleaned repo name and the optional snapshot id into similarity
-                // so sampling can be snapshot-scoped.
-                // resolve_ref_to_snapshot now returns (Option<repo_filter>, Option<commit>, Option<snapshot>)
-                let (repo_filter_to_pass, snapshot_id_to_pass) = if let Some(r) = repo {
-                    if let Some(idx) = r.find('@') {
-                        let repo_name = r[..idx].to_string();
-                        let raw_ref = &r[idx + 1..];
-                        let (repo_filter_opt, _commit_opt, snapshot_opt) =
-                            utils::resolve_ref_to_snapshot(
-                                self.state.db.connection(),
-                                &repo_name,
-                                Some(raw_ref),
-                            )
-                            .await
-                            .map_err(|e| MCPError::internal_error(e.to_string()))?;
-                        (repo_filter_opt, snapshot_opt)
-                    } else {
-                        let (repo_filter_opt, _commit_opt, snapshot_opt) =
-                            utils::resolve_ref_to_snapshot(self.state.db.connection(), r, None)
-                                .await
-                                .map_err(|e| MCPError::internal_error(e.to_string()))?;
-                        (repo_filter_opt, snapshot_opt)
-                    }
-                } else {
-                    (None, None)
-                };
+
+                // Optional repo filters
+                let repo_filter_to_pass: Option<String> = args
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let snapshot_id_to_pass: Option<String> = None;
 
                 let results: Vec<EntityPayload> = similarity::similarity_with_conn(
                     self.state.db.connection(),
@@ -222,6 +227,160 @@ impl ToolHandler for HZHandler {
                 if let Some(nc) = next {
                     content.push(ToolContent::text(format!("__NEXT_CURSOR__:{nc}")));
                 }
+                Ok(ToolResult {
+                    content,
+                    is_error: Some(false),
+                })
+            }
+            "hirag_retrieve" => {
+                let args = call.arguments.clone().unwrap_or_default();
+                let q = args
+                    .get("q")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| MCPError::invalid_params("missing q".into()))?;
+                let top_k = args
+                    .get("top_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(5usize);
+
+                // Accept either a single "repo" string or an array "repos"
+                let allowed_repos: Option<Vec<String>> = if let Some(repos_v) = args.get("repos") {
+                    repos_v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                } else if let Some(r) = args.get("repo").and_then(|v| v.as_str()) {
+                    Some(vec![r.to_string()])
+                } else {
+                    None
+                };
+
+                // Embed the query text (allow test hook override)
+                let emb: Vec<f32> = if let Some(hook) = &self.state.embed_query_hook {
+                    (hook)(q)
+                        .await
+                        .map_err(|e| MCPError::internal_error(e.to_string()))?
+                } else {
+                    similarity::embed_query(q)
+                        .await
+                        .map_err(|e| MCPError::internal_error(e.to_string()))?
+                };
+
+                // Call HiRAG retrieval (3-level) with optional allowed repos
+                // Call HiRAG retrieval (3-level) with optional allowed repos (allow test hook override)
+                let (top, clusters, bridge) = if let Some(hook) = &self.state.hirag_retrieve_hook {
+                    (hook)(
+                        self.state.db.connection().as_ref(),
+                        &emb,
+                        top_k,
+                        allowed_repos.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| MCPError::internal_error(e.to_string()))?
+                } else {
+                    hirag::retrieve_three_level_with_allowed_repos(
+                        self.state.db.connection(),
+                        &emb,
+                        top_k,
+                        allowed_repos.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| MCPError::internal_error(e.to_string()))?
+                };
+
+                // Build a structured JSON result so consuming agents can parse it easily.
+                let clusters_json: Vec<serde_json::Value> = clusters
+                    .into_iter()
+                    .map(|c| {
+                        // Omit centroid vectors/lengths from the returned JSON; callers
+                        // should fetch member snapshots individually (see member_fetch_tool).
+                        serde_json::json!({
+                            "label": c.label,
+                            "summary": c.summary,
+                            "members": c.members,
+                            "member_repos": c.member_repos
+                        })
+                    })
+                    .collect();
+
+                let bridge_json: Vec<serde_json::Value> = bridge
+                    .into_iter()
+                    .map(|(a, b, c)| serde_json::json!({"a": a, "b": b, "meta": c}))
+                    .collect();
+
+                let payload = serde_json::json!({
+                    "top_entities": top,
+                    "clusters": clusters_json,
+                    "bridge": bridge_json,
+                    // Guidance for clients/LLMs: use this tool name to fetch member snapshots
+                    "member_fetch_tool": "fetch_entity_snapshot"
+                });
+
+                // Serialize as compact JSON string in a single ToolContent::text so clients
+                // and LLM tools can parse the output deterministically.
+                let content: Vec<ToolContent> = vec![ToolContent::text(payload.to_string())];
+
+                Ok(ToolResult {
+                    content,
+                    is_error: Some(false),
+                })
+            }
+            "fetch_entity_snapshot" => {
+                let args = call.arguments.clone().unwrap_or_default();
+                let stable_id = args
+                    .get("stable_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| MCPError::invalid_params("missing stable_id".into()))?;
+
+                // Query entity_snapshot for metadata and source content
+                let sql = "SELECT stable_id, repo_name, source_content, snapshot.file AS file, snapshot.start_line AS start_line, snapshot.source_display AS source_display FROM entity_snapshot WHERE stable_id = $stable_id LIMIT 1";
+                let resp = match self.state.db.connection().as_ref() {
+                    SurrealConnection::Local(db_conn) => {
+                        db_conn
+                            .query(sql)
+                            .bind(("stable_id", stable_id.to_string()))
+                            .await
+                    }
+                    SurrealConnection::RemoteHttp(db_conn) => {
+                        db_conn
+                            .query(sql)
+                            .bind(("stable_id", stable_id.to_string()))
+                            .await
+                    }
+                    SurrealConnection::RemoteWs(db_conn) => {
+                        db_conn
+                            .query(sql)
+                            .bind(("stable_id", stable_id.to_string()))
+                            .await
+                    }
+                };
+
+                let mut content = Vec::new();
+                if let Ok(mut r) = resp {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        if let Some(row) = rows.into_iter().next() {
+                            // Return the row as compact JSON text
+                            let s =
+                                serde_json::to_string(&row).unwrap_or_else(|_| "{}".to_string());
+                            content.push(ToolContent::text(s));
+                        } else {
+                            content.push(ToolContent::text(format!(
+                                "{{\"found\":false,\"stable_id\":\"{}\"}}",
+                                stable_id
+                            )));
+                        }
+                    } else {
+                        content.push(ToolContent::text(format!(
+                            "{{\"found\":false,\"stable_id\":\"{}\"}}",
+                            stable_id
+                        )));
+                    }
+                } else {
+                    return Err(MCPError::internal_error("database query failed".into()));
+                }
+
                 Ok(ToolResult {
                     content,
                     is_error: Some(false),
@@ -1344,6 +1503,76 @@ impl ToolHandler for HZHandler {
                 output_schema: None,
                 annotations: Some(ToolAnnotations::default()),
             },
+            Tool {
+                name: "hirag_retrieve".into(),
+                description:
+                    "Retrieve HiRAG three-level context (top entities + clusters) for a query"
+                        .into(),
+                input_schema: serde_json::json!({
+                    "type": "object", "properties": { "q": {"type": "string"}, "repo": {"type":"string"}, "repos": {"type":"array","items":{"type":"string"}}, "top_k": {"type":"integer"} }, "required": ["q"]
+                }),
+                // Provide a formal output schema describing the structured JSON payload
+                // we return for `hirag_retrieve`. Note: the UltraFast MCP ToolContent enum
+                // (Text/Image/Resource) does not include a native "json" variant, so the
+                // handler serializes the structured payload into a compact JSON string
+                // and returns it as a single `ToolContent::Text` entry. Consumers should
+                // consult this output schema and parse the `content[0].text` string as JSON.
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "top_entities": { "type": "array", "items": { "type": "string" } },
+                        "clusters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "summary": { "type": "string" },
+                                    "members": { "type": "array", "items": { "type": "string" } },
+                                    "member_repos": { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["label", "summary", "members"]
+                            }
+                        },
+                        "bridge": { "type": "array", "items": { "type": "object", "properties": { "a": {"type":"string"}, "b": {"type":"string"}, "meta": {"type":"string"} }, "required": ["a","b"] } },
+                        "member_fetch_tool": { "type": "string", "description": "Tool name clients can call to fetch member snapshots by stable_id" }
+                    },
+                    "required": ["top_entities", "clusters", "bridge", "member_fetch_tool"]
+                })),
+                annotations: Some(ToolAnnotations::default()),
+            },
+            Tool {
+                name: "fetch_entity_snapshot".into(),
+                description:
+                    "Fetch a single entity_snapshot record (metadata + source_content) by stable_id.\nOptional `start` and `limit` parameters can be provided to request a byte/character slice of the source content when supported by the server; large results may be paged. If more content remains, the MCP response will set `next_cursor` (and the tool may also append a `__NEXT_CURSOR__:<offset>` marker which the server exposes as `next_cursor`).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stable_id": { "type": "string", "description": "Stable id of the entity_snapshot to fetch." },
+                        "start": { "type": "integer", "description": "Optional start offset (bytes or characters, server-dependent) for slicing the returned source content." },
+                        "limit": { "type": "integer", "description": "Optional maximum number of bytes/characters to return starting at `start`. If omitted the full content may be returned." }
+                    },
+                    "required": ["stable_id"]
+                }),
+                // Output is a compact JSON object serialized as text. Example fields include:
+                // stable_id, repo_name, file, start_line, source_display, source_content OR snippet, snippet_start, snippet_end, total_len
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stable_id": { "type": "string" },
+                        "repo_name": { "type": "string" },
+                        "file": { "type": "string" },
+                        "start_line": { "type": ["integer", "null"] },
+                        "source_display": { "type": ["string", "null"] },
+                        "source_content": { "type": ["string", "null"], "description": "Full source content when returned in full." },
+                        "snippet": { "type": ["string", "null"], "description": "A sliced snippet of source_content when start/limit were used." },
+                        "snippet_start": { "type": ["integer", "null"], "description": "Offset of the returned snippet within the full content." },
+                        "snippet_end": { "type": ["integer", "null"], "description": "Offset end (exclusive) of the returned snippet within the full content." },
+                        "total_len": { "type": ["integer", "null"], "description": "Total length of the full source_content when known." }
+                    }
+                })),
+                annotations: Some(ToolAnnotations::default()),
+            },
         ];
         Ok(ListToolsResponse {
             tools,
@@ -1487,6 +1716,8 @@ async fn main() -> Result<()> {
         db,
         webui_base,
         http: reqwest::Client::new(),
+        embed_query_hook: None,
+        hirag_retrieve_hook: None,
     };
     let app = Router::new()
         .route("/mcp", axum::routing::post(handle_mcp))
@@ -1502,4 +1733,87 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// Internal unit tests for the MCP handler.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future::BoxFuture;
+    use std::sync::Arc as StdArc;
+    use ultrafast_mcp::types::tools::ToolCallRequest;
+
+    #[tokio::test]
+    async fn test_hirag_retrieve_handler_returns_json_payload() {
+        // Build a minimal AppState with hooks
+        std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
+        let db = db::Database::new(None, "zoekt", "repos")
+            .await
+            .expect("db create");
+        let mut state = AppState {
+            db,
+            webui_base: "http://localhost".into(),
+            http: reqwest::Client::new(),
+            embed_query_hook: None,
+            hirag_retrieve_hook: None,
+        };
+
+        // Install hooks
+        let emb_hook: StdArc<
+            dyn Fn(&str) -> BoxFuture<'static, anyhow::Result<Vec<f32>>> + Send + Sync,
+        > = StdArc::new(|_: &str| Box::pin(async move { Ok(vec![0.1, 0.2, 0.3]) }));
+        let hirag_hook: StdArc<
+            dyn Fn(
+                    &db::connection::SurrealConnection,
+                    &Vec<f32>,
+                    usize,
+                    Option<&[String]>,
+                ) -> BoxFuture<
+                    'static,
+                    anyhow::Result<(
+                        Vec<String>,
+                        Vec<hirag::ClusterSummary>,
+                        Vec<(String, String, String)>,
+                    )>,
+                > + Send
+                + Sync,
+        > = StdArc::new(|_conn, _emb, _k, _repos| {
+            Box::pin(async move {
+                let top = vec!["e1".to_string(), "e2".to_string()];
+                let cs = hirag::ClusterSummary {
+                    id: "c1".to_string(),
+                    label: "L1".to_string(),
+                    summary: "S1".to_string(),
+                    members: vec!["e1".to_string()],
+                    centroid: vec![],
+                    centroid_len: 3,
+                    member_repos: vec!["r1".to_string()],
+                };
+                let bridge = vec![("e1".to_string(), "e2".to_string(), "meta".to_string())];
+                Ok((top, vec![cs], bridge))
+            })
+        });
+        state.embed_query_hook = Some(emb_hook);
+        state.hirag_retrieve_hook = Some(hirag_hook);
+
+        let handler = HZHandler { state };
+
+        let args = serde_json::json!({"q": "hello", "top_k": 2});
+        let call = ToolCallRequest {
+            name: "hirag_retrieve".to_string(),
+            arguments: Some(args),
+        };
+
+        let res = handler.handle_tool_call(call).await.expect("handler call");
+        assert_eq!(res.is_error, Some(false));
+        assert_eq!(res.content.len(), 1);
+        if let ultrafast_mcp::types::tools::ToolContent::Text { text } = &res.content[0] {
+            let v: serde_json::Value = serde_json::from_str(text).expect("valid json");
+            assert!(v.get("top_entities").is_some());
+            assert!(v.get("clusters").is_some());
+            assert!(v.get("bridge").is_some());
+        } else {
+            panic!("unexpected ToolContent variant");
+        }
+    }
 }

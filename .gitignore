@@ -17,3 +17,5 @@ dump.rdb
 
 linux_clone_*/
 test_repos/goose/
+docker/.env
+.envdocker/.env

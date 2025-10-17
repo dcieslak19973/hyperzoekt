@@ -757,6 +757,13 @@ impl EventProcessor {
                 let sbom_branch_prepared = event.branch.clone();
                 let sbom_commit_prepared = event.last_commit_sha.clone();
 
+                // Prepare similarity job data (repo + commit)
+                let similarity_repo = repo_name.clone();
+                let similarity_commit = event
+                    .last_commit_sha
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 // Collect dependencies in a blocking way before spawning the main blocking indexer
                 let deps_temp_dir = temp_dir.clone();
                 let deps_found: Vec<deps::Dependency> =
@@ -866,6 +873,12 @@ impl EventProcessor {
                                 }
 
                                 if let Some(branch) = event.branch.as_ref() {
+                                    log::info!(
+                                        "📌 Creating branch ref: repo={} branch={} commit={}",
+                                        repo_name_for_meta,
+                                        branch,
+                                        meta.commit_id
+                                    );
                                     if let Err(e) = db::create_branch(
                                         &conn,
                                         &repo_name_for_meta,
@@ -883,12 +896,18 @@ impl EventProcessor {
                                         );
                                     } else {
                                         log::info!(
-                                            "Created branch ref {} -> {} for repo {}",
+                                            "✅ Created branch ref {} -> {} for repo {} (points_to relation should now exist)",
                                             branch,
                                             meta.commit_id,
                                             repo_name_for_meta
                                         );
                                     }
+                                } else {
+                                    log::warn!(
+                                        "⚠️  No branch specified in event for repo {} (commit={}). points_to relation will NOT be created. Event branch field was None.",
+                                        repo_name_for_meta,
+                                        meta.commit_id
+                                    );
                                 }
 
                                 maybe_commit = Some(meta.commit_id.clone());
@@ -1182,17 +1201,38 @@ impl EventProcessor {
                         } else {
                             log::debug!("SBOM jobs disabled (HZ_ENABLE_SBOM_JOBS not set)");
                         }
-                        // Emit a clear, always-on info line showing the embedding gate decision so
-                        // operators do not have to rely on a missing debug log to infer why jobs
-                        // were (not) enqueued. This avoids confusion when RUST_LOG excludes debug.
-                        let embed_env = std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default();
-                        let will_enqueue = Self::embed_jobs_enabled();
+
+                        // Always enqueue similarity job for this repo+commit
                         log::info!(
-                            "embedding enqueue gate: repo={} HZ_ENABLE_EMBED_JOBS='{}' payloads={} will_enqueue={}",
+                            "Enqueueing similarity job for repo={} commit={}",
+                            similarity_repo,
+                            similarity_commit
+                        );
+                        tokio::spawn(async move {
+                            match Self::enqueue_similarity_job(&similarity_repo, &similarity_commit)
+                                .await
+                            {
+                                Ok(_) => log::info!(
+                                    "✓ Similarity job successfully enqueued for repo={} commit={}",
+                                    similarity_repo,
+                                    similarity_commit
+                                ),
+                                Err(e) => log::warn!(
+                                    "✗ Failed to enqueue similarity job for repo={} commit={}: {}",
+                                    similarity_repo,
+                                    similarity_commit,
+                                    e
+                                ),
+                            }
+                        });
+
+                        // Embedding jobs are no longer enqueued by the indexer. The
+                        // writer computes embeddings synchronously when a model is
+                        // configured (see HZ_EMBED_MODEL).
+                        log::info!(
+                            "embedding enqueue gate removed: repo={} payloads={} (embeddings computed inline if configured)",
                             event.repo_name,
-                            embed_env,
                             payloads.len(),
-                            will_enqueue
                         );
                         // Additional diagnostic summary for repository indexing results.
                         // This helps operators quickly assess what was produced before optional embedding.
@@ -1237,9 +1277,8 @@ impl EventProcessor {
                         } else {
                             log::warn!("Index produced zero entities for repo={}; skipping embedding enqueue", event.repo_name);
                         }
-                        // Optionally enqueue embedding jobs to Redis
-                        // Legacy post-all enqueue removed: per-batch enqueue now handled in db_writer after each batch persistence.
-                        if Self::embed_jobs_enabled() { log::info!("per-batch embedding enqueue active (post-persist)"); } else { log::debug!("Embedding jobs disabled (HZ_ENABLE_EMBED_JOBS not set)"); }
+                        // Embedding enqueue removed; embeddings are handled by the writer.
+                        log::debug!("Embedding enqueue removed; writer handles embeddings when HZ_EMBED_MODEL is set");
 
                         // Final completion marker (stderr + info) so operators can reliably detect end-of-repo lifecycle.
                         log::info!(
@@ -1317,9 +1356,56 @@ impl EventProcessor {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Remove temp directory if it already exists (cleanup from previous failed run)
+        // If temp_dir already exists, try to be conservative:
+        // - If the directory is empty, leave it for the clone to populate.
+        // - If it contains a git repo whose `origin` matches the requested URL,
+        //   reuse it and skip cloning.
+        // - Otherwise remove it and start fresh.
         if temp_dir.exists() {
-            tokio::fs::remove_dir_all(&temp_dir).await?;
+            // Helper to normalize simple git URLs for best-effort comparison.
+            fn normalize_git_url(u: &str) -> String {
+                let s = u.trim();
+                // Drop .git suffix and lower-case for case-insensitive compare
+                let s = s.trim_end_matches(".git").to_lowercase();
+                // Remove common protocol prefixes and credentials
+                let s = s
+                    .replace("https://", "")
+                    .replace("http://", "")
+                    .replace("ssh://", "")
+                    .replace("git@", "")
+                    .replace('@', "_");
+                // Normalize ':' separators to '/'
+                s.replace(':', "/")
+            }
+
+            // Check if dir is empty
+            let is_empty = match std::fs::read_dir(&temp_dir) {
+                Ok(mut rd) => rd.next().is_none(),
+                Err(_) => false,
+            };
+
+            if !is_empty {
+                // Try opening as a git repo and compare remotes
+                let _reused = false;
+                if let Ok(existing_repo) = git2::Repository::open(&temp_dir) {
+                    if let Ok(remote) = existing_repo.find_remote("origin") {
+                        if let Some(remote_url) = remote.url() {
+                            let a = normalize_git_url(remote_url);
+                            let b = normalize_git_url(&event.git_url);
+                            if a == b || a.ends_with(&b) || b.ends_with(&a) {
+                                log::info!(
+                                    "Reusing existing clone at {} for url {}",
+                                    temp_dir.display(),
+                                    event.git_url
+                                );
+                                return Ok(temp_dir);
+                            }
+                        }
+                    }
+                }
+                // Not reusable: remove and recreate
+                tokio::fs::remove_dir_all(&temp_dir).await?;
+            }
         }
 
         log::debug!(
@@ -1470,10 +1556,8 @@ impl EventProcessor {
 }
 
 impl EventProcessor {
-    fn embed_jobs_enabled() -> bool {
-        let v = std::env::var("HZ_ENABLE_EMBED_JOBS").unwrap_or_default();
-        matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
-    }
+    // Embedding enqueueing has been removed; the writer computes embeddings
+    // synchronously when `HZ_EMBED_MODEL` is configured.
 
     fn sbom_jobs_enabled() -> bool {
         let v = std::env::var("HZ_ENABLE_SBOM_JOBS").unwrap_or_default();
@@ -1524,6 +1608,50 @@ impl EventProcessor {
             "Enqueued sbom job for repo={} to queue={}",
             repo_name,
             queue_key
+        );
+        Ok(1usize)
+    }
+
+    async fn enqueue_similarity_job(repo_name: &str, commit: &str) -> Result<usize, anyhow::Error> {
+        let pool_opt = zoekt_distributed::redis_adapter::create_redis_pool();
+        if pool_opt.is_none() {
+            log::warn!(
+                "Redis pool not available when attempting to enqueue similarity job for repo={}; check REDIS_URL/credentials",
+                repo_name
+            );
+            return Err(anyhow::anyhow!(
+                "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
+            ));
+        }
+        let pool = pool_opt.unwrap();
+
+        #[derive(serde::Serialize)]
+        struct SimilarityJob<'a> {
+            repo_name: &'a str,
+            commit: &'a str,
+        }
+
+        let queue_key = std::env::var("HZ_SIMILARITY_JOBS_QUEUE")
+            .unwrap_or_else(|_| "zoekt:similarity_jobs".to_string());
+
+        let job = SimilarityJob { repo_name, commit };
+
+        let s = serde_json::to_string(&job)?;
+
+        log::info!(
+            "Pushing similarity job to Redis queue={} payload={}",
+            queue_key,
+            s
+        );
+
+        let mut conn = pool.get().await?;
+        let _: () = deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &queue_key, &s).await?;
+        log::info!(
+            "✓ Successfully enqueued similarity job for repo={} commit={} to queue={} payload={}",
+            repo_name,
+            commit,
+            queue_key,
+            s
         );
         Ok(1usize)
     }

@@ -1,0 +1,187 @@
+{% extends "base" %}
+{% block title %}HiRAG Clusters{% endblock %}
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h2>🧭 HiRAG Hierarchical Clusters</h2>
+    </div>
+    <div class="card-body">
+        <p style="color:var(--muted);">Visualize persisted HiRAG clusters stored in SurrealDB as
+            <code>hirag_cluster</code> records.
+        </p>
+
+        <div style="display:flex; gap:8px; align-items:center;">
+            <button id="load-hirag" class="btn" style="padding:0.4rem 0.75rem;">Load clusters</button>
+            <span id="hirag-status" style="color:var(--muted); font-size:0.95rem;">Ready</span>
+        </div>
+
+        <div id="hirag-canvas"
+            style="height:600px; margin-top:1rem; border:1px solid var(--input-border); border-radius:8px; background:var(--panel); display:none;">
+        </div>
+
+        <div id="hirag-list" style="margin-top:1rem; max-height:300px; overflow:auto;"></div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/cytoscape@3.24.0/dist/cytoscape.min.js"></script>
+<script type="module">
+    (function () {
+        const btn = document.getElementById('load-hirag');
+        const status = document.getElementById('hirag-status');
+        const canvas = document.getElementById('hirag-canvas');
+        const list = document.getElementById('hirag-list');
+
+        function safeId(s) { return (s || '').toString().replace(/[^a-zA-Z0-9_\-]/g, '_'); }
+
+        async function load() {
+            status.textContent = 'Loading…';
+            try {
+                const res = await fetch('/api/hirag');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                status.textContent = `Loaded ${data.clusters.length} clusters`;
+                render(data.clusters || []);
+            } catch (e) {
+                status.textContent = 'Failed to load HiRAG';
+                console.warn('load hirag failed', e);
+            }
+        }
+
+        function render(clusters) {
+            if (!canvas) return;
+            canvas.style.display = 'block';
+            list.innerHTML = '';
+            const elements = [];
+            const seen = new Set();
+
+            // Build a lookup by stable_id so member references can show human labels
+            const clusterByStable = new Map();
+            clusters.forEach((c) => { if (c && c.stable_id) clusterByStable.set(c.stable_id, c); });
+
+            // Helper to produce readable labels when label is missing
+            function humanizeStable(s) {
+                if (!s) return '';
+                // strip common hirag prefix
+                let out = s.toString();
+                out = out.replace(/^hirag::/, '');
+                // replace separators with spaces
+                out = out.replace(/[:_\-\.\/]+/g, ' ');
+                // collapse multiple spaces
+                out = out.replace(/\s+/g, ' ').trim();
+                return out;
+            }
+
+            // Add cluster nodes (use label when available, fall back to summary or humanized stable_id)
+            clusters.forEach((c, idx) => {
+                const stable = c.stable_id || ('idx_' + idx);
+                const id = 'c_' + safeId(stable);
+                let displayLabel = (c && c.label) ? c.label : (c && c.summary) ? (c.summary.substring(0, 40) + '...') : humanizeStable(stable);
+                if (!displayLabel || displayLabel.length === 0) displayLabel = stable;
+                elements.push({ data: { id: id, label: displayLabel, summary: c.summary || '', stable_id: stable } });
+                seen.add(id);
+            });
+
+            // Add edges from cluster -> member (only when member looks like a cluster id)
+            clusters.forEach((c, idx) => {
+                const src = 'c_' + safeId(c.stable_id || c.label || ('idx_' + idx));
+                if (Array.isArray(c.members)) {
+                    c.members.forEach((m, midx) => {
+                        // if member contains 'hirag::layer' or 'layer' treat it as cluster-to-cluster
+                        if (typeof m === 'string' && (m.includes('hirag::layer') || m.includes('layer'))) {
+                            const tgt = 'c_' + safeId(m);
+                            // create minimal target node if missing
+                            if (!seen.has(tgt)) {
+                                // If the member refers to another hirag cluster, prefer that cluster's label
+                                const refCluster = clusterByStable.get(m);
+                                const tgtLabel = (refCluster && (refCluster.label || refCluster.stable_label)) || humanizeStable(m) || m;
+                                elements.push({ data: { id: tgt, label: tgtLabel, summary: (refCluster && refCluster.summary) || '', stable_id: refCluster ? refCluster.stable_id : m } });
+                                seen.add(tgt);
+                            }
+                            elements.push({ data: { id: 'e_' + safeId(src + '_' + tgt + '_' + midx), source: src, target: tgt } });
+                        }
+                    });
+                }
+            });
+
+            const cy = cytoscape({
+                container: canvas, elements: elements, style: [
+                    { selector: 'node', style: { 'label': 'data(label)', 'text-valign': 'center', 'color': '#fff', 'background-color': '#0ea5a4', 'font-size': 11, 'padding': '6px', 'text-wrap': 'wrap', 'text-max-width': 160 } },
+                    { selector: 'edge', style: { 'width': 2, 'line-color': '#94a3b8', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#94a3b8' } }
+                ], layout: { name: 'breadthfirst', directed: true, padding: 10 }
+            });
+
+            async function showNodeDetails(n) {
+                const lbl = n.data('label');
+                const summ = n.data('summary');
+                const stable = n.data('stable_id');
+
+                // header
+                let html = `<div class="card" style="padding:8px;"><div style="font-weight:600;">${lbl}</div><div style="color:var(--muted); margin-top:6px;">${(summ || '').substring(0, 200)}</div>`;
+
+                // If we have a stable_id, fetch expanded members
+                if (stable) {
+                    try {
+                        const resp = await fetch(`/api/hirag/${encodeURIComponent(stable)}/members`);
+                        if (resp.ok) {
+                            const j = await resp.json();
+                            const members = j.members || [];
+                            html += '<div style="margin-top:8px;"><strong>Members</strong><ul style="margin:0.5rem 0 0 1rem;">';
+                            for (const m of members) {
+                                const mid = m.id || (m.details && m.details.stable_id) || '';
+                                if (m.type === 'entity') {
+                                    // entity: link to entity page
+                                    const entStable = (m.details && (m.details.stable_id || m.details.id)) || mid;
+                                    html += `<li><a href="/entity/${encodeURIComponent(entStable)}" target="_blank">${entStable}</a> <span style="color:var(--muted);">(entity)</span></li>`;
+                                } else if (m.type === 'cluster') {
+                                    // cluster: link that focuses the node in the graph
+                                    const clusterStable = mid;
+                                    const nodeId = 'c_' + safeId(clusterStable);
+                                    html += `<li><a href="#" data-cluster-id="${nodeId}" class="focus-cluster">${(m.details && (m.details.label || m.details.stable_id)) || clusterStable}</a> <span style="color:var(--muted);">(cluster)</span></li>`;
+                                } else {
+                                    html += `<li>${mid} <span style="color:var(--muted);">(unknown)</span></li>`;
+                                }
+                            }
+                            html += '</ul></div>';
+                        } else {
+                            html += '<div style="margin-top:8px;color:var(--muted);">Failed to fetch members</div>';
+                        }
+                    } catch (e) {
+                        console.warn('member fetch failed', e);
+                        html += '<div style="margin-top:8px;color:var(--muted);">Error fetching members</div>';
+                    }
+                }
+
+                html += '</div>';
+                list.innerHTML = html + list.innerHTML;
+
+                // Wire up focus links
+                for (const el of list.querySelectorAll('a.focus-cluster')) {
+                    el.addEventListener('click', (ev) => {
+                        ev.preventDefault();
+                        const nid = el.getAttribute('data-cluster-id');
+                        const targetNode = cy.getElementById(nid);
+                        if (targetNode && targetNode.length > 0) {
+                            cy.center(targetNode);
+                            // flash style
+                            targetNode.animate({ style: { 'background-color': '#f59e0b' } }, { duration: 300 }).animate({ style: { 'background-color': '#0ea5a4' } }, { duration: 800 });
+                            // also open its details by recursion
+                            showNodeDetails(targetNode[0]);
+                        } else {
+                            // maybe node exists but not loaded: show message
+                            alert('Cluster node not present in graph');
+                        }
+                    });
+                }
+            }
+
+            cy.on('tap', 'node', function (evt) {
+                const n = evt.target;
+                showNodeDetails(n);
+            });
+        }
+
+        btn.addEventListener('click', load);
+    })();
+</script>
+
+{% endblock %}
