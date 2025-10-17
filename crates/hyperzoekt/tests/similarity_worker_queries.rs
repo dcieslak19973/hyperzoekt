@@ -5,6 +5,9 @@ use hyperzoekt::db::connection::connect;
 
 #[tokio::test]
 async fn test_same_repo_similarity_query_syntax() -> Result<()> {
+    // Force using embedded in-memory SurrealDB for test isolation even when
+    // SURREALDB_URL is set in the environment (e.g. local dev or CI).
+    std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
     // Create in-memory SurrealDB instance
     let conn = connect(&None, &None, &None, "testns", "testdb").await?;
 
@@ -78,6 +81,9 @@ async fn test_same_repo_similarity_query_syntax() -> Result<()> {
 
 #[tokio::test]
 async fn test_external_repo_similarity_query_syntax() -> Result<()> {
+    // Force using embedded in-memory SurrealDB for test isolation even when
+    // SURREALDB_URL is set in the environment (e.g. local dev or CI).
+    std::env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
     // Create in-memory SurrealDB instance
     let conn = connect(&None, &None, &None, "testns", "testdb").await?;
 
