@@ -224,6 +224,7 @@ async fn test_same_repo_similarity_creates_relations() -> Result<()> {
         .await?;
 
     #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
     struct SimilarRow {
         id: surrealdb::sql::Thing,
         stable_id: String,
