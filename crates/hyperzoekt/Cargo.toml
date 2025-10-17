@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+futures = "0.3"
 walkdir = "2"
 regex = "1"
 ignore = "0.4"
@@ -55,6 +56,9 @@ ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http"] }
 async-trait = "0.1"
 tempfile = "3"
 
+# small dependency used by hirag prototype
+rand = "0.8"
+
 # Web UI dependencies
 axum = { version = "0.8", features = ["json", "query"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
@@ -62,6 +66,9 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 minijinja = "1.0"
 url = "2"
 base64 = "0.22"
+
+# Tokenizer for token-aware embedding handling (always enabled)
+tiktoken-rs = "0.5"
 
 # For timestamps used when creating repo records
 chrono = { version = "0.4", features = ["serde"] }
@@ -86,6 +93,11 @@ otel = [
 	"opentelemetry-otlp",
 ]
 
+# Tokenization support via tiktoken-rs is always compiled in (no feature gate).
+# Provide a no-op `tiktoken` feature so any remaining #[cfg(feature = "tiktoken")] checks
+# across the codebase don't error. This does not make the dependency optional.
+tiktoken = []
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
@@ -93,6 +105,8 @@ predicates = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serial_test = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+futures = "0.3"
+
 
 [[bin]]
 name = "hyperzoekt-indexer"
@@ -113,3 +127,7 @@ path = "src/bin/hyperzoekt-mcp.rs"
 [[bin]]
 name = "hyperzoekt-sbom-worker"
 path = "src/bin/hyperzoekt-sbom-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-hirag-worker"
+path = "src/bin/hyperzoekt-hirag-worker.rs"
