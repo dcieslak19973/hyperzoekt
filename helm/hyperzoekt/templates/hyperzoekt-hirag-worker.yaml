@@ -1,4 +1,4 @@
-{{- if .Values.hyperzoektHiragWorker.enabled }}
+{{- if and (hasKey .Values "hyperzoektHiragWorker") .Values.hyperzoektHiragWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,7 +81,7 @@ spec:
 {{- end }}
 
 ---
-{{- if and .Values.hyperzoektHiragWorker.enabled (eq .Values.hyperzoektHiragWorker.exposure.type "service") }}
+{{- if and (hasKey .Values "hyperzoektHiragWorker") (and .Values.hyperzoektHiragWorker.enabled (eq .Values.hyperzoektHiragWorker.exposure.type "service")) }}
 apiVersion: v1
 kind: Service
 metadata:

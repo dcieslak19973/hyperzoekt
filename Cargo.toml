@@ -22,12 +22,12 @@ rustls = "0.23"
 storekey = "0.8"
 sysinfo = "0.33"
 tokio-tungstenite = "0.23"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # Align heavy transitive dependencies to single versions
 itertools = "0.14"
 hashbrown = "0.15"
 indexmap = "2.11"
-toml_edit = "0.22"
+toml_edit = "0.23"
 lru = "0.16"
 
 [profile.dev]

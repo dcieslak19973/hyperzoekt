@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use deadpool_redis::redis::AsyncCommands;
 use hyperzoekt::db::connection::{connect, SurrealConnection};
-use hyperzoekt::db::{upsert_content_if_missing, write_content_embedding};
+use hyperzoekt::db::content::{upsert_content_if_missing, write_content_embedding};
 use log::{error, info, warn};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
