@@ -14,3 +14,43 @@ SELECT * FROM entity_snapshot WHERE id = type::thing('entity_snapshot:A');
 SELECT out FROM calls WHERE in = type::thing('entity_snapshot:A');
 SELECT * FROM entity WHERE stable_id IN ['A','B'];
 CREATE entity_snapshot:`A` SET stable_id="A";
+SELECT id, stable_id, embedding_len, embedding FROM entity_snapshot WHERE repo_name='test-repo' AND sourcecontrol_commit='commits:abc123';
+DELETE entity_snapshot WHERE repo_name='test-repo' AND sourcecontrol_commit='commits:abc123';
+CREATE entity_snapshot:test1 SET stable_id = 'test1', embedding = [1.0, 0.0, 0.0], embedding_len = 3, repo_name = 'test-repo', sourcecontrol_commit = 'commits:abc123';
+CREATE entity_snapshot:test2 SET stable_id = 'test2', embedding = [0.9, 0.1, 0.0], embedding_len = 3, repo_name = 'test-repo', sourcecontrol_commit = 'commits:abc123';
+SELECT id, stable_id, embedding_len, embedding FROM entity_snapshot WHERE repo_name='test-repo' AND sourcecontrol_commit='commits:abc123';
+INFO FOR TABLE entity_snapshot;
+DELETE entity_snapshot WHERE repo_name='test-repo' AND sourcecontrol_commit='commits:abc123';
+CREATE entity_snapshot:test1 CONTENT { stable_id: "test1", embedding: [1.0, 0.0, 0.0], embedding_len: 3, repo_name: "test-repo", sourcecontrol_commit: "commits:abc123" };
+CREATE entity_snapshot:test2 CONTENT { stable_id: "test2", embedding: [0.9, 0.1, 0.0], embedding_len: 3, repo_name: "test-repo", sourcecontrol_commit: "commits:abc123" };
+SELECT id, stable_id, embedding_len, embedding FROM entity_snapshot WHERE repo_name='test-repo' AND sourcecontrol_commit='commits:abc123';
+-- Create a fresh table without prior schema
+DEFINE TABLE test_embed SCHEMALESS PERMISSIONS FULL;
+DELETE test_embed WHERE true;
+-- Create via SET with array literal
+CREATE test_embed:one SET embedding = [1.0, 2.0, 3.0];
+-- Create via CONTENT with array literal
+CREATE test_embed:two CONTENT { embedding: [4.0, 5.0, 6.0] };
+-- Insert via generic INSERT
+DEFINE TABLE entity_snapshot_fresh SCHEMAFULL;
+DEFINE FIELD stable_id ON entity_snapshot_fresh TYPE string PERMISSIONS FULL;
+DEFINE FIELD embedding ON entity_snapshot_fresh TYPE array PERMISSIONS FULL;
+DELETE entity_snapshot_fresh WHERE true;
+CREATE entity_snapshot_fresh:one CONTENT { stable_id: "fresh1", embedding: [0.1, 0.2, 0.3], embedding_len: 3 };
+CREATE entity_snapshot_fresh:two SET stable_id = 'fresh2', embedding = [0.4, 0.5, 0.6], embedding_len = 3;
+SELECT id, stable_id, embedding_len, embedding FROM entity_snapshot_fresh;
+INFO FOR TABLE entity_snapshot_fresh;
+-- Fresh table for typed-array experiments
+DEFINE TABLE typed_embed_test SCHEMAFULL;
+DEFINE FIELD embedding ON typed_embed_test TYPE array PERMISSIONS FULL;
+DELETE typed_embed_test WHERE true;
+-- Insert integer array via SET
+CREATE typed_embed_test:int_one SET embedding = [1,2,3];
+-- Insert float array via SET
+CREATE typed_embed_test:float_one SET embedding = [1.0,2.0,3.0];
+-- Insert integer array via CONTENT
+CREATE typed_embed_test:int_two CONTENT { embedding: [4,5,6] };
+-- Insert float array via CONTENT
+CREATE typed_embed_test:float_two CONTENT { embedding: [4.0,5.0,6.0] };
+SELECT id, embedding FROM typed_embed_test;
+INFO FOR TABLE typed_embed_test;

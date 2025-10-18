@@ -88,11 +88,10 @@ Env vars:
 - `HZ_TEI_BASE`: TEI embeddings endpoint base (e.g. `http://127.0.0.1:8088` or `http://tei:80`)
 - `HZ_EMBED_MODEL`: embedding model id (e.g. `jinaai/jina-embeddings-v2-base-code`)
 - `HZ_ENABLE_EMBED_SIMILARITY`: enable similarity computation (default: false)
-- `HZ_SIMILARITY_THRESHOLD_SAME_REPO`: minimum similarity score for same-repo matches (default: 0.75)
-- `HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO`: minimum similarity score for external-repo matches (default: 0.85)
+- `HZ_SIMILARITY_THRESHOLD_SAME_REPO`: minimum similarity score for same-repo matches (default: 0.90)
+- `HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO`: minimum similarity score for external-repo matches (default: 0.95)
 - `HZ_SIMILARITY_MAX_SAME_REPO`: maximum similar entities to find within same repo (default: 25)
 - `HZ_SIMILARITY_MAX_EXTERNAL_REPO`: maximum similar entities to find across repos (default: 50)
-- `HZ_SIMILARITY_MIN_STORE`: minimum number of similar entities to store even if below threshold (default: 0)
 - `HZ_SIMILARITY_MIN_SOURCE_CHARS`: minimum source content length to consider (default: 100)
 - Optional: `HZ_SIMSEARCH_TOPK` (default 50), `HZ_SIMSEARCH_SAMPLE` (default 3000)
 
@@ -238,12 +237,6 @@ This will start:
 
 **Embeddings Service (TEI):**
 - **TEI** on port 8088 → 80 (local embeddings)
-
-Note: embeddings are mostly working, but you may observe some entities without
-embeddings when their `source_content` is empty. This is frequently caused by
-upstream tree-sitter extraction not populating `source_content` for certain
-entities; we intentionally avoid fabricating snippets (for example by falling
-back to `name`) so the root cause remains visible during debugging.
 
 2. **Access the services:**
 - **Legacy Admin UI**: http://localhost:7201 (username: `admin`, password: `password`)
