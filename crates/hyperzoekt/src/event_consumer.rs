@@ -1226,6 +1226,15 @@ impl EventProcessor {
                             }
                         });
 
+                        // Enqueue a HiRAG job with default parameters (k=0, min_clusters=3)
+                        let hirag_repo = event.repo_name.clone();
+                        tokio::spawn(async move {
+                            match Self::enqueue_hirag_job(&hirag_repo, 0, Some(3)).await {
+                                Ok(_) => log::info!("✓ HiRAG job enqueued for repo={}", hirag_repo),
+                                Err(e) => log::warn!("✗ Failed to enqueue HiRAG job for repo={}: {}", hirag_repo, e),
+                            }
+                        });
+
                         // Embedding jobs are no longer enqueued by the indexer. The
                         // writer computes embeddings synchronously when a model is
                         // configured (see HZ_EMBED_MODEL).
@@ -1650,6 +1659,52 @@ impl EventProcessor {
             "✓ Successfully enqueued similarity job for repo={} commit={} to queue={} payload={}",
             repo_name,
             commit,
+            queue_key,
+            s
+        );
+        Ok(1usize)
+    }
+
+    async fn enqueue_hirag_job(
+        repo_name: &str,
+        k: i64,
+        min_clusters: Option<i64>,
+    ) -> Result<usize, anyhow::Error> {
+        let pool_opt = zoekt_distributed::redis_adapter::create_redis_pool();
+        if pool_opt.is_none() {
+            log::warn!(
+                "Redis pool not available when attempting to enqueue hirag job for repo={}; check REDIS_URL/credentials",
+                repo_name
+            );
+            return Err(anyhow::anyhow!(
+                "Redis not configured (REDIS_URL/REDIS_USERNAME/REDIS_PASSWORD)"
+            ));
+        }
+        let pool = pool_opt.unwrap();
+
+        #[derive(serde::Serialize)]
+        struct HiragJob<'a> {
+            repo: &'a str,
+            k: i64,
+            min_clusters: Option<i64>,
+        }
+
+        let queue_key =
+            std::env::var("HZ_HIRAG_JOBS_QUEUE").unwrap_or_else(|_| "zoekt:hirag_jobs".to_string());
+
+        let job = HiragJob {
+            repo: repo_name,
+            k,
+            min_clusters,
+        };
+
+        let s = serde_json::to_string(&job)?;
+
+        let mut conn = pool.get().await?;
+        let _: () = deadpool_redis::redis::AsyncCommands::rpush(&mut conn, &queue_key, &s).await?;
+        log::info!(
+            "Enqueued hirag job for repo={} to queue={} payload={}",
+            repo_name,
             queue_key,
             s
         );
