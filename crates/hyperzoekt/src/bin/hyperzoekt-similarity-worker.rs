@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use deadpool_redis::redis::AsyncCommands;
 use log::{debug, error, info, warn};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -42,6 +42,12 @@ struct SimilarityWorkerMetricsSnapshot {
     jobs_failed: u64,
     last_job_unix: u64,
 }
+
+// Global flag set at startup after probing the SurrealDB instance to see if
+// vector functions (vector::similarity::cosine) are available. This lets the
+// worker pick a fast path and avoid trying DB-side vector queries per-entity
+// when they're known not to exist.
+static SURREAL_HAS_VECTOR_FUNCS: AtomicBool = AtomicBool::new(false);
 
 /// Shared state for the HTTP server
 #[derive(Clone)]
@@ -135,6 +141,46 @@ async fn main() -> Result<()> {
             error!("HTTP server failed: {:?}", e);
         }
     });
+
+    // Probe the SurrealDB instance once at startup to detect whether vector
+    // functions are available. We do this here so the per-job processing can
+    // skip a failing DB-side vector query and go straight to the local scoring
+    // fallback when appropriate.
+    {
+        use hyperzoekt::db::connection::connect;
+        let has_vec = match connect(
+            &std::env::var("SURREALDB_URL").ok(),
+            &std::env::var("SURREALDB_USERNAME").ok(),
+            &std::env::var("SURREALDB_PASSWORD").ok(),
+            &std::env::var("SURREAL_NS").unwrap_or_else(|_| "zoekt".to_string()),
+            &std::env::var("SURREAL_DB").unwrap_or_else(|_| "repos".to_string()),
+        )
+        .await
+        {
+            Ok(conn) => {
+                let probe_sql = "SELECT vector::similarity::cosine([1.0,0.0,0.0], [1.0,0.0,0.0]) AS score LIMIT 1";
+                match conn.query(probe_sql).await {
+                    Ok(_) => {
+                        info!("SurrealDB vector functions available (probe passed)");
+                        true
+                    }
+                    Err(e) => {
+                        info!(
+                            "SurrealDB vector probe failed - will use local scoring fallback: {}",
+                            e
+                        );
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                info!("Failed to connect to SurrealDB for vector probe - will use local scoring fallback: {}", e);
+                false
+            }
+        };
+
+        SURREAL_HAS_VECTOR_FUNCS.store(has_vec, Ordering::Relaxed);
+    }
 
     // Spawn the similarity job consumer
     let similarity_queue = std::env::var("HZ_SIMILARITY_JOBS_QUEUE")
@@ -561,85 +607,100 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
             threshold_same
         );
 
-        let same_resp = conn
-            .query_with_binds(
-                &same_repo_sql,
-                vec![
-                    ("source_stable_id", serde_json::json!(source_stable_id)),
-                    (
-                        "source_id",
-                        serde_json::json!(format!("entity_snapshot:{}", id_str)),
-                    ),
-                    ("repo", serde_json::json!(repo_name)),
-                    ("commit", serde_json::json!(&source_commit)),
-                    ("threshold", serde_json::json!(threshold_same)),
-                ],
-            )
-            .await?;
-
-        #[derive(serde::Deserialize, Debug)]
-        #[allow(dead_code)]
-        struct SimilarRow {
-            id: surrealdb::sql::Thing,
-            stable_id: String,
-            sourcecontrol_commit: String,
-            score: f32,
-        }
-
-        // LET is slot 0, SELECT is slot 1
-        let mut resp = same_resp;
-        let same_results: Vec<SimilarRow> = match resp.take::<Vec<SimilarRow>>(1) {
-            Ok(rows) => {
-                let above_threshold: Vec<_> =
-                    rows.iter().filter(|r| r.score >= threshold_same).collect();
-
-                // Find max score for diagnostics
-                let max_score = rows
-                    .iter()
-                    .map(|r| r.score)
-                    .fold(f32::NEG_INFINITY, f32::max);
-
-                if processed_count == 0 {
-                    info!(
-                        "First entity same-repo: {} candidates, {} above threshold ({}), max_score={:.3}",
-                        rows.len(),
-                        above_threshold.len(),
-                        threshold_same,
-                        max_score
-                    );
-                    if !above_threshold.is_empty() {
-                        info!(
-                            "First result: stable_id={}, score={:.3}",
-                            above_threshold[0].stable_id, above_threshold[0].score
-                        );
-                    } else if !rows.is_empty() {
+        // If the startup probe determined that SurrealDB doesn't offer
+        // vector functions, skip attempting the DB-side vector query and go
+        // straight to the local scoring fallback. This avoids expensive
+        // failed round-trips and noisy logs when the server cannot execute
+        // vector::similarity::cosine.
+        let same_results: Vec<serde_json::Value> = if SURREAL_HAS_VECTOR_FUNCS
+            .load(Ordering::Relaxed)
+        {
+            match conn
+                .query_with_binds(
+                    &same_repo_sql,
+                    vec![
+                        ("source_stable_id", serde_json::json!(source_stable_id)),
+                        (
+                            "source_id",
+                            serde_json::json!(format!("entity_snapshot:{}", id_str)),
+                        ),
+                        ("repo", serde_json::json!(repo_name)),
+                        ("commit", serde_json::json!(&source_commit)),
+                        ("threshold", serde_json::json!(threshold_same)),
+                    ],
+                )
+                .await
+            {
+                Ok(mut resp) => match resp.take::<Vec<serde_json::Value>>(1) {
+                    Ok(rows) if !rows.is_empty() => rows,
+                    _ => Vec::new(),
+                },
+                Err(e) => {
+                    if processed_count == 0 {
                         warn!(
-                            "⚠️  No candidates above threshold! Best candidate: stable_id={}, score={:.3} (threshold={})",
-                            rows[0].stable_id, rows[0].score, threshold_same
+                            "DB-side similarity query failed: {} - falling back to local scoring",
+                            e
                         );
                     }
+                    Vec::new()
                 }
-
-                // Log max score periodically
-                if processed_count % 100 == 0 && !rows.is_empty() {
-                    debug!(
-                        "Entity {} same-repo: max_score={:.3}, above_threshold={}/{}",
-                        source_stable_id,
-                        max_score,
-                        above_threshold.len(),
-                        rows.len()
-                    );
-                }
-
-                rows
             }
-            Err(e) => {
-                if processed_count == 0 {
-                    warn!("Failed to deserialize same-repo results from slot 1: {}", e);
-                }
-                vec![]
-            }
+        } else {
+            debug!("Skipping DB-side vector similarity - startup probe indicates server lacks vector functions");
+            Vec::new()
         };
+
+        // If DB-side query returned rows, we'll use them. Otherwise compute
+        // the top candidates locally.
+        let mut same_results_rows: Vec<(String, f64)> = Vec::new();
+        if !same_results.is_empty() {
+            // Convert JSON rows into (stable_id, score) tuples for uniform handling
+            for v in same_results.iter() {
+                if let (Some(sid), Some(score)) = (v.get("stable_id"), v.get("score")) {
+                    if let (Some(sid_s), Some(score_n)) = (sid.as_str(), score.as_f64()) {
+                        same_results_rows.push((sid_s.to_string(), score_n));
+                    }
+                }
+            }
+        } else {
+            // Local scoring: fetch candidate embeddings for same repo/commit
+            let mut cand_resp = conn
+                .query_with_binds(
+                    "SELECT stable_id, embedding FROM entity_snapshot WHERE embedding_len > 0 AND repo_name = $repo AND sourcecontrol_commit = $commit AND stable_id != $source_stable_id LIMIT 1000",
+                    vec![
+                        ("repo", serde_json::json!(repo_name)),
+                        ("commit", serde_json::json!(&source_commit)),
+                        ("source_stable_id", serde_json::json!(source_stable_id)),
+                    ],
+                )
+                .await?;
+            let cands: Vec<(String, Vec<f32>)> = match cand_resp.take::<Vec<serde_json::Value>>(0) {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        let sid = r.get("stable_id")?.as_str()?.to_string();
+                        // embedding might be an array of numbers
+                        let emb = r.get("embedding")?;
+                        let arr = emb.as_array()?;
+                        let mut v = Vec::with_capacity(arr.len());
+                        for x in arr.iter() {
+                            if let Some(n) = x.as_f64() {
+                                v.push(n as f32);
+                            } else {
+                                return None;
+                            }
+                        }
+                        Some((sid, v))
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            if !cands.is_empty() {
+                // use score_top_k to compute top matches
+                same_results_rows =
+                    hyperzoekt::similarity::score_top_k(&embedding, &cands, max_same);
+            }
+        }
 
         debug!(
             "Same-repo query for {} returned {} candidates",
@@ -649,20 +710,19 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
 
         // Create relations for candidates above threshold OR ensure minimum stored
         let mut stored_count = 0;
-        for result in &same_results {
-            // Store if above threshold OR if we haven't reached min_store yet
-            if result.score < threshold_same && stored_count >= min_store {
+        for (target_sid, score) in same_results_rows.iter() {
+            let score_f = *score as f32;
+            if score_f < threshold_same && stored_count >= min_store {
                 continue;
             }
 
-            // Extract target ID from Thing type
-            let target_id_str = result.id.to_string();
+            // Build target ID as entity_snapshot:<stable_id>
+            let target_id_str = format!("entity_snapshot:{}", target_sid);
 
             // Check if reverse relation already exists (target->source)
-            // This prevents duplicate bidirectional relations
             let check_reverse_sql = format!(
-                "SELECT VALUE id FROM similar_same_repo WHERE in = {} AND out = entity_snapshot:{} LIMIT 1",
-                target_id_str, id_str
+                "SELECT VALUE id FROM similar_same_repo WHERE in = entity_snapshot:{} AND out = entity_snapshot:{} LIMIT 1",
+                target_sid, id_str
             );
 
             let reverse_exists = if let Ok(mut check_resp) = conn.query(&check_reverse_sql).await {
@@ -677,7 +737,7 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
             if reverse_exists {
                 debug!(
                     "Skipping duplicate relation: reverse already exists ({} -> {})",
-                    result.stable_id, source_stable_id
+                    target_sid, source_stable_id
                 );
                 continue;
             }
@@ -689,10 +749,7 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
             );
 
             match conn
-                .query_with_binds(
-                    &relate_sql,
-                    vec![("score", serde_json::json!(result.score))],
-                )
+                .query_with_binds(&relate_sql, vec![("score", serde_json::json!(score_f))])
                 .await
             {
                 Ok(_) => {
@@ -702,7 +759,7 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
                 Err(e) => {
                     warn!(
                         "Failed to create same_repo relation {} -> {}: {}",
-                        source_stable_id, result.stable_id, e
+                        source_stable_id, target_sid, e
                     );
                 }
             }
@@ -710,9 +767,9 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
 
         debug!(
             "Same-repo: created {} relations for {}",
-            same_results
+            same_results_rows
                 .iter()
-                .filter(|r| r.score >= threshold_same)
+                .filter(|(_, s)| (*s as f32) >= threshold_same)
                 .count(),
             source_stable_id
         );
@@ -763,15 +820,24 @@ async fn process_similarity_job(repo_name: &str, commit: &str) -> Result<()> {
             source_stable_id, repo_name
         );
 
-        let external_resp = conn
-            .query_with_binds(
+        let external_resp = if SURREAL_HAS_VECTOR_FUNCS.load(Ordering::Relaxed) {
+            conn.query_with_binds(
                 &external_sql,
                 vec![
                     ("source_stable_id", serde_json::json!(source_stable_id)),
                     ("repo", serde_json::json!(repo_name)),
                 ],
             )
-            .await?;
+            .await?
+        } else {
+            // If vector functions aren't available, create an empty Response so
+            // deserialization to slot 1 yields an empty vec and we fall back to
+            // local/external scoring logic below.
+            // We construct a trivial empty response via a harmless select that
+            // returns no rows to preserve the same flow.
+            conn.query("SELECT * FROM entity_snapshot WHERE false LIMIT 0")
+                .await?
+        };
 
         #[derive(serde::Deserialize, Debug)]
         struct ExternalRow {
