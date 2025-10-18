@@ -12,7 +12,7 @@
 // existing `db::SurrealConnection` abstraction so it integrates with the repo.
 
 use anyhow::Result;
-// Deterministic selection used for initial centers to avoid pulling RNG traits
+// Deterministic selection is used for initial centers; no RNG dependency is required
 use serde::{Deserialize, Serialize};
 
 use crate::db::{helpers::normalize_git_url, SurrealConnection};

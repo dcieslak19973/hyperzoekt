@@ -140,7 +140,10 @@ fn sql_value_to_json(v: &surrealdb::sql::Value) -> serde_json::Value {
     use surrealdb::sql::Value;
     match v {
         Value::Thing(_) => serde_json::Value::String(v.to_string()),
-        Value::Strand(_) => serde_json::Value::String(v.to_string()),
+        Value::Strand(s) => {
+            let sref: &str = s.as_ref();
+            serde_json::Value::String(sref.to_string())
+        }
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Number(n) => {
             // Use the Display representation; try to parse as integer then float.
