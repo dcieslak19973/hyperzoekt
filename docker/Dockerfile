@@ -32,7 +32,7 @@ ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller
 
 # Build hyperzoekt binaries with optional OTEL feature (safe even if unused at runtime)
-RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-similarity-worker --bin hyperzoekt-webui --bin hyperzoekt-mcp --bin hyperzoekt-sbom-worker --bin hyperzoekt-hirag-worker
+RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-embed-worker --bin hyperzoekt-webui --bin hyperzoekt-mcp --bin hyperzoekt-sbom-worker
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
@@ -46,7 +46,7 @@ ENV HYPERZOEKT_BUILD_ID=${HYPERZOEKT_BUILD_ID}
 ARG DEP_SCAN_VERSION=v5.5.0
 RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates git nodejs npm default-jre-headless curl python3-venv \
+        ca-certificates git nodejs npm default-jre-headless curl python3-venv python3-pip pipx \
         build-essential libssl-dev libffi-dev python3-dev \
         && rm -rf /var/lib/apt/lists/*;
 
@@ -77,12 +77,11 @@ COPY --from=builder /app/target/release/dzr-admin-poller /app/
 COPY --from=builder /app/target/release/dzr-http-search /app/
 COPY --from=builder /app/target/release/dzr-indexer /app/
 COPY --from=builder /app/target/release/dzr-mcp-search /app/
-COPY --from=builder /app/target/release/hyperzoekt-similarity-worker /app/
+COPY --from=builder /app/target/release/hyperzoekt-embed-worker /app/
 COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
 COPY --from=builder /app/target/release/hyperzoekt-mcp /app/
 COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 COPY --from=builder /app/target/release/hyperzoekt-sbom-worker /app/
-COPY --from=builder /app/target/release/hyperzoekt-hirag-worker /app/
 
 # Copy configuration and static files
 COPY --from=builder /app/crates/zoekt-distributed/config.toml /app/

@@ -1,4 +1,4 @@
-{{- if .Values.hyperzoektSbomWorker.enabled }}
+{{- if and (hasKey .Values "hyperzoektSbomWorker") .Values.hyperzoektSbomWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,7 +81,7 @@ spec:
 {{- end }}
 
 ---
-{{- if and .Values.hyperzoektSbomWorker.enabled (eq .Values.hyperzoektSbomWorker.exposure.type "service") }}
+{{- if and (hasKey .Values "hyperzoektSbomWorker") (and .Values.hyperzoektSbomWorker.enabled (eq .Values.hyperzoektSbomWorker.exposure.type "service")) }}
 apiVersion: v1
 kind: Service
 metadata:

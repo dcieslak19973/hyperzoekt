@@ -1,4 +1,4 @@
-{{- if .Values.hyperzoektSimilarityWorker.enabled }}
+{{- if and (hasKey .Values "hyperzoektSimilarityWorker") .Values.hyperzoektSimilarityWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -83,7 +83,7 @@ spec:
 {{- end }}
 
 ---
-{{- if and .Values.hyperzoektSimilarityWorker.enabled (eq .Values.hyperzoektSimilarityWorker.exposure.type "service") }}
+{{- if and (hasKey .Values "hyperzoektSimilarityWorker") (and .Values.hyperzoektSimilarityWorker.enabled (eq .Values.hyperzoektSimilarityWorker.exposure.type "service")) }}
 apiVersion: v1
 kind: Service
 metadata:
