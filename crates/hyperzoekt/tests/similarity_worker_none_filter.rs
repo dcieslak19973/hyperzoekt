@@ -160,8 +160,9 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
     assert!(!stable_ids.contains(&"none_filter_4".to_string()));
 
     // Test 4: Same-repo similarity query with != NONE — fetch embedding first to avoid LET+SELECT
-    let source_emb_opt =
-        hyperzoekt::db::helpers::get_embedding_for_entity(&conn, "none_filter_1").await?;
+    let source_emb_opt = hyperzoekt::db::helpers::get_embedding_for_entity(&conn, "none_filter_1")
+        .await
+        .map_err(|e| anyhow::anyhow!("get_embedding_for_entity failed: {}", e))?;
     let source_emb = source_emb_opt.expect("source embedding present");
     let emb_literal = source_emb
         .iter()
