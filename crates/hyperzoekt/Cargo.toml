@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-futures = "0.3"
 walkdir = "2"
 regex = "1"
 ignore = "0.4"
@@ -38,6 +37,9 @@ sha2 = "0.10"
 signal-hook = "0.3.18"
 petgraph = "0.6"
 
+# Needed by hirag.rs for random initialization of kmeans
+rand = "0.8"
+
 # Redis for event consumption from zoekt-distributed
 deadpool-redis = "0.22"
 redis = { version = "0.32", features = ["tokio-comp"] }
@@ -56,9 +58,6 @@ ultrafast-mcp = { version = "202506018.1.0", features = ["core", "http"] }
 async-trait = "0.1"
 tempfile = "3"
 
-# small dependency used by hirag prototype
-rand = "0.8"
-
 # Web UI dependencies
 axum = { version = "0.8", features = ["json", "query"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
@@ -67,17 +66,19 @@ minijinja = "1.0"
 url = "2"
 base64 = "0.22"
 
-# Tokenizer for token-aware embedding handling (always enabled)
-tiktoken-rs = "0.5"
-
 # For timestamps used when creating repo records
 chrono = { version = "0.4", features = ["serde"] }
 pulldown-cmark = "0.13"
 ammonia = "4.1"
+futures = "0.3"
+
+# Optional tokenizer dependency used in embedding chunking (kept as normal dependency so
+# library code can reference types when enabled)
+tiktoken-rs = "0.3"
 
 # Optional: tracing + OpenTelemetry for performance instrumentation
 tracing = { version = "0.1", optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 opentelemetry = { version = "0.22", optional = true }
 opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
@@ -93,11 +94,6 @@ otel = [
 	"opentelemetry-otlp",
 ]
 
-# Tokenization support via tiktoken-rs is always compiled in (no feature gate).
-# Provide a no-op `tiktoken` feature so any remaining #[cfg(feature = "tiktoken")] checks
-# across the codebase don't error. This does not make the dependency optional.
-tiktoken = []
-
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
@@ -105,8 +101,6 @@ predicates = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serial_test = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-futures = "0.3"
-
 
 [[bin]]
 name = "hyperzoekt-indexer"
@@ -117,13 +111,13 @@ name = "hyperzoekt-webui"
 path = "src/bin/hyperzoekt-webui.rs"
 
 [[bin]]
+name = "hyperzoekt-embed-worker"
+path = "src/bin/hyperzoekt-embed-worker.rs"
+
+[[bin]]
 name = "hyperzoekt-mcp"
 path = "src/bin/hyperzoekt-mcp.rs"
 
 [[bin]]
 name = "hyperzoekt-sbom-worker"
 path = "src/bin/hyperzoekt-sbom-worker.rs"
-
-[[bin]]
-name = "hyperzoekt-hirag-worker"
-path = "src/bin/hyperzoekt-hirag-worker.rs"
