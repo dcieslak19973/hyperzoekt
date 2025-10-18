@@ -62,7 +62,7 @@ tempfile = "3"
 axum = { version = "0.8", features = ["json", "query"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
-minijinja = "1.0"
+minijinja = "2.12"
 url = "2"
 base64 = "0.22"
 
