@@ -180,6 +180,7 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
     // This avoids fragile typed takes and keeps parsing logic centralized.
     // Deserialize into typed rows using the Surreal client shapes (Thing id)
     #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
     struct SimilarRow {
         id: surrealdb::sql::Thing,
         stable_id: String,
@@ -225,6 +226,7 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
 
     let mut resp = conn.query(&external_query).await?;
     #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
     struct ExternalRow {
         id: surrealdb::sql::Thing,
         stable_id: String,
