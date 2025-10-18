@@ -109,7 +109,7 @@ Notes:
 
 ## Similarity (embeddings)
 
-The similarity worker can compute and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the similarity worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
+The similarity worker computes and persist inter-entity similarity relations based on stored embedding vectors. This workspace uses SurrealDB vector functions to perform the heavy-lifting server-side: the similarity worker issues SELECT queries that compute cosine similarity inside SurrealDB (via `vector::similarity::cosine(embedding, $vec)`) and returns the top-N candidates which are then materialized as relation rows (`similar_same_repo` and `similar_external_repo`).
 
 Notes and requirements:
 

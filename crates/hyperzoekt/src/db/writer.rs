@@ -3,7 +3,7 @@
 use crate::db::config::DbWriterConfig;
 use crate::db::config::{PersistAckSender, PersistedEntityMeta, SpawnResult};
 use crate::db::connection::{connect, SurrealConnection};
-use crate::db::helpers::CALL_EDGE_CAPTURE;
+use crate::db::helpers::{build_file_record_id, sanitize_id, CALL_EDGE_CAPTURE};
 use crate::repo_index::indexer::payload::EntityPayload;
 use anyhow::Result;
 use log::{debug, info, trace, warn};
@@ -548,12 +548,11 @@ async fn initial_batch_insert(
             if let Some(f) = &p.file {
                 snapshot_obj.insert("file".to_string(), serde_json::Value::String(f.clone()));
                 // Add embedded record reference to file table
-                // Generate a deterministic file ID from repo_name and file path
-                let file_id = format!("{}:{}", p.repo_name, f);
-                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                // Use the canonical deterministic file ID (sanitized) so CREATE and RELATE match
+                let file_id = build_file_record_id(&p.repo_name, None, f);
                 snapshot_obj.insert(
                     "file_ref".to_string(),
-                    serde_json::Value::String(format!("file:{}", file_id_hash)),
+                    serde_json::Value::String(format!("file:{}", file_id)),
                 );
             }
             if let Some(par) = &p.parent {
@@ -711,14 +710,14 @@ async fn initial_batch_insert(
                 eid = eid
             );
 
-            // If we have a file, create the snapshot_file relation
+            // If we have a file, create the snapshot_file relation using the canonical file id
             if p.file.is_some() {
-                let file_id = format!("{}:{}", p.repo_name, p.file.as_ref().unwrap());
-                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                let f = p.file.as_ref().unwrap();
+                let file_id = build_file_record_id(&p.repo_name, None, f);
                 sql.push_str(&format!(
-                    " RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id_hash};",
+                    " RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id};",
                     eid = eid,
-                    file_id_hash = file_id_hash
+                    file_id = file_id
                 ));
             }
 
@@ -995,43 +994,6 @@ async fn init_schema(db: &SurrealConnection, namespace: &str, database: &str) {
     }
     let _ = SCHEMA_INIT_ONCE.set(());
     let _ = SCHEMA_INIT_ONCE.set(());
-}
-
-fn sanitize_id(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut last_was_us = false;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            last_was_us = false;
-        } else {
-            if !last_was_us {
-                out.push('_');
-            }
-            last_was_us = true;
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "_".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn build_file_record_id(repo_name: &str, commit_id: Option<&str>, path: &str) -> String {
-    let repo_component = if repo_name.trim().is_empty() {
-        "repo".to_string()
-    } else {
-        sanitize_id(repo_name)
-    };
-    let commit_component = commit_id
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(sanitize_id)
-        .unwrap_or_else(|| "no_commit".to_string());
-    let path_component = sanitize_id(path);
-    format!("{}_{}_{}", repo_component, commit_component, path_component)
 }
 
 type BatchStatements = Vec<(String, Option<Vec<(&'static str, serde_json::Value)>>)>;
@@ -1523,14 +1485,15 @@ fn build_batch_sql(
             );
             statements.push((snapshot_rel, None));
 
-            // Link entity_snapshot to file if available
+            // Link entity_snapshot to file if available (use canonical file id to match created rows)
             if p.file.is_some() {
-                let file_id = format!("{}:{}", cfg.repo_name, p.file.as_ref().unwrap());
-                let file_id_hash = format!("{:x}", Sha256::digest(file_id.as_bytes()));
+                let f = p.file.as_ref().unwrap();
+                // Use the entity's repo_name to build the file id so it matches the CREATE file fid
+                let file_id = build_file_record_id(&p.repo_name, cfg.commit_id.as_deref(), f);
                 let file_rel = format!(
-                    "RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id_hash};",
+                    "RELATE entity_snapshot:{eid}->snapshot_file->file:{file_id};",
                     eid = eid,
-                    file_id_hash = file_id_hash
+                    file_id = file_id
                 );
                 statements.push((file_rel, None));
             }

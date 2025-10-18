@@ -15,6 +15,7 @@
 // Consolidated database layer for HyperZoekt
 // Combines connection logic, query operations, data models, and writing operations
 
+pub mod branch;
 pub mod config;
 pub mod connection;
 pub mod content;
@@ -24,6 +25,7 @@ pub mod queries;
 pub mod refs;
 pub mod writer;
 
+pub use branch::{resolve_commit_branch, resolve_default_branch};
 pub use config::{DbWriterConfig, SpawnResult};
 pub use connection::{connect, SurrealConnection, SHARED_MEM};
 pub use content::{
@@ -33,6 +35,7 @@ pub use content::{
 pub use helpers::normalize_git_url;
 pub use helpers::normalize_sql_value_id;
 pub use helpers::response_to_json;
+pub use helpers::{build_file_record_id, sanitize_id};
 pub use helpers::{init_call_edge_capture, CALL_EDGE_CAPTURE};
 pub use models::*;
 pub use queries::*;

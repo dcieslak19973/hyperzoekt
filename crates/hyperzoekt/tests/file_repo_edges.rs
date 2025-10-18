@@ -15,7 +15,7 @@
 //! Integration test validating bidirectional repo<->file graph edges using a remote SurrealDB
 //! instance specified via SURREALDB_URL (in-memory engine is NOT acceptable for this test).
 
-use hyperzoekt::db::{spawn_db_writer, DbWriterConfig};
+use hyperzoekt::db::{build_file_record_id, spawn_db_writer, DbWriterConfig};
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
 use serial_test::serial;
 use surrealdb::sql::Thing;
@@ -58,7 +58,10 @@ async fn file_repo_edges_created_bidirectionally() {
         .is_test(true)
         .try_init();
 
-    // Require remote SurrealDB URL; skip the test if missing (this is an external integration).
+    // Require remote SurrealDB URL for graph-capable tests. If not provided,
+    // default to localhost:8000 so CI/dev runs target the external SurrealDB
+    // instance instead of falling back to an in-memory engine (which lacks
+    // graph traversal behavior required by these assertions).
     let url = match std::env::var("SURREALDB_URL").ok() {
         Some(u) => {
             // Normalize early so any downstream Surreal client code never sees a malformed value.
@@ -68,10 +71,17 @@ async fn file_repo_edges_created_bidirectionally() {
             schemeful
         }
         None => {
+            // Default to local remote SurrealDB expected at port 8000. Tests rely on a
+            // graph-capable remote engine; do not use in-memory Mem for these tests.
+            let default = "http://localhost:8000".to_string();
+            let (schemeful, _no_scheme) = hyperzoekt::test_utils::normalize_surreal_host(&default);
+            std::env::set_var("SURREALDB_URL", &schemeful);
+            std::env::set_var("SURREALDB_HTTP_BASE", &schemeful);
             log::info!(
-                "SURREALDB_URL not set; skipping integration test that requires external SurrealDB"
+                "SURREALDB_URL not set; defaulting to {} for graph tests",
+                schemeful
             );
-            return;
+            schemeful
         }
     };
     let user = std::env::var("SURREALDB_USERNAME").ok();
@@ -135,9 +145,39 @@ async fn file_repo_edges_created_bidirectionally() {
     let _ = db.use_ns(&test_ns).await;
     let _ = db.use_db(&test_db).await;
 
+    // Optional stronger cleanup: when HZ_CLEAN_SURREAL_BEFORE_TEST=1 run a broad
+    // DELETE FROM <table> for common tables to ensure no leftover state interferes
+    // with tests. This is opt-in to avoid accidentally wiping shared DBs.
+    if std::env::var("HZ_CLEAN_SURREAL_BEFORE_TEST")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        log::warn!(
+            "HZ_CLEAN_SURREAL_BEFORE_TEST=1 set; performing broad cleanup of SurrealDB tables"
+        );
+        let broader_cleanup = [
+            "DELETE FROM has_file;",
+            "DELETE FROM in_repo;",
+            "DELETE FROM snapshot_file;",
+            "DELETE FROM has_snapshot;",
+            "DELETE FROM entity_snapshot;",
+            "DELETE FROM entity;",
+            "DELETE FROM repo;",
+            "DELETE FROM file;",
+            "DELETE FROM commits;",
+        ];
+        for stmt in broader_cleanup.iter() {
+            match db.query(stmt).await {
+                Ok(_) => log::info!("broad cleanup applied: {}", stmt),
+                Err(e) => log::warn!("broad cleanup stmt failed {} err {}", stmt, e),
+            }
+        }
+    }
+
     // Targeted deletes (edges first, then entities, then base records)
     let cleanup_statements = [
-        // Edge deletions for known pairs (repo_one/src files, repo_two/lib file)
+        // Edge deletions for known pairs (remove any matching edges pointing to test commits/repos)
         "DELETE has_file WHERE in=commits:test_commit_123;",
         "DELETE has_file WHERE in=repo:repo_one;",
         "DELETE has_file WHERE in=repo:repo_two;",
@@ -146,13 +186,19 @@ async fn file_repo_edges_created_bidirectionally() {
         "DELETE in_repo WHERE out=repo:repo_two;",
         // Commit records
         "DELETE commits:test_commit_123;",
-        // File + repo records (only those we will recreate)
-        "DELETE file:src_file1_rs;",
-        "DELETE file:src_file2_rs;",
-        "DELETE file:lib_file3_rs;",
-        "DELETE repo:repo_one;",
-        "DELETE repo:repo_two;",
+        // File records: remove by path (robust against deterministic-id naming changes)
+        "DELETE file WHERE path='src/file1.rs';",
+        "DELETE file WHERE path='src/file2.rs';",
+        "DELETE file WHERE path='lib/file3.rs';",
+        // Also remove any deterministically-named file ids that include repo and path
+        "DELETE file WHERE id LIKE 'file:repo_%_src_file1_rs';",
+        "DELETE file WHERE id LIKE 'file:repo_%_src_file2_rs';",
+        "DELETE file WHERE id LIKE 'file:repo_%_lib_file3_rs';",
+        // Repo records: remove by name
+        "DELETE repo WHERE name='repo_one';",
+        "DELETE repo WHERE name='repo_two';",
         // Entities by stable ids (deterministic sanitize with underscores)
+        "DELETE entity WHERE stable_id IN ['stable:r1_f1','stable:r1_f2','stable:r2_f3'] ;",
         "DELETE entity:stable_r1_f1;",
         "DELETE entity:stable_r1_f2;",
         "DELETE entity:stable_r2_f3;",
@@ -222,6 +268,9 @@ async fn file_repo_edges_created_bidirectionally() {
         return;
     }
     log::info!("Writer completed; opening fresh connection for assertions");
+    // Allow a short pause so remote SurrealDB has time to make recently committed
+    // rows visible to subsequent connections (avoid transient visibility races).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Establish assertion connection using the project's connect helper so it follows
     // the same normalization and auth behavior as the writer.
@@ -261,16 +310,25 @@ async fn file_repo_edges_created_bidirectionally() {
     .expect("create commit for repo_two");
 
     // Manually create the commit-based relations
-    let relations = vec![
+    let relations: Vec<String> = vec![
         // repo_one files
-        "RELATE commits:test_commit_repo_one->in_repo->repo:repo_one;",
-        "RELATE commits:test_commit_repo_one->has_file->file:src_file1_rs;",
-        "RELATE commits:test_commit_repo_one->has_file->file:src_file2_rs;",
+        String::from("RELATE commits:test_commit_repo_one->in_repo->repo:repo_one;"),
+        format!(
+            "RELATE commits:test_commit_repo_one->has_file->file:{};",
+            build_file_record_id("repo_one", None, "src/file1.rs")
+        ),
+        format!(
+            "RELATE commits:test_commit_repo_one->has_file->file:{};",
+            build_file_record_id("repo_one", None, "src/file2.rs")
+        ),
         // repo_two files
-        "RELATE commits:test_commit_repo_two->in_repo->repo:repo_two;",
-        "RELATE commits:test_commit_repo_two->has_file->file:lib_file3_rs;",
+        String::from("RELATE commits:test_commit_repo_two->in_repo->repo:repo_two;"),
+        format!(
+            "RELATE commits:test_commit_repo_two->has_file->file:{};",
+            build_file_record_id("repo_two", None, "lib/file3.rs")
+        ),
     ];
-    for rel in relations {
+    for rel in relations.iter() {
         if let Err(e) = db.query(rel).await {
             log::warn!("Failed to create relation {}: {}", rel, e);
         }
@@ -294,8 +352,21 @@ async fn file_repo_edges_created_bidirectionally() {
     // 1. Repos
     let repo_query = "SELECT name FROM repo WHERE name IN ['repo_one','repo_two'];";
     log::info!("QUERY repos: {}", repo_query);
-    let mut res = db.query(repo_query).await.expect("query repos");
-    let rows: Vec<serde_json::Value> = res.take(0).unwrap_or_default();
+    // Query repos, retrying briefly to avoid transient visibility races on remote SurrealDB
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for attempt in 0..10 {
+        let mut res = db.query(repo_query).await.expect("query repos");
+        rows = res.take(0).unwrap_or_default();
+        if rows.len() >= 2 {
+            break;
+        }
+        log::warn!(
+            "repo query returned {} rows on attempt {}; retrying...",
+            rows.len(),
+            attempt
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(rows.len(), 2, "expected 2 repos, got {:?}", rows);
 
     if std::env::var("HZ_DEBUG_EDGE_DUMP").ok().as_deref() == Some("1") {
@@ -315,8 +386,20 @@ async fn file_repo_edges_created_bidirectionally() {
     let q_repo_one =
         "SELECT <-in_repo<-commits->has_file->file.path AS files FROM repo WHERE name='repo_one';";
     log::info!("QUERY repo_one files: {}", q_repo_one);
-    let mut r1 = db.query(q_repo_one).await.expect("repo_one files");
-    let r1_rows: Vec<serde_json::Value> = r1.take(0).unwrap_or_default();
+    // Retry traversal query to handle eventual consistency/visibility windows
+    let mut r1_rows: Vec<serde_json::Value> = Vec::new();
+    for attempt in 0..10 {
+        let mut r1 = db.query(q_repo_one).await.expect("repo_one files");
+        r1_rows = r1.take(0).unwrap_or_default();
+        if !r1_rows.is_empty() {
+            break;
+        }
+        log::warn!(
+            "repo_one traversal returned no rows on attempt {}; retrying...",
+            attempt
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(!r1_rows.is_empty(), "no rows for repo_one files");
     let file_list = r1_rows[0]
         .get("files")
@@ -342,8 +425,19 @@ async fn file_repo_edges_created_bidirectionally() {
     let q_repo_two =
         "SELECT <-in_repo<-commits->has_file->file.path AS files FROM repo WHERE name='repo_two';";
     log::info!("QUERY repo_two files: {}", q_repo_two);
-    let mut r2 = db.query(q_repo_two).await.expect("repo_two files");
-    let r2_rows: Vec<serde_json::Value> = r2.take(0).unwrap_or_default();
+    let mut r2_rows: Vec<serde_json::Value> = Vec::new();
+    for attempt in 0..10 {
+        let mut r2 = db.query(q_repo_two).await.expect("repo_two files");
+        r2_rows = r2.take(0).unwrap_or_default();
+        if !r2_rows.is_empty() {
+            break;
+        }
+        log::warn!(
+            "repo_two traversal returned no rows on attempt {}; retrying...",
+            attempt
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(!r2_rows.is_empty(), "no rows for repo_two files");
     let r2_files = r2_rows[0]
         .get("files")
@@ -369,8 +463,19 @@ async fn file_repo_edges_created_bidirectionally() {
     // 4. Reverse edge file -> repo (through commits)
     let q_file_rev = "SELECT <-has_file<-commits->in_repo->repo.name AS repos FROM file WHERE path='src/file1.rs';";
     log::info!("QUERY file reverse: {}", q_file_rev);
-    let mut f1 = db.query(q_file_rev).await.expect("file1 reverse");
-    let f1_rows: Vec<serde_json::Value> = f1.take(0).unwrap_or_default();
+    let mut f1_rows: Vec<serde_json::Value> = Vec::new();
+    for attempt in 0..10 {
+        let mut f1 = db.query(q_file_rev).await.expect("file1 reverse");
+        f1_rows = f1.take(0).unwrap_or_default();
+        if !f1_rows.is_empty() {
+            break;
+        }
+        log::warn!(
+            "file reverse traversal returned no rows on attempt {}; retrying...",
+            attempt
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(!f1_rows.is_empty(), "no file row for reverse edge");
     let repos = f1_rows[0]
         .get("repos")

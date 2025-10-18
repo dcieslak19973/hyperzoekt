@@ -11,9 +11,53 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate::db::connection::SurrealConnection;
 use std::sync::{Mutex, OnceLock};
 
 pub static CALL_EDGE_CAPTURE: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+/// Sanitize a raw string to produce a valid SurrealDB record ID component.
+/// Replaces non-alphanumeric characters with underscores, collapses consecutive
+/// underscores, and trims leading/trailing underscores.
+pub fn sanitize_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_us = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_was_us = false;
+        } else {
+            if !last_was_us {
+                out.push('_');
+            }
+            last_was_us = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "_".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build a deterministic file record ID from repo name, optional commit ID, and file path.
+/// Uses sanitize_id to ensure valid SurrealDB identifiers.
+/// Format: {repo}_{commit}_{path} where commit defaults to "no_commit" when absent.
+pub fn build_file_record_id(repo_name: &str, commit_id: Option<&str>, path: &str) -> String {
+    let repo_component = if repo_name.trim().is_empty() {
+        "repo".to_string()
+    } else {
+        sanitize_id(repo_name)
+    };
+    let commit_component = commit_id
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(sanitize_id)
+        .unwrap_or_else(|| "no_commit".to_string());
+    let path_component = sanitize_id(path);
+    format!("{}_{}_{}", repo_component, commit_component, path_component)
+}
 
 pub fn init_call_edge_capture() {
     let _ = CALL_EDGE_CAPTURE.get_or_init(|| Mutex::new(Vec::new()));
@@ -556,6 +600,109 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
         }
     }
     None
+}
+
+/// Convenience helper: fetch an entity's embedding (from entity_snapshot) by stable_id.
+/// Returns Ok(Some(vec)) when an embedding exists, Ok(None) when not found, or Err on query error.
+pub async fn get_embedding_for_entity(
+    conn: &SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = "SELECT embedding FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
+    if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
+        if let Some(obj) = rows.into_iter().next() {
+            if let Some(emb_val) = obj.get("embedding") {
+                if emb_val.is_array() {
+                    let out = emb_val
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>();
+                    return Ok(Some(out));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch short snippet (source_content) from entity_snapshot by stable_id.
+pub async fn get_snippet_for_entity_snapshot(
+    conn: &SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = "SELECT source_content FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
+    if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
+        if let Some(obj) = rows.into_iter().next() {
+            if let Some(sc) = obj.get("source_content") {
+                if sc.is_string() {
+                    return Ok(sc.as_str().map(|s| s.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch short snippet (from entity.snapshot.source_content) for an entity stable_id.
+pub async fn get_snippet_for_entity(
+    conn: &SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = "SELECT snapshot.source_content AS source_content FROM entity WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
+    if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
+        if let Some(obj) = rows.into_iter().next() {
+            if let Some(sc) = obj.get("source_content") {
+                if sc.is_string() {
+                    return Ok(sc.as_str().map(|s| s.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Return a Vec of repo names (repo_name) associated with an entity stable_id.
+pub async fn get_repos_for_entity(
+    conn: &SurrealConnection,
+    stable_id: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Try entity_snapshot first (denormalized repo_name)
+    let sql = "SELECT repo_name FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    if let Ok(mut resp) = conn.query_with_binds(sql, binds.clone()).await {
+        if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(0) {
+            if let Some(obj) = rows.into_iter().next() {
+                if let Some(rn) = obj.get("repo_name") {
+                    if let Some(s) = rn.as_str() {
+                        return Ok(vec![s.to_string()]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to entity table
+    let sql2 = "SELECT repo_name FROM entity WHERE stable_id = $sid LIMIT 1";
+    let binds2 = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp2 = conn.query_with_binds(sql2, binds2).await?;
+    if let Ok(rows) = resp2.take::<Vec<serde_json::Value>>(0) {
+        if let Some(obj) = rows.into_iter().next() {
+            if let Some(rn) = obj.get("repo_name") {
+                if let Some(s) = rn.as_str() {
+                    return Ok(vec![s.to_string()]);
+                }
+            }
+        }
+    }
+    Ok(vec![])
 }
 
 #[cfg(test)]
