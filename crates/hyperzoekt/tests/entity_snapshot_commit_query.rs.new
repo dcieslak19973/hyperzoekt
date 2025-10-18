@@ -1,0 +1,58 @@
+// Minimal, safe integration test for entity_snapshot queries against a real SurrealDB.
+// This file is intentionally small and idempotent so it can be used while
+// response normalization is being diagnosed.
+
+use hyperzoekt::db::connection::connect as hz_connect;
+use hyperzoekt::db::helpers;
+use serde_json::Value as JsonValue;
+use surrealdb::Response as SurrealResponse;
+
+fn resp_to_json_alt(resp: SurrealResponse) -> Option<JsonValue> {
+    // For now, delegate to the crate helper; fallback logic can be added later
+    helpers::response_to_json(resp)
+}
+
+#[tokio::test]
+#[ignore = "Requires manual SurrealDB setup and CLI testing"]
+async fn test_entity_snapshot_commit_filter_real_db() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = hz_connect(
+        &Some("http://127.0.0.1:8000".to_string()),
+        &Some("root".to_string()),
+        &Some("root".to_string()),
+        "test_ns",
+        "test_db",
+    )
+    .await?;
+
+    // idempotent cleanup
+    conn.query("DELETE entity_snapshot WHERE repo_name = 'test_commit_filter';").await?;
+
+    // create two fixtures with the same commit tag
+    conn.query("DELETE entity_snapshot:test_commit_1;").await?;
+    conn.query(&format!(
+        r#"CREATE entity_snapshot:test_commit_1 CONTENT {{ stable_id: "test_commit_1", repo_name: "test_commit_filter", sourcecontrol_commit: "commits:abc", embedding_len: 768 }};"#
+    ))
+    .await?;
+
+    conn.query("DELETE entity_snapshot:test_commit_2;").await?;
+    conn.query(&format!(
+        r#"CREATE entity_snapshot:test_commit_2 CONTENT {{ stable_id: "test_commit_2", repo_name: "test_commit_filter", sourcecontrol_commit: "commits:abc", embedding_len: 768 }};"#
+    ))
+    .await?;
+
+    let query_with_cast = r#"SELECT id, stable_id FROM entity_snapshot WHERE repo_name = 'test_commit_filter' AND type::string(sourcecontrol_commit) = 'commits:abc'"#;
+
+    let resp = conn.query(query_with_cast).await?;
+    let rows = resp_to_json_alt(resp);
+
+    assert!(rows.is_some(), "Expected rows for the commit-filter query");
+
+    let arr = rows.unwrap();
+    let items = arr.as_array().expect("Rows must be an array");
+    assert_eq!(items.len(), 2, "Should have created two snapshots");
+
+    // cleanup
+    conn.query("DELETE entity_snapshot WHERE repo_name = 'test_commit_filter';").await?;
+
+    Ok(())
+}

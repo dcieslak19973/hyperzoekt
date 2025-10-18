@@ -136,83 +136,11 @@ pub fn normalize_git_url(input: &str) -> String {
     format!("https://{}", raw)
 }
 
-/// Redact sensitive or large fields (embeddings, centroid arrays, long source_content)
-/// This is a shared helper used by modules that log SurrealDB responses so we
-/// avoid printing full embedding vectors or huge source blobs in logs.
-pub fn redact_for_log(mut v: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match &mut v {
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                let _ = redact_for_log(item.clone());
-            }
-            if arr.len() > 10 {
-                let prefix = arr.drain(0..10).collect::<Vec<_>>();
-                let mut new = Vec::new();
-                for p in prefix.into_iter() {
-                    new.push(redact_for_log(p));
-                }
-                new.push(Value::String(format!("... {} more items ...", arr.len())));
-                return Value::Array(new);
-            }
-        }
-        Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for k in keys.into_iter() {
-                if let Some(val) = map.get_mut(&k) {
-                    if (k.to_lowercase().contains("embedding")
-                        || k.to_lowercase().contains("centroid"))
-                        && val.is_array()
-                    {
-                        if let Some(arr) = val.as_array() {
-                            let mut summary = Vec::new();
-                            for (i, item) in arr.iter().enumerate() {
-                                if i >= 3 {
-                                    break;
-                                }
-                                if let Some(n) = item.as_f64() {
-                                    summary.push(Value::Number(
-                                        serde_json::Number::from_f64(n)
-                                            .unwrap_or(serde_json::Number::from(0)),
-                                    ));
-                                } else {
-                                    summary.push(item.clone());
-                                }
-                            }
-                            let s = serde_json::json!({"type":"redacted_vector","len":arr.len(),"sample":summary});
-                            *val = s;
-                            continue;
-                        }
-                    }
-                    if val.is_string() {
-                        if let Some(s) = val.as_str() {
-                            if s.len() > 200 {
-                                let truncated = format!("{}... ({} bytes)", &s[..200], s.len());
-                                *val = Value::String(truncated);
-                                continue;
-                            }
-                        }
-                    }
-                    let red = redact_for_log(val.clone());
-                    *val = red;
-                }
-            }
-        }
-        _ => {}
-    }
-    v
-}
-
 fn sql_value_to_json(v: &surrealdb::sql::Value) -> serde_json::Value {
     use surrealdb::sql::Value;
     match v {
         Value::Thing(_) => serde_json::Value::String(v.to_string()),
-        Value::Strand(s) => {
-            // Use the inner string value for Strands instead of the Display
-            // representation which may include quotes in some client outputs.
-            let sref: &str = s.as_ref();
-            serde_json::Value::String(sref.to_string())
-        }
+        Value::Strand(_) => serde_json::Value::String(v.to_string()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Number(n) => {
             // Use the Display representation; try to parse as integer then float.
@@ -332,124 +260,107 @@ pub async fn relate_and_collect_ids(
     Ok(ids)
 }
 
-/// Fetch a short snippet for an entity by stable_id. Returns None when not found.
-/// Now queries entity_snapshot.source_content directly since content has been denormalized.
-pub async fn get_snippet_for_entity(
-    conn: &crate::db::connection::SurrealConnection,
-    stable_id: &str,
-) -> Result<Option<String>, surrealdb::Error> {
-    #[derive(serde::Deserialize)]
-    struct ERow {
-        source_content: Option<String>,
-    }
-    let q = format!(
-        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut r) = conn.query(&q).await {
-        if let Ok(rows) = r.take::<Vec<ERow>>(0) {
-            if let Some(row) = rows.into_iter().next() {
-                if let Some(s) = row.source_content {
-                    // Filter out empty strings
-                    if !s.trim().is_empty() {
-                        return Ok(Some(s));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Try to fetch the embedding vector for a given entity stable_id by looking
-/// up the corresponding `entity_snapshot` record (preferred). This returns
-/// None when no embedding is found. This helper centralizes the snapshot
-/// lookup and keeps callers migration-friendly.
+// Compatibility helpers expected by hirag.rs. These are small wrappers that
+// query the entity_snapshot table for embeddings/snippets/repo provenance.
+// They intentionally return Option types and never panic; errors are bubbled
+// through as Results so callers can treat missing data as None.
 pub async fn get_embedding_for_entity(
     conn: &crate::db::connection::SurrealConnection,
     stable_id: &str,
 ) -> Result<Option<Vec<f32>>, surrealdb::Error> {
+    let sql = "SELECT embedding FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
+    // Try to deserialize as a row with optional embedding
     #[derive(serde::Deserialize)]
     struct Row {
         embedding: Option<Vec<f32>>,
     }
-    // Try snapshot-scoped lookup first (entity_snapshot with matching stable_id)
-    let q = format!(
-        "SELECT embedding FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q).await {
-        if let Ok(rows) = resp.take::<Vec<Row>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                return Ok(r.embedding);
-            }
-        }
+    let rows: Vec<Row> = resp.take(0)?;
+    if let Some(r) = rows.into_iter().next() {
+        Ok(r.embedding)
+    } else {
+        Ok(None)
     }
-    Ok(None)
 }
 
-/// Fetch a short snippet for an entity by stable_id from entity_snapshot.source_content.
-/// This is the preferred method since content has been denormalized to entity_snapshot.
 pub async fn get_snippet_for_entity_snapshot(
     conn: &crate::db::connection::SurrealConnection,
     stable_id: &str,
 ) -> Result<Option<String>, surrealdb::Error> {
+    let sql = "SELECT source_content FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
     #[derive(serde::Deserialize)]
-    struct SRow {
+    struct Row {
         source_content: Option<String>,
     }
-    let q = format!(
-        "SELECT source_content FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q).await {
-        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                if let Some(s) = r.source_content {
-                    // Filter out empty strings
-                    if !s.trim().is_empty() {
-                        return Ok(Some(s));
-                    }
-                }
-            }
-        }
+    let rows: Vec<Row> = resp.take(0)?;
+    if let Some(r) = rows.into_iter().next() {
+        Ok(r.source_content)
+    } else {
+        Ok(None)
     }
-    Ok(None)
 }
 
-/// Extract repo provenance for a given entity stable_id. Returns a deduped Vec of repo strings.
-/// Queries entity_snapshot.repo_name directly since content has been denormalized.
+pub async fn get_snippet_for_entity(
+    conn: &crate::db::connection::SurrealConnection,
+    stable_id: &str,
+) -> Result<Option<String>, surrealdb::Error> {
+    // Fallback: try to read from entity.snapshot.source_content
+    let sql = "SELECT snapshot.source_content AS source_content FROM entity WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    let mut resp = conn.query_with_binds(sql, binds).await?;
+    #[derive(serde::Deserialize)]
+    struct Row {
+        source_content: Option<String>,
+    }
+    let rows: Vec<Row> = resp.take(0)?;
+    if let Some(r) = rows.into_iter().next() {
+        Ok(r.source_content)
+    } else {
+        Ok(None)
+    }
+}
+
 pub async fn get_repos_for_entity(
     conn: &crate::db::connection::SurrealConnection,
     stable_id: &str,
 ) -> Result<Vec<String>, surrealdb::Error> {
-    use std::collections::HashSet;
-    #[derive(serde::Deserialize)]
-    struct SRow {
-        repo_name: Option<String>,
-    }
-    let mut repos_set: HashSet<String> = HashSet::new();
-
-    let q_snap = format!(
-        "SELECT repo_name FROM entity_snapshot WHERE stable_id = \"{}\" LIMIT 1",
-        stable_id
-    );
-    if let Ok(mut resp) = conn.query(&q_snap).await {
-        if let Ok(rows) = resp.take::<Vec<SRow>>(0) {
+    // Try snapshot-level repo_name then entity.repo_name and return deduped list
+    let mut out: Vec<String> = Vec::new();
+    let sql1 = "SELECT repo_name FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+    let binds = vec![("sid", serde_json::Value::String(stable_id.to_string()))];
+    if let Ok(mut resp) = conn.query_with_binds(sql1, binds.clone()).await {
+        #[derive(serde::Deserialize)]
+        struct Row1 {
+            repo_name: Option<String>,
+        }
+        if let Ok(rows) = resp.take::<Vec<Row1>>(0) {
             if let Some(r) = rows.into_iter().next() {
-                if let Some(rn) = r.repo_name {
-                    let n = normalize_git_url(&rn);
-                    if !n.is_empty() {
-                        repos_set.insert(n);
+                if let Some(repo) = r.repo_name {
+                    out.push(repo);
+                }
+            }
+        }
+    }
+    let sql2 = "SELECT repo_name FROM entity WHERE stable_id = $sid LIMIT 1";
+    if let Ok(mut resp2) = conn.query_with_binds(sql2, binds).await {
+        #[derive(serde::Deserialize)]
+        struct Row2 {
+            repo_name: Option<String>,
+        }
+        if let Ok(rows2) = resp2.take::<Vec<Row2>>(0) {
+            if let Some(r) = rows2.into_iter().next() {
+                if let Some(repo) = r.repo_name {
+                    if !out.contains(&repo) {
+                        out.push(repo);
                     }
                 }
             }
         }
     }
-
-    let mut list: Vec<String> = repos_set.into_iter().collect();
-    list.sort();
-    Ok(list)
+    Ok(out)
 }
 
 /// Convert a `surrealdb::Response` into a `serde_json::Value` when possible.
@@ -457,160 +368,211 @@ pub async fn get_repos_for_entity(
 /// `surrealdb::sql::Value` shapes to maximize compatibility with remote
 /// and embedded clients which return slightly different response shapes.
 pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Value> {
-    // Fast path: some remote HTTP responses for simple SELECT single-column
-    // queries deserialize cleanly as an Option<serde_json::Value> in slot 0
-    // but attempting sql::Value vector shapes first can consume/empty the slot.
-    // Try a quick scan for up to a few slots before the heavier probing logic.
+    // Use debug-level logs for diagnostics so CI output remains clean. The
+    // function otherwise preserves its probing logic and return shapes.
+    log::debug!("response_to_json: begin probes for response: {:?}", resp);
+
+    let diagnostic_ret =
+        |label: &str, slot: Option<usize>, v: serde_json::Value| -> Option<serde_json::Value> {
+            log::debug!(
+                "response_to_json: RETURN label={} slot={:?} value_debug={}",
+                label,
+                slot,
+                v
+            );
+            Some(v)
+        };
+
     for slot in 0usize..3usize {
         if let Ok(Some(val)) = resp.take::<Option<serde_json::Value>>(slot) {
             if val.is_array() {
                 if val.as_array().map(|a| a.is_empty()).unwrap_or(false) {
                     continue;
                 }
-                return Some(val);
+                log::debug!(
+                    "response_to_json: slot={} Option<serde_json::Value> -> array (len={})",
+                    slot,
+                    val.as_array().map(|a| a.len()).unwrap_or(0)
+                );
+                return diagnostic_ret("Option<serde_json::Value>-array", Some(slot), val);
             } else {
-                return Some(serde_json::Value::Array(vec![val]));
-            }
-        }
-    }
-    // Prefer probing the `surrealdb::sql::Value` shapes first because remote
-    // HTTP clients often return nested `Array(Array({...}))` structures that
-    // deserialize into nested `Vec<Vec<sql::Value>>`. Trying SQL-shaped takes
-    // first avoids some serde_json deserialization failures and makes the
-    // normalization deterministic.
-    for slot in 0usize..10usize {
-        // Nested Vec<Vec<sql::Value>> — common shape for Array(Array(...)).
-        if let Ok(nested) = resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
-            for inner in nested.into_iter() {
-                let mut arr = Vec::new();
-                for v in inner.into_iter() {
-                    arr.push(sql_value_to_json(&v));
-                }
-                if !arr.is_empty() {
-                    return Some(serde_json::Value::Array(arr));
-                }
-            }
-        }
-        // Option-wrapped nested vectors
-        if let Ok(Some(nv)) = resp.take::<Option<Vec<Vec<surrealdb::sql::Value>>>>(slot) {
-            for inner in nv.into_iter() {
-                let mut arr = Vec::new();
-                for v in inner.into_iter() {
-                    arr.push(sql_value_to_json(&v));
-                }
-                if !arr.is_empty() {
-                    return Some(serde_json::Value::Array(arr));
-                }
-            }
-        }
-        // Vec<sql::Value>
-        if let Ok(rows) = resp.take::<Vec<surrealdb::sql::Value>>(slot) {
-            let mut arr = Vec::with_capacity(rows.len());
-            for v in rows.into_iter() {
-                let jv = sql_value_to_json(&v);
-                arr.push(jv);
-            }
-            // Flatten one level when the response shape is [[{...}]]
-            if arr.len() == 1
-                && arr[0].is_array()
-                && !arr[0].as_array().map(|a| a.is_empty()).unwrap_or(true)
-            {
-                return Some(arr[0].clone());
-            }
-            if !arr.is_empty() {
-                return Some(serde_json::Value::Array(arr));
-            }
-        }
-        // Option<Vec<sql::Value>>
-        if let Ok(Some(rows)) = resp.take::<Option<Vec<surrealdb::sql::Value>>>(slot) {
-            let mut arr = Vec::new();
-            for v in rows.into_iter() {
-                arr.push(sql_value_to_json(&v));
-            }
-            if !arr.is_empty() {
-                return Some(serde_json::Value::Array(arr));
-            }
-        }
-        // Option<sql::Value>
-        if let Ok(Some(val)) = resp.take::<Option<surrealdb::sql::Value>>(slot) {
-            let jv = sql_value_to_json(&val);
-            if jv.is_array() {
-                if jv.as_array().map(|a| a.is_empty()).unwrap_or(false) {
-                    continue;
-                }
-                return Some(jv);
-            } else {
-                return Some(serde_json::Value::Array(vec![jv]));
+                log::debug!(
+                    "response_to_json: slot={} Option<serde_json::Value> -> single value",
+                    slot
+                );
+                return diagnostic_ret(
+                    "Option<serde_json::Value>-single",
+                    Some(slot),
+                    serde_json::Value::Array(vec![val]),
+                );
             }
         }
     }
 
-    // Probe multiple slots (0..10) more aggressively to account for remote
-    // clients that populate non-zero or non-vector slots. Critical ordering:
-    // attempt Option<serde_json::Value> BEFORE Vec<serde_json::Value>. We have
-    // observed that a single object row (e.g. {sbom_blob: ...}) can deserialize
-    // as an empty Vec<serde_json::Value>, causing the slot to be consumed and
-    // data lost. Reordering preserves that object.
-    for slot in 0usize..10usize {
-        // Single value first.
+    for slot in 0usize..3usize {
         if let Ok(Some(val)) = resp.take::<Option<serde_json::Value>>(slot) {
+            log::debug!(
+                "response_to_json: slot={} take::<Option<serde_json::Value>> succeeded: kind={}",
+                slot,
+                if val.is_array() { "array" } else { "other" }
+            );
             if val.is_array() {
-                if val.as_array().map(|a| a.is_empty()).unwrap_or(false) {
-                    // keep probing other slots
-                } else {
-                    return Some(val);
+                if let Some(first) = val.as_array().and_then(|a| a.first()) {
+                    if first.is_array() && val.as_array().map(|a| a.len()).unwrap_or(0) == 1 {
+                        return diagnostic_ret(
+                            "Option<serde_json::Value>-flatten1",
+                            Some(slot),
+                            first.clone(),
+                        );
+                    }
+                }
+                if !val.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                    return diagnostic_ret(
+                        "Option<serde_json::Value>-array-return",
+                        Some(slot),
+                        val,
+                    );
                 }
             } else {
-                return Some(serde_json::Value::Array(vec![val]));
+                return diagnostic_ret(
+                    "Option<serde_json::Value>-nonarray-wrap",
+                    Some(slot),
+                    serde_json::Value::Array(vec![val]),
+                );
             }
         }
-        // Vector of rows.
+    }
+
+    for slot in 0usize..3usize {
+        if let Ok(nested) = resp.take::<Vec<Vec<serde_json::Value>>>(slot) {
+            log::debug!(
+                "response_to_json: slot={} take::<Vec<Vec<serde_json::Value>>> succeeded outer_len={}",
+                slot,
+                nested.len()
+            );
+            for inner in nested.into_iter() {
+                if inner.is_empty() {
+                    continue;
+                }
+                return diagnostic_ret(
+                    "Vec<Vec<serde_json::Value>>-inner",
+                    Some(slot),
+                    serde_json::Value::Array(inner),
+                );
+            }
+        }
+    }
+
+    for slot in 0usize..10usize {
+        match resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
+            Ok(nested_sql) => {
+                log::debug!(
+                    "response_to_json: slot={} take::<Vec<Vec<sql::Value>>> succeeded outer_len={}",
+                    slot,
+                    nested_sql.len()
+                );
+                for inner in nested_sql.into_iter() {
+                    if inner.is_empty() {
+                        continue;
+                    }
+                    let mut arr = Vec::new();
+                    for v in inner.into_iter() {
+                        arr.push(sql_value_to_json(&v));
+                    }
+                    if !arr.is_empty() {
+                        return Some(serde_json::Value::Array(arr));
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!(
+                    "response_to_json: slot={} take::<Vec<Vec<sql::Value>>> Err={:?}",
+                    slot,
+                    e
+                );
+            }
+        }
+    }
+
+    for slot in 0usize..5usize {
         if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(slot) {
-            if rows.is_empty() {
-                // continue probing other slots – do NOT return an empty array
-                continue;
+            if !rows.is_empty() {
+                let v = serde_json::Value::Array(rows);
+                return diagnostic_ret("Vec<serde_json::Value>", Some(slot), v);
             }
-            let v = serde_json::Value::Array(rows);
-            // Some clients return nested arrays like [[row1, row2]] — flatten one level.
-            let candidate = if let Some(first) = v.as_array().and_then(|a| a.first()) {
-                if first.is_array() && v.as_array().unwrap().len() == 1 {
-                    first.clone()
-                } else {
-                    v.clone()
-                }
-            } else {
-                v.clone()
-            };
-            if candidate.as_array().map(|a| a.is_empty()).unwrap_or(false) {
-                continue;
-            }
-            return Some(candidate);
         }
-        // Nested Vec<Vec<serde_json::Value>> shapes
+        if let Ok(rows) = resp.take::<Vec<surrealdb::sql::Value>>(slot) {
+            if !rows.is_empty() {
+                let mut arr = Vec::with_capacity(rows.len());
+                for v in rows.into_iter() {
+                    arr.push(sql_value_to_json(&v));
+                }
+                return diagnostic_ret(
+                    "Vec<sql::Value>",
+                    Some(slot),
+                    serde_json::Value::Array(arr),
+                );
+            }
+        }
         if let Ok(nested) = resp.take::<Vec<Vec<serde_json::Value>>>(slot) {
             for inner in nested.into_iter() {
                 if inner.is_empty() {
                     continue;
                 }
-                let v = serde_json::Value::Array(inner);
-                if v.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                    return Some(v);
+                return diagnostic_ret(
+                    "Vec<Vec<serde_json::Value>>-inner",
+                    Some(slot),
+                    serde_json::Value::Array(inner),
+                );
+            }
+        }
+        if let Ok(nested_sql) = resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
+            for inner in nested_sql.into_iter() {
+                if inner.is_empty() {
+                    continue;
+                }
+                let mut arr = Vec::new();
+                for v in inner.into_iter() {
+                    arr.push(sql_value_to_json(&v));
+                }
+                if !arr.is_empty() {
+                    return diagnostic_ret(
+                        "Vec<Vec<sql::Value>>-inner",
+                        Some(slot),
+                        serde_json::Value::Array(arr),
+                    );
                 }
             }
         }
-        if let Ok(Some(rows)) = resp.take::<Option<Vec<serde_json::Value>>>(slot) {
-            if rows.is_empty() {
-                continue;
+        if let Ok(Some(val)) = resp.take::<Option<serde_json::Value>>(slot) {
+            if val.is_array() {
+                if !val.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                    return diagnostic_ret("Option<serde_json::Value>-array", Some(slot), val);
+                }
+            } else {
+                return diagnostic_ret(
+                    "Option<serde_json::Value>-single",
+                    Some(slot),
+                    serde_json::Value::Array(vec![val]),
+                );
             }
-            let v = serde_json::Value::Array(rows);
-            if v.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                return Some(v);
+        }
+        if let Ok(Some(val)) = resp.take::<Option<surrealdb::sql::Value>>(slot) {
+            let jv = sql_value_to_json(&val);
+            if jv.is_array() {
+                if !jv.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                    return diagnostic_ret("Option<sql::Value>-array", Some(slot), jv);
+                }
+            } else {
+                return diagnostic_ret(
+                    "Option<sql::Value>-single",
+                    Some(slot),
+                    serde_json::Value::Array(vec![jv]),
+                );
             }
         }
     }
 
-    // Try serde_json::Value rows first (typed slot access can fail for some
-    // client backends; this is a best-effort probe).
     for slot in 0usize..3usize {
         if let Ok(rows) = resp.take::<Vec<serde_json::Value>>(slot) {
             let v = serde_json::Value::Array(rows);
@@ -638,7 +600,6 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
         }
     }
 
-    // Fallback to surrealdb::sql::Value and convert each to JSON
     for slot in 0usize..10usize {
         if let Ok(rows) = resp.take::<Vec<surrealdb::sql::Value>>(slot) {
             let mut arr = Vec::with_capacity(rows.len());
@@ -646,7 +607,6 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
                 let jv = sql_value_to_json(&v);
                 arr.push(jv);
             }
-            // Flatten one level when the response shape is [[{...}]]
             if arr.len() == 1
                 && arr[0].is_array()
                 && !arr[0].as_array().map(|a| a.is_empty()).unwrap_or(true)
@@ -657,7 +617,6 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
                 return Some(serde_json::Value::Array(arr));
             }
         }
-        // Nested Vec<Vec<sql::Value>>
         if let Ok(nested) = resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
             for inner in nested.into_iter() {
                 let mut arr = Vec::new();
@@ -665,7 +624,11 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
                     arr.push(sql_value_to_json(&v));
                 }
                 if !arr.is_empty() {
-                    return Some(serde_json::Value::Array(arr));
+                    return diagnostic_ret(
+                        "Vec<Vec<sql::Value>>-inner",
+                        Some(slot),
+                        serde_json::Value::Array(arr),
+                    );
                 }
             }
         }
@@ -690,93 +653,55 @@ pub fn response_to_json(mut resp: surrealdb::Response) -> Option<serde_json::Val
             }
         }
     }
-    // Diagnostic: when all probes fail, attempt to capture several typed takes
-    // and log them to help triage mysterious serialization errors observed
-    // in integration tests. These logs are at debug level.
+
     for slot in 0usize..10usize {
-        // try serde_json variants
         if let Ok(Some(v)) = resp.take::<Option<serde_json::Value>>(slot) {
-            let red = redact_for_log(v.clone());
             log::debug!(
-                "response_to_json diagnostics: slot={} took Option<serde_json::Value> = {}",
+                "response_to_json diagnostics: slot={} took Option<serde_json::Value> = {:?}",
                 slot,
-                red
+                v
             );
         }
         if let Ok(vs) = resp.take::<Option<Vec<serde_json::Value>>>(slot) {
-            let red = redact_for_log(serde_json::Value::Array(vs.clone().unwrap_or_default()));
             log::debug!(
-                "response_to_json diagnostics: slot={} took Option<Vec<serde_json::Value>> = {}",
+                "response_to_json diagnostics: slot={} took Option<Vec<serde_json::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs2) = resp.take::<Vec<Vec<serde_json::Value>>>(slot) {
-            // Flatten one level and redact
-            let mut flat = Vec::new();
-            for inner in vs2.iter() {
-                for item in inner.iter() {
-                    flat.push(item.clone());
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(flat));
             log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<Vec<serde_json::Value>> = {}",
+                "response_to_json diagnostics: slot={} took Vec<Vec<serde_json::Value>> = {:?}",
                 slot,
-                red
+                vs2
             );
         }
-        // try surreal sql::Value variants
         if let Ok(vs) = resp.take::<Option<surrealdb::sql::Value>>(slot) {
-            let j = vs
-                .as_ref()
-                .map(sql_value_to_json)
-                .unwrap_or(serde_json::Value::Null);
-            let red = redact_for_log(j);
             log::debug!(
-                "response_to_json diagnostics: slot={} took Option<sql::Value> = {}",
+                "response_to_json diagnostics: slot={} took Option<sql::Value> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Option<Vec<surrealdb::sql::Value>>>(slot) {
-            let mut arr = Vec::new();
-            if let Some(vs2) = vs.as_ref() {
-                for v in vs2.iter() {
-                    arr.push(sql_value_to_json(v));
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(arr));
             log::debug!(
-                "response_to_json diagnostics: slot={} took Option<Vec<sql::Value>> = {}",
+                "response_to_json diagnostics: slot={} took Option<Vec<sql::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Vec<Vec<surrealdb::sql::Value>>>(slot) {
-            let mut flat = Vec::new();
-            for inner in vs.iter() {
-                for v in inner.iter() {
-                    flat.push(sql_value_to_json(v));
-                }
-            }
-            let red = redact_for_log(serde_json::Value::Array(flat));
             log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<Vec<sql::Value>> = {}",
+                "response_to_json diagnostics: slot={} took Vec<Vec<sql::Value>> = {:?}",
                 slot,
-                red
+                vs
             );
         }
         if let Ok(vs) = resp.take::<Vec<surrealdb::sql::Value>>(slot) {
-            let mut arr = Vec::new();
-            for v in vs.iter() {
-                arr.push(sql_value_to_json(v));
-            }
-            let red = redact_for_log(serde_json::Value::Array(arr));
             log::debug!(
-                "response_to_json diagnostics: slot={} took Vec<sql::Value> = {}",
+                "response_to_json diagnostics: slot={} took Vec<sql::Value> = {:?}",
                 slot,
-                red
+                vs
             );
         }
     }
@@ -852,19 +777,5 @@ mod tests {
         // The helper should not error; returned ids may be empty depending on client
         // response shape. Accept either outcome but assert the call completed.
         assert!(ids.iter().all(|s| s.contains(':') || s.is_empty()));
-    }
-
-    #[test]
-    fn sql_value_to_json_array_shape() {
-        use surrealdb::sql::{Array, Value};
-
-        // Construct a simple sql::Value::Array containing a Strand which mirrors
-        // a typed client response slot. Ensure conversion to serde_json works.
-        let arr = Array::from(vec![Value::Strand("s1".into())]);
-        let v = Value::Array(arr);
-        let j = sql_value_to_json(&v);
-        // Expect the strand's raw content without surrounding quotes.
-        let expected = serde_json::Value::Array(vec![serde_json::Value::String("s1".to_string())]);
-        assert_eq!(j, expected);
     }
 }

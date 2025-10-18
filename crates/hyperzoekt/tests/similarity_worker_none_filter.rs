@@ -159,20 +159,35 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
     assert!(!stable_ids.contains(&"none_filter_3".to_string()));
     assert!(!stable_ids.contains(&"none_filter_4".to_string()));
 
-    // Test 4: Same-repo similarity query with != NONE
+    // Test 4: Same-repo similarity query with != NONE — fetch embedding first to avoid LET+SELECT
+    let source_emb_opt =
+        hyperzoekt::db::helpers::get_embedding_for_entity(&conn, "none_filter_1").await?;
+    let source_emb = source_emb_opt.expect("source embedding present");
+    let emb_literal = source_emb
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
     let sim_query = format!(
-        r#"LET $source_embedding = (SELECT embedding FROM entity_snapshot WHERE stable_id = "none_filter_1" LIMIT 1)[0].embedding;
-           SELECT id, stable_id, sourcecontrol_commit, vector::similarity::cosine(embedding, $source_embedding) AS score FROM entity_snapshot WHERE embedding_len > 0 AND repo_name = "{}" AND sourcecontrol_commit = "{}" AND stable_id != "none_filter_1" AND source_content != NONE ORDER BY score DESC LIMIT 25"#,
-        repo_name, commit_ref
+        r#"SELECT id, stable_id, sourcecontrol_commit, vector::similarity::cosine(embedding, [{}]) AS score FROM entity_snapshot WHERE embedding_len > 0 AND repo_name = "{}" AND sourcecontrol_commit = "{}" AND stable_id != "none_filter_1" AND source_content != NONE ORDER BY score DESC LIMIT 25"#,
+        emb_literal, repo_name, commit_ref
     );
 
     let mut resp = conn.query(&sim_query).await?;
-    let _: Option<serde_json::Value> = resp.take(0)?; // LET binding
-    let rows_opt: Option<Vec<serde_json::Value>> = resp.take(1)?; // SELECT
+    // Use the canonical response_to_json helper to normalize remote and
+    // embedded SurrealDB client response shapes into a serde_json::Value.
+    // This avoids fragile typed takes and keeps parsing logic centralized.
+    // Deserialize into typed rows using the Surreal client shapes (Thing id)
+    #[derive(serde::Deserialize, Debug)]
+    struct SimilarRow {
+        id: surrealdb::sql::Thing,
+        stable_id: String,
+        sourcecontrol_commit: String,
+        score: f32,
+    }
 
-    assert!(rows_opt.is_some(), "Similarity query should return results");
-
-    let rows = rows_opt.unwrap();
+    let rows: Vec<SimilarRow> = resp.take(0)?;
     assert_eq!(
         rows.len(),
         1,
@@ -180,14 +195,10 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
     );
 
     let result = &rows[0];
-    assert_eq!(
-        result.get("stable_id").and_then(|v| v.as_str()),
-        Some("none_filter_2")
-    );
-    assert!(
-        result.get("score").is_some(),
-        "Should have similarity score"
-    );
+    // Access typed fields directly on the deserialized row
+    assert_eq!(result.stable_id, "none_filter_2");
+    // Score should be a finite f32 value (not NaN/inf)
+    assert!(result.score.is_finite(), "Should have similarity score");
 
     // Test 5: External-repo query pattern
     conn.query(
@@ -202,30 +213,33 @@ async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::
     )
     .await?;
 
+    let external_emb_literal = source_emb
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let external_query = format!(
-        r#"LET $source_embedding = (SELECT embedding FROM entity_snapshot WHERE stable_id = "none_filter_1" LIMIT 1)[0].embedding;
-           SELECT id, stable_id, repo_name, sourcecontrol_commit, vector::similarity::cosine(embedding, $source_embedding) AS score FROM entity_snapshot WHERE embedding_len > 0 AND repo_name != "{}" AND source_content != NONE ORDER BY score DESC LIMIT 50"#,
-        repo_name
+        r#"SELECT id, stable_id, repo_name, sourcecontrol_commit, vector::similarity::cosine(embedding, [{}]) AS score FROM entity_snapshot WHERE embedding_len > 0 AND repo_name != "{}" AND source_content != NONE ORDER BY score DESC LIMIT 50"#,
+        external_emb_literal, repo_name
     );
 
     let mut resp = conn.query(&external_query).await?;
-    let _: Option<serde_json::Value> = resp.take(0)?; // LET binding
-    let rows_opt: Option<Vec<serde_json::Value>> = resp.take(1)?; // SELECT
+    #[derive(serde::Deserialize, Debug)]
+    struct ExternalRow {
+        id: surrealdb::sql::Thing,
+        stable_id: String,
+        repo_name: String,
+        sourcecontrol_commit: String,
+        score: f32,
+    }
 
-    assert!(
-        rows_opt.is_some(),
-        "External-repo query should return results"
-    );
-
-    let rows = rows_opt.unwrap();
+    let rows: Vec<ExternalRow> = resp.take(0)?;
     assert!(
         rows.len() >= 1,
         "Should find at least external_none_test from other_repo"
     );
 
-    let external_found = rows
-        .iter()
-        .any(|r| r.get("stable_id").and_then(|v| v.as_str()) == Some("external_none_test"));
+    let external_found = rows.iter().any(|r| r.stable_id == "external_none_test");
     assert!(
         external_found,
         "Should find external_none_test from other_repo"

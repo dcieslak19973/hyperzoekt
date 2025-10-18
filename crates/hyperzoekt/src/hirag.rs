@@ -12,8 +12,7 @@
 // existing `db::SurrealConnection` abstraction so it integrates with the repo.
 
 use anyhow::Result;
-use rand::seq::SliceRandom;
-use rand::{rngs::StdRng, SeedableRng};
+// Deterministic selection used for initial centers to avoid pulling RNG traits
 use serde::{Deserialize, Serialize};
 
 use crate::db::{helpers::normalize_git_url, SurrealConnection};
@@ -208,17 +207,16 @@ pub async fn persist_cluster_relations(
 /// Simple in-memory KMeans for small clusters. This is intentionally tiny and
 /// uses cosine similarity as a distance proxy by normalizing vectors. For large
 /// datasets you should replace this with a scalable implementation.
-fn kmeans_assign(embeddings: &[(String, Vec<f32>)], k: usize, seed: u64) -> Vec<usize> {
+fn kmeans_assign(embeddings: &[(String, Vec<f32>)], k: usize, _seed: u64) -> Vec<usize> {
     if embeddings.is_empty() || k == 0 {
         return vec![];
     }
-    let mut rng = StdRng::seed_from_u64(seed);
     let dim = embeddings[0].1.len();
-    // pick k random initial centers (by index)
-    let mut centers: Vec<Vec<f32>> = embeddings
-        .choose_multiple(&mut rng, k)
-        .map(|(_, v)| v.clone())
-        .collect();
+    // pick first k embeddings as initial centers deterministically
+    let mut centers: Vec<Vec<f32>> = Vec::new();
+    for (_id, v) in embeddings.iter().take(k.min(embeddings.len())) {
+        centers.push(v.clone());
+    }
 
     // normalize centers
     for c in centers.iter_mut() {
