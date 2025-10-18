@@ -14,13 +14,21 @@
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use clap::Parser;
+use deadpool_redis::Pool;
 use hyperzoekt::event_consumer;
 use log::{error, info, LevelFilter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::signal;
-use zoekt_distributed::redis_adapter::{create_redis_pool, DynRedis, RealRedis};
+use zoekt_distributed::redis_adapter::{DynRedis, RealRedis};
+
+/// Shared application state
+#[derive(Clone)]
+struct AppState {
+    metrics: Arc<IndexerMetrics>,
+    redis_pool: Option<Arc<Pool>>,
+}
 
 /// Metrics for the indexer
 #[derive(Debug)]
@@ -55,11 +63,13 @@ struct IndexerMetricsSnapshot {
     last_event_unix: u64,
 }
 
-async fn health_handler() -> impl IntoResponse {
-    // Try to create a redis pool and ping it
-    match create_redis_pool() {
-        Some(p) => {
-            let r = RealRedis { pool: p };
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Use the shared Redis pool instead of creating a new one
+    match &state.redis_pool {
+        Some(pool) => {
+            let r = RealRedis {
+                pool: (**pool).clone(),
+            };
             match r.ping().await {
                 Ok(_) => (axum::http::StatusCode::OK, "OK".to_string()),
                 Err(e) => (
@@ -75,8 +85,8 @@ async fn health_handler() -> impl IntoResponse {
     }
 }
 
-async fn metrics_handler(State(metrics): State<Arc<IndexerMetrics>>) -> impl IntoResponse {
-    let s = metrics.snapshot();
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let s = state.metrics.snapshot();
     let body = format!("# HELP hyperzoekt_indexer_events_processed_total Total events processed\n# TYPE hyperzoekt_indexer_events_processed_total counter\nhyperzoekt_indexer_events_processed_total {}\n# HELP hyperzoekt_indexer_events_failed_total Events that failed processing\n# TYPE hyperzoekt_indexer_events_failed_total counter\nhyperzoekt_indexer_events_failed_total {}\n# HELP hyperzoekt_indexer_last_event_unix_seconds Last event time (unix seconds)\n# TYPE hyperzoekt_indexer_last_event_unix_seconds gauge\nhyperzoekt_indexer_last_event_unix_seconds {}\n", s.events_processed, s.events_failed, s.last_event_unix);
     (
         axum::http::StatusCode::OK,
@@ -208,12 +218,25 @@ async fn main() -> Result<(), anyhow::Error> {
     // Initialize metrics
     let metrics = Arc::new(IndexerMetrics::new());
 
+    // Create Redis pool once at startup
+    let redis_pool = zoekt_distributed::redis_adapter::create_redis_pool().map(Arc::new);
+    if redis_pool.is_some() {
+        info!("Redis pool created successfully");
+    } else {
+        info!("Redis pool not available");
+    }
+
+    // Create shared app state
+    let app_state = AppState {
+        metrics: Arc::clone(&metrics),
+        redis_pool,
+    };
+
     // Start HTTP server for health/metrics
-    let metrics_for_server = Arc::clone(&metrics);
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(metrics_for_server);
+        .with_state(app_state);
 
     let addr = format!("{}:{}", args.host, args.port)
         .parse::<std::net::SocketAddr>()
