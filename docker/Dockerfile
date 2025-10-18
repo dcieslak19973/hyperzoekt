@@ -82,6 +82,7 @@ COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
 COPY --from=builder /app/target/release/hyperzoekt-mcp /app/
 COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 COPY --from=builder /app/target/release/hyperzoekt-sbom-worker /app/
+COPY --from=builder /app/target/release/hyperzoekt-hirag-worker /app/
 
 # Copy configuration and static files
 COPY --from=builder /app/crates/zoekt-distributed/config.toml /app/
