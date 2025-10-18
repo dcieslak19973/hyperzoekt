@@ -1,4 +1,3 @@
-```dockercompose
 # Port mappings use environment variable substitution so a single source
 # of truth can live in `docker/.env`. Example: REDIS_PORT=6379
 services:
