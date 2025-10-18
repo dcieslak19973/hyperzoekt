@@ -32,6 +32,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use hyperzoekt::db::connection::SurrealConnection;
 use hyperzoekt::repo_index::indexer::payload::EntityPayload;
+use hyperzoekt::similarity;
 use hyperzoekt::utils;
 use hyperzoekt::utils::*;
 use surrealdb::Value as DbValue;
@@ -1391,112 +1392,115 @@ async fn search_api_handler(
         .unwrap_or(0);
 
     // If repo filters resolved to a single snapshot, use that snapshot id to scope similarity.
-    // let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
-    //     // take the single map entry's snapshot option if present
-    //     let mut iter = resolved_refs.values();
-    //     if let Some((_, snap_opt)) = iter.next() {
-    //         snap_opt.as_deref()
-    //     } else {
-    //         None
-    //     }
-    // } else {
-    //     None
-    // };
+    let snapshot_id_opt: Option<&str> = if resolved_refs.len() == 1 {
+        // take the single map entry's snapshot option if present
+        let mut iter = resolved_refs.values();
+        if let Some((_, snap_opt)) = iter.next() {
+            snap_opt.as_deref()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // Temporarily skip similarity search to test text search fallback
-    // match similarity::similarity_with_conn_multi(
-    //     &state.db.db,
-    //     &query.q,
-    //     repo_slice_opt,
-    //     snapshot_id_opt,
-    // )
-    // .await
-    // {
-    //     Ok(mut results) => {
-    //         // Enrich links
-    //         for entity in &mut results {
-    //             if entity.rank.is_none() {
-    //                 entity.rank = Some(0.0);
-    //             }
-    //             let raw_file_hint = file_hint_for_entity(entity);
-    //             let file_hint = clean_file_path(&raw_file_hint);
-    //             if entity.source_url.is_none() {
-    //                 if let Some(url) =
-    //                     construct_source_url(&state, &entity.repo_name, &file_hint, None).await
-    //                 {
-    //                     entity.source_url = Some(url.clone());
-    //                     if entity.source_display.is_none() {
-    //                         entity.source_display =
-    //                             Some(short_display_from_source_url(&url, &entity.repo_name));
-    //                     }
-    //                 }
-    //             } else if entity.source_display.is_none() {
-    //                 if let Some(ref url) = entity.source_url {
-    //                     entity.source_display =
-    //                         Some(short_display_from_source_url(url, &entity.repo_name));
-    //                 }
-    //             }
-    //         }
-    //         let elapsed_ms = started.elapsed().as_millis();
-    //         // Support cursor/limit pagination: request a larger set and slice
-    //         let total = results.len();
-    //         let end = (start + limit).min(total);
-    //         let next_cursor = if end < total {
-    //             Some(end.to_string())
-    //         } else {
-    //             None
-    //         };
-    //         let page_results = if start < total {
-    //             results[start..end].to_vec()
-    //         } else {
-    //             vec![]
-    //         };
-    //         // Serialize and enrich each returned entity JSON with resolved ref
-    //         let mut results_value =
-    //             serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
-    //         if let serde_json::Value::Array(ref mut arr) = results_value {
-    //             for v in arr.iter_mut() {
-    //                 if let serde_json::Value::Object(ref mut m) = v {
-    //                     if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
-    //                         if let Some((commit, snap)) = resolved_refs.get(repo_name) {
-    //                             m.insert(
-    //                                 "resolved_commit".to_string(),
-    //                                 serde_json::Value::String(commit.clone()),
-    //                             );
-    //                             if let Some(sid) = snap {
-    //                                 m.insert(
-    //                                     "resolved_snapshot".to_string(),
-    //                                     serde_json::Value::String(sid.clone()),
-    //                                 );
-    //                             } else {
-    //                                 m.insert(
-    //                                     "resolved_snapshot".to_string(),
-    //                                     serde_json::Value::Null,
-    //                                 );
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //         let mut obj = serde_json::Map::new();
-    //         obj.insert("results".to_string(), results_value);
-    //         obj.insert(
-    //             "elapsed_ms".to_string(),
-    //             serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
-    //         );
-    //         if let Some(nc) = next_cursor {
-    //             obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
-    //         }
-    //         return Ok(Json(serde_json::Value::Object(obj)));
-    //     }
-    //     Err(e) => {
-    //         log::warn!(
-    //             "similarity_search failed; falling back to text search: {}",
-    //             e
-    //         );
-    //     }
-    // }
+    // Convert to Option<&[String]> for the similarity function
+    let repo_slice_opt: Option<&[String]> = cleaned_repo_vec.as_deref().or(repo_vec_opt.as_deref());
+
+    // Attempt similarity search first; fallback to text search if TEI or embeddings unavailable
+    match similarity::similarity_with_conn_multi(
+        state.db.connection(),
+        &query.q,
+        repo_slice_opt,
+        snapshot_id_opt,
+    )
+    .await
+    {
+        Ok(mut results) => {
+            // Enrich links
+            for entity in &mut results {
+                if entity.rank.is_none() {
+                    entity.rank = Some(0.0);
+                }
+                let raw_file_hint = file_hint_for_entity(entity);
+                let file_hint = clean_file_path(&raw_file_hint);
+                if entity.source_url.is_none() {
+                    if let Some(url) =
+                        construct_source_url(&state, &entity.repo_name, &file_hint, None).await
+                    {
+                        entity.source_url = Some(url.clone());
+                        if entity.source_display.is_none() {
+                            entity.source_display =
+                                Some(short_display_from_source_url(&url, &entity.repo_name));
+                        }
+                    }
+                } else if entity.source_display.is_none() {
+                    if let Some(ref url) = entity.source_url {
+                        entity.source_display =
+                            Some(short_display_from_source_url(url, &entity.repo_name));
+                    }
+                }
+            }
+            let elapsed_ms = started.elapsed().as_millis();
+            // Support cursor/limit pagination: request a larger set and slice
+            let total = results.len();
+            let end = (start + limit).min(total);
+            let next_cursor = if end < total {
+                Some(end.to_string())
+            } else {
+                None
+            };
+            let page_results = if start < total {
+                results[start..end].to_vec()
+            } else {
+                vec![]
+            };
+            // Serialize and enrich each returned entity JSON with resolved ref
+            let mut results_value =
+                serde_json::to_value(page_results).unwrap_or(serde_json::Value::Array(vec![]));
+            if let serde_json::Value::Array(ref mut arr) = results_value {
+                for v in arr.iter_mut() {
+                    if let serde_json::Value::Object(ref mut m) = v {
+                        if let Some(serde_json::Value::String(repo_name)) = m.get("repo_name") {
+                            if let Some((commit, snap)) = resolved_refs.get(repo_name) {
+                                m.insert(
+                                    "resolved_commit".to_string(),
+                                    serde_json::Value::String(commit.clone()),
+                                );
+                                if let Some(sid) = snap {
+                                    m.insert(
+                                        "resolved_snapshot".to_string(),
+                                        serde_json::Value::String(sid.clone()),
+                                    );
+                                } else {
+                                    m.insert(
+                                        "resolved_snapshot".to_string(),
+                                        serde_json::Value::Null,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert("results".to_string(), results_value);
+            obj.insert(
+                "elapsed_ms".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)),
+            );
+            if let Some(nc) = next_cursor {
+                obj.insert("next_cursor".to_string(), serde_json::Value::String(nc));
+            }
+            return Ok(Json(serde_json::Value::Object(obj)));
+        }
+        Err(e) => {
+            log::warn!(
+                "similarity_search failed; falling back to text search: {}",
+                e
+            );
+        }
+    }
 
     // Fallback: legacy text search. Prefer multi-repo-aware search if provided.
     // If the request resolved exactly one repo -> snapshot mapping, prefer the
