@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use surrealdb::sql::Value as SqlValue;
 use surrealdb::Response as SurrealResponse;
 
+#[allow(dead_code)]
 fn sql_value_to_json(v: &SqlValue) -> JsonValue {
     use surrealdb::sql::Value;
     match v {
