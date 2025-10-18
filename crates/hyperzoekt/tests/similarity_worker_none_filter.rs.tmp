@@ -1,0 +1,85 @@
+// Minimal test that avoids LET+SELECT multi-slot responses by fetching
+// embeddings in a separate query and inlining them in similarity SELECTs.
+use hyperzoekt::db::connection::connect as hz_connect;
+
+#[tokio::test]
+#[ignore = "Requires manual SurrealDB setup on port 8000"]
+async fn test_similarity_worker_none_filter() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = hz_connect(
+        &Some("http://127.0.0.1:8000".to_string()),
+        &Some("root".to_string()),
+        &Some("root".to_string()),
+        "test_ns",
+        "test_db",
+    )
+    .await?;
+
+    let repo_name = "test_none_filter";
+    let commit_ref = "commits:abc123def456789";
+
+    // Clean up previous data
+    conn.query(&format!("DELETE entity_snapshot WHERE repo_name = '{}' ;", repo_name))
+        .await?;
+    conn.query("DELETE entity_snapshot WHERE repo_name = 'other_repo';")
+        .await?;
+
+    // Create fixtures
+    conn.query(&format!(
+        "CREATE entity_snapshot:none_filter_1 CONTENT {{ stable_id: \"none_filter_1\", repo_name: \"{}\", sourcecontrol_commit: \"{}\", embedding_len: 3, embedding: [0.1,0.2,0.3], source_content: \"ok\" }};",
+        repo_name, commit_ref
+    ))
+    .await?;
+
+    conn.query(&format!(
+        "CREATE entity_snapshot:none_filter_2 CONTENT {{ stable_id: \"none_filter_2\", repo_name: \"{}\", sourcecontrol_commit: \"{}\", embedding_len: 3, embedding: [0.2,0.3,0.4], source_content: \"ok\" }};",
+        repo_name, commit_ref
+    ))
+    .await?;
+
+    conn.query(&format!(
+        "CREATE entity_snapshot:none_filter_3 CONTENT {{ stable_id: \"none_filter_3\", repo_name: \"{}\", sourcecontrol_commit: \"{}\", embedding_len: 3, embedding: [0.3,0.4,0.5], source_content: NONE }};",
+        repo_name, commit_ref
+    ))
+    .await?;
+
+    // Simple count query to verify fixtures
+    let count_q = format!(
+        r#"SELECT COUNT() FROM entity_snapshot WHERE repo_name = "{}" AND sourcecontrol_commit = "{}" AND source_content != NONE GROUP ALL"#,
+        repo_name, commit_ref
+    );
+
+    let resp = conn.query(&count_q).await?;
+    let binding = hyperzoekt::db::helpers::response_to_json(resp).expect("Count rows");
+    let rows = binding.as_array().expect("Count result array");
+    let cnt = rows[0].get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+    assert_eq!(cnt, 2, "Expect two non-NONE snapshots");
+
+    // Fetch embedding for none_filter_1 and inline into similarity query
+    let emb_q = r#"SELECT embedding FROM entity_snapshot WHERE stable_id = "none_filter_1" LIMIT 1"#;
+    let resp = conn.query(emb_q).await?;
+    let emb_binding = hyperzoekt::db::helpers::response_to_json(resp).expect("embedding rows");
+    let emb_array = emb_binding
+        .as_array()
+        .and_then(|a| a.get(0))
+        .and_then(|r| r.get("embedding"))
+        .and_then(|e| e.as_array())
+        .expect("embedding array");
+    let emb_vals: Vec<String> = emb_array.iter().map(|n| n.as_f64().unwrap_or(0.0).to_string()).collect();
+    let emb_literal = emb_vals.join(",");
+
+    let sim_q = format!(
+        r#"SELECT stable_id, vector::similarity::cosine(embedding, [{}]) AS score FROM entity_snapshot WHERE repo_name = "{}" AND stable_id != "none_filter_1" AND source_content != NONE ORDER BY score DESC LIMIT 10"#,
+        emb_literal, repo_name
+    );
+
+    let resp = conn.query(&sim_q).await?;
+    let sim_binding = hyperzoekt::db::helpers::response_to_json(resp).expect("sim rows");
+    let sim_arr = sim_binding.as_array().expect("sim array");
+    assert!(!sim_arr.is_empty(), "Expected similarity results");
+
+    // Cleanup
+    conn.query(&format!("DELETE entity_snapshot WHERE repo_name = '{}' ;", repo_name)).await?;
+    conn.query("DELETE entity_snapshot WHERE repo_name = 'other_repo';").await?;
+
+    Ok(())
+}
