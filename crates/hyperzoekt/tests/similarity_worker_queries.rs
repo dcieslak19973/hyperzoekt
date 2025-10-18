@@ -81,7 +81,7 @@ async fn test_same_repo_similarity_query_syntax() -> Result<()> {
     );
 
     // DEBUG: fetch the source embedding directly to see what's stored
-    let mut emb_resp = conn
+    let emb_resp = conn
         .query_with_binds(
             "SELECT VALUE embedding FROM entity_snapshot WHERE stable_id = $s LIMIT 1",
             vec![("s", serde_json::json!("test1"))],
