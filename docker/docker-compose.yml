@@ -180,7 +180,6 @@ services:
     ports:
       - "${HYPERZOEKT_INDEXER_PORT}:${HYPERZOEKT_INDEXER_PORT}"
     environment:
-      # Enqueue embedding jobs after indexing (default ON for local dev)
       - HZ_EMBED_BATCH_SIZE=8
       - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
       # Default limits for embeddings (overridable via environment)
@@ -189,8 +188,11 @@ services:
       # LLM endpoint (OpenAI-compatible). If unset, defaults to the public OpenAI API.
       # Override with HZ_LLM_URL to point to a local or private OpenAI-compatible endpoint.
       - HZ_LLM_URL=${HZ_LLM_URL:-https://api.openai.com}
+      # Debug toggles: enable to log SQL statements and raw DB responses
       - HZ_DEBUG_SQL=0
       - HZ_DEBUG_SQL_RESP=0
+      # When enabled, SurrealDB client will include verbose payloads in logs
+      - SURREAL_DB_VERBOSE_PAYLOADS=0
       - HZ_ENABLE_SBOM_JOBS=1
       - HZ_INDEXER_PORT=${HYPERZOEKT_INDEXER_PORT}
       # Path where the writer will append embedding DLQ records (mount host ./docker/embed-dlq to /tmp to persist)
@@ -227,6 +229,11 @@ services:
       - "${HYPERZOEKT_WEBUI_PORT}:${HYPERZOEKT_WEBUI_PORT}"
     environment:
       - HYPERZOEKT_LOG_LEVEL=debug
+      # Enable SQL and response debugging in the WebUI when troubleshooting
+      - HZ_DEBUG_SQL=1
+      - HZ_DEBUG_SQL_RESP=1
+      # Also enable SurrealDB client verbose payloads for WebUI diagnostics
+      - SURREAL_DB_VERBOSE_PAYLOADS=1
       - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
       # Default embedding limits (overridable)
       - HZ_EMBED_MAX_BYTES=${HZ_EMBED_MAX_BYTES:-10000}
@@ -308,6 +315,8 @@ services:
       # Debugging toggles - enable to log SQL and verify DB updates
       - HZ_EMBED_DEBUG_SQL=1
       - HZ_EMBED_DEBUG_DB=1
+      # Allow toggling of SurrealDB verbose payloads for similarity worker
+      - SURREAL_DB_VERBOSE_PAYLOADS=0
       - HZ_EMBED_DLQ_PATH=${HZ_EMBED_DLQ_PATH:-/tmp/hz_embed_dlq.log}
       # Enable SurrealDB client debug output and verbose payload logs for troubleshooting
       - REDIS_URL=redis://redis:${REDIS_PORT}

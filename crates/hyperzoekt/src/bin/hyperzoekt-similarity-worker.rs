@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(conn) => {
-                let probe_sql = "SELECT vector::similarity::cosine([1.0,0.0,0.0], [1.0,0.0,0.0]) AS score LIMIT 1";
+                let probe_sql = "RETURN vector::similarity::cosine([1.0,0.0,0.0], [1.0,0.0,0.0]);";
                 match conn.query(probe_sql).await {
                     Ok(_) => {
                         info!("SurrealDB vector functions available (probe passed)");

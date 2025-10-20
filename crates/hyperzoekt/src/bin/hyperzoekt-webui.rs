@@ -74,12 +74,13 @@ const BASE_TEMPLATE: &str = include_str!("../../static/webui/base.html");
 const INDEX_TEMPLATE: &str = include_str!("../../static/webui/index.html");
 const REPO_TEMPLATE: &str = include_str!("../../static/webui/repo.html");
 const ENTITY_TEMPLATE: &str = include_str!("../../static/webui/entity.html");
-const ENTITY_FIELDS: &str = "id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 const SEARCH_TEMPLATE: &str = include_str!("../../static/webui/search.html");
 const PAGERANK_TEMPLATE: &str = include_str!("../../static/webui/pagerank.html");
 const DUPES_TEMPLATE: &str = include_str!("../../static/webui/dupes.html");
 const DEPENDENCIES_TEMPLATE: &str = include_str!("../../static/webui/dependencies.html");
 const SBOM_TEMPLATE: &str = include_str!("../../static/webui/sbom.html");
+const HIRAG_TEMPLATE: &str = include_str!("../../static/webui/hirag.html");
+const HIRAG_MINDMAP_TEMPLATE: &str = include_str!("../../static/webui/hirag-mindmap.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -269,6 +270,19 @@ impl Database {
         raw: &str,
     ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         self.queries.resolve_ref_to_snapshot(repo, raw).await
+    }
+
+    /// Forwarding variant that accepts an optional raw ref. When `raw_ref` is
+    /// None the implementation will attempt to resolve the repo's default
+    /// branch or common fallback refs (main/master/trunk) via the `refs` table.
+    pub async fn resolve_ref_to_snapshot_opt(
+        &self,
+        repo: &str,
+        raw_ref: Option<&str>,
+    ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+        self.queries
+            .resolve_ref_to_snapshot_opt(repo, raw_ref)
+            .await
     }
 
     /// Return the repo's configured default branch, falling back to `SOURCE_BRANCH` env or `main`.
@@ -814,6 +828,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("dupes", DUPES_TEMPLATE)?;
     templates.add_template("dependencies", DEPENDENCIES_TEMPLATE)?;
     templates.add_template("sbom", SBOM_TEMPLATE)?;
+    templates.add_template("hirag", HIRAG_TEMPLATE)?;
+    templates.add_template("hirag-mindmap", HIRAG_MINDMAP_TEMPLATE)?;
     // Reuse repo template with dupes section via route-driven render
     log::info!("Templates loaded successfully");
 
@@ -872,6 +888,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/entity/{stable_id}", get(entity_handler))
         .route("/search", get(search_handler))
         .route("/pagerank", get(pagerank_handler))
+        .route("/hirag", get(hirag_page_handler))
+        .route("/hirag-mindmap", get(hirag_mindmap_handler))
+        .route("/api/hirag", get(hirag_api_handler))
+        .route(
+            "/api/hirag/{stable_id}/members",
+            get(hirag_members_api_handler),
+        )
         .nest_service("/static", ServeDir::new("../../static"))
         .layer(cors_layer)
         .with_state(state);
@@ -2111,6 +2134,7 @@ struct PageRankQuery {
     limit: Option<usize>,
 }
 
+#[allow(unused_assignments)]
 async fn pagerank_api_handler(
     State(state): State<AppState>,
     Query(query): Query<PageRankQuery>,
@@ -2120,53 +2144,461 @@ async fn pagerank_api_handler(
     // Respect a limit to avoid fetching extremely large repos. Default to 500.
     let limit = query.limit.unwrap_or(500usize);
 
-    // Fetch entities with a limit via a new lightweight query path to avoid pulling everything.
-    let entity_fields = ENTITY_FIELDS;
-    let mut response = match state.db.connection().as_ref() {
-        SurrealConnection::Local(db_conn) => {
-            db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
-                    entity_fields
-                ))
-                .bind(("repo", query.repo.clone()))
-                .bind(("limit", limit as i64))
+    // Attempt to resolve the repository's default branch to a snapshot and
+    // prefer querying PageRank values scoped to that snapshot/commit. If
+    // resolution fails or yields zero rows, fall back to the repo-wide query.
+    // Cast `id` to string so SurrealDB Thing values deserialize into Rust `String`.
+    // Some SurrealDB clients may return `id` as a Thing object which fails
+    // serde deserialization when the struct expects a String. Using
+    // `type::string(id) AS id` ensures we receive a simple string value.
+    let entity_fields = "type::string(id) AS id, language, kind, name, page_rank_value AS rank, repo_name, signature, stable_id, file, parent, start_line, end_line, doc, imports, unresolved_imports, methods, source_url, source_display, calls, source_content";
+
+    // Helper to execute a prepared SQL with optional bindings.
+    // Bind both the selected repo and a cleaned repo name variant so queries
+    // still match when DB rows store e.g. "owner/repo" or a UUID-suffixed name.
+    async fn run_query_with_bindings(
+        conn: &SurrealConnection,
+        sql: &str,
+        repo_candidates: serde_json::Value,
+        limit: i64,
+        snapshot: Option<&str>,
+    ) -> Result<surrealdb::Response, surrealdb::Error> {
+        // Optionally log SQL and binds for troubleshooting when HZ_DEBUG_SQL=1
+        let debug_sql = std::env::var("HZ_DEBUG_SQL")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if debug_sql {
+            log::debug!("pagerank SQL: {}", sql);
+            log::debug!(
+                "pagerank SQL binds: repos={:?}, limit={}",
+                repo_candidates,
+                limit
+            );
+            if let Some(s) = snapshot {
+                log::debug!("pagerank snapshot: {}", s);
+            }
+        }
+        match conn {
+            SurrealConnection::Local(db_conn) => {
+                let mut q = db_conn
+                    .query(sql)
+                    .bind(("repos", repo_candidates.clone()))
+                    .bind(("limit", limit));
+                if let Some(s) = snapshot {
+                    q = q.bind(("snapshot", s.to_string()));
+                }
+                q.await
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut q = db_conn
+                    .query(sql)
+                    .bind(("repos", repo_candidates.clone()))
+                    .bind(("limit", limit));
+                if let Some(s) = snapshot {
+                    q = q.bind(("snapshot", s.to_string()));
+                }
+                q.await
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut q = db_conn
+                    .query(sql)
+                    .bind(("repos", repo_candidates.clone()))
+                    .bind(("limit", limit));
+                if let Some(s) = snapshot {
+                    q = q.bind(("snapshot", s.to_string()));
+                }
+                q.await
+            }
+        }
+    }
+
+    // First, try to resolve default branch -> snapshot. If that doesn't
+    // yield a snapshot_id that contains page_rank rows, inspect the
+    // entity_snapshot table for the repo and pick the snapshot_id with the
+    // most page_rank_value rows as the default snapshot.
+    let mut response: Option<Result<surrealdb::Response, surrealdb::Error>> = None;
+    let mut tried_snapshot = false;
+    // Also prepare a cleaned repo name variant to use in DB queries. This mirrors
+    // `remove_uuid_suffix` usage elsewhere to tolerate names like "repo-<uuid>".
+    let clean_repo = remove_uuid_suffix(&query.repo);
+    // Prepare repo candidates array for IN-style queries so DB rows that
+    // store either the raw name or the cleaned variant match deterministically.
+    // Also include the Thing-id style "repo:<name>" because some rows use
+    // the SurrealDB Thing id form for repo_name values.
+    let repo_thing = format!("repo:{}", clean_repo);
+    let repo_candidates = serde_json::Value::Array(vec![
+        serde_json::Value::String(query.repo.clone()),
+        serde_json::Value::String(clean_repo.clone()),
+        serde_json::Value::String(repo_thing),
+    ]);
+
+    // Attempt to use the resolved snapshot first (if present). If the
+    // resolved snapshot doesn't contain ranked rows, we'll choose the
+    // snapshot which has the most page_rank_value rows for this repo.
+    response = None;
+    if let Ok(default_branch) = state.db.get_repo_default_branch(&query.repo).await {
+        if !default_branch.is_empty() {
+            match state
+                .db
+                .resolve_ref_to_snapshot(&query.repo, &default_branch)
                 .await
+            {
+                Ok(Some((commit_id, snap_opt))) => {
+                    // Use snapshot id when available, otherwise construct the
+                    // canonical snapshot Thing id used in entity_snapshot rows.
+                    // entity_snapshot.snapshot_id values are stored as
+                    // "snapshot:<repo>:<commit>", so when we only have a
+                    // commit id, prefer the prefixed form to match rows.
+                    let selector = snap_opt.as_deref().unwrap_or(commit_id.as_str());
+                    let mut selector_owned = selector.to_string();
+                    if !selector_owned.starts_with("snapshot:") {
+                        selector_owned = format!("snapshot:{}:{}", clean_repo, selector_owned);
+                    }
+                    // We'll tentatively try the resolved selector (prefixed as
+                    // needed), but if it doesn't return ranked rows we'll pick
+                    // the snapshot with the most page_rank_value rows below.
+                    let snapshot_sql = format!(
+                        "SELECT {} FROM entity_snapshot WHERE repo_name IN $repos AND snapshot_id = $snapshot AND page_rank_value IS NOT NONE ORDER BY page_rank_value DESC LIMIT $limit",
+                        entity_fields
+                    );
+                    tried_snapshot = true;
+                    response = Some(
+                        run_query_with_bindings(
+                            state.db.connection().as_ref(),
+                            &snapshot_sql,
+                            repo_candidates.clone(),
+                            limit as i64,
+                            Some(&selector_owned),
+                        )
+                        .await,
+                    );
+                }
+                Ok(None) => {
+                    // No snapshot resolved for default branch; we'll pick one below.
+                    response = None;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "pagerank_api_handler: resolve_ref_to_snapshot failed for {}: {}",
+                        &query.repo,
+                        e
+                    );
+                    response = None;
+                }
+            }
+        } else {
+            response = None;
+        }
+    } else {
+        response = None;
+    }
+
+    // If snapshot attempt failed or returned empty results, fall back to repo-wide query
+    let mut entities: Vec<EntityPayload> = Vec::new();
+    if let Some(Ok(mut r)) = response {
+        match r.take::<Vec<EntityPayload>>(0) {
+            Ok(vals) => {
+                entities = vals;
+            }
+            Err(e) => {
+                // If decoding into the typed struct fails, attempt to extract
+                // the raw JSON rows for diagnostics and surface a helpful log
+                // so operators can see why the query produced no usable rows.
+                match r.take::<Vec<serde_json::Value>>(0) {
+                    Ok(raw_rows) => {
+                        log::error!(
+                            "pagerank_api_handler: failed to decode EntityPayload rows: {}. raw rows: {:?}",
+                            e,
+                            raw_rows
+                        );
+                    }
+                    Err(e2) => {
+                        log::error!(
+                            "pagerank_api_handler: failed to decode EntityPayload rows: {} and failed to read raw rows: {}",
+                            e,
+                            e2
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if entities.is_empty() {
+        // If the initial snapshot attempt returned zero rows, try to discover
+        // the snapshot_id which actually contains PageRank rows for this repo
+        // and retry with that snapshot. This avoids relying solely on the
+        // process that sets the default snapshot_id which may be broken.
+        if tried_snapshot {
+            // If initial snapshot attempt returned zero rows, try to resolve
+            // the repository default via refs -> commit -> snapshot (without
+            // scanning entity_snapshot counts). This mirrors how other parts
+            // of the codebase resolve refs and avoids expensive/fragile
+            // GROUP BY queries over entity_snapshot.
+            log::info!(
+                "pagerank_api_handler: initial snapshot-scoped PageRank returned 0 rows for repo={}, attempting refs->commit->snapshot fallback",
+                &query.repo
+            );
+
+            match state
+                .db
+                .resolve_ref_to_snapshot_opt(&query.repo, None)
+                .await
+            {
+                Ok(Some((commit_id, snap_opt))) => {
+                    // Prefer explicit snapshot id when available, otherwise
+                    // build the canonical snapshot Thing id from the commit.
+                    let selector = snap_opt.as_deref().unwrap_or(commit_id.as_str());
+                    let mut selector_owned = selector.to_string();
+                    if !selector_owned.starts_with("snapshot:") {
+                        selector_owned = format!("snapshot:{}:{}", clean_repo, selector_owned);
+                    }
+                    log::info!("pagerank_api_handler: resolved fallback snapshot selector='{}' for repo={}", selector_owned, &query.repo);
+                    let sql = format!(
+                        "SELECT {} FROM entity_snapshot WHERE repo_name IN $repos AND snapshot_id = $snapshot AND page_rank_value IS NOT NONE ORDER BY page_rank_value DESC LIMIT $limit",
+                        entity_fields
+                    );
+                    response = Some(
+                        run_query_with_bindings(
+                            state.db.connection().as_ref(),
+                            &sql,
+                            repo_candidates.clone(),
+                            limit as i64,
+                            Some(&selector_owned),
+                        )
+                        .await,
+                    );
+                }
+                Ok(None) => {
+                    log::info!("pagerank_api_handler: refs fallback did not resolve a commit/snapshot for repo={}", &query.repo);
+                    // leave response as None so the repo-wide query runs below
+                }
+                Err(e) => {
+                    log::warn!(
+                        "pagerank_api_handler: resolve_ref_to_snapshot_opt failed for {}: {}",
+                        &query.repo,
+                        e
+                    );
+                }
+            }
+        }
+        let sql = format!(
+            "SELECT {} FROM entity_snapshot WHERE repo_name IN $repos AND page_rank_value IS NOT NONE ORDER BY page_rank_value DESC LIMIT $limit",
+            entity_fields
+        );
+        response = Some(
+            run_query_with_bindings(
+                state.db.connection().as_ref(),
+                &sql,
+                repo_candidates.clone(),
+                limit as i64,
+                None,
+            )
+            .await,
+        );
+        match response {
+            Some(Ok(mut r)) => entities = r.take(0).unwrap_or_default(),
+            Some(Err(e)) => {
+                log::error!(
+                    "pagerank get_entities_for_repo failed for {}: {}",
+                    &query.repo,
+                    e
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            None => {
+                log::error!(
+                    "pagerank get_entities_for_repo: snapshot resolution/path produced no query for {}",
+                    &query.repo
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    // Debug: log counts to help diagnose missing page_rank_value
+    let debug_counts_sql = "SELECT COUNT(*) AS total, COUNT(page_rank_value) AS with_rank FROM entity_snapshot WHERE repo_name IN $repos";
+    match state.db.connection().as_ref() {
+        SurrealConnection::Local(db_conn) => {
+            if let Ok(mut r) = db_conn
+                .query(debug_counts_sql)
+                .bind(("repos", repo_candidates.clone()))
+                .await
+            {
+                if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                    log::debug!("pagerank debug counts: {:?}", rows);
+                }
+            }
         }
         SurrealConnection::RemoteHttp(db_conn) => {
-            db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
-                    entity_fields
-                ))
-                .bind(("repo", query.repo.clone()))
-                .bind(("limit", limit as i64))
+            if let Ok(mut r) = db_conn
+                .query(debug_counts_sql)
+                .bind(("repos", repo_candidates.clone()))
                 .await
+            {
+                if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                    log::debug!("pagerank debug counts: {:?}", rows);
+                }
+            }
         }
         SurrealConnection::RemoteWs(db_conn) => {
-            db_conn
-                .query(format!(
-                    "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY rank DESC LIMIT $limit",
-                    entity_fields
-                ))
-                .bind(("repo", query.repo.clone()))
-                .bind(("limit", limit as i64))
+            if let Ok(mut r) = db_conn
+                .query(debug_counts_sql)
+                .bind(("repos", repo_candidates.clone()))
                 .await
+            {
+                if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                    log::debug!("pagerank debug counts: {:?}", rows);
+                }
+            }
         }
-    };
+    }
 
-    let mut entities: Vec<EntityPayload> = match &mut response {
-        Ok(r) => r.take(0).unwrap_or_default(),
-        Err(e) => {
-            log::error!(
-                "pagerank get_entities_for_repo failed for {}: {}",
-                &query.repo,
-                e
-            );
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    // If nothing matched, and HZ_DEBUG_SQL is enabled, run additional lightweight
+    // diagnostics to help understand how `entity_snapshot` rows are named and
+    // whether page_rank_value exists under different repo_name variants.
+    let debug_sql_enabled = std::env::var("HZ_DEBUG_SQL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if entities.is_empty() && debug_sql_enabled {
+        // If we attempted snapshot-scoped query and it returned zero rows,
+        // report which snapshot_id values actually exist for this repo so
+        // operators can reconcile the resolved snapshot vs stored snapshots.
+        if tried_snapshot {
+            let snapshot_dist_sql = "SELECT snapshot_id, COUNT(*) AS cnt FROM entity_snapshot WHERE repo_name IN $repos GROUP BY snapshot_id ORDER BY cnt DESC LIMIT 20";
+            match state.db.connection().as_ref() {
+                SurrealConnection::Local(db_conn) => {
+                    if let Ok(mut r) = db_conn
+                        .query(snapshot_dist_sql)
+                        .bind(("repos", repo_candidates.clone()))
+                        .await
+                    {
+                        if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                            log::debug!(
+                                "pagerank debug snapshot distribution for {}: {:?}",
+                                &query.repo,
+                                rows
+                            );
+                        }
+                    }
+                }
+                SurrealConnection::RemoteHttp(db_conn) => {
+                    if let Ok(mut r) = db_conn
+                        .query(snapshot_dist_sql)
+                        .bind(("repos", repo_candidates.clone()))
+                        .await
+                    {
+                        if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                            log::debug!(
+                                "pagerank debug snapshot distribution for {}: {:?}",
+                                &query.repo,
+                                rows
+                            );
+                        }
+                    }
+                }
+                SurrealConnection::RemoteWs(db_conn) => {
+                    if let Ok(mut r) = db_conn
+                        .query(snapshot_dist_sql)
+                        .bind(("repos", repo_candidates.clone()))
+                        .await
+                    {
+                        if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                            log::debug!(
+                                "pagerank debug snapshot distribution for {}: {:?}",
+                                &query.repo,
+                                rows
+                            );
+                        }
+                    }
+                }
+            }
         }
-    };
+        // 1) Global counts: total rows and rows with a page_rank_value
+        let global_counts_sql = "SELECT COUNT(*) AS total_rows, COUNT(page_rank_value) AS with_rank FROM entity_snapshot";
+        match state.db.connection().as_ref() {
+            SurrealConnection::Local(db_conn) => {
+                if let Ok(mut r) = db_conn.query(global_counts_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug global counts: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                if let Ok(mut r) = db_conn.query(global_counts_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug global counts: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                if let Ok(mut r) = db_conn.query(global_counts_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug global counts: {:?}", rows);
+                    }
+                }
+            }
+        }
 
+        // 2) Distinct repo_name distribution (top 20)
+        let distinct_sql = "SELECT repo_name, COUNT(*) AS cnt FROM entity_snapshot GROUP BY repo_name ORDER BY cnt DESC LIMIT 20";
+        match state.db.connection().as_ref() {
+            SurrealConnection::Local(db_conn) => {
+                if let Ok(mut r) = db_conn.query(distinct_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug distinct repo_name counts: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                if let Ok(mut r) = db_conn.query(distinct_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug distinct repo_name counts: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                if let Ok(mut r) = db_conn.query(distinct_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug distinct repo_name counts: {:?}", rows);
+                    }
+                }
+            }
+        }
+
+        // 3) Sample rows that have a page_rank_value set
+        let sample_ranked_sql = "SELECT id, repo_name, file, page_rank_value FROM entity_snapshot WHERE page_rank_value IS NOT NONE LIMIT 20";
+        match state.db.connection().as_ref() {
+            SurrealConnection::Local(db_conn) => {
+                if let Ok(mut r) = db_conn.query(sample_ranked_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug sample ranked rows: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                if let Ok(mut r) = db_conn.query(sample_ranked_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug sample ranked rows: {:?}", rows);
+                    }
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                if let Ok(mut r) = db_conn.query(sample_ranked_sql).await {
+                    if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!("pagerank debug sample ranked rows: {:?}", rows);
+                    }
+                }
+            }
+        }
+
+        // No LIKE/contains diagnostic: we avoid expensive and fragile pattern
+        // matching for repo names. Snapshot selection prefers explicit
+        // snapshot_id discovery above and falls back to repo-wide results.
+    }
     log::debug!(
         "pagerank_api_handler: fetched {} entities (limit={}) for repo={}",
         entities.len(),
@@ -2309,6 +2741,149 @@ async fn pagerank_api_handler(
     }
 
     Ok(Json(out))
+}
+
+async fn hirag_page_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    let template = state.templates.get_template("hirag").unwrap();
+    let html = template
+        .render(context! { title => "HiRAG Clusters" })
+        .map_err(|e| {
+            log::error!("Failed to render hirag template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Html(html))
+}
+
+async fn hirag_mindmap_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    let template = state.templates.get_template("hirag-mindmap").unwrap();
+    let html = template
+        .render(context! { title => "HiRAG Mindmap" })
+        .map_err(|e| {
+            log::error!("Failed to render hirag-mindmap template: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Html(html))
+}
+
+// Simple API to return hirag clusters. Returns an object { clusters: [..] }
+async fn hirag_api_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Query a conservative set of fields to keep payload small
+    let fields = "stable_id, label, summary, members, centroid_len, member_repos";
+    let sql = format!("SELECT {} FROM hirag_cluster START AT 0 LIMIT 1000", fields);
+    let mut resp = match state.db.connection().as_ref() {
+        SurrealConnection::Local(db_conn) => db_conn.query(&sql).await,
+        SurrealConnection::RemoteHttp(db_conn) => db_conn.query(&sql).await,
+        SurrealConnection::RemoteWs(db_conn) => db_conn.query(&sql).await,
+    };
+
+    let mut clusters: Vec<serde_json::Value> = Vec::new();
+    match &mut resp {
+        Ok(r) => {
+            if let Ok(vals) = r.take::<Vec<serde_json::Value>>(0) {
+                clusters = vals;
+            }
+        }
+        Err(e) => {
+            log::error!("hirag_api_handler: query failed: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "clusters": clusters })))
+}
+
+async fn hirag_members_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(stable_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Fetch the cluster row
+    let sel = "SELECT stable_id, members FROM hirag_cluster WHERE stable_id = $sid LIMIT 1";
+    let resp = match state.db.connection().as_ref() {
+        SurrealConnection::Local(db_conn) => db_conn
+            .query(sel)
+            .bind(("sid", stable_id.clone()))
+            .await
+            .ok(),
+        SurrealConnection::RemoteHttp(db_conn) => db_conn
+            .query(sel)
+            .bind(("sid", stable_id.clone()))
+            .await
+            .ok(),
+        SurrealConnection::RemoteWs(db_conn) => db_conn
+            .query(sel)
+            .bind(("sid", stable_id.clone()))
+            .await
+            .ok(),
+    };
+
+    let mut members_out: Vec<serde_json::Value> = Vec::new();
+    if let Some(mut r) = resp {
+        if let Ok(rows) = r.take::<Vec<serde_json::Value>>(0) {
+            if let Some(first) = rows.into_iter().next() {
+                if let Some(arr) = first.get("members").and_then(|v| v.as_array()) {
+                    for m in arr.iter() {
+                        if let Some(ms) = m.as_str() {
+                            if ms.starts_with("hirag::") {
+                                // return minimal cluster info
+                                let mut cinfo = serde_json::json!({ "id": ms, "type": "cluster" });
+                                // try to fetch cluster summary
+                                let q = "SELECT stable_id, label, summary, member_repos FROM hirag_cluster WHERE stable_id = $sid LIMIT 1";
+                                let resp2 = match state.db.connection().as_ref() {
+                                    SurrealConnection::Local(db_conn) => {
+                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
+                                    }
+                                    SurrealConnection::RemoteHttp(db_conn) => {
+                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
+                                    }
+                                    SurrealConnection::RemoteWs(db_conn) => {
+                                        db_conn.query(q).bind(("sid", ms.to_string())).await.ok()
+                                    }
+                                };
+                                if let Some(mut r2) = resp2 {
+                                    if let Ok(rows2) = r2.take::<Vec<serde_json::Value>>(0) {
+                                        if let Some(rr) = rows2.into_iter().next() {
+                                            cinfo = serde_json::json!({ "id": ms, "type": "cluster", "details": rr });
+                                        }
+                                    }
+                                }
+                                members_out.push(cinfo);
+                                continue;
+                            }
+                            // Otherwise, assume entity stable_id -> fetch snapshot/entity info
+                            let q2 = "SELECT id, stable_id, repo_name, sourcecontrol_commit FROM entity_snapshot WHERE stable_id = $sid LIMIT 1";
+                            let resp3 = match state.db.connection().as_ref() {
+                                SurrealConnection::Local(db_conn) => {
+                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
+                                }
+                                SurrealConnection::RemoteHttp(db_conn) => {
+                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
+                                }
+                                SurrealConnection::RemoteWs(db_conn) => {
+                                    db_conn.query(q2).bind(("sid", ms.to_string())).await.ok()
+                                }
+                            };
+                            if let Some(mut r3) = resp3 {
+                                if let Ok(rows3) = r3.take::<Vec<serde_json::Value>>(0) {
+                                    if let Some(rr) = rows3.into_iter().next() {
+                                        members_out.push(serde_json::json!({ "id": ms, "type": "entity", "details": rr }));
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Fallback: return only id
+                            members_out.push(serde_json::json!({ "id": ms, "type": "unknown" }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(
+        serde_json::json!({ "stable_id": stable_id, "members": members_out }),
+    ))
 }
 
 async fn construct_source_url(

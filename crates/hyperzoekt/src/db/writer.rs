@@ -59,7 +59,7 @@ pub fn spawn_db_writer(
             }
             if cfg_clone.initial_batch {
                 if !payloads_clone.is_empty() {
-                    initial_batch_insert(&db, &payloads_clone, batch_capacity).await?;
+                    initial_batch_insert(&db, &payloads_clone, batch_capacity, &cfg_clone).await?;
                     return Ok(());
                 } else {
                     info!("initial_batch=true but no initial payloads provided; continuing to normal writer loop");
@@ -465,6 +465,7 @@ async fn initial_batch_insert(
     db: &SurrealConnection,
     payloads: &[EntityPayload],
     chunk: usize,
+    cfg: &DbWriterConfig,
 ) -> Result<()> {
     info!("Initial batch mode: inserting {} entities", payloads.len());
 
@@ -533,6 +534,13 @@ async fn initial_batch_insert(
 
             // Build snapshot JSON (include embedding fields if computed)
             let mut snapshot_obj = serde_json::Map::new();
+            // Include snapshot_id for filtering by branch/commit
+            if let Some(sid) = &cfg.snapshot_id {
+                snapshot_obj.insert(
+                    "snapshot_id".to_string(),
+                    serde_json::Value::String(sid.clone()),
+                );
+            }
             snapshot_obj.insert(
                 "repo_name".to_string(),
                 serde_json::Value::String(p.repo_name.clone()),
@@ -544,6 +552,19 @@ async fn initial_batch_insert(
             snapshot_obj.insert(
                 "name".to_string(),
                 serde_json::Value::String(p.name.clone()),
+            );
+            // Include entity metadata for snapshot-level queries
+            snapshot_obj.insert(
+                "language".to_string(),
+                serde_json::Value::String(p.language.clone()),
+            );
+            snapshot_obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String(p.kind.clone()),
+            );
+            snapshot_obj.insert(
+                "signature".to_string(),
+                serde_json::Value::String(p.signature.clone()),
             );
             if let Some(f) = &p.file {
                 snapshot_obj.insert("file".to_string(), serde_json::Value::String(f.clone()));
@@ -1306,6 +1327,13 @@ fn build_batch_sql(
 
             // Create entity_snapshot with the same ID for relations
             let mut snapshot_obj = serde_json::Map::new();
+            // Include snapshot_id for filtering by branch/commit
+            if let Some(sid) = &cfg.snapshot_id {
+                snapshot_obj.insert(
+                    "snapshot_id".to_string(),
+                    serde_json::Value::String(sid.clone()),
+                );
+            }
             // Include repo_name so snapshot-scoped queries can filter by repo
             snapshot_obj.insert(
                 "repo_name".to_string(),
@@ -1318,6 +1346,19 @@ fn build_batch_sql(
             snapshot_obj.insert(
                 "name".to_string(),
                 serde_json::Value::String(p.name.clone()),
+            );
+            // Include entity metadata for snapshot-level queries
+            snapshot_obj.insert(
+                "language".to_string(),
+                serde_json::Value::String(p.language.clone()),
+            );
+            snapshot_obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String(p.kind.clone()),
+            );
+            snapshot_obj.insert(
+                "signature".to_string(),
+                serde_json::Value::String(p.signature.clone()),
             );
             if let Some(f) = &p.file {
                 snapshot_obj.insert("file".to_string(), serde_json::Value::String(f.clone()));
@@ -1380,6 +1421,15 @@ fn build_batch_sql(
                             .map(|s| serde_json::Value::String(s.clone()))
                             .collect(),
                     ),
+                );
+            }
+            // Attach per-snapshot PageRank value when provided by the indexer.
+            // Persist under `page_rank_value` to avoid conflict with SQL keywords
+            // and to make it explicit this is a snapshot-scoped metric.
+            if let Some(rank) = p.rank {
+                snapshot_obj.insert(
+                    "page_rank_value".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from_f64(rank as f64).unwrap()),
                 );
             }
             // Persist full source text (used for embeddings) on the snapshot
