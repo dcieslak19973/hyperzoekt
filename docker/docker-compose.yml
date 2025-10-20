@@ -181,8 +181,8 @@ services:
     ports:
       - "${HYPERZOEKT_INDEXER_PORT}:${HYPERZOEKT_INDEXER_PORT}"
     environment:
-      # Enqueue embedding jobs after indexing (default ON for local dev)
-      - HZ_ENABLE_EMBED_JOBS=1
+  # Enqueue embedding jobs after indexing (default OFF for local dev)
+  - HZ_ENABLE_EMBED_JOBS=0
       - HZ_ENABLE_SBOM_JOBS=1
       - HZ_INDEXER_PORT=${HYPERZOEKT_INDEXER_PORT}
       - REDIS_URL=redis://redis:${REDIS_PORT}
@@ -256,40 +256,7 @@ services:
       tei-prober:
         condition: service_healthy
 
-  hyperzoekt-embed-worker:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: hyperzoekt:latest
-    ports:
-      - "${HYPERZOEKT_EMBED_WORKER_PORT}:${HYPERZOEKT_EMBED_WORKER_PORT}"
-    environment:
-      - HZ_EMBED_JOBS_QUEUE=zoekt:embed_jobs
-      - HZ_EMBED_PROCESSING_TTL_SECONDS=300
-      - HZ_EMBED_WORKER_PORT=${HYPERZOEKT_EMBED_WORKER_PORT}
-      # Model id used for embeddings (required)
-      - HZ_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
-      - HZ_ENABLE_EMBED_SIMILARITY=1
-      # Similarity thresholds (cosine similarity scores)
-      - HZ_SIMILARITY_THRESHOLD_SAME_REPO=0.80
-      - HZ_SIMILARITY_THRESHOLD_EXTERNAL_REPO=0.85
-      # Debugging toggles - enable to log SQL and verify DB updates
-      - HZ_EMBED_DEBUG_SQL=1
-      - HZ_EMBED_DEBUG_DB=1
-      - REDIS_URL=redis://redis:${REDIS_PORT}
-      - RUST_LOG=info
-      - SURREALDB_URL=http://surrealdb:${SURREALDB_PORT}
-      - SURREALDB_USERNAME=root
-      - SURREALDB_PASSWORD=root
-      - SURREAL_DB=repos
-      - SURREAL_NS=zoekt
-    command: [ "/app/hyperzoekt-embed-worker" ]
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-      surrealdb-prober:
-        condition: service_healthy
+  # embedding worker removed: use TEI/local embedding prober via indexer
 
   hyperzoekt-sbom-worker:
     build:
@@ -354,18 +321,7 @@ services:
       retries: 6
       start_period: 5s
 
-  hyperzoekt-embed-worker-prober:
-    image: curlimages/curl:8.3.0
-    command: [ "tail", "-f", "/dev/null" ]
-    depends_on:
-      hyperzoekt-embed-worker:
-        condition: service_started
-    healthcheck:
-      test: [ "CMD-SHELL", "curl -sS http://hyperzoekt-embed-worker:${HYPERZOEKT_EMBED_WORKER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 5s
+  # embed-worker prober removed
 
   hyperzoekt-sbom-worker-prober:
     image: curlimages/curl:8.3.0
