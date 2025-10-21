@@ -100,129 +100,57 @@ impl DatabaseQueries {
         // statement to be robust against how repo rows were created.
         let sql_branch_both =
             "SELECT branch FROM repo WHERE (name = $name OR name = $prefixed) LIMIT 1";
-        // Use the tolerant response_to_json helper to handle varying client shapes
-        let branch_from_repo: Option<String> = match &*self.db {
+
+        // Try a straightforward typed deserialize first — it's the most robust
+        // across client backends and avoids complex JSON-shape probing.
+        #[derive(Deserialize)]
+        struct BranchRowInner {
+            branch: Option<String>,
+        }
+
+        match &*self.db {
             SurrealConnection::Local(db_conn) => {
-                let r = db_conn
+                let mut r = db_conn
                     .query(sql_branch_both)
                     .bind(("name", repo_name.to_string()))
                     .bind(("prefixed", format!("repo:{}", repo_name)))
                     .await?;
-                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
-                    log::debug!(
-                        "get_repo_default_branch: sql_branch_both raw result = {:?}",
-                        json_val
-                    );
-                    // Normalize common nested shapes: Array(Array(obj)) or Array(obj)
-                    let candidate = if json_val.is_array() {
-                        let arr = json_val.as_array().unwrap();
-                        if !arr.is_empty() {
-                            if arr[0].is_array() {
-                                arr[0].as_array().and_then(|a| a.first()).cloned()
-                            } else {
-                                arr.first().cloned()
-                            }
-                        } else {
-                            None
-                        }
-                    } else if json_val.is_object() {
-                        Some(json_val)
-                    } else {
-                        None
-                    };
-                    if let Some(obj) = candidate {
-                        if let Some(b) = obj.get("branch") {
-                            if !b.is_null() {
-                                return Ok(b.as_str().unwrap_or_default().to_string());
-                            }
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
                         }
                     }
-                    None
-                } else {
-                    None
                 }
             }
             SurrealConnection::RemoteHttp(db_conn) => {
-                let r = db_conn
+                let mut r = db_conn
                     .query(sql_branch_both)
                     .bind(("name", repo_name.to_string()))
                     .bind(("prefixed", format!("repo:{}", repo_name)))
                     .await?;
-                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
-                    log::debug!(
-                        "get_repo_default_branch: sql_branch_both (remote http) raw result = {:?}",
-                        json_val
-                    );
-                    let candidate = if json_val.is_array() {
-                        let arr = json_val.as_array().unwrap();
-                        if !arr.is_empty() {
-                            if arr[0].is_array() {
-                                arr[0].as_array().and_then(|a| a.first()).cloned()
-                            } else {
-                                arr.first().cloned()
-                            }
-                        } else {
-                            None
-                        }
-                    } else if json_val.is_object() {
-                        Some(json_val)
-                    } else {
-                        None
-                    };
-                    if let Some(obj) = candidate {
-                        if let Some(b) = obj.get("branch") {
-                            if !b.is_null() {
-                                return Ok(b.as_str().unwrap_or_default().to_string());
-                            }
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
                         }
                     }
-                    None
-                } else {
-                    None
                 }
             }
             SurrealConnection::RemoteWs(db_conn) => {
-                let r = db_conn
+                let mut r = db_conn
                     .query(sql_branch_both)
                     .bind(("name", repo_name.to_string()))
                     .bind(("prefixed", format!("repo:{}", repo_name)))
                     .await?;
-                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
-                    log::debug!(
-                        "get_repo_default_branch: sql_branch_both (remote ws) raw result = {:?}",
-                        json_val
-                    );
-                    let candidate = if json_val.is_array() {
-                        let arr = json_val.as_array().unwrap();
-                        if !arr.is_empty() {
-                            if arr[0].is_array() {
-                                arr[0].as_array().and_then(|a| a.first()).cloned()
-                            } else {
-                                arr.first().cloned()
-                            }
-                        } else {
-                            None
-                        }
-                    } else if json_val.is_object() {
-                        Some(json_val)
-                    } else {
-                        None
-                    };
-                    if let Some(obj) = candidate {
-                        if let Some(b) = obj.get("branch") {
-                            if !b.is_null() {
-                                return Ok(b.as_str().unwrap_or_default().to_string());
-                            }
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
                         }
                     }
-                    None
-                } else {
-                    None
                 }
             }
-        };
-        if branch_from_repo.is_some() {
-            // returned above already; continue to fallbacks otherwise
         }
         log::debug!("get_repo_default_branch: explicit branch query executed");
 
