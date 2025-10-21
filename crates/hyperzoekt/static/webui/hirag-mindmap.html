@@ -78,6 +78,33 @@
                         return null;
                     }
 
+                    // sanitize labels for Mermaid (avoid characters that produce syntax errors)
+                    function sanitizeLabel(raw, fallback) {
+                        if (!raw && !fallback) return 'Cluster';
+                        let s = raw || '';
+                        try {
+                            s = String(s);
+                        } catch (e) { s = '' }
+                        // remove newlines and control chars
+                        s = s.replace(/\r?\n|[\x00-\x1F\x7F]/g, ' ');
+                        // unescape common escaped quotes
+                        s = s.replace(/\\"/g, '"');
+                        // remove double quotes (we'll delimit the label with quotes)
+                        s = s.replace(/\"/g, '');
+                        // strip characters that can look like Mermaid operators
+                        // only allow basic punctuation and alphanumerics
+                        s = s.replace(/[^\w\s\-\.,:;()\/]/g, '');
+                        // collapse spaces
+                        s = s.replace(/\s+/g, ' ').trim();
+                        if (!s && fallback) {
+                            s = String(fallback).replace(/[:\/\.\-@]/g, ' ').replace(/\s+/g, ' ').trim();
+                        }
+                        if (!s) s = 'Cluster';
+                        // limit length to avoid enormous nodes
+                        if (s.length > 120) s = s.substring(0, 117).trim() + '...';
+                        return s;
+                    }
+
                     for (const c of clusters) {
                         const id = c.stable_id || c.id || JSON.stringify(c.id);
                         // prefer explicit c.label, otherwise try to pull label from summary JSON
@@ -88,7 +115,7 @@
                             if (inner) label = inner;
                         }
                         if (!label) label = (c.summary ? String(c.summary).substring(0, 40) : id);
-                        idToLabel[id] = String(label).replace(/\n/g, ' ');
+                        idToLabel[id] = sanitizeLabel(String(label), id);
                     }
 
                     let mermaidSrc = 'graph LR\n';
@@ -104,37 +131,50 @@
                         } catch (e) { return false; }
                     }
 
+                    // Normalize any string into a Mermaid-safe node id: ASCII letters, digits and '_'
+                    function safeNodeId(raw) {
+                        if (raw === undefined || raw === null) return 'n_unknown';
+                        let s = String(raw);
+                        // replace all non alphanumeric/underscore chars with underscore
+                        s = s.replace(/[^a-zA-Z0-9_]/g, '_');
+                        // ensure it starts with a letter to be safe for Mermaid
+                        if (!/^[a-zA-Z]/.test(s)) s = 'n_' + s;
+                        // collapse multiple underscores
+                        s = s.replace(/_+/g, '_');
+                        // trim trailing/leading underscores
+                        s = s.replace(/^_+|_+$/g, '');
+                        if (!s) return 'n_unknown';
+                        return s;
+                    }
+
                     for (const c of clusters) {
-                        // normalize id and ensure it starts with a letter to satisfy Mermaid
+                        // normalize id into a Mermaid-safe identifier
                         let rawId = (c.stable_id || c.id) || '';
-                        let id = rawId.replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(id)) id = 'n_' + id;
+                        let id = safeNodeId(rawId);
                         // Prefer human label when available; fallback to a sanitized label
-                        let label = '';
+                        let labelRaw = '';
                         if (c.label && c.label.length > 0 && !looksLikeId(c.label, rawId)) {
-                            label = c.label;
-                        } else if (c.summary && c.summary.length > 0) {
-                            label = c.summary.substring(0, 40);
+                            labelRaw = c.label;
                         } else if (idToLabel[c.stable_id || c.id]) {
-                            label = idToLabel[c.stable_id || c.id];
+                            labelRaw = idToLabel[c.stable_id || c.id];
+                        } else if (c.summary && c.summary.length > 0) {
+                            labelRaw = c.summary.substring(0, 40);
                         } else {
                             // humanize the raw id
-                            label = (c.stable_id || c.id || '').toString().replace(/^hirag::/, '').replace(/[:_\-\.\/]+/g, ' ').trim() || ('Cluster ' + (Math.random().toString(36).slice(2, 6)));
+                            labelRaw = (c.stable_id || c.id || '').toString().replace(/^hirag::/, '').replace(/[:_\-\.\/]+/g, ' ').trim() || ('Cluster ' + (Math.random().toString(36).slice(2, 6)));
                         }
-                        label = label.replace(/"/g, '\\"').replace(/\[/g, '(').replace(/\]/g, ')');
+                        const label = sanitizeLabel(labelRaw, rawId).replace(/\[/g, '(').replace(/\]/g, ')');
                         mermaidSrc += `${id}["${label}"]\n`;
                     }
                     mermaidSrc += 'end\n';
 
                     for (const c of clusters) {
                         let rawSrc = (c.stable_id || c.id) || '';
-                        let src = rawSrc.replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(src)) src = 'n_' + src;
+                        let src = safeNodeId(rawSrc);
                         const members = c.members || [];
                         for (const m of members) {
                             if (typeof m === 'string' && m.startsWith('hirag::')) {
-                                let tgt = m.replace(/[:\/\.\-@]/g, '_');
-                                if (!/^[a-zA-Z]/.test(tgt)) tgt = 'n_' + tgt;
+                                let tgt = safeNodeId(m);
                                 mermaidSrc += `${src} --> ${tgt}\n`;
                             }
                         }
@@ -142,11 +182,7 @@
 
                     mermaidSrc += 'classDef cluster fill:#fef7e6,stroke:#ffcc66\n';
                     // build class list with normalized ids
-                    const classNodes = Object.keys(idToLabel).map(id => {
-                        let n = (id || '').replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(n)) n = 'n_' + n;
-                        return n;
-                    }).join(',');
+                    const classNodes = Object.keys(idToLabel).map(id => safeNodeId(id)).join(',');
                     if (classNodes) mermaidSrc += 'class ' + classNodes + ' cluster\n';
 
                     const diagramEl = document.getElementById('diagram');

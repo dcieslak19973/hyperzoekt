@@ -115,10 +115,45 @@ impl DatabaseQueries {
                     .bind(("name", repo_name.to_string()))
                     .bind(("prefixed", format!("repo:{}", repo_name)))
                     .await?;
+                // Prefer a typed deserialize when possible, but if it yields no
+                // usable branch fall back to the tolerant JSON-shape probing
+                // (some Surreal client transports return nested array shapes).
                 if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
                     if let Some(row) = rows.into_iter().next() {
                         if let Some(b) = row.branch {
                             return Ok(b);
+                        }
+                    }
+                }
+                // Typed deserialize did not yield a branch; re-run the query and
+                // probe the JSON-shaped response to handle nested/array shapes.
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
                         }
                     }
                 }
@@ -136,6 +171,36 @@ impl DatabaseQueries {
                         }
                     }
                 }
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                }
             }
             SurrealConnection::RemoteWs(db_conn) => {
                 let mut r = db_conn
@@ -147,6 +212,36 @@ impl DatabaseQueries {
                     if let Some(row) = rows.into_iter().next() {
                         if let Some(b) = row.branch {
                             return Ok(b);
+                        }
+                    }
+                }
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
                         }
                     }
                 }
