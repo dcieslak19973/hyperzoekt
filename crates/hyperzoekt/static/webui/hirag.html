@@ -138,12 +138,23 @@
                                 // If the member refers to another hirag cluster, prefer that cluster's label
                                 const refCluster = clusterByStable.get(m);
                                 let tgtLabel = '';
-                                if (refCluster && refCluster.label) {
-                                    tgtLabel = refCluster.label;
-                                } else if (refCluster && refCluster.summary) {
-                                    tgtLabel = (refCluster.summary || '').substring(0, 40) + '...';
+                                if (refCluster) {
+                                    // Prefer an explicit label when available and it doesn't look like an internal id
+                                    if (refCluster.label && !looksLikeId(refCluster.label, refCluster.stable_id || m)) {
+                                        tgtLabel = String(refCluster.label).trim();
+                                    } else {
+                                        // Try extracting a label from a JSON summary blob
+                                        const parsed = extractLabelFromSummary(refCluster.summary);
+                                        if (parsed && !looksLikeId(parsed, refCluster.stable_id || m)) {
+                                            tgtLabel = parsed.trim();
+                                        } else if (refCluster.summary && String(refCluster.summary).trim().length > 0) {
+                                            tgtLabel = String(refCluster.summary).trim().substring(0, 40) + '...';
+                                        } else {
+                                            tgtLabel = humanizeStable(refCluster.stable_id || m) || 'Cluster';
+                                        }
+                                    }
                                 } else {
-                                    tgtLabel = 'Cluster';
+                                    tgtLabel = humanizeStable(m) || 'Cluster';
                                 }
                                 elements.push({ data: { id: tgt, label: tgtLabel, summary: (refCluster && refCluster.summary) || '', stable_id: refCluster ? refCluster.stable_id : m } });
                                 seen.add(tgt);
