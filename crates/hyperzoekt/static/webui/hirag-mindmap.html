@@ -11,18 +11,23 @@
         <style>
             /* Use viewport-aware sizing so the mindmap fits on a single screen by default */
             #diagram.mermaid {
-                /* leave a bit of room for header/controls: 18vh for chrome/UI */
-                min-height: 40vh;
+                /* leave a bit of room for header/controls: larger to make room for long graphs */
+                min-height: 60vh;
                 height: calc(100vh - 140px);
-                max-height: 80vh;
+                max-height: 85vh;
                 overflow: auto;
+                display: flex;
+                justify-content: center;
+                align-items: flex-start;
             }
 
+            /* Let the SVG scale via transforms; keep natural sizing otherwise */
             #diagram.mermaid svg {
-                width: 100% !important;
+                width: auto !important;
                 height: auto !important;
                 display: block;
                 margin: 0 auto;
+                max-width: none !important;
             }
         </style>
         <p class="note">Interactive Mermaid mindmap summarizing the HiRag WebUI: frontend, backend, DB relations, and
@@ -248,8 +253,9 @@
                     diagramEl.style.overflow = 'auto';
                     updateDisplay();
                 }
-                // precise fit-to-width implementation using SVG viewBox
-                function fitToWidthPrecise() {
+                // precise fit-to-viewport implementation using SVG viewBox
+                // Fits both width and height so the diagram is readable without manual zooming
+                function fitToViewportPrecise() {
                     try {
                         // prefer viewBox if available
                         let vb = null;
@@ -259,35 +265,39 @@
                             const vbAttr = svg.getAttribute('viewBox');
                             if (vbAttr) {
                                 const parts = vbAttr.split(/\s+/).map(Number);
-                                if (parts.length === 4 && parts[2] > 0) {
+                                if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
                                     vb = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
                                 }
                             }
                         }
                         if (!vb) {
-                            // fallback: clear transforms and let width:100% handle it
+                            // fallback: clear transforms and let natural sizing handle it
                             svg.style.transform = '';
                             diagramEl.dataset.scale = '1';
                             updateDisplay();
                             return;
                         }
-                        const containerWidth = diagramEl.clientWidth || diagramEl.getBoundingClientRect().width;
-                        if (!containerWidth || !vb.width) {
+                        const containerRect = diagramEl.getBoundingClientRect();
+                        const containerWidth = containerRect.width;
+                        const containerHeight = containerRect.height;
+                        if (!containerWidth || !containerHeight || !vb.width || !vb.height) {
                             svg.style.transform = '';
                             diagramEl.dataset.scale = '1';
                             updateDisplay();
                             return;
                         }
-                        // compute scale to fit width (leave small padding)
-                        const padding = 8; // px
-                        const scale = Math.max(0.1, Math.min(4.0, (containerWidth - padding) / vb.width));
+                        // compute scale to fit both width and height (leave a small padding)
+                        const padding = 16; // px
+                        const widthScale = (containerWidth - padding) / vb.width;
+                        const heightScale = (containerHeight - padding) / vb.height;
+                        const scale = Math.max(0.05, Math.min(4.0, Math.min(widthScale, heightScale)));
                         // apply scale and ensure transform origin
                         svg.style.transformOrigin = '0 0';
                         svg.style.transform = `scale(${scale})`;
                         diagramEl.dataset.scale = String(scale);
                         updateDisplay();
                     } catch (e) {
-                        console.warn('fitToWidthPrecise failed', e);
+                        console.warn('fitToViewportPrecise failed', e);
                         svg.style.transform = '';
                         diagramEl.dataset.scale = '1';
                         updateDisplay();
@@ -304,8 +314,8 @@
                     setScale(next);
                 };
                 fitBtn.onclick = () => {
-                    // use precise fit-to-width first, fallback to reset
-                    fitToWidthPrecise();
+                    // fit to viewport (width and height)
+                    fitToViewportPrecise();
                 };
                 // support mousewheel + ctrl for zooming
                 diagramEl.addEventListener('wheel', (e) => {
@@ -317,6 +327,10 @@
                         setScale(next);
                     }
                 }, { passive: false });
+                // Run an initial fit so the diagram is readable on first render
+                setTimeout(() => {
+                    try { fitToViewportPrecise(); } catch (e) { /* ignore */ }
+                }, 70);
                 updateDisplay();
             }
 
