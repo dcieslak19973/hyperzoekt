@@ -83,6 +83,26 @@
                 } catch (e) { return false; }
             }
 
+            // Try to extract label field from stored summary JSON; returns null if not found
+            function extractLabelFromSummary(summary) {
+                if (!summary) return null;
+                try {
+                    let obj = summary;
+                    if (typeof obj === 'string') {
+                        const s = obj.trim();
+                        if (s.startsWith('{')) {
+                            obj = JSON.parse(s);
+                        } else {
+                            return null;
+                        }
+                    }
+                    if (obj && typeof obj === 'object' && obj.label) return String(obj.label);
+                } catch (e) {
+                    // swallow parse errors
+                }
+                return null;
+            }
+
             // Add cluster nodes (prefer label, then summary; never show raw stable_id as the node label)
             clusters.forEach((c, idx) => {
                 const stable = c.stable_id || ('idx_' + idx);
@@ -90,10 +110,16 @@
                 let displayLabel = '';
                 if (c && c.label && String(c.label).trim().length > 0 && !looksLikeId(c.label, stable)) {
                     displayLabel = String(c.label).trim();
-                } else if (c && c.summary && String(c.summary).trim().length > 0) {
-                    displayLabel = String(c.summary).trim().substring(0, 40) + '...';
                 } else {
-                    displayLabel = 'Cluster ' + (idx + 1);
+                    // try to parse label from summary JSON blob
+                    const inner = extractLabelFromSummary(c.summary);
+                    if (inner && !looksLikeId(inner, stable)) {
+                        displayLabel = inner.trim();
+                    } else if (c && c.summary && String(c.summary).trim().length > 0) {
+                        displayLabel = String(c.summary).trim().substring(0, 40) + '...';
+                    } else {
+                        displayLabel = 'Cluster ' + (idx + 1);
+                    }
                 }
                 elements.push({ data: { id: id, label: displayLabel, summary: c.summary || '', stable_id: stable } });
                 seen.add(id);
