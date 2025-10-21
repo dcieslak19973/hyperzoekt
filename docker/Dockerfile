@@ -32,7 +32,7 @@ ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 RUN cargo build --release --bin dzr-admin --bin dzr-http-search --bin dzr-indexer --bin dzr-mcp-search --bin dzr-admin-poller
 
 # Build hyperzoekt binaries with optional OTEL feature (safe even if unused at runtime)
-RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-webui --bin hyperzoekt-mcp --bin hyperzoekt-sbom-worker
+RUN cargo build --release -p hyperzoekt --features otel --bin hyperzoekt-indexer --bin hyperzoekt-webui --bin hyperzoekt-mcp --bin hyperzoekt-sbom-worker --bin hyperzoekt-similarity-worker --bin hyperzoekt-hirag-worker
 
 # Use Debian trixie slim as the runtime image (Debian testing with latest GLIBC)
 FROM debian:trixie-slim
@@ -81,6 +81,8 @@ COPY --from=builder /app/target/release/hyperzoekt-indexer /app/
 COPY --from=builder /app/target/release/hyperzoekt-mcp /app/
 COPY --from=builder /app/target/release/hyperzoekt-webui /app/
 COPY --from=builder /app/target/release/hyperzoekt-sbom-worker /app/
+COPY --from=builder /app/target/release/hyperzoekt-similarity-worker /app/
+COPY --from=builder /app/target/release/hyperzoekt-hirag-worker /app/
 
 # Copy configuration and static files
 COPY --from=builder /app/crates/zoekt-distributed/config.toml /app/
