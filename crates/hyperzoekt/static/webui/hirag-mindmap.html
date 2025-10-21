@@ -9,11 +9,11 @@
     </div>
     <div class="card-body">
         <style>
-            /* Make the mermaid diagram taller and let the SVG scale to the container */
+            /* Make the mermaid diagram much taller so large mindmaps are readable; keep scrolling */
             #diagram.mermaid {
-                min-height: 480px;
-                height: 480px;
-                max-height: 900px;
+                min-height: 1200px;
+                height: 1600px;
+                max-height: 4000px;
                 overflow: auto;
             }
 
@@ -24,6 +24,12 @@
         </style>
         <p class="note">Interactive Mermaid mindmap summarizing the HiRag WebUI: frontend, backend, DB relations, and
             tests.</p>
+        <div class="mm-controls" style="margin-bottom:8px">
+            <button id="mm-zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+            <button id="mm-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+            <button id="mm-fit" title="Fit to width" aria-label="Fit to width">Fit</button>
+            <span id="mm-scale-display" style="margin-left:8px;font-size:0.9em;color:#444">100%</span>
+        </div>
         <div id="diagram" class="mermaid">Loading mindmap…</div>
         <script type="module">
             import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
@@ -45,13 +51,34 @@
 
                     let mermaidSrc = 'graph LR\n';
                     mermaidSrc += 'subgraph HiRag_Clusters\n';
+                    function looksLikeId(s, stable) {
+                        if (!s) return false;
+                        try {
+                            const ss = String(s).trim();
+                            if (ss === String(stable).trim()) return true;
+                            if (ss.includes('::')) return true;
+                            if (/^[a-z0-9_\-]+:[a-z0-9_\-]+$/i.test(ss)) return true;
+                            return false;
+                        } catch (e) { return false; }
+                    }
+
                     for (const c of clusters) {
                         // normalize id and ensure it starts with a letter to satisfy Mermaid
                         let rawId = (c.stable_id || c.id) || '';
                         let id = rawId.replace(/[:\/\.\-@]/g, '_');
                         if (!/^[a-zA-Z]/.test(id)) id = 'n_' + id;
-                        // sanitize label: escape double quotes and replace square brackets
-                        let label = (idToLabel[c.stable_id || c.id] || id).toString();
+                        // Prefer human label when available; fallback to a sanitized label
+                        let label = '';
+                        if (c.label && c.label.length > 0 && !looksLikeId(c.label, rawId)) {
+                            label = c.label;
+                        } else if (c.summary && c.summary.length > 0) {
+                            label = c.summary.substring(0, 40);
+                        } else if (idToLabel[c.stable_id || c.id]) {
+                            label = idToLabel[c.stable_id || c.id];
+                        } else {
+                            // humanize the raw id
+                            label = (c.stable_id || c.id || '').toString().replace(/^hirag::/, '').replace(/[:_\-\.\/]+/g, ' ').trim() || ('Cluster ' + (Math.random().toString(36).slice(2, 6)));
+                        }
                         label = label.replace(/"/g, '\\"').replace(/\[/g, '(').replace(/\]/g, ')');
                         mermaidSrc += `${id}["${label}"]\n`;
                     }
@@ -95,19 +122,81 @@
                                 diagramEl.textContent = mermaidSrc;
                                 try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
                             }
+                            // attach controls after render
+                            setTimeout(attachMindmapControls, 50);
                         } else {
                             diagramEl.textContent = mermaidSrc;
                             try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
+                            setTimeout(attachMindmapControls, 200);
                         }
                     } catch (e) {
                         console.error('mermaid.render failed, falling back to init', e);
                         diagramEl.textContent = mermaidSrc;
                         try { mermaid.init(undefined, diagramEl); } catch (ee) { console.error(ee); }
+                        setTimeout(attachMindmapControls, 200);
                     }
                 } catch (e) {
                     document.getElementById('diagram').textContent = 'Error building mindmap: ' + e;
                     console.error(e);
                 }
+            }
+
+            // UI controls: zoom in/out and fit-to-width for the generated SVG
+            function attachMindmapControls() {
+                const diagramEl = document.getElementById('diagram');
+                if (!diagramEl) return;
+                const svg = diagramEl.querySelector('svg');
+                const zoomInBtn = document.getElementById('mm-zoom-in');
+                const zoomOutBtn = document.getElementById('mm-zoom-out');
+                const fitBtn = document.getElementById('mm-fit');
+                const display = document.getElementById('mm-scale-display');
+                if (!svg || !zoomInBtn || !zoomOutBtn || !fitBtn) return;
+                // ensure svg is responsive
+                svg.style.width = svg.style.width || '100%';
+                svg.style.height = svg.style.height || 'auto';
+                svg.style.transformOrigin = svg.style.transformOrigin || '0 0';
+                // keep scale in dataset
+                if (!diagramEl.dataset.scale) diagramEl.dataset.scale = '1';
+                function updateDisplay() {
+                    const s = parseFloat(diagramEl.dataset.scale || '1');
+                    display.textContent = Math.round(s * 100) + '%';
+                }
+                function setScale(s) {
+                    diagramEl.dataset.scale = String(s);
+                    svg.style.transform = `scale(${s})`;
+                    // adjust container overflow to allow scrolling when scaled
+                    diagramEl.style.overflow = 'auto';
+                    updateDisplay();
+                }
+                zoomInBtn.onclick = () => {
+                    const cur = parseFloat(diagramEl.dataset.scale || '1');
+                    const next = Math.min(cur + 0.1, 4.0);
+                    setScale(next);
+                };
+                zoomOutBtn.onclick = () => {
+                    const cur = parseFloat(diagramEl.dataset.scale || '1');
+                    const next = Math.max(cur - 0.1, 0.1);
+                    setScale(next);
+                };
+                fitBtn.onclick = () => {
+                    // remove any scaling and ensure svg fills width
+                    diagramEl.dataset.scale = '1';
+                    svg.style.transform = '';
+                    svg.style.width = '100%';
+                    svg.style.height = 'auto';
+                    updateDisplay();
+                };
+                // support mousewheel + ctrl for zooming
+                diagramEl.addEventListener('wheel', (e) => {
+                    if (e.ctrlKey) {
+                        e.preventDefault();
+                        const delta = -Math.sign(e.deltaY) * 0.05;
+                        const cur = parseFloat(diagramEl.dataset.scale || '1');
+                        const next = Math.min(Math.max(cur + delta, 0.1), 4.0);
+                        setScale(next);
+                    }
+                }, { passive: false });
+                updateDisplay();
             }
 
             window.addEventListener('load', () => setTimeout(buildMindmap, 50));
