@@ -103,7 +103,7 @@ impl DatabaseQueries {
 
         // Try a straightforward typed deserialize first — it's the most robust
         // across client backends and avoids complex JSON-shape probing.
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Debug)]
         struct BranchRowInner {
             branch: Option<String>,
         }
@@ -118,11 +118,43 @@ impl DatabaseQueries {
                 // Prefer a typed deserialize when possible, but if it yields no
                 // usable branch fall back to the tolerant JSON-shape probing
                 // (some Surreal client transports return nested array shapes).
-                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
-                    if let Some(row) = rows.into_iter().next() {
-                        if let Some(b) = row.branch {
-                            return Ok(b);
+                match r.take::<Vec<BranchRowInner>>(0) {
+                    Ok(rows) => {
+                        log::debug!(
+                            "get_repo_default_branch: typed take rows for repo='{}' -> {:?}",
+                            repo_name,
+                            rows
+                        );
+                        eprintln!(
+                            "DEBUG get_repo_default_branch: typed take rows for {} -> {:?}",
+                            repo_name, rows
+                        );
+                        if let Some(row) = rows.into_iter().next() {
+                            if let Some(b) = row.branch {
+                                log::debug!(
+                                        "get_repo_default_branch: found branch via typed take for repo='{}' -> {}",
+                                        repo_name,
+                                        b
+                                    );
+                                eprintln!(
+                                    "DEBUG get_repo_default_branch: found branch via typed take for {} -> {}",
+                                    repo_name,
+                                    b
+                                );
+                                return Ok(b);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "get_repo_default_branch: typed take error for repo='{}' -> {}",
+                            repo_name,
+                            e
+                        );
+                        eprintln!(
+                            "DEBUG get_repo_default_branch: typed take error for {} -> {}",
+                            repo_name, e
+                        );
                     }
                 }
                 // Typed deserialize did not yield a branch; re-run the query and
@@ -133,6 +165,15 @@ impl DatabaseQueries {
                     .bind(("prefixed", format!("repo:{}", repo_name)))
                     .await?;
                 if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    log::debug!(
+                        "get_repo_default_branch: json fallback for repo='{}' -> {}",
+                        repo_name,
+                        json_val
+                    );
+                    eprintln!(
+                        "DEBUG get_repo_default_branch: json fallback for {} -> {}",
+                        repo_name, json_val
+                    );
                     let candidate = if json_val.is_array() {
                         let arr = json_val.as_array().unwrap();
                         if !arr.is_empty() {
@@ -155,6 +196,33 @@ impl DatabaseQueries {
                                 return Ok(b.as_str().unwrap_or_default().to_string());
                             }
                         }
+                    }
+                } else {
+                    // Extra diagnostics: try fetching the full row shape to help
+                    // triage cases where response_to_json fails to find any slot.
+                    let mut r_inspect = db_conn
+                        .query(
+                            "SELECT * FROM repo WHERE (name = $name OR name = $prefixed) LIMIT 1",
+                        )
+                        .bind(("name", repo_name.to_string()))
+                        .bind(("prefixed", format!("repo:{}", repo_name)))
+                        .await?;
+                    // Try serde_json take
+                    if let Ok(rows) = r_inspect.take::<Vec<serde_json::Value>>(0) {
+                        eprintln!(
+                            "DEBUG get_repo_default_branch: inspect serde_json rows for {} -> {:?}",
+                            repo_name, rows
+                        );
+                    } else if let Ok(vs) = r_inspect.take::<Vec<surrealdb::sql::Value>>(0) {
+                        eprintln!(
+                            "DEBUG get_repo_default_branch: inspect sql::Value rows for {} -> {:?}",
+                            repo_name, vs
+                        );
+                    } else {
+                        eprintln!(
+                            "DEBUG get_repo_default_branch: inspect returned no usable rows for {}",
+                            repo_name
+                        );
                     }
                 }
             }
