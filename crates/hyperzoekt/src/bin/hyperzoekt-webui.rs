@@ -80,7 +80,6 @@ const DUPES_TEMPLATE: &str = include_str!("../../static/webui/dupes.html");
 const DEPENDENCIES_TEMPLATE: &str = include_str!("../../static/webui/dependencies.html");
 const SBOM_TEMPLATE: &str = include_str!("../../static/webui/sbom.html");
 const HIRAG_TEMPLATE: &str = include_str!("../../static/webui/hirag.html");
-const HIRAG_MINDMAP_TEMPLATE: &str = include_str!("../../static/webui/hirag-mindmap.html");
 
 #[derive(Parser)]
 #[command(name = "hyperzoekt-webui")]
@@ -829,7 +828,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     templates.add_template("dependencies", DEPENDENCIES_TEMPLATE)?;
     templates.add_template("sbom", SBOM_TEMPLATE)?;
     templates.add_template("hirag", HIRAG_TEMPLATE)?;
-    templates.add_template("hirag-mindmap", HIRAG_MINDMAP_TEMPLATE)?;
     // Reuse repo template with dupes section via route-driven render
     log::info!("Templates loaded successfully");
 
@@ -889,7 +887,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/search", get(search_handler))
         .route("/pagerank", get(pagerank_handler))
         .route("/hirag", get(hirag_page_handler))
-        .route("/hirag-mindmap", get(hirag_mindmap_handler))
         .route("/api/hirag", get(hirag_api_handler))
         .route(
             "/api/hirag/{stable_id}/members",
@@ -2754,16 +2751,7 @@ async fn hirag_page_handler(State(state): State<AppState>) -> Result<Html<String
     Ok(Html(html))
 }
 
-async fn hirag_mindmap_handler(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    let template = state.templates.get_template("hirag-mindmap").unwrap();
-    let html = template
-        .render(context! { title => "HiRAG Mindmap" })
-        .map_err(|e| {
-            log::error!("Failed to render hirag-mindmap template: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(Html(html))
-}
+// hirag_mindmap_handler removed: mindmap feature was consolidated into the HiRAG explorer.
 
 // Simple API to return hirag clusters. Returns an object { clusters: [..] }
 async fn hirag_api_handler(
