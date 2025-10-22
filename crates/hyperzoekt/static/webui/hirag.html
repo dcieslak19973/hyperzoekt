@@ -83,6 +83,17 @@
                 } catch (e) { return false; }
             }
 
+            // Helper: treat common sentinel label values as 'no label'
+            function isSentinelLabel(s) {
+                if (s === null || s === undefined) return true;
+                try {
+                    const ss = String(s).trim();
+                    if (ss.length === 0) return true;
+                    const lowered = ss.toLowerCase();
+                    return lowered === 'none' || lowered === 'null' || lowered === 'n/a' || lowered === 'na' || lowered === 'unknown';
+                } catch (e) { return true; }
+            }
+
             // Try to extract label field from stored summary JSON; returns null if not found
             function extractLabelFromSummary(summary) {
                 if (!summary) return null;
@@ -139,13 +150,13 @@
                                 const refCluster = clusterByStable.get(m);
                                 let tgtLabel = '';
                                 if (refCluster) {
-                                    // Prefer an explicit label when available and it doesn't look like an internal id
-                                    if (refCluster.label && !looksLikeId(refCluster.label, refCluster.stable_id || m)) {
+                                    // Prefer an explicit label when available, but treat sentinel values like 'NONE' as absent
+                                    if (!isSentinelLabel(refCluster.label) && refCluster.label && !looksLikeId(refCluster.label, refCluster.stable_id || m)) {
                                         tgtLabel = String(refCluster.label).trim();
                                     } else {
-                                        // Try extracting a label from a JSON summary blob
+                                        // Try extracting a label from a JSON summary blob (this handles layer2+ where label may be missing)
                                         const parsed = extractLabelFromSummary(refCluster.summary);
-                                        if (parsed && !looksLikeId(parsed, refCluster.stable_id || m)) {
+                                        if (parsed && !looksLikeId(parsed, refCluster.stable_id || m) && !isSentinelLabel(parsed)) {
                                             tgtLabel = parsed.trim();
                                         } else if (refCluster.summary && String(refCluster.summary).trim().length > 0) {
                                             tgtLabel = String(refCluster.summary).trim().substring(0, 40) + '...';

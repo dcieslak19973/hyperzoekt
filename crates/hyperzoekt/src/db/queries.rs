@@ -125,10 +125,6 @@ impl DatabaseQueries {
                             repo_name,
                             rows
                         );
-                        eprintln!(
-                            "DEBUG get_repo_default_branch: typed take rows for {} -> {:?}",
-                            repo_name, rows
-                        );
                         if let Some(row) = rows.into_iter().next() {
                             if let Some(b) = row.branch {
                                 log::debug!(
@@ -136,11 +132,6 @@ impl DatabaseQueries {
                                         repo_name,
                                         b
                                     );
-                                eprintln!(
-                                    "DEBUG get_repo_default_branch: found branch via typed take for {} -> {}",
-                                    repo_name,
-                                    b
-                                );
                                 return Ok(b);
                             }
                         }
@@ -150,10 +141,6 @@ impl DatabaseQueries {
                             "get_repo_default_branch: typed take error for repo='{}' -> {}",
                             repo_name,
                             e
-                        );
-                        eprintln!(
-                            "DEBUG get_repo_default_branch: typed take error for {} -> {}",
-                            repo_name, e
                         );
                     }
                 }
@@ -169,10 +156,6 @@ impl DatabaseQueries {
                         "get_repo_default_branch: json fallback for repo='{}' -> {}",
                         repo_name,
                         json_val
-                    );
-                    eprintln!(
-                        "DEBUG get_repo_default_branch: json fallback for {} -> {}",
-                        repo_name, json_val
                     );
                     let candidate = if json_val.is_array() {
                         let arr = json_val.as_array().unwrap();
@@ -209,18 +192,20 @@ impl DatabaseQueries {
                         .await?;
                     // Try serde_json take
                     if let Ok(rows) = r_inspect.take::<Vec<serde_json::Value>>(0) {
-                        eprintln!(
-                            "DEBUG get_repo_default_branch: inspect serde_json rows for {} -> {:?}",
-                            repo_name, rows
+                        log::debug!(
+                            "get_repo_default_branch: inspect serde_json rows for {} -> {:?}",
+                            repo_name,
+                            rows
                         );
                     } else if let Ok(vs) = r_inspect.take::<Vec<surrealdb::sql::Value>>(0) {
-                        eprintln!(
-                            "DEBUG get_repo_default_branch: inspect sql::Value rows for {} -> {:?}",
-                            repo_name, vs
+                        log::debug!(
+                            "get_repo_default_branch: inspect sql::Value rows for {} -> {:?}",
+                            repo_name,
+                            vs
                         );
                     } else {
-                        eprintln!(
-                            "DEBUG get_repo_default_branch: inspect returned no usable rows for {}",
+                        log::debug!(
+                            "get_repo_default_branch: inspect returned no usable rows for {}",
                             repo_name
                         );
                     }
@@ -435,6 +420,52 @@ impl DatabaseQueries {
         };
         if name_in_result.is_some() {
             // already returned above if non-null; fallthrough if None
+        }
+
+        // Extra defensive check: some environments store the repo under Thing id
+        // (e.g. id = type::thing("repo:...")) rather than name field. Try
+        // selecting by Thing equality and prefer its branch when present.
+        let repo_by_thing_sql = "SELECT branch FROM repo WHERE id = type::thing($prefixed) LIMIT 1";
+        match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+            }
         }
 
         // Fallbacks
