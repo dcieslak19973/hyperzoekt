@@ -1,6 +1,8 @@
 use hyperzoekt::db::Database;
+use serial_test::serial;
 use std::env;
 
+#[serial]
 #[tokio::test]
 async fn uses_refs_when_repo_branch_missing() {
     // Force in-memory Surreal so tests are hermetic
@@ -85,6 +87,7 @@ async fn uses_refs_when_repo_branch_missing() {
     assert_eq!(branch, "trunk");
 }
 
+#[serial]
 #[tokio::test]
 async fn prefers_repo_branch_if_present() {
     env::set_var("HZ_DISABLE_SURREAL_ENV", "1");
