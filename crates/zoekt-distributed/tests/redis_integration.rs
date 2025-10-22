@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine;
-use getrandom::getrandom;
 use parking_lot::RwLock;
+use rand::random;
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 use zoekt_distributed::LeaseManager;
@@ -25,8 +25,7 @@ struct TestStateInner {
 type TestState = Arc<TestStateInner>;
 
 fn gen_token() -> String {
-    let mut b = [0u8; 16];
-    getrandom(&mut b).expect("failed to get random bytes");
+    let b: [u8; 16] = random();
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
