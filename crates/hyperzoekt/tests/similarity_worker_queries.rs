@@ -56,7 +56,9 @@ async fn test_same_repo_similarity_query_syntax() -> Result<()> {
         );
 
     // Fetch source embedding in Rust and pass it as a bind to avoid LET/SELECT fragility
-    let source_emb_opt = hyperzoekt::db::helpers::get_embedding_for_entity(&conn, "test1").await?;
+    let source_emb_opt = hyperzoekt::db::helpers::get_embedding_for_entity(&conn, "test1")
+        .await
+        .map_err(|e| anyhow::anyhow!("get_embedding_for_entity failed: {}", e))?;
     let source_emb = source_emb_opt.expect("source embedding present");
     println!("source_emb (Rust) = {:?}", source_emb);
     let result = conn

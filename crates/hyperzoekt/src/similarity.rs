@@ -138,18 +138,11 @@ pub async fn similarity_with_conn_multi(
         embedding: Vec<f32>,
     }
 
-    // If a snapshot_id is provided, sample candidate embeddings directly from
-    // `entity_snapshot` for that snapshot. This scopes similarity sampling to
-    // a specific snapshot's contents and avoids the old `content` table.
+    // If a snapshot_id is provided, sample embeddings from entity_snapshot
+    // scoped to that specific snapshot
     let scored = if let Some(sid) = snapshot_id {
-        #[derive(serde::Deserialize)]
-        struct EsRow {
-            stable_id: String,
-            embedding: Option<Vec<f32>>,
-        }
-
         let sql_es = format!(
-            "SELECT stable_id, embedding FROM entity_snapshot WHERE snapshot_id = $sid START AT 0 LIMIT {}",
+            "SELECT stable_id, embedding FROM entity_snapshot WHERE snapshot_id = $sid AND embedding_len > 0 START AT 0 LIMIT {}",
             sample
         );
         let mut resp_es = conn
@@ -158,26 +151,20 @@ pub async fn similarity_with_conn_multi(
                 vec![("sid", serde_json::Value::String(sid.to_string()))],
             )
             .await?;
-        let es_rows: Vec<EsRow> = resp_es.take(0)?;
-        if es_rows.is_empty() {
+        let cands: Vec<Cand> = resp_es.take(0)?;
+        if cands.is_empty() {
             return Ok(vec![]);
         }
-
-        // Build candidate list mapping a stable_id to its embedding (if available)
-        let mut candidates: Vec<(String, Vec<f32>)> = Vec::new();
-        for r in es_rows.into_iter() {
-            if let Some(e) = r.embedding {
-                if !e.is_empty() {
-                    candidates.push((r.stable_id.clone(), e));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return Ok(vec![]);
-        }
-        score_top_k(&query_embedding, &candidates, top_k)
+        score_top_k(
+            &query_embedding,
+            &cands
+                .iter()
+                .map(|c| (c.stable_id.clone(), c.embedding.clone()))
+                .collect::<Vec<_>>(),
+            top_k,
+        )
     } else {
-        // Sample candidate embeddings directly from entity_snapshot
+        // Sample candidate embeddings from entity_snapshot table
         let (sql, binds): (String, Vec<(&'static str, serde_json::Value)>) = if let Some(rfs) =
             repo_filters
         {
@@ -235,12 +222,16 @@ pub async fn similarity_with_conn_multi(
     if scored.is_empty() {
         return Ok(vec![]);
     }
-    let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
+    // Fetch entity details from entity_snapshot
+    let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, page_rank_value AS rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
     let ids: Vec<serde_json::Value> = scored
         .iter()
         .map(|(sid, _)| serde_json::Value::String(sid.clone()))
         .collect();
-    let sql2 = format!("SELECT {} FROM entity WHERE stable_id INSIDE $ids", fields);
+    let sql2 = format!(
+        "SELECT {} FROM entity_snapshot WHERE stable_id INSIDE $ids",
+        fields
+    );
     let mut resp2 = conn
         .query_with_binds(&sql2, vec![("ids", serde_json::Value::Array(ids))])
         .await?;

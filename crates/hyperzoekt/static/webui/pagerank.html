@@ -58,7 +58,16 @@
 
         try {
             const response = await fetch(`/api/pagerank?repo=${encodeURIComponent(selectedRepo)}`);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
             const data = await response.json();
+
+            if (!Array.isArray(data)) {
+                throw new Error('Invalid response format: expected an array');
+            }
 
             const entitiesByKind = {};
             data.forEach(entity => {

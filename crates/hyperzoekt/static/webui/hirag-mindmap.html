@@ -9,21 +9,35 @@
     </div>
     <div class="card-body">
         <style>
-            /* Make the mermaid diagram taller and let the SVG scale to the container */
+            /* Use viewport-aware sizing so the mindmap fits on a single screen by default */
             #diagram.mermaid {
-                min-height: 480px;
-                height: 480px;
-                max-height: 900px;
+                /* leave a bit of room for header/controls: larger to make room for long graphs */
+                min-height: 60vh;
+                height: calc(100vh - 140px);
+                max-height: 85vh;
                 overflow: auto;
+                display: flex;
+                justify-content: center;
+                align-items: flex-start;
             }
 
+            /* Let the SVG scale via transforms; keep natural sizing otherwise */
             #diagram.mermaid svg {
-                width: 100% !important;
-                height: 100% !important;
+                width: auto !important;
+                height: auto !important;
+                display: block;
+                margin: 0 auto;
+                max-width: none !important;
             }
         </style>
         <p class="note">Interactive Mermaid mindmap summarizing the HiRag WebUI: frontend, backend, DB relations, and
             tests.</p>
+        <div class="mm-controls" style="margin-bottom:8px">
+            <button id="mm-zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+            <button id="mm-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+            <button id="mm-fit" title="Fit to width" aria-label="Fit to width">Fit</button>
+            <span id="mm-scale-display" style="margin-left:8px;font-size:0.9em;color:#444">100%</span>
+        </div>
         <div id="diagram" class="mermaid">Loading mindmap…</div>
         <script type="module">
             import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
@@ -37,35 +51,135 @@
                     const clusters = data.clusters || [];
 
                     const idToLabel = {};
+                    // helper: try to extract a human label from the stored summary JSON
+                    function extractLabelFromSummary(summary) {
+                        if (!summary) return null;
+                        try {
+                            // some records store the JSON as a string; attempt to parse if it's a string
+                            let obj = summary;
+                            if (typeof obj === 'string') {
+                                // trim and check for leading brace
+                                const s = obj.trim();
+                                if (s.startsWith('{') || s.startsWith('\"{')) {
+                                    // try to unescape JSON that may have embedded escaped quotes
+                                    try {
+                                        obj = JSON.parse(s);
+                                    } catch (e) {
+                                        // fallback: try double-unescape (some DBs nest strings)
+                                        try {
+                                            obj = JSON.parse(JSON.parse('"' + s.replace(/"/g, '\\"') + '"'));
+                                        } catch (ee) {
+                                            return null;
+                                        }
+                                    }
+                                } else {
+                                    return null;
+                                }
+                            }
+                            if (obj && typeof obj === 'object' && obj.label) return String(obj.label);
+                        } catch (e) {
+                            // ignore parse errors and fall back
+                        }
+                        return null;
+                    }
+
+                    // sanitize labels for Mermaid (avoid characters that produce syntax errors)
+                    function sanitizeLabel(raw, fallback) {
+                        if (!raw && !fallback) return 'Cluster';
+                        let s = raw || '';
+                        try {
+                            s = String(s);
+                        } catch (e) { s = '' }
+                        // remove newlines and control chars
+                        s = s.replace(/\r?\n|[\x00-\x1F\x7F]/g, ' ');
+                        // unescape common escaped quotes
+                        s = s.replace(/\\"/g, '"');
+                        // remove double quotes (we'll delimit the label with quotes)
+                        s = s.replace(/\"/g, '');
+                        // strip characters that can look like Mermaid operators
+                        // only allow basic punctuation and alphanumerics
+                        s = s.replace(/[^\w\s\-\.,:;()\/]/g, '');
+                        // collapse spaces
+                        s = s.replace(/\s+/g, ' ').trim();
+                        if (!s && fallback) {
+                            s = String(fallback).replace(/[:\/\.\-@]/g, ' ').replace(/\s+/g, ' ').trim();
+                        }
+                        if (!s) s = 'Cluster';
+                        // limit length to avoid enormous nodes
+                        if (s.length > 120) s = s.substring(0, 117).trim() + '...';
+                        return s;
+                    }
+
                     for (const c of clusters) {
                         const id = c.stable_id || c.id || JSON.stringify(c.id);
-                        const label = c.label || (c.summary ? c.summary.substring(0, 40) : id);
-                        idToLabel[id] = label.replace(/\n/g, ' ');
+                        // prefer explicit c.label, otherwise try to pull label from summary JSON
+                        let label = null;
+                        if (c.label) label = c.label;
+                        if (!label) {
+                            const inner = extractLabelFromSummary(c.summary);
+                            if (inner) label = inner;
+                        }
+                        if (!label) label = (c.summary ? String(c.summary).substring(0, 40) : id);
+                        idToLabel[id] = sanitizeLabel(String(label), id);
                     }
 
                     let mermaidSrc = 'graph LR\n';
                     mermaidSrc += 'subgraph HiRag_Clusters\n';
+                    function looksLikeId(s, stable) {
+                        if (!s) return false;
+                        try {
+                            const ss = String(s).trim();
+                            if (ss === String(stable).trim()) return true;
+                            if (ss.includes('::')) return true;
+                            if (/^[a-z0-9_\-]+:[a-z0-9_\-]+$/i.test(ss)) return true;
+                            return false;
+                        } catch (e) { return false; }
+                    }
+
+                    // Normalize any string into a Mermaid-safe node id: ASCII letters, digits and '_'
+                    function safeNodeId(raw) {
+                        if (raw === undefined || raw === null) return 'n_unknown';
+                        let s = String(raw);
+                        // replace all non alphanumeric/underscore chars with underscore
+                        s = s.replace(/[^a-zA-Z0-9_]/g, '_');
+                        // ensure it starts with a letter to be safe for Mermaid
+                        if (!/^[a-zA-Z]/.test(s)) s = 'n_' + s;
+                        // collapse multiple underscores
+                        s = s.replace(/_+/g, '_');
+                        // trim trailing/leading underscores
+                        s = s.replace(/^_+|_+$/g, '');
+                        if (!s) return 'n_unknown';
+                        return s;
+                    }
+
                     for (const c of clusters) {
-                        // normalize id and ensure it starts with a letter to satisfy Mermaid
+                        // normalize id into a Mermaid-safe identifier
                         let rawId = (c.stable_id || c.id) || '';
-                        let id = rawId.replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(id)) id = 'n_' + id;
-                        // sanitize label: escape double quotes and replace square brackets
-                        let label = (idToLabel[c.stable_id || c.id] || id).toString();
-                        label = label.replace(/"/g, '\\"').replace(/\[/g, '(').replace(/\]/g, ')');
+                        let id = safeNodeId(rawId);
+                        // Prefer human label when available; fallback to a sanitized label
+                        let labelRaw = '';
+                        if (c.label && c.label.length > 0 && !looksLikeId(c.label, rawId)) {
+                            labelRaw = c.label;
+                        } else if (idToLabel[c.stable_id || c.id]) {
+                            labelRaw = idToLabel[c.stable_id || c.id];
+                        } else if (c.summary && c.summary.length > 0) {
+                            labelRaw = c.summary.substring(0, 40);
+                        } else {
+                            // humanize the raw id
+                            labelRaw = (c.stable_id || c.id || '').toString().replace(/^hirag::/, '').replace(/[:_\-\.\/]+/g, ' ').trim() || ('Cluster ' + (Math.random().toString(36).slice(2, 6)));
+                        }
+                        const label = sanitizeLabel(labelRaw, rawId).replace(/\[/g, '(').replace(/\]/g, ')');
                         mermaidSrc += `${id}["${label}"]\n`;
                     }
                     mermaidSrc += 'end\n';
 
                     for (const c of clusters) {
                         let rawSrc = (c.stable_id || c.id) || '';
-                        let src = rawSrc.replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(src)) src = 'n_' + src;
+                        let src = safeNodeId(rawSrc);
                         const members = c.members || [];
                         for (const m of members) {
                             if (typeof m === 'string' && m.startsWith('hirag::')) {
-                                let tgt = m.replace(/[:\/\.\-@]/g, '_');
-                                if (!/^[a-zA-Z]/.test(tgt)) tgt = 'n_' + tgt;
+                                let tgt = safeNodeId(m);
                                 mermaidSrc += `${src} --> ${tgt}\n`;
                             }
                         }
@@ -73,11 +187,7 @@
 
                     mermaidSrc += 'classDef cluster fill:#fef7e6,stroke:#ffcc66\n';
                     // build class list with normalized ids
-                    const classNodes = Object.keys(idToLabel).map(id => {
-                        let n = (id || '').replace(/[:\/\.\-@]/g, '_');
-                        if (!/^[a-zA-Z]/.test(n)) n = 'n_' + n;
-                        return n;
-                    }).join(',');
+                    const classNodes = Object.keys(idToLabel).map(id => safeNodeId(id)).join(',');
                     if (classNodes) mermaidSrc += 'class ' + classNodes + ' cluster\n';
 
                     const diagramEl = document.getElementById('diagram');
@@ -95,19 +205,165 @@
                                 diagramEl.textContent = mermaidSrc;
                                 try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
                             }
+                            // attach controls after render
+                            setTimeout(attachMindmapControls, 50);
                         } else {
                             diagramEl.textContent = mermaidSrc;
                             try { mermaid.init(undefined, diagramEl); } catch (e) { console.error(e); }
+                            setTimeout(attachMindmapControls, 200);
                         }
                     } catch (e) {
                         console.error('mermaid.render failed, falling back to init', e);
                         diagramEl.textContent = mermaidSrc;
                         try { mermaid.init(undefined, diagramEl); } catch (ee) { console.error(ee); }
+                        setTimeout(attachMindmapControls, 200);
                     }
                 } catch (e) {
                     document.getElementById('diagram').textContent = 'Error building mindmap: ' + e;
                     console.error(e);
                 }
+            }
+
+            // UI controls: zoom in/out and fit-to-width for the generated SVG
+            function attachMindmapControls() {
+                const diagramEl = document.getElementById('diagram');
+                if (!diagramEl) return;
+                const svg = diagramEl.querySelector('svg');
+                const zoomInBtn = document.getElementById('mm-zoom-in');
+                const zoomOutBtn = document.getElementById('mm-zoom-out');
+                const fitBtn = document.getElementById('mm-fit');
+                const display = document.getElementById('mm-scale-display');
+                if (!svg || !zoomInBtn || !zoomOutBtn || !fitBtn) return;
+                // ensure svg is responsive and ready for transforms
+                svg.style.width = svg.style.width || '100%';
+                svg.style.height = svg.style.height || 'auto';
+                svg.style.transformOrigin = svg.style.transformOrigin || '0 0';
+                // Use transform-box to ensure scale transforms apply to the SVG content
+                svg.style.transformBox = svg.style.transformBox || 'fill-box';
+                // keep scale in dataset
+                if (!diagramEl.dataset.scale) diagramEl.dataset.scale = '1';
+                function updateDisplay() {
+                    const s = parseFloat(diagramEl.dataset.scale || '1');
+                    display.textContent = Math.round(s * 100) + '%';
+                }
+                function setScale(s) {
+                    diagramEl.dataset.scale = String(s);
+                    svg.style.transform = `scale(${s})`;
+                    // adjust container overflow to allow scrolling when scaled
+                    diagramEl.style.overflow = 'auto';
+                    updateDisplay();
+                }
+                // precise fit-to-viewport implementation using SVG viewBox
+                // Fits both width and height so the diagram is readable without manual zooming
+                function fitToViewportPrecise() {
+                    try {
+                        // prefer viewBox if available
+                        let vb = null;
+                        if (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width && svg.viewBox.baseVal.width > 0) {
+                            vb = svg.viewBox.baseVal;
+                        } else {
+                            const vbAttr = svg.getAttribute('viewBox');
+                            if (vbAttr) {
+                                const parts = vbAttr.split(/\s+/).map(Number);
+                                if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+                                    vb = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
+                                }
+                            }
+                        }
+                        if (!vb) {
+                            // fallback: clear transforms and let natural sizing handle it
+                            svg.style.transform = '';
+                            diagramEl.dataset.scale = '1';
+                            updateDisplay();
+                            return;
+                        }
+                        const containerRect = diagramEl.getBoundingClientRect();
+                        const containerWidth = containerRect.width;
+                        const containerHeight = containerRect.height;
+                        if (!containerWidth || !containerHeight || !vb.width || !vb.height) {
+                            svg.style.transform = '';
+                            diagramEl.dataset.scale = '1';
+                            updateDisplay();
+                            return;
+                        }
+                        // compute scale to fit both width and height (leave a small padding)
+                        const padding = 16; // px
+                        const widthScale = (containerWidth - padding) / vb.width;
+                        const heightScale = (containerHeight - padding) / vb.height;
+                        const scale = Math.max(0.05, Math.min(4.0, Math.min(widthScale, heightScale)));
+                        // apply scale and ensure transform origin
+                        svg.style.transformOrigin = '0 0';
+                        svg.style.transform = `scale(${scale})`;
+                        diagramEl.dataset.scale = String(scale);
+                        updateDisplay();
+                    } catch (e) {
+                        console.warn('fitToViewportPrecise failed', e);
+                        svg.style.transform = '';
+                        diagramEl.dataset.scale = '1';
+                        updateDisplay();
+                    }
+                }
+                zoomInBtn.onclick = () => {
+                    const cur = parseFloat(diagramEl.dataset.scale || '1');
+                    const next = Math.min(cur + 0.1, 4.0);
+                    setScale(next);
+                };
+                zoomOutBtn.onclick = () => {
+                    const cur = parseFloat(diagramEl.dataset.scale || '1');
+                    const next = Math.max(cur - 0.1, 0.1);
+                    setScale(next);
+                };
+                fitBtn.onclick = () => {
+                    // fit to viewport (width and height)
+                    fitToViewportPrecise();
+                };
+                // support mousewheel + ctrl for zooming
+                diagramEl.addEventListener('wheel', (e) => {
+                    if (e.ctrlKey) {
+                        e.preventDefault();
+                        const delta = -Math.sign(e.deltaY) * 0.05;
+                        const cur = parseFloat(diagramEl.dataset.scale || '1');
+                        const next = Math.min(Math.max(cur + delta, 0.1), 4.0);
+                        setScale(next);
+                    }
+                }, { passive: false });
+                // Run an initial fit so the diagram is readable on first render
+                setTimeout(() => {
+                    try { fitToViewportPrecise(); } catch (e) { /* ignore */ }
+                }, 70);
+                updateDisplay();
+            }
+
+            // Observe the diagram container for inserted SVGs and attach controls when they appear
+            function observeDiagramForSvg() {
+                const diagramEl = document.getElementById('diagram');
+                if (!diagramEl) return;
+                // If SVG already present, attach controls now
+                if (diagramEl.querySelector && diagramEl.querySelector('svg')) {
+                    setTimeout(attachMindmapControls, 50);
+                    return;
+                }
+                const mo = new MutationObserver((mutations) => {
+                    for (const m of mutations) {
+                        if (m.addedNodes && m.addedNodes.length > 0) {
+                            for (const n of m.addedNodes) {
+                                if (n.nodeType === 1 && n.tagName && n.tagName.toLowerCase() === 'svg') {
+                                    // SVG inserted
+                                    setTimeout(attachMindmapControls, 50);
+                                    mo.disconnect();
+                                    return;
+                                }
+                                // sometimes mermaid injects into a wrapper — query for svg
+                                if (n.querySelector && n.querySelector('svg')) {
+                                    setTimeout(attachMindmapControls, 50);
+                                    mo.disconnect();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+                mo.observe(diagramEl, { childList: true, subtree: true });
             }
 
             window.addEventListener('load', () => setTimeout(buildMindmap, 50));

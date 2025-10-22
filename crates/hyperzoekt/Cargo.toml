@@ -109,11 +109,6 @@ path = "src/bin/hyperzoekt-indexer.rs"
 [[bin]]
 name = "hyperzoekt-webui"
 path = "src/bin/hyperzoekt-webui.rs"
-
-[[bin]]
-name = "hyperzoekt-embed-worker"
-path = "src/bin/hyperzoekt-embed-worker.rs"
-
 [[bin]]
 name = "hyperzoekt-mcp"
 path = "src/bin/hyperzoekt-mcp.rs"
@@ -121,3 +116,11 @@ path = "src/bin/hyperzoekt-mcp.rs"
 [[bin]]
 name = "hyperzoekt-sbom-worker"
 path = "src/bin/hyperzoekt-sbom-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-hirag-worker"
+path = "src/bin/hyperzoekt-hirag-worker.rs"
+
+[[bin]]
+name = "hyperzoekt-similarity-worker"
+path = "src/bin/hyperzoekt-similarity-worker.rs"

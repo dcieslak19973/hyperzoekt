@@ -60,6 +60,24 @@ impl DatabaseQueries {
         }
     }
 
+    /// Resolve a ref to a commit and optional snapshot, allowing the caller to
+    /// pass None to indicate "use repo default / common fallback refs". This
+    /// forwards to the shared utils::resolve_ref_to_snapshot which already
+    /// implements the lookup logic against `refs` and `snapshot_meta`.
+    pub async fn resolve_ref_to_snapshot_opt(
+        &self,
+        repo: &str,
+        raw_ref: Option<&str>,
+    ) -> Result<Option<(String, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+        let (_, commit_opt, snapshot_id_opt) =
+            crate::utils::resolve_ref_to_snapshot(&self.db, repo, raw_ref).await?;
+        if let Some(commit) = commit_opt {
+            Ok(Some((commit, snapshot_id_opt)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Return the repo's configured default branch, falling back to `SOURCE_BRANCH` env or `main`.
     pub async fn get_repo_default_branch(
         &self,
@@ -70,25 +88,382 @@ impl DatabaseQueries {
             branch: Option<String>,
         }
 
-        let sql = "SELECT branch FROM repo WHERE name = $name LIMIT 1";
-        let mut res = match &*self.db {
+        // Try to match repo row by either its stored name or the Thing id form
+        // (e.g. "repo:<name>") to tolerate differences in how repo rows are
+        // created by helpers across the codebase.
+
+        // First try to find an explicit branch value on the repo row. Use a
+        // tight query that only returns rows where branch is set to avoid
+        // falling back to refs when a repo row with an explicit branch exists
+        // (this helps in parallel test runs where timing can be flaky).
+        // Query both the exact name and the Thing-id prefixed name in one
+        // statement to be robust against how repo rows were created.
+        let sql_branch_both =
+            "SELECT branch FROM repo WHERE (name = $name OR name = $prefixed) LIMIT 1";
+
+        // Try a straightforward typed deserialize first — it's the most robust
+        // across client backends and avoids complex JSON-shape probing.
+        #[derive(Deserialize, Debug)]
+        struct BranchRowInner {
+            branch: Option<String>,
+        }
+
+        match &*self.db {
             SurrealConnection::Local(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
+                let mut r = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                // Prefer a typed deserialize when possible, but if it yields no
+                // usable branch fall back to the tolerant JSON-shape probing
+                // (some Surreal client transports return nested array shapes).
+                match r.take::<Vec<BranchRowInner>>(0) {
+                    Ok(rows) => {
+                        log::debug!(
+                            "get_repo_default_branch: typed take rows for repo='{}' -> {:?}",
+                            repo_name,
+                            rows
+                        );
+                        if let Some(row) = rows.into_iter().next() {
+                            if let Some(b) = row.branch {
+                                log::debug!(
+                                        "get_repo_default_branch: found branch via typed take for repo='{}' -> {}",
+                                        repo_name,
+                                        b
+                                    );
+                                return Ok(b);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "get_repo_default_branch: typed take error for repo='{}' -> {}",
+                            repo_name,
+                            e
+                        );
+                    }
+                }
+                // Typed deserialize did not yield a branch; re-run the query and
+                // probe the JSON-shaped response to handle nested/array shapes.
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    log::debug!(
+                        "get_repo_default_branch: json fallback for repo='{}' -> {}",
+                        repo_name,
+                        json_val
+                    );
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                } else {
+                    // Extra diagnostics: try fetching the full row shape to help
+                    // triage cases where response_to_json fails to find any slot.
+                    let mut r_inspect = db_conn
+                        .query(
+                            "SELECT * FROM repo WHERE (name = $name OR name = $prefixed) LIMIT 1",
+                        )
+                        .bind(("name", repo_name.to_string()))
+                        .bind(("prefixed", format!("repo:{}", repo_name)))
+                        .await?;
+                    // Try serde_json take
+                    if let Ok(rows) = r_inspect.take::<Vec<serde_json::Value>>(0) {
+                        log::debug!(
+                            "get_repo_default_branch: inspect serde_json rows for {} -> {:?}",
+                            repo_name,
+                            rows
+                        );
+                    } else if let Ok(vs) = r_inspect.take::<Vec<surrealdb::sql::Value>>(0) {
+                        log::debug!(
+                            "get_repo_default_branch: inspect sql::Value rows for {} -> {:?}",
+                            repo_name,
+                            vs
+                        );
+                    } else {
+                        log::debug!(
+                            "get_repo_default_branch: inspect returned no usable rows for {}",
+                            repo_name
+                        );
+                    }
+                }
             }
             SurrealConnection::RemoteHttp(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
+                let mut r = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                }
             }
             SurrealConnection::RemoteWs(db_conn) => {
-                let q = db_conn.query(sql).bind(("name", repo_name.to_string()));
-                q.await?
+                let mut r = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+                let r2 = db_conn
+                    .query(sql_branch_both)
+                    .bind(("name", repo_name.to_string()))
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r2) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        log::debug!("get_repo_default_branch: explicit branch query executed");
+
+        // If we didn't find a repo row with a branch set, try a tolerant
+        // query that fetches any repo row matching either the exact name or
+        // the Thing-id prefixed name and inspect the JSON value for a
+        // non-null `branch` field. This is more defensive across client
+        // response shapes and avoids missing an explicit branch.
+        let sql_name_in = "SELECT branch FROM repo WHERE name IN $names LIMIT 1";
+        let repo_names = serde_json::Value::Array(vec![
+            serde_json::Value::String(repo_name.to_string()),
+            serde_json::Value::String(format!("repo:{}", repo_name)),
+        ]);
+
+        let name_in_result: Option<String> = match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let r = db_conn
+                    .query(sql_name_in)
+                    .bind(("names", repo_names.clone()))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
+                    // Normalize common nested shapes: Array(Array(obj)) or Array(obj)
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let r = db_conn
+                    .query(sql_name_in)
+                    .bind(("names", repo_names.clone()))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let r = db_conn
+                    .query(sql_name_in)
+                    .bind(("names", repo_names.clone()))
+                    .await?;
+                if let Some(json_val) = crate::db::helpers::response_to_json(r) {
+                    let candidate = if json_val.is_array() {
+                        let arr = json_val.as_array().unwrap();
+                        if !arr.is_empty() {
+                            if arr[0].is_array() {
+                                arr[0].as_array().and_then(|a| a.first()).cloned()
+                            } else {
+                                arr.first().cloned()
+                            }
+                        } else {
+                            None
+                        }
+                    } else if json_val.is_object() {
+                        Some(json_val)
+                    } else {
+                        None
+                    };
+                    if let Some(obj) = candidate {
+                        if let Some(b) = obj.get("branch") {
+                            if !b.is_null() {
+                                return Ok(b.as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                    }
+                    None
+                } else {
+                    None
+                }
             }
         };
-        if let Ok(rows) = res.take::<Vec<BranchRow>>(0) {
-            if let Some(r) = rows.into_iter().next() {
-                if let Some(b) = r.branch {
-                    return Ok(b);
+        if name_in_result.is_some() {
+            // already returned above if non-null; fallthrough if None
+        }
+
+        // Extra defensive check: some environments store the repo under Thing id
+        // (e.g. id = type::thing("repo:...")) rather than name field. Try
+        // selecting by Thing equality and prefer its branch when present.
+        let repo_by_thing_sql = "SELECT branch FROM repo WHERE id = type::thing($prefixed) LIMIT 1";
+        match &*self.db {
+            SurrealConnection::Local(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+            }
+            SurrealConnection::RemoteHttp(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
+                }
+            }
+            SurrealConnection::RemoteWs(db_conn) => {
+                let mut r = db_conn
+                    .query(repo_by_thing_sql)
+                    .bind(("prefixed", format!("repo:{}", repo_name)))
+                    .await?;
+                if let Ok(rows) = r.take::<Vec<BranchRowInner>>(0) {
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(b) = row.branch {
+                            return Ok(b);
+                        }
+                    }
                 }
             }
         }
@@ -97,12 +472,20 @@ impl DatabaseQueries {
         // If repo row didn't contain a branch, try to find a common default branch
         // by querying the refs table (this mirrors the SBOM lookup behavior and
         // centralizes fallback logic so both UI paths behave the same).
-        let refs_query = "SELECT VALUE name FROM refs WHERE repo = $repo AND name IN ['refs/heads/main', 'refs/heads/master', 'refs/heads/trunk'] LIMIT 1";
+        // Look for refs rows matching either the raw repo name or the sanitized
+        // "repo:<name>" Thing id form. Using an IN $repos bind makes this robust
+        // to how other helpers populate the `repo` column.
+        let refs_query = "SELECT VALUE name FROM refs WHERE repo IN $repos AND name IN ['refs/heads/main', 'refs/heads/master', 'refs/heads/trunk'] LIMIT 1";
+        let repo_candidates = serde_json::Value::Array(vec![
+            serde_json::Value::String(repo_name.to_string()),
+            serde_json::Value::String(format!("repo:{}", repo_name)),
+        ]);
+
         let default_from_refs: Option<String> = match &*self.db {
             SurrealConnection::Local(db_conn) => {
                 let result = db_conn
                     .query(refs_query)
-                    .bind(("repo", repo_name.to_string()))
+                    .bind(("repos", repo_candidates.clone()))
                     .await?;
                 if let Some(json_val) = crate::db::response_to_json(result) {
                     if let Some(arr) = json_val.as_array() {
@@ -117,7 +500,7 @@ impl DatabaseQueries {
             SurrealConnection::RemoteHttp(db_conn) => {
                 let result = db_conn
                     .query(refs_query)
-                    .bind(("repo", repo_name.to_string()))
+                    .bind(("repos", repo_candidates.clone()))
                     .await?;
                 if let Some(json_val) = crate::db::response_to_json(result) {
                     if let Some(arr) = json_val.as_array() {
@@ -132,7 +515,7 @@ impl DatabaseQueries {
             SurrealConnection::RemoteWs(db_conn) => {
                 let result = db_conn
                     .query(refs_query)
-                    .bind(("repo", repo_name.to_string()))
+                    .bind(("repos", repo_candidates.clone()))
                     .await?;
                 if let Some(json_val) = crate::db::response_to_json(result) {
                     if let Some(arr) = json_val.as_array() {
@@ -201,9 +584,7 @@ impl DatabaseQueries {
         // Prefer filtering on the explicit `repo_name` field (safer and more direct).
         // Fall back to matching file path prefixes for older/imported records that
         // don't have `repo_name` populated.
-        // Use the per-snapshot page rank value stored under snapshot.page_rank_value.
-        // We no longer fall back to a top-level entity field; page_rank is snapshot-scoped.
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql = format!(
             "SELECT {} FROM entity WHERE repo_name = $repo ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -233,7 +614,7 @@ impl DatabaseQueries {
 
         // Fallback: look for file paths that start with the provided repo_name.
         // Use a parameterized query to avoid injection.
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql2 = format!(
             "SELECT {} FROM entity WHERE string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -251,7 +632,7 @@ impl DatabaseQueries {
     }
 
     pub async fn get_all_entities(&self) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let query_sql = format!(
             "SELECT {} FROM entity ORDER BY snapshot.file, snapshot.start_line",
             entity_fields
@@ -275,7 +656,7 @@ impl DatabaseQueries {
         &self,
         stable_id: &str,
     ) -> Result<Option<EntityPayload>, Box<dyn std::error::Error>> {
-        let entity_fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let entity_fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
         let sql = format!(
             "SELECT {} FROM entity WHERE stable_id = $stable_id",
             entity_fields
@@ -466,13 +847,7 @@ impl DatabaseQueries {
         let mut out_same: Vec<serde_json::Value> = Vec::new();
         let mut out_external: Vec<serde_json::Value> = Vec::new();
         for e in same_repo.into_iter() {
-            // Convert entity_snapshot ID to entity ID for map lookup
-            let target_id = if e.target.to_string().starts_with("entity_snapshot:") {
-                e.target.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.target.to_string()
-            };
-            if let Some(er) = ent_map.get(&target_id) {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
                 out_same.push(serde_json::json!({
                     "stable_id": er.stable_id,
                     "name": er.name,
@@ -487,13 +862,7 @@ impl DatabaseQueries {
             }
         }
         for e in external_repo.into_iter() {
-            // Convert entity_snapshot ID to entity ID for map lookup
-            let target_id = if e.target.to_string().starts_with("entity_snapshot:") {
-                e.target.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.target.to_string()
-            };
-            if let Some(er) = ent_map.get(&target_id) {
+            if let Some(er) = ent_map.get(&e.target.to_string()) {
                 out_external.push(serde_json::json!({
                     "stable_id": er.stable_id,
                     "name": er.name,
@@ -559,20 +928,15 @@ impl DatabaseQueries {
             return Ok(vec![]);
         }
 
-        // Gather unique ids referenced and bulk load entity rows to filter by repo
+        // Gather unique ids referenced and bulk load entity_snapshot rows to filter by repo
         use std::collections::{HashMap, HashSet};
         let mut ids: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
         for e in &edge_rows {
             for tid in [e.a.to_string(), e.b.to_string()] {
-                // Convert entity_snapshot ID to entity ID
-                let entity_id = if tid.starts_with("entity_snapshot:") {
-                    tid.replace("entity_snapshot:", "entity:")
-                } else {
-                    tid
-                };
-                if seen.insert(entity_id.clone()) {
-                    ids.push(entity_id);
+                // Keep entity_snapshot IDs as-is since relations point to entity_snapshot records
+                if seen.insert(tid.clone()) {
+                    ids.push(tid);
                 }
             }
         }
@@ -580,8 +944,9 @@ impl DatabaseQueries {
         for (i, _) in ids.iter().enumerate() {
             thing_exprs.push(format!("type::thing($x{})", i));
         }
+        // Query entity_snapshot table directly since similarity relations point to entity_snapshot records
         let sql2 = format!(
-            "SELECT id, stable_id, name, snapshot.file AS file, repo_name, language, kind, snapshot.source_url AS source_url, snapshot.source_display AS source_display FROM entity WHERE id IN [{}]",
+            "SELECT id, stable_id, name, file AS file, repo_name, language, kind, source_url AS source_url, source_display AS source_display FROM entity_snapshot WHERE id IN [{}]",
             thing_exprs.join(", ")
         );
         let mut resp2 = match &*self.db {
@@ -632,18 +997,7 @@ impl DatabaseQueries {
         let lang_lc = language.map(|s| s.to_lowercase());
         let kind_lc = kind.map(|s| s.to_lowercase());
         for e in edge_rows.into_iter() {
-            // Convert entity_snapshot IDs to entity IDs for map lookup
-            let a_id = if e.a.to_string().starts_with("entity_snapshot:") {
-                e.a.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.a.to_string()
-            };
-            let b_id = if e.b.to_string().starts_with("entity_snapshot:") {
-                e.b.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.b.to_string()
-            };
-            if let (Some(ae), Some(be)) = (map.get(&a_id), map.get(&b_id)) {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
                 if ae.repo_name == repo_name && be.repo_name == repo_name {
                     if let Some(ms) = min_score {
                         if e.score < ms {
@@ -738,14 +1092,9 @@ impl DatabaseQueries {
         let mut seen = HashSet::new();
         for e in &edge_rows {
             for tid in [e.a.to_string(), e.b.to_string()] {
-                // Convert entity_snapshot ID to entity ID
-                let entity_id = if tid.starts_with("entity_snapshot:") {
-                    tid.replace("entity_snapshot:", "entity:")
-                } else {
-                    tid
-                };
-                if seen.insert(entity_id.clone()) {
-                    ids.push(entity_id);
+                // Keep entity_snapshot IDs as-is since relations point to entity_snapshot records
+                if seen.insert(tid.clone()) {
+                    ids.push(tid);
                 }
             }
         }
@@ -753,8 +1102,9 @@ impl DatabaseQueries {
         for (i, _) in ids.iter().enumerate() {
             thing_exprs.push(format!("type::thing($x{})", i));
         }
+        // Query entity_snapshot table directly since similarity relations point to entity_snapshot records
         let sql2 = format!(
-            "SELECT id, stable_id, name, snapshot.file AS file, repo_name, language, kind, snapshot.source_url AS source_url, snapshot.source_display AS source_display FROM entity WHERE id IN [{}]",
+            "SELECT id, stable_id, name, file AS file, repo_name, language, kind, source_url AS source_url, source_display AS source_display FROM entity_snapshot WHERE id IN [{}]",
             thing_exprs.join(", ")
         );
         let mut resp2 = match &*self.db {
@@ -800,18 +1150,7 @@ impl DatabaseQueries {
 
         let mut out: Vec<serde_json::Value> = Vec::new();
         for e in edge_rows.into_iter() {
-            // Convert entity_snapshot IDs to entity IDs for map lookup
-            let a_id = if e.a.to_string().starts_with("entity_snapshot:") {
-                e.a.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.a.to_string()
-            };
-            let b_id = if e.b.to_string().starts_with("entity_snapshot:") {
-                e.b.to_string().replace("entity_snapshot:", "entity:")
-            } else {
-                e.b.to_string()
-            };
-            if let (Some(ae), Some(be)) = (map.get(&a_id), map.get(&b_id)) {
+            if let (Some(ae), Some(be)) = (map.get(&e.a.to_string()), map.get(&e.b.to_string())) {
                 if ae.repo_name == repo_name && be.repo_name != repo_name {
                     if let Some(ms) = min_score {
                         if e.score < ms {
@@ -867,7 +1206,7 @@ impl DatabaseQueries {
         repo_name: &str,
         parent_name: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let fields = "<string>id AS id, language, kind, name, rank AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 
         let mut response = match &*self.db {
             SurrealConnection::Local(db_conn) => {
@@ -1807,7 +2146,7 @@ impl DatabaseQueries {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
-        let fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS page_rank_value, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
+        let fields = "<string>id AS id, language, kind, name, snapshot.page_rank_value AS rank, repo_name, signature, stable_id, snapshot.file AS file, snapshot.parent AS parent, snapshot.start_line AS start_line, snapshot.end_line AS end_line, snapshot.doc AS doc, snapshot.imports AS imports, snapshot.unresolved_imports AS unresolved_imports, snapshot.methods AS methods, snapshot.source_url AS source_url, snapshot.source_display AS source_display, snapshot.calls AS calls, snapshot.source_content AS source_content";
 
         // If we have repo_filters, split into repo_names (for repo_name IN) and
         // path_prefixes (for string::starts_with on file)
@@ -1831,13 +2170,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1859,13 +2198,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1879,13 +2218,13 @@ impl DatabaseQueries {
                 } else {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1901,13 +2240,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1929,13 +2268,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1949,13 +2288,13 @@ impl DatabaseQueries {
                 } else {
                     let q0 = if offset == 0 {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         ))
                     } else {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1968,13 +2307,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -1996,13 +2335,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) AND string::starts_with(snapshot.file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2016,13 +2355,13 @@ impl DatabaseQueries {
                 } else {
                     let q0 = if offset == 0 {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         ))
                     } else {
                         db_conn.query(format!(
-                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY snapshot.page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity WHERE string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2060,7 +2399,7 @@ impl DatabaseQueries {
         snapshot_id: &str,
     ) -> Result<Vec<EntityPayload>, Box<dyn std::error::Error>> {
         // Fields for entity_snapshot are top-level (not under `snapshot.`)
-        let fields = "<string>id AS id, language, kind, name, page_rank_value, repo_name, signature, stable_id, file AS file, parent AS parent, start_line AS start_line, end_line AS end_line, doc AS doc, imports AS imports, unresolved_imports AS unresolved_imports, methods AS methods, source_url AS source_url, source_display AS source_display, calls AS calls, source_content AS source_content";
+        let fields = "<string>id AS id, language, kind, name, rank, repo_name, signature, stable_id, file AS file, parent AS parent, start_line AS start_line, end_line AS end_line, doc AS doc, imports AS imports, unresolved_imports AS unresolved_imports, methods AS methods, source_url AS source_url, source_display AS source_display, calls AS calls, source_content AS source_content";
 
         // Split repo_filters into repo_names and path_prefixes as in the non-snapshot variant
         let mut repo_names: Vec<String> = Vec::new();
@@ -2080,13 +2419,13 @@ impl DatabaseQueries {
                 if !repo_names.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND repo_name IN $repos ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2109,13 +2448,13 @@ impl DatabaseQueries {
                 } else if !path_prefixes.is_empty() {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) AND string::starts_with(file ?? '', $repo) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit
@@ -2130,13 +2469,13 @@ impl DatabaseQueries {
                 } else {
                     let sql = if offset == 0 {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY page_rank_value DESC LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY rank DESC LIMIT {}",
                             fields,
                             limit
                         )
                     } else {
                         format!(
-                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY page_rank_value DESC START AT {} LIMIT {}",
+                            "SELECT {} FROM entity_snapshot WHERE snapshot_id = $sid AND string::contains(name, $q) ORDER BY rank DESC START AT {} LIMIT {}",
                             fields,
                             offset,
                             limit

@@ -71,12 +71,67 @@
                 return out;
             }
 
-            // Add cluster nodes (use label when available, fall back to summary or humanized stable_id)
+            // Helper: decide if a string looks like an internal ID (contains '::' or is equal to stable)
+            function looksLikeId(s, stable) {
+                if (!s) return false;
+                try {
+                    const ss = String(s).trim();
+                    if (ss === String(stable).trim()) return true;
+                    if (ss.includes('::')) return true;
+                    if (/^[a-z0-9_\-]+:[a-z0-9_\-]+$/i.test(ss)) return true;
+                    return false;
+                } catch (e) { return false; }
+            }
+
+            // Helper: treat common sentinel label values as 'no label'
+            function isSentinelLabel(s) {
+                if (s === null || s === undefined) return true;
+                try {
+                    const ss = String(s).trim();
+                    if (ss.length === 0) return true;
+                    const lowered = ss.toLowerCase();
+                    return lowered === 'none' || lowered === 'null' || lowered === 'n/a' || lowered === 'na' || lowered === 'unknown';
+                } catch (e) { return true; }
+            }
+
+            // Try to extract label field from stored summary JSON; returns null if not found
+            function extractLabelFromSummary(summary) {
+                if (!summary) return null;
+                try {
+                    let obj = summary;
+                    if (typeof obj === 'string') {
+                        const s = obj.trim();
+                        if (s.startsWith('{')) {
+                            obj = JSON.parse(s);
+                        } else {
+                            return null;
+                        }
+                    }
+                    if (obj && typeof obj === 'object' && obj.label) return String(obj.label);
+                } catch (e) {
+                    // swallow parse errors
+                }
+                return null;
+            }
+
+            // Add cluster nodes (prefer label, then summary; never show raw stable_id as the node label)
             clusters.forEach((c, idx) => {
                 const stable = c.stable_id || ('idx_' + idx);
                 const id = 'c_' + safeId(stable);
-                let displayLabel = (c && c.label) ? c.label : (c && c.summary) ? (c.summary.substring(0, 40) + '...') : humanizeStable(stable);
-                if (!displayLabel || displayLabel.length === 0) displayLabel = stable;
+                let displayLabel = '';
+                if (c && c.label && String(c.label).trim().length > 0 && !looksLikeId(c.label, stable)) {
+                    displayLabel = String(c.label).trim();
+                } else {
+                    // try to parse label from summary JSON blob
+                    const inner = extractLabelFromSummary(c.summary);
+                    if (inner && !looksLikeId(inner, stable)) {
+                        displayLabel = inner.trim();
+                    } else if (c && c.summary && String(c.summary).trim().length > 0) {
+                        displayLabel = String(c.summary).trim().substring(0, 40) + '...';
+                    } else {
+                        displayLabel = 'Cluster ' + (idx + 1);
+                    }
+                }
                 elements.push({ data: { id: id, label: displayLabel, summary: c.summary || '', stable_id: stable } });
                 seen.add(id);
             });
@@ -93,7 +148,25 @@
                             if (!seen.has(tgt)) {
                                 // If the member refers to another hirag cluster, prefer that cluster's label
                                 const refCluster = clusterByStable.get(m);
-                                const tgtLabel = (refCluster && (refCluster.label || refCluster.stable_label)) || humanizeStable(m) || m;
+                                let tgtLabel = '';
+                                if (refCluster) {
+                                    // Prefer an explicit label when available, but treat sentinel values like 'NONE' as absent
+                                    if (!isSentinelLabel(refCluster.label) && refCluster.label && !looksLikeId(refCluster.label, refCluster.stable_id || m)) {
+                                        tgtLabel = String(refCluster.label).trim();
+                                    } else {
+                                        // Try extracting a label from a JSON summary blob (this handles layer2+ where label may be missing)
+                                        const parsed = extractLabelFromSummary(refCluster.summary);
+                                        if (parsed && !looksLikeId(parsed, refCluster.stable_id || m) && !isSentinelLabel(parsed)) {
+                                            tgtLabel = parsed.trim();
+                                        } else if (refCluster.summary && String(refCluster.summary).trim().length > 0) {
+                                            tgtLabel = String(refCluster.summary).trim().substring(0, 40) + '...';
+                                        } else {
+                                            tgtLabel = humanizeStable(refCluster.stable_id || m) || 'Cluster';
+                                        }
+                                    }
+                                } else {
+                                    tgtLabel = humanizeStable(m) || 'Cluster';
+                                }
                                 elements.push({ data: { id: tgt, label: tgtLabel, summary: (refCluster && refCluster.summary) || '', stable_id: refCluster ? refCluster.stable_id : m } });
                                 seen.add(tgt);
                             }
@@ -129,16 +202,19 @@
                             for (const m of members) {
                                 const mid = m.id || (m.details && m.details.stable_id) || '';
                                 if (m.type === 'entity') {
-                                    // entity: link to entity page
+                                    // entity: link to entity page; prefer human-friendly name/label over stable id
                                     const entStable = (m.details && (m.details.stable_id || m.details.id)) || mid;
-                                    html += `<li><a href="/entity/${encodeURIComponent(entStable)}" target="_blank">${entStable}</a> <span style="color:var(--muted);">(entity)</span></li>`;
+                                    const entLabel = (m.details && (m.details.name || m.details.label)) || entStable;
+                                    html += `<li><a href="/entity/${encodeURIComponent(entStable)}" target="_blank">${entLabel}</a> <span style="color:var(--muted);">(entity)</span></li>`;
                                 } else if (m.type === 'cluster') {
-                                    // cluster: link that focuses the node in the graph
+                                    // cluster: link that focuses the node in the graph; prefer label over id
                                     const clusterStable = mid;
                                     const nodeId = 'c_' + safeId(clusterStable);
-                                    html += `<li><a href="#" data-cluster-id="${nodeId}" class="focus-cluster">${(m.details && (m.details.label || m.details.stable_id)) || clusterStable}</a> <span style="color:var(--muted);">(cluster)</span></li>`;
+                                    const clusterLabel = (m.details && (m.details.label)) || humanizeStable(clusterStable) || '';
+                                    html += `<li><a href="#" data-cluster-id="${nodeId}" class="focus-cluster">${clusterLabel}</a> <span style="color:var(--muted);">(cluster)</span></li>`;
                                 } else {
-                                    html += `<li>${mid} <span style="color:var(--muted);">(unknown)</span></li>`;
+                                    const unknownLabel = (m.details && (m.details.label || m.details.name)) || humanizeStable(mid) || '';
+                                    html += `<li>${unknownLabel} <span style="color:var(--muted);">(unknown)</span></li>`;
                                 }
                             }
                             html += '</ul></div>';
