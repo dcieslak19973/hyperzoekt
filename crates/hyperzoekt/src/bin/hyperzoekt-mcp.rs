@@ -1361,6 +1361,7 @@ enum JsonRpcMessage {
 }
 #[derive(Deserialize, Debug)]
 struct JsonRpcRequest {
+    #[serde(rename = "jsonrpc")]
     _jsonrpc: String,
     method: String,
     params: Option<serde_json::Value>,
@@ -1375,10 +1376,15 @@ async fn handle_mcp(
     let handler = HZHandler { state };
     let parsed: Result<JsonRpcMessage, _> = serde_json::from_slice(&body);
     match parsed {
-        Ok(JsonRpcMessage::Single(req)) => handle_single(handler, req).await,
+        Ok(JsonRpcMessage::Single(req)) => {
+            log::info!("MCP request received: method={}", req.method);
+            handle_single(handler, req).await
+        }
         Ok(JsonRpcMessage::Batch(reqs)) => {
+            log::info!("MCP batch request received: count={}", reqs.len());
             let mut out = Vec::new();
             for req in reqs {
+                log::info!("MCP batch item: method={}", req.method);
                 out.push(
                     handle_single(handler.clone(), req)
                         .await
@@ -1387,9 +1393,12 @@ async fn handle_mcp(
             }
             axum::response::Json(serde_json::Value::Array(out))
         }
-        Err(e) => Json(
-            serde_json::json!({ "jsonrpc": "2.0", "error": {"code": -32700, "message": format!("Parse error: {}", e)}, "id": null }),
-        ),
+        Err(e) => {
+            log::error!("Failed to parse MCP request: {}", e);
+            Json(
+                serde_json::json!({ "jsonrpc": "2.0", "error": {"code": -32700, "message": format!("Parse error: {}", e)}, "id": null }),
+            )
+        }
     }
 }
 
@@ -1403,9 +1412,10 @@ impl IntoResponseJson for Json<serde_json::Value> {
 }
 
 async fn handle_single(handler: HZHandler, req: JsonRpcRequest) -> Json<serde_json::Value> {
-    match req.method.as_str() {
+    let method_name = req.method.clone();
+    let response = match req.method.as_str() {
         "initialize" => Json(serde_json::json!({
-            "jsonrpc":"2.0", "result": { "protocol_version": "2024-11-05", "capabilities": {"tools": {}} , "server_info": {"name":"hyperzoekt-mcp","version":"0.1.0"}}, "id": req.id
+            "jsonrpc":"2.0", "result": { "protocolVersion": "2024-11-05", "capabilities": {"tools": {}} , "serverInfo": {"name":"hyperzoekt-mcp","version":"0.1.0"}}, "id": req.id
         })),
         "tools/list" => match handler.list_tools(ListToolsRequest { cursor: None }).await {
             Ok(resp) => Json(
@@ -1415,6 +1425,11 @@ async fn handle_single(handler: HZHandler, req: JsonRpcRequest) -> Json<serde_js
                 serde_json::json!({"jsonrpc":"2.0", "error": {"code": -32000, "message": e.to_string()}, "id": req.id}),
             ),
         },
+        "prompts/list" => Json(serde_json::json!({
+            "jsonrpc":"2.0",
+            "result": {"prompts": [], "nextCursor": serde_json::Value::Null},
+            "id": req.id
+        })),
         "tools/call" => {
             if let Some(params) = req.params.as_ref() {
                 if let (Some(name), Some(arguments)) = (params.get("name"), params.get("arguments"))
@@ -1465,7 +1480,9 @@ async fn handle_single(handler: HZHandler, req: JsonRpcRequest) -> Json<serde_js
         _ => Json(
             serde_json::json!({"jsonrpc":"2.0", "error": {"code": -32601, "message": format!("Unknown method: {}", req.method)}, "id": req.id}),
         ),
-    }
+    };
+    log::info!("MCP request handled: method={method_name}");
+    response
 }
 
 #[tokio::main]
@@ -1500,6 +1517,7 @@ async fn main() -> Result<()> {
         .parse()
         .expect("invalid HZ_MCP_HOST/HZ_MCP_PORT");
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    log::info!("hyperzoekt-mcp listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

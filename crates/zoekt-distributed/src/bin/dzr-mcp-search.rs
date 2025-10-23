@@ -91,6 +91,7 @@ enum JsonRpcMessage {
 
 #[derive(Deserialize, Debug)]
 struct JsonRpcRequest {
+    #[serde(rename = "jsonrpc")]
     _jsonrpc: String,
     method: String,
     params: Option<serde_json::Value>,
@@ -129,6 +130,7 @@ struct JsonRpcError {
 
 // MCP-specific structures
 #[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct InitializeResult {
     protocol_version: String,
     capabilities: ServerCapabilities,
@@ -432,8 +434,6 @@ async fn extract_git_headers(headers: &HeaderMap, credentials: &SharedCredential
     let mut creds = credentials.write().await;
     let mut extracted_count = 0;
 
-    tracing::debug!("Starting header extraction from {} headers", headers.len());
-
     // Extract GitHub credentials
     if let Some(username) = headers
         .get("x-github-username")
@@ -491,22 +491,20 @@ async fn extract_git_headers(headers: &HeaderMap, credentials: &SharedCredential
         extracted_count += 1;
     }
 
-    tracing::info!(
-        "🔐 Header extraction completed - extracted {} credential(s)",
-        extracted_count
-    );
+    if extracted_count > 0 {
+        let github_present = creds.github_username.is_some() && creds.github_token.is_some();
+        let gitlab_present = creds.gitlab_username.is_some() && creds.gitlab_token.is_some();
+        let bitbucket_present =
+            creds.bitbucket_username.is_some() && creds.bitbucket_token.is_some();
 
-    // Log current credential status
-    let github_present = creds.github_username.is_some() && creds.github_token.is_some();
-    let gitlab_present = creds.gitlab_username.is_some() && creds.gitlab_token.is_some();
-    let bitbucket_present = creds.bitbucket_username.is_some() && creds.bitbucket_token.is_some();
-
-    tracing::debug!(
-        "Current credential status - GitHub: {}, GitLab: {}, BitBucket: {}",
-        if github_present { "✅" } else { "❌" },
-        if gitlab_present { "✅" } else { "❌" },
-        if bitbucket_present { "✅" } else { "❌" }
-    );
+        tracing::info!(
+            "🔐 Updated credential cache ({} field(s)); GitHub: {}, GitLab: {}, BitBucket: {}",
+            extracted_count,
+            if github_present { "✅" } else { "❌" },
+            if gitlab_present { "✅" } else { "❌" },
+            if bitbucket_present { "✅" } else { "❌" }
+        );
+    }
 }
 
 // Enhanced MCP handler with session management and batch support
@@ -517,12 +515,6 @@ async fn handle_mcp_with_headers(
 ) -> impl IntoResponse {
     let start_time = std::time::Instant::now();
     let request_id = format!("req_{}", start_time.elapsed().as_nanos());
-
-    tracing::info!(
-        "🚀 [{}] Incoming MCP request - body size: {} bytes",
-        request_id,
-        body.len()
-    );
 
     // Extract session ID from headers or generate one
     let session_id = headers
@@ -561,9 +553,13 @@ async fn handle_mcp_with_headers(
 
     match message {
         Ok(JsonRpcMessage::Single(req)) => {
+            if req.method != "prompts/list" {
+                tracing::info!("MCP request received: method={}", req.method);
+            }
             handle_single_request(req, request_id, start_time, state).await
         }
         Ok(JsonRpcMessage::Batch(requests)) => {
+            tracing::info!("MCP batch request received: {} item(s)", requests.len());
             handle_batch_requests(requests, request_id, start_time, state).await
         }
         Err(e) => {
@@ -605,6 +601,13 @@ async fn handle_single_request(
     start_time: std::time::Instant,
     state: AppState,
 ) -> axum::response::Response {
+    let method = req.method.clone();
+    if method == "prompts/list" {
+        return handle_prompts_list_request(req, request_id, start_time)
+            .await
+            .into_response();
+    }
+
     tracing::info!(
         "📨 [{}] Parsed JSON-RPC request - method: '{}', id: {:?}",
         request_id,
@@ -625,43 +628,40 @@ async fn handle_single_request(
     }
 
     // Handle requests (with id)
-    tracing::info!(
-        "🔧 [{}] Processing request method: {}",
-        request_id,
-        req.method
-    );
+    tracing::info!("🔧 [{}] Processing request method: {}", request_id, method);
 
-    match req.method.as_str() {
-        "initialize" => {
-            let response = handle_initialize_request(req, request_id, start_time).await;
-            // Convert impl IntoResponse to Response
-            response.into_response()
-        }
-        "tools/list" => {
-            let response = handle_tools_list_request(req, request_id, start_time).await;
-            response.into_response()
-        }
-        "tools/call" => {
-            let response = handle_tools_call_request(req, request_id, start_time, state).await;
-            response.into_response()
-        }
-        "shutdown" => {
-            let response = handle_shutdown_request(req, request_id, start_time).await;
-            response.into_response()
-        }
-        "exit" => {
-            let response = handle_exit_request(req, request_id, start_time).await;
-            response.into_response()
-        }
-        "$/ping" => {
-            let response = handle_ping_request(req, request_id, start_time).await;
-            response.into_response()
-        }
-        _ => {
-            let response = handle_unknown_method(req, request_id, start_time).await;
-            response.into_response()
-        }
-    }
+    let response: axum::response::Response = match method.as_str() {
+        "initialize" => handle_initialize_request(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+        "tools/list" => handle_tools_list_request(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+        "tools/call" => handle_tools_call_request(req, request_id.clone(), start_time, state)
+            .await
+            .into_response(),
+        "shutdown" => handle_shutdown_request(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+        "exit" => handle_exit_request(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+        "$/ping" => handle_ping_request(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+        _ => handle_unknown_method(req, request_id.clone(), start_time)
+            .await
+            .into_response(),
+    };
+
+    let status = response.status();
+    tracing::info!(
+        "✅ [{}] Request completed: method={}, status={}",
+        request_id,
+        method,
+        status
+    );
+    response
 }
 
 // Handle batch JSON-RPC requests
@@ -681,7 +681,21 @@ async fn handle_batch_requests(
     let mut has_notifications = false;
 
     for req in requests {
-        let req_id = format!("{}_{}", request_id, req.method);
+        let method = req.method.clone();
+        let req_id = format!("{}_{}", request_id, method);
+
+        if method != "prompts/list" {
+            tracing::info!(
+                "📨 [{}] Batch item received - method: '{}', id: {:?}",
+                request_id,
+                method,
+                req.id
+            );
+
+            if let Some(params) = &req.params {
+                tracing::debug!("📋 [{}] Batch item params: {}", request_id, params);
+            }
+        }
 
         if req.id.is_none() {
             has_notifications = true;
@@ -689,13 +703,17 @@ async fn handle_batch_requests(
             handle_notification(req, req_id, start_time).await;
         } else {
             // Handle request and collect response
-            let response: axum::response::Response = match req.method.as_str() {
+            let response: axum::response::Response = match method.as_str() {
                 "initialize" => {
                     let resp = handle_initialize_request(req, req_id, start_time).await;
                     resp.into_response()
                 }
                 "tools/list" => {
                     let resp = handle_tools_list_request(req, req_id, start_time).await;
+                    resp.into_response()
+                }
+                "prompts/list" => {
+                    let resp = handle_prompts_list_request(req, req_id, start_time).await;
                     resp.into_response()
                 }
                 "tools/call" => {
@@ -720,6 +738,16 @@ async fn handle_batch_requests(
                     resp.into_response()
                 }
             };
+
+            if method != "prompts/list" {
+                let status = response.status();
+                tracing::info!(
+                    "✅ [{}] Batch item completed: method={}, status={}",
+                    request_id,
+                    method,
+                    status
+                );
+            }
 
             // For simplicity, we'll just handle one response for now
             // In a full implementation, we'd collect all responses
@@ -999,6 +1027,27 @@ async fn handle_tools_list_request(
     add_cors_headers(response)
 }
 
+async fn handle_prompts_list_request(
+    req: JsonRpcRequest,
+    _request_id: String,
+    _start_time: std::time::Instant,
+) -> impl IntoResponse {
+    let result = serde_json::json!({
+        "prompts": [],
+        "nextCursor": serde_json::Value::Null,
+    });
+
+    let response = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        result,
+        id: req.id,
+    };
+
+    let json_response = Json(response);
+    let response = json_response.into_response();
+    add_cors_headers(response)
+}
+
 async fn handle_tools_call_request(
     req: JsonRpcRequest,
     request_id: String,
@@ -1212,7 +1261,7 @@ async fn handle_unknown_method(
         code: -32601,
         message: format!("Method '{}' not found", req.method),
         data: Some(
-            serde_json::json!({ "available_methods": ["initialize", "tools/list", "tools/call", "shutdown", "exit", "$/ping"] }),
+            serde_json::json!({ "available_methods": ["initialize", "tools/list", "prompts/list", "tools/call", "shutdown", "exit", "$/ping"] }),
         ),
     };
 
@@ -1271,7 +1320,7 @@ async fn handle_v1_mcp_messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    tracing::info!("📨 /v1 MCP message received");
+    tracing::debug!("📨 /v1 MCP message received");
 
     // Extract Git credentials from headers
     extract_git_headers(&headers, &credentials).await;
@@ -1308,40 +1357,47 @@ async fn handle_v1_single_request(
     req: JsonRpcRequest,
     credentials: SharedCredentials,
 ) -> axum::response::Response {
-    tracing::info!("📨 /v1 single request - method: '{}'", req.method);
+    let method = req.method.clone();
+    if method == "prompts/list" {
+        return handle_v1_prompts_list_request(req).await.into_response();
+    }
+
+    tracing::info!("📨 /v1 single request - method: '{}'", method);
 
     // Check if this is a notification
     if req.id.is_none() {
-        tracing::info!("🔔 /v1 notification: {}", req.method);
+        tracing::info!("🔔 /v1 notification: {}", method);
         return handle_v1_notification(req).await.into_response();
     }
 
     // Handle requests
-    match req.method.as_str() {
-        "initialize" => {
-            let response = handle_v1_initialize_request(req, credentials).await;
-            response.into_response()
-        }
-        "tools/list" => {
-            let response = handle_v1_tools_list_request(req, credentials).await;
-            response.into_response()
-        }
-        "tools/call" => {
-            let response = handle_v1_tools_call_request(req, credentials).await;
-            response.into_response()
-        }
-        _ => {
-            let response = handle_v1_unknown_method(req).await;
-            response.into_response()
-        }
-    }
+    let response: axum::response::Response = match method.as_str() {
+        "initialize" => handle_v1_initialize_request(req, credentials)
+            .await
+            .into_response(),
+        "tools/list" => handle_v1_tools_list_request(req, credentials)
+            .await
+            .into_response(),
+        "tools/call" => handle_v1_tools_call_request(req, credentials)
+            .await
+            .into_response(),
+        _ => handle_v1_unknown_method(req).await.into_response(),
+    };
+
+    let status = response.status();
+    tracing::info!(
+        "✅ /v1 request completed: method={}, status={}",
+        method,
+        status
+    );
+    response
 }
 
 async fn handle_v1_batch_requests(
     requests: Vec<JsonRpcRequest>,
     credentials: SharedCredentials,
 ) -> axum::response::Response {
-    tracing::info!("📦 /v1 batch request with {} items", requests.len());
+    tracing::debug!("📦 /v1 batch request with {} items", requests.len());
 
     let mut responses = Vec::new();
 
@@ -1358,6 +1414,10 @@ async fn handle_v1_batch_requests(
                 }
                 "tools/list" => {
                     let resp = handle_v1_tools_list_request(req, credentials.clone()).await;
+                    resp.into_response()
+                }
+                "prompts/list" => {
+                    let resp = handle_v1_prompts_list_request(req).await;
                     resp.into_response()
                 }
                 "tools/call" => {
@@ -1494,6 +1554,25 @@ async fn handle_v1_tools_list_request(
     add_cors_headers(response)
 }
 
+async fn handle_v1_prompts_list_request(req: JsonRpcRequest) -> impl IntoResponse {
+    tracing::debug!("🔧 /v1 prompts/list request");
+
+    let result = serde_json::json!({
+        "prompts": [],
+    });
+
+    let response = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        result,
+        id: req.id,
+    };
+
+    tracing::debug!("✅ /v1 prompts/list response prepared");
+    let json_response = Json(response);
+    let response = json_response.into_response();
+    add_cors_headers(response)
+}
+
 async fn handle_v1_tools_call_request(
     req: JsonRpcRequest,
     _credentials: SharedCredentials,
@@ -1573,7 +1652,7 @@ async fn handle_v1_unknown_method(req: JsonRpcRequest) -> impl IntoResponse {
         code: -32601,
         message: format!("Method '{}' not found", req.method),
         data: Some(
-            serde_json::json!({ "available_methods": ["initialize", "tools/list", "tools/call"] }),
+            serde_json::json!({ "available_methods": ["initialize", "tools/list", "prompts/list", "tools/call"] }),
         ),
     };
     let error_response = JsonRpcErrorResponse {
