@@ -41,7 +41,7 @@ services:
       dockerfile: docker/Dockerfile
     image: hyperzoekt:latest
     ports:
-      - "${ZOEK_INDEXER_PORT}:${ZOEK_INDEXER_PORT}"
+      - "${ZOEKT_INDEXER_PORT}:${ZOEKT_INDEXER_PORT}"
     environment:
       - DISTRIBUTED_ZOEKT_REPO_EVENTS=1
       - REDIS_URL=redis://redis:${REDIS_PORT}
@@ -52,9 +52,9 @@ services:
       - SURREAL_DB=repos
       - SURREAL_DB_VERBOSE_PAYLOADS=1
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_INDEXER_PORT}
-      - ZOEKT_ENDPOINT=http://zoekt-indexer:${ZOEK_INDEXER_PORT}
-    command: [ "/app/dzr-indexer", "--host", "0.0.0.0", "--port", "${ZOEK_INDEXER_PORT}" ]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEKT_INDEXER_PORT}
+      - ZOEKT_ENDPOINT=http://zoekt-indexer:${ZOEKT_INDEXER_PORT}
+    command: [ "/app/dzr-indexer", "--host", "0.0.0.0", "--port", "${ZOEKT_INDEXER_PORT}" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -68,7 +68,7 @@ services:
       dockerfile: docker/Dockerfile
     image: hyperzoekt:latest
     ports:
-      - "${ZOEK_ADMIN_PORT}:${ZOEK_ADMIN_PORT}"
+      - "${ZOEKT_ADMIN_PORT}:${ZOEKT_ADMIN_PORT}"
     environment:
       - REDIS_URL=redis://redis:${REDIS_PORT}
       - RUST_LOG=debug
@@ -79,7 +79,7 @@ services:
       - SURREAL_NS=zoekt
       - ZOEKTD_ADMIN_USERNAME=admin
       - ZOEKTD_ADMIN_PASSWORD=password
-    command: [ "/app/dzr-admin", "--host", "0.0.0.0", "--port", "${ZOEK_ADMIN_PORT}" ]
+    command: [ "/app/dzr-admin", "--host", "0.0.0.0", "--port", "${ZOEKT_ADMIN_PORT}" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -102,10 +102,10 @@ services:
       - SURREAL_NS=zoekt
       - ZOEKTD_POLL_INTERVAL_SECONDS=30
       # Bind internal metrics/health server to the same port we map on the host
-      - ZOEKT_POLLER_METRICS_PORT=${ZOEK_ADMIN_POLLER_PORT}
+      - ZOEKT_POLLER_METRICS_PORT=${ZOEKT_ADMIN_POLLER_PORT}
     ports:
-      - "${ZOEK_ADMIN_POLLER_PORT}:${ZOEK_ADMIN_POLLER_PORT}"
-    command: [ "/app/dzr-admin-poller", "--host", "0.0.0.0", "--port", "${ZOEK_ADMIN_POLLER_PORT}" ]
+      - "${ZOEKT_ADMIN_POLLER_PORT}:${ZOEKT_ADMIN_POLLER_PORT}"
+    command: [ "/app/dzr-admin-poller", "--host", "0.0.0.0", "--port", "${ZOEKT_ADMIN_POLLER_PORT}" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -118,7 +118,7 @@ services:
       zoekt-admin-poller:
         condition: service_started
     healthcheck:
-      test: [ "CMD-SHELL", "curl -sS http://zoekt-admin-poller:${ZOEK_ADMIN_POLLER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
+      test: [ "CMD-SHELL", "curl -sS http://zoekt-admin-poller:${ZOEKT_ADMIN_POLLER_PORT}/health -o /dev/null -w '%{http_code}' | grep -q '^200$'" ]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -130,7 +130,7 @@ services:
       dockerfile: docker/Dockerfile
     image: hyperzoekt:latest
     ports:
-      - "${ZOEK_SEARCH_PORT}:${ZOEK_SEARCH_PORT}"
+      - "${ZOEKT_SEARCH_PORT}:${ZOEKT_SEARCH_PORT}"
     environment:
       - REDIS_URL=redis://redis:${REDIS_PORT}
       - RUST_LOG=debug
@@ -139,8 +139,8 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_SEARCH_PORT}
-    command: [ "/app/dzr-http-search", "--host", "0.0.0.0", "--port", "${ZOEK_SEARCH_PORT}" ]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEKT_SEARCH_PORT}
+    command: [ "/app/dzr-http-search", "--host", "0.0.0.0", "--port", "${ZOEKT_SEARCH_PORT}" ]
     restart: unless-stopped
     depends_on:
       redis:
@@ -154,7 +154,7 @@ services:
       dockerfile: docker/Dockerfile
     image: hyperzoekt:latest
     ports:
-      - "${ZOEK_MCP_PORT}:${ZOEK_MCP_PORT}"
+      - "${ZOEKT_MCP_PORT}:${ZOEKT_MCP_PORT}"
     environment:
       - REDIS_URL=redis://redis:${REDIS_PORT}
       - RUST_LOG=debug
@@ -163,8 +163,8 @@ services:
       - SURREALDB_PASSWORD=root
       - SURREAL_DB=repos
       - SURREAL_NS=zoekt
-      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEK_MCP_PORT}
-    command: [ "/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "${ZOEK_MCP_PORT}" ]
+      - ZOEKTD_BIND_ADDR=0.0.0.0:${ZOEKT_MCP_PORT}
+    command: [ "/app/dzr-mcp-search", "--host", "0.0.0.0", "--port", "${ZOEKT_MCP_PORT}" ]
     restart: unless-stopped
     depends_on:
       redis:
