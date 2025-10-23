@@ -29,8 +29,8 @@ struct ChatResp {
     choices: Vec<ChatChoice>,
 }
 
-fn preview_with_total(input: &str, max_chars: usize) -> String {
-    let total_chars = input.chars().count();
+fn preview_with_total(input: &str, max_chars: usize, precomputed_len: Option<usize>) -> String {
+    let total_chars = precomputed_len.unwrap_or_else(|| input.chars().count());
     if total_chars <= max_chars {
         return input.to_owned();
     }
@@ -137,7 +137,7 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
         model,
         endpoint
     );
-    let prompt_preview = preview_with_total(&prompt, 500);
+    let prompt_preview = preview_with_total(&prompt, 500, Some(prompt_char_len));
     log::info!(
         "LLM prompt for cluster '{}': {}",
         cluster_label,
@@ -189,7 +189,8 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
 
     // Get the response text first so we can log it before parsing
     let response_text = resp.text().await.map_err(|e| anyhow::anyhow!(e))?;
-    let response_preview = preview_with_total(&response_text, 1000);
+    let response_char_len = response_text.chars().count();
+    let response_preview = preview_with_total(&response_text, 1000, Some(response_char_len));
     log::info!(
         "LLM raw response text for cluster '{}': {}",
         cluster_label,

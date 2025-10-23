@@ -1410,10 +1410,10 @@ pub async fn build_hierarchical_layers(
             let mut summary_text = raw_meta_summary.trim().to_string();
 
             if !raw_meta_summary.trim().is_empty() {
-                if let Ok(serde_json::Value::Object(mut map)) =
+                if let Ok(serde_json::Value::Object(map)) =
                     serde_json::from_str::<serde_json::Value>(&raw_meta_summary)
                 {
-                    if let Some(lbl) = map.get_mut("label").and_then(|v| v.as_str()) {
+                    if let Some(lbl) = map.get("label").and_then(|v| v.as_str()) {
                         let trimmed = lbl.trim();
                         if !trimmed.is_empty() {
                             info!(
@@ -1426,7 +1426,7 @@ pub async fn build_hierarchical_layers(
                             label_text = trimmed.to_string();
                         }
                     }
-                    if let Some(summary_body) = map.get_mut("summary").and_then(|v| v.as_str()) {
+                    if let Some(summary_body) = map.get("summary").and_then(|v| v.as_str()) {
                         let trimmed = summary_body.trim();
                         if !trimmed.is_empty() {
                             summary_text = trimmed.to_string();
