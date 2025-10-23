@@ -223,7 +223,7 @@ pub async fn similarity_with_conn_multi(
         return Ok(vec![]);
     }
     // Fetch entity details from entity_snapshot
-    let fields = "file, language, kind, name, parent, signature, start_line, end_line, doc, page_rank_value AS rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
+    let fields = "stable_id AS id, file, language, kind, name, parent, signature, start_line, end_line, doc, page_rank_value AS rank, imports, unresolved_imports, stable_id, repo_name, source_url, source_display";
     let ids: Vec<serde_json::Value> = scored
         .iter()
         .map(|(sid, _)| serde_json::Value::String(sid.clone()))

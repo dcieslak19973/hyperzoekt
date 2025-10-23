@@ -1,5 +1,7 @@
 #[cfg(feature = "otel")]
 pub fn init_otel_from_env() {
+    use opentelemetry::global;
+    use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::WithExportConfig;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -8,14 +10,24 @@ pub fn init_otel_from_env() {
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "hyperzoekt".into());
 
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
-        .with_endpoint(endpoint);
-    let tracer = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
-        .expect("install OTLP pipeline");
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("failed to build OTLP exporter");
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.clone())
+        .build();
+
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
+    let tracer = tracer_provider.tracer("hyperzoekt");
+
+    global::set_tracer_provider(tracer_provider);
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let fmt_layer = tracing_subscriber::fmt::layer();

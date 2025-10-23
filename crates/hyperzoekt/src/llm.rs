@@ -29,6 +29,23 @@ struct ChatResp {
     choices: Vec<ChatChoice>,
 }
 
+fn preview_with_total(input: &str, max_chars: usize, precomputed_len: Option<usize>) -> String {
+    let total_chars = precomputed_len.unwrap_or_else(|| input.chars().count());
+    if total_chars <= max_chars {
+        return input.to_owned();
+    }
+    let truncated: String = input.chars().take(max_chars).collect();
+    format!("{}... [truncated, total {} chars]", truncated, total_chars)
+}
+
+fn preview_simple(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_owned();
+    }
+    let truncated: String = input.chars().take(max_chars).collect();
+    format!("{}...", truncated)
+}
+
 /// Summarize a cluster using an OpenAI-compatible chat completion API.
 /// The endpoint is read from HZ_LLM_URL (default empty). The model is read
 /// from HZ_LLM_MODEL (default: "gpt-5-nano"). Returns an empty string on
@@ -110,27 +127,21 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
         Provide your analysis now:\n",
     );
 
+    let prompt_char_len = prompt.chars().count();
     log::info!(
         "LLM request for cluster '{}': sending {} non-empty snippets (out of {} total, prompt length: {} chars) to model '{}' at endpoint '{}'",
         cluster_label,
         sample_size,
         member_snippets.len(),
-        prompt.len(),
+        prompt_char_len,
         model,
         endpoint
     );
+    let prompt_preview = preview_with_total(&prompt, 500, Some(prompt_char_len));
     log::info!(
         "LLM prompt for cluster '{}': {}",
         cluster_label,
-        if prompt.len() > 500 {
-            format!(
-                "{}... [truncated, total {} chars]",
-                &prompt[..500],
-                prompt.len()
-            )
-        } else {
-            prompt.clone()
-        }
+        prompt_preview
     );
 
     let client = Client::new();
@@ -178,18 +189,12 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
 
     // Get the response text first so we can log it before parsing
     let response_text = resp.text().await.map_err(|e| anyhow::anyhow!(e))?;
+    let response_char_len = response_text.chars().count();
+    let response_preview = preview_with_total(&response_text, 1000, Some(response_char_len));
     log::info!(
         "LLM raw response text for cluster '{}': {}",
         cluster_label,
-        if response_text.len() > 1000 {
-            format!(
-                "{}... [truncated, total {} chars]",
-                &response_text[..1000],
-                response_text.len()
-            )
-        } else {
-            response_text.clone()
-        }
+        response_preview
     );
 
     let jr: ChatResp = serde_json::from_str(&response_text)
@@ -224,11 +229,7 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
                     "LLM summary extracted for cluster '{}' (length: {} chars): {}",
                     cluster_label,
                     s.len(),
-                    if s.len() > 100 {
-                        format!("{}...", &s[..100])
-                    } else {
-                        s.to_string()
-                    }
+                    preview_simple(s, 100)
                 );
                 return Ok(s.trim().to_string());
             }
@@ -242,11 +243,7 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
                         "LLM summary extracted (nested) for cluster '{}' (length: {} chars): {}",
                         cluster_label,
                         s.len(),
-                        if s.len() > 100 {
-                            format!("{}...", &s[..100])
-                        } else {
-                            s.clone()
-                        }
+                        preview_simple(&s, 100)
                     );
                     return Ok(s);
                 } else if let Some(m) = content_val.get("text") {
@@ -255,7 +252,7 @@ pub async fn summarize_cluster(cluster_label: &str, member_snippets: &[String]) 
                         "LLM summary extracted (text field) for cluster '{}' (length: {} chars): {}",
                         cluster_label,
                         s.len(),
-                        if s.len() > 100 { format!("{}...", &s[..100]) } else { s.clone() }
+                        preview_simple(&s, 100)
                     );
                     return Ok(s);
                 }

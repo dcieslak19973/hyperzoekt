@@ -339,6 +339,19 @@ fn sort_members_by_centroid(
     scored.into_iter().map(|(id, _)| id).collect()
 }
 
+fn canonical_repo_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = normalize_git_url(trimmed);
+    let without_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized);
+    without_scheme.trim_matches('/').to_string()
+}
+
 /// Build a first-pass hierarchical layer over the entities stored in Surreal.
 /// This will read `entity` rows that have embeddings, cluster them, and write
 /// cluster summaries back into Surreal as `hirag_cluster` records (id,label,summary,members).
@@ -531,7 +544,10 @@ pub async fn build_first_layer(conn: &SurrealConnection, k: usize) -> Result<()>
         for m in members.iter() {
             if let Ok(repos) = crate::db::helpers::get_repos_for_entity(conn, m).await {
                 for r in repos.into_iter() {
-                    repos_set.insert(r);
+                    let canonical = canonical_repo_name(&r);
+                    if !canonical.is_empty() {
+                        repos_set.insert(canonical);
+                    }
                 }
             }
         }
@@ -792,15 +808,22 @@ pub async fn build_first_layer_for_repo(
                 // Normalize the explicitly-provided repo provenance so we don't
                 // end up with mixed forms like "https://foo" and "foo".
                 let norm_repo = normalize_git_url(repo);
-                if !norm_repo.is_empty() {
-                    repos_set.insert(norm_repo);
+                let canonical = canonical_repo_name(&norm_repo);
+                if !canonical.is_empty() {
+                    repos_set.insert(canonical);
                 } else {
-                    repos_set.insert(repo.to_string());
+                    let fallback = canonical_repo_name(repo);
+                    if !fallback.is_empty() {
+                        repos_set.insert(fallback);
+                    }
                 }
                 for m in members.iter() {
                     if let Ok(repos) = crate::db::helpers::get_repos_for_entity(conn, m).await {
                         for r in repos.into_iter() {
-                            repos_set.insert(r);
+                            let canonical = canonical_repo_name(&r);
+                            if !canonical.is_empty() {
+                                repos_set.insert(canonical);
+                            }
                         }
                     }
                 }
@@ -1007,15 +1030,22 @@ pub async fn build_first_layer_for_repo(
         let mut repos_set: HashSet<String> = HashSet::new();
         // Since we're scoped to a repo, include it explicitly and normalize.
         let norm_repo = normalize_git_url(repo);
-        if !norm_repo.is_empty() {
-            repos_set.insert(norm_repo);
+        let canonical = canonical_repo_name(&norm_repo);
+        if !canonical.is_empty() {
+            repos_set.insert(canonical);
         } else {
-            repos_set.insert(repo.to_string());
+            let fallback = canonical_repo_name(repo);
+            if !fallback.is_empty() {
+                repos_set.insert(fallback);
+            }
         }
         for m in members.iter() {
             if let Ok(repos) = crate::db::helpers::get_repos_for_entity(conn, m).await {
                 for r in repos.into_iter() {
-                    repos_set.insert(r);
+                    let canonical = canonical_repo_name(&r);
+                    if !canonical.is_empty() {
+                        repos_set.insert(canonical);
+                    }
                 }
             }
         }
@@ -1333,7 +1363,7 @@ pub async fn build_hierarchical_layers(
             );
 
             // Generate meta-summary by having LLM summarize the cluster summaries
-            let meta_summary: String =
+            let raw_meta_summary: String =
                 if cluster_summaries.is_empty() {
                     warn!(
                         "No summaries available for layer{} meta-cluster {}, skipping LLM",
@@ -1374,6 +1404,47 @@ pub async fn build_hierarchical_layers(
                     }
                 };
 
+            // Attempt to parse the LLM JSON response so we can persist a human-readable label
+            let default_label = format!("layer{}-cluster-{}", next_layer, meta_cid);
+            let mut label_text = default_label.clone();
+            let mut summary_text = raw_meta_summary.trim().to_string();
+
+            if !raw_meta_summary.trim().is_empty() {
+                if let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(&raw_meta_summary)
+                {
+                    if let Some(lbl) = map.get("label").and_then(|v| v.as_str()) {
+                        let trimmed = lbl.trim();
+                        if !trimmed.is_empty() {
+                            info!(
+                                "Layer{} meta-cluster {} overriding label '{}' -> '{}' from LLM response",
+                                next_layer,
+                                meta_cid,
+                                label_text,
+                                trimmed
+                            );
+                            label_text = trimmed.to_string();
+                        }
+                    }
+                    if let Some(summary_body) = map.get("summary").and_then(|v| v.as_str()) {
+                        let trimmed = summary_body.trim();
+                        if !trimmed.is_empty() {
+                            summary_text = trimmed.to_string();
+                        }
+                    }
+                }
+            }
+
+            if label_text.trim().is_empty() {
+                log::debug!(
+                    "Layer{} meta-cluster {} fallback to default label '{}' after empty LLM label",
+                    next_layer,
+                    meta_cid,
+                    default_label
+                );
+                label_text = default_label.clone();
+            }
+
             // Aggregate member repos from all lower layer clusters in this meta-cluster
             use std::collections::HashSet;
             let mut all_repos: HashSet<String> = HashSet::new();
@@ -1390,8 +1461,8 @@ pub async fn build_hierarchical_layers(
             // Store member cluster IDs (from lower layer)
             let summary = ClusterSummary {
                 id: cluster_id.clone(),
-                label: format!("layer{}-cluster-{}", next_layer, meta_cid),
-                summary: meta_summary,
+                label: label_text.clone(),
+                summary: summary_text.clone(),
                 members: sorted_members.clone(), // These are lower layer cluster stable_ids
                 centroid: meta_centroid.clone(),
                 centroid_len: meta_centroid.len(),
@@ -1406,7 +1477,7 @@ pub async fn build_hierarchical_layers(
                 );
                 map.insert(
                     "stable_label".to_string(),
-                    serde_json::Value::String(format!("layer{}-cluster-{}", next_layer, meta_cid)),
+                    serde_json::Value::String(default_label.clone()),
                 );
                 map.insert(
                     "layer".to_string(),
