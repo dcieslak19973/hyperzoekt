@@ -38,7 +38,7 @@ signal-hook = "0.3.18"
 petgraph = "0.6"
 
 # Needed by hirag.rs for random initialization of kmeans
-rand = "0.8"
+rand = "0.9"
 
 # Redis for event consumption from zoekt-distributed
 deadpool-redis = "0.22"
