@@ -40,7 +40,7 @@ tree-sitter-verilog = "1.0"
 tree-sitter-ocaml = "0.23.2"
 tree-sitter-ocamllex = "0.20.2"
 tree-sitter-groovy = { version = "0.1.2", package = "tree-sitter-groovy" }
-regex-syntax = "0.6"
+regex-syntax = "0.8"
 memchr = "2"
 tempfile = "3"
 git2 = "0.20"
